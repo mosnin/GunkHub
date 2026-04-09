@@ -24,6 +24,53 @@ export const getOrganization = query({
 });
 
 /**
+ * Upsert an organization record. Creates the org if it does not exist;
+ * updates name and slug if it does. Called from the Clerk webhook handler
+ * for both organization.created and organization.updated events.
+ */
+export const upsertOrganization = mutation({
+  args: {
+    clerkOrgId: v.string(),
+    name: v.string(),
+    slug: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+
+    const existing = await ctx.db
+      .query("organizations")
+      .withIndex("by_clerk_org_id", (q) =>
+        q.eq("clerkOrgId", args.clerkOrgId),
+      )
+      .unique();
+
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        name: args.name,
+        slug: args.slug,
+        updatedAt: now,
+      });
+      const updated = await ctx.db.get(existing._id);
+      if (!updated) throw new Error("Failed to update organization");
+      return updated;
+    }
+
+    const orgId = await ctx.db.insert("organizations", {
+      clerkOrgId: args.clerkOrgId,
+      name: args.name,
+      slug: args.slug,
+      plan: "free",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const org = await ctx.db.get(orgId);
+    if (!org) throw new Error("Failed to create organization");
+    return org;
+  },
+});
+
+/**
  * Create an organization record. This mutation is called from the Clerk
  * organization.created webhook — not directly by end users.
  */
