@@ -16,7 +16,7 @@ export async function POST(req: NextRequest) {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     body = await req.json()
   } catch {
-    return NextResponse.json<ApiError>({ code: 'INVALID_BODY', message: 'Request body must be valid JSON' }, { status: 400 })
+    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'Request body must be valid JSON' }, { status: 400 })
   }
 
   if (!body.targetId) {
@@ -29,6 +29,17 @@ export async function POST(req: NextRequest) {
     return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'content is required' }, { status: 422 })
   }
 
-  const result = await createComment(body)
-  return NextResponse.json<CreateCommentResponse>(result, { status: 201 })
+  try {
+    const result = await createComment(body)
+    return NextResponse.json<CreateCommentResponse>(result, { status: 201 })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Internal error'
+    if (message === 'Not authenticated' || message.includes('Unauthorized')) {
+      return NextResponse.json<ApiError>({ code: 'UNAUTHORIZED', message: 'Authentication required' }, { status: 401 })
+    }
+    if (message.includes('not found') || message.includes('Not found')) {
+      return NextResponse.json<ApiError>({ code: 'NOT_FOUND', message }, { status: 404 })
+    }
+    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
+  }
 }

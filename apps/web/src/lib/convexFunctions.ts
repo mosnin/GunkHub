@@ -10,6 +10,12 @@ type M = 'mutation'
 export const convex = {
   organizations: {
     getOrganization: makeFunctionReference<Q>('organizations:getOrganization'),
+    upsertOrganization: makeFunctionReference<M>('organizations:upsertOrganization'),
+  },
+  api_keys: {
+    createApiKey: makeFunctionReference<M>('api_keys:createApiKey'),
+    listApiKeys: makeFunctionReference<Q>('api_keys:listApiKeys'),
+    revokeApiKey: makeFunctionReference<M>('api_keys:revokeApiKey'),
   },
   runs: {
     listRuns: makeFunctionReference<Q>('runs:listRuns'),
