@@ -1,5 +1,4 @@
-import type { ReplayProjection, ReplayFrame, ReplayActor, FrameStatus } from "@agent-flight-recorder/contracts";
-import type { Event, Run } from "@agent-flight-recorder/contracts";
+import type { Event, FrameStatus, ReplayActor, ReplayFrame, ReplayProjection, Run } from "@agent-flight-recorder/contracts";
 
 /**
  * Maximum parent-chain depth traversal to prevent runaway cycles.

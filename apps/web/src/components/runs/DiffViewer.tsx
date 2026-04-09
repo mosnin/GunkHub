@@ -30,10 +30,10 @@ const kindConfig: Record<
   DiffKind,
   { prefix: string; border: string; bg: string; text: string }
 > = {
-  same:    { prefix: ' ', border: 'border-l-neutral-700', bg: '',                      text: 'text-neutral-500' },
-  added:   { prefix: '+', border: 'border-l-emerald-600', bg: 'bg-emerald-950/20',     text: 'text-emerald-400' },
-  removed: { prefix: '-', border: 'border-l-red-600',     bg: 'bg-red-950/20',         text: 'text-red-400'     },
-  changed: { prefix: '~', border: 'border-l-amber-600',   bg: 'bg-amber-950/20',       text: 'text-amber-400'   },
+  same:    { prefix: ' ', border: 'border-l-neutral-700', bg: '',                  text: 'text-neutral-500' },
+  added:   { prefix: '+', border: 'border-l-emerald-600', bg: 'bg-emerald-950/20', text: 'text-emerald-400' },
+  removed: { prefix: '-', border: 'border-l-red-600',     bg: 'bg-red-950/20',     text: 'text-red-400'    },
+  changed: { prefix: '~', border: 'border-l-amber-600',   bg: 'bg-amber-950/20',   text: 'text-amber-400'  },
 }
 
 interface FieldChangesTableProps {
@@ -76,7 +76,8 @@ function EventDiffRow({ entry, isFirstDivergence }: EventDiffRowProps) {
   const [expanded, setExpanded] = useState(false)
   const cfg = kindConfig[entry.kind]
   const type = entry.leftEvent?.type ?? entry.rightEvent?.type
-  const hasChanges = entry.kind === 'changed' && (entry.changes?.length ?? 0) > 0
+  const changes = entry.changes ?? []
+  const hasChanges = entry.kind === 'changed' && changes.length > 0
 
   return (
     <div>
@@ -109,7 +110,7 @@ function EventDiffRow({ entry, isFirstDivergence }: EventDiffRowProps) {
               onClick={() => setExpanded((v) => !v)}
               className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors duration-75 flex items-center gap-1"
             >
-              {expanded ? 'hide' : `${entry.changes!.length} changes`}
+              {expanded ? 'hide' : `${changes.length} changes`}
               <svg
                 width="10"
                 height="10"
@@ -124,7 +125,7 @@ function EventDiffRow({ entry, isFirstDivergence }: EventDiffRowProps) {
           )}
         </div>
         {hasChanges && expanded && (
-          <FieldChangesTable changes={entry.changes!} />
+          <FieldChangesTable changes={changes} />
         )}
       </div>
     </div>
@@ -191,40 +192,15 @@ function RunSelector() {
   )
 }
 
-export function DiffViewer({ diff, incomparable, incomparableReason, loading }: DiffViewerProps) {
-  // No diff loaded yet — show selector
-  if (!diff && !loading) {
-    return (
-      <div className="flex flex-col gap-6">
-        <RunSelector />
-        <div className="rounded-md border border-neutral-800 bg-neutral-900">
-          <EmptyState
-            title="No runs selected"
-            description="Enter two run IDs above to compare their event sequences."
-          />
-        </div>
-      </div>
-    )
-  }
+interface DiffResultProps {
+  diff: RunDiff
+  incomparable?: boolean
+  incomparableReason?: string
+}
 
-  if (loading) {
-    return (
-      <div className="flex flex-col gap-4">
-        <div className="grid grid-cols-2 gap-4">
-          <div className="h-9 rounded-md bg-neutral-900 border border-neutral-800 animate-pulse" />
-          <div className="h-9 rounded-md bg-neutral-900 border border-neutral-800 animate-pulse" />
-        </div>
-        <div className="rounded-md border border-neutral-800 bg-neutral-900 py-20 flex items-center justify-center">
-          <span className="text-sm text-neutral-500">Computing diff…</span>
-        </div>
-      </div>
-    )
-  }
-
-  const summary = diff!.summary
-  const { leftRunId, rightRunId } = diff!
-
-  const firstDivergenceIndex = diff!.eventDiffs.findIndex((e) => e.kind !== 'same')
+function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps) {
+  const { summary, leftRunId, rightRunId, eventDiffs } = diff
+  const firstDivergenceIndex = eventDiffs.findIndex((e) => e.kind !== 'same')
 
   return (
     <div className="flex flex-col gap-4">
@@ -277,14 +253,14 @@ export function DiffViewer({ diff, incomparable, incomparableReason, loading }: 
 
       {/* Diff list */}
       <div className="rounded-md border border-neutral-800 bg-neutral-950 overflow-hidden">
-        {diff!.eventDiffs.length === 0 ? (
+        {eventDiffs.length === 0 ? (
           <EmptyState
             title="No differences"
             description="These runs have identical event sequences."
           />
         ) : (
           <div className="divide-y divide-neutral-800/50">
-            {diff!.eventDiffs.map((entry, i) => (
+            {eventDiffs.map((entry, i) => (
               <EventDiffRow
                 key={`${entry.sequenceNumber}-${entry.kind}`}
                 entry={entry}
@@ -295,5 +271,45 @@ export function DiffViewer({ diff, incomparable, incomparableReason, loading }: 
         )}
       </div>
     </div>
+  )
+}
+
+export function DiffViewer({ diff, incomparable, incomparableReason, loading }: DiffViewerProps) {
+  // Loading state
+  if (loading) {
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="grid grid-cols-2 gap-4">
+          <div className="h-9 rounded-md bg-neutral-900 border border-neutral-800 animate-pulse" />
+          <div className="h-9 rounded-md bg-neutral-900 border border-neutral-800 animate-pulse" />
+        </div>
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 py-20 flex items-center justify-center">
+          <span className="text-sm text-neutral-500">Computing diff…</span>
+        </div>
+      </div>
+    )
+  }
+
+  // No diff loaded yet — show selector + empty state
+  if (!diff) {
+    return (
+      <div className="flex flex-col gap-6">
+        <RunSelector />
+        <div className="rounded-md border border-neutral-800 bg-neutral-900">
+          <EmptyState
+            title="No runs selected"
+            description="Enter two run IDs above to compare their event sequences."
+          />
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <DiffResult
+      diff={diff}
+      incomparable={incomparable}
+      incomparableReason={incomparableReason}
+    />
   )
 }

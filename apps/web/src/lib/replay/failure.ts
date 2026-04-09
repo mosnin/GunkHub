@@ -12,6 +12,7 @@ function extractErrorMessage(payload: unknown): string | undefined {
   const errorMsg = (p["error"] as Record<string, unknown> | undefined)?.["message"];
   if (typeof errorMsg === "string" && errorMsg.length > 0) return errorMsg;
 
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const directMsg = p["message"];
   if (typeof directMsg === "string" && directMsg.length > 0) return directMsg;
 

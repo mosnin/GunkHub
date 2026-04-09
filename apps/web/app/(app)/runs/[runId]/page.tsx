@@ -1,16 +1,19 @@
 import { notFound } from 'next/navigation'
 import { Suspense } from 'react'
 
+import type { FailureSummary } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { ArtifactList } from '@/components/runs/ArtifactList'
 import { CommentThread } from '@/components/runs/CommentThread'
 import { EventInspector } from '@/components/runs/EventInspector'
+import { FailureSummary as FailureSummaryPanel } from '@/components/runs/FailureSummary'
 import { RunHeader } from '@/components/runs/RunHeader'
 import { Timeline } from '@/components/runs/Timeline'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { LoadingState } from '@/components/ui/LoadingState'
 import { listEvents } from '@/lib/services/events'
+import { getReplayProjection } from '@/lib/services/replay'
 import { getRun } from '@/lib/services/runs'
 
 export const metadata: Metadata = { title: 'Run Detail' }
@@ -20,6 +23,7 @@ const TABS = [
   { id: 'events', label: 'Events' },
   { id: 'artifacts', label: 'Artifacts' },
   { id: 'comments', label: 'Comments' },
+  { id: 'replay', label: 'Replay' },
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
@@ -41,6 +45,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   let runData: Awaited<ReturnType<typeof getRun>> | null = null
   let eventsData: Awaited<ReturnType<typeof listEvents>> | null = null
   let fetchError: string | null = null
+  let failureSummary: FailureSummary | null = null
 
   try {
     runData = await getRun(runId)
@@ -49,6 +54,14 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
     const msg = err instanceof Error ? err.message : 'Unknown error'
     if (msg.toLowerCase().includes('not found')) notFound()
     fetchError = msg
+  }
+
+  // Failure summary is additive — a failed fetch does not block the rest of the page.
+  try {
+    const replayData = await getReplayProjection(runId)
+    failureSummary = replayData.failureSummary
+  } catch {
+    // Non-fatal: skip the failure panel if the projection cannot be built.
   }
 
   if (fetchError) {
@@ -76,15 +89,25 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         triggeredBy={run.triggeredBy}
       />
 
+      {/* Failure summary panel — additive, shown only when there is a failure or incomplete run */}
+      {failureSummary && (
+        <FailureSummaryPanel summary={failureSummary} />
+      )}
+
       {/* Tab bar */}
-      <div className="border-b border-neutral-800 px-6">
+      <div className="border-b border-neutral-800 px-6 mt-3">
         <nav className="-mb-px flex gap-6" role="tablist">
           {TABS.map((tab) => {
             const isActive = tab.id === activeTab
+            // Replay tab links to the dedicated replay page instead of a tab panel
+            const href =
+              tab.id === 'replay'
+                ? `/runs/${runId}/replay`
+                : `/runs/${runId}?tab=${tab.id}`
             return (
               <a
                 key={tab.id}
-                href={`/runs/${runId}?tab=${tab.id}`}
+                href={href}
                 role="tab"
                 aria-selected={isActive}
                 className={[
