@@ -1,6 +1,7 @@
 import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
+import { ApiKeysSection } from '@/components/settings/ApiKeysSection'
 import { Card } from '@/components/ui/Card'
 
 export const metadata: Metadata = { title: 'Settings' }
@@ -67,18 +68,8 @@ export default function SettingsPage() {
           </div>
         </Card>
 
-        {/* API Keys */}
-        <Card>
-          <div className="px-5 py-4 border-b border-neutral-800">
-            <h2 className="text-sm font-semibold text-neutral-200">API Keys</h2>
-          </div>
-          <div className="px-5 py-4">
-            <p className="text-sm text-neutral-500">
-              API key management coming in{' '}
-              <span className="font-mono text-neutral-400">v1.1</span>.
-            </p>
-          </div>
-        </Card>
+        {/* API Keys — functional UI (route handled by Team A at /api/api-keys) */}
+        <ApiKeysSection />
       </div>
     </div>
   )

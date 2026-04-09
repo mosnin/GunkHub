@@ -1,5 +1,7 @@
 'use client'
 
+import { useState } from 'react'
+
 import type { Event } from '@agent-flight-recorder/contracts'
 
 import { EmptyState } from '@/components/ui/EmptyState'
@@ -11,16 +13,57 @@ interface TimelineProps {
   loading?: boolean
 }
 
-// Colour-code event type prefixes for quick visual scanning
+/** Colour-code event type prefixes for quick visual scanning */
 function dotClass(type: string): string {
   if (type.startsWith('llm.')) return 'border-violet-700 bg-violet-950'
   if (type.startsWith('tool.')) return 'border-amber-700 bg-amber-950'
   if (type.startsWith('http.')) return 'border-sky-700 bg-sky-950'
   if (type.startsWith('run.')) return 'border-emerald-700 bg-emerald-950'
+  if (type.startsWith('memory.')) return 'border-pink-700 bg-pink-950'
+  if (type.startsWith('retrieval.')) return 'border-cyan-700 bg-cyan-950'
   return 'border-neutral-700 bg-neutral-900'
 }
 
+function payloadSummary(event: Event): string {
+  const p = event.payload as unknown as Record<string, unknown>
+  if (event.type === 'llm.request') {
+    const model = typeof p.model === 'string' ? p.model : ''
+    const msgs = Array.isArray(p.messages) ? p.messages.length : 0
+    return model ? `${model} — ${msgs} message${msgs !== 1 ? 's' : ''}` : `${msgs} message${msgs !== 1 ? 's' : ''}`
+  }
+  if (event.type === 'llm.response') {
+    const model = typeof p.model === 'string' ? p.model : ''
+    const usage = p.usage as Record<string, number> | undefined
+    const tokens = usage?.total_tokens
+    return [model, tokens != null ? `${tokens} tokens` : ''].filter(Boolean).join(' — ')
+  }
+  if (event.type === 'tool.call') {
+    return typeof p.name === 'string' ? p.name : ''
+  }
+  if (event.type === 'tool.result') {
+    const ms = typeof p.duration_ms === 'number' ? `${p.duration_ms}ms` : ''
+    return ms
+  }
+  if (event.type === 'http.request') {
+    const method = typeof p.method === 'string' ? p.method : ''
+    const url = typeof p.url === 'string' ? p.url.slice(0, 60) : ''
+    return [method, url].filter(Boolean).join(' ')
+  }
+  if (event.type === 'http.response') {
+    const status = typeof p.status === 'number' ? String(p.status) : ''
+    const ms = typeof p.duration_ms === 'number' ? `${p.duration_ms}ms` : ''
+    return [status, ms].filter(Boolean).join(' — ')
+  }
+  if (event.type === 'run.failed') {
+    const err = p.error as Record<string, unknown> | undefined
+    return typeof err?.message === 'string' ? err.message.slice(0, 80) : ''
+  }
+  return ''
+}
+
 export function Timeline({ runId: _runId, events, loading }: TimelineProps) {
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+
   if (loading) {
     return <LoadingState message="Loading timeline..." />
   }
@@ -38,29 +81,63 @@ export function Timeline({ runId: _runId, events, loading }: TimelineProps) {
       <div className="relative">
         {/* Vertical rail */}
         <div className="absolute left-[11px] top-3 bottom-3 w-px bg-neutral-800" aria-hidden="true" />
-        <div className="flex flex-col gap-2">
-          {events.map((event) => (
-            <div key={event.id} className="flex items-start gap-3">
-              <div
-                className={[
-                  'w-[23px] h-[23px] shrink-0 rounded-full border z-10 mt-0.5',
-                  dotClass(event.type),
-                ].join(' ')}
-                aria-hidden="true"
-              />
-              <div className="flex-1 rounded bg-neutral-900 border border-neutral-800 px-3 py-2">
-                <div className="flex items-center gap-3">
-                  <span className="text-xs font-mono text-neutral-300">{event.type}</span>
-                  <span className="text-xs font-mono text-neutral-600">
-                    #{event.sequenceNumber}
-                  </span>
-                  <span className="ml-auto text-xs font-mono text-neutral-600">
-                    {new Date(event.timestamp).toISOString().slice(11, 23)}
-                  </span>
+        <div className="flex flex-col gap-1.5">
+          {events.map((event) => {
+            const isExpanded = expandedId === event.id
+            const summary = payloadSummary(event)
+
+            return (
+              <div key={event.id} className="flex items-start gap-3">
+                <div
+                  className={[
+                    'w-[23px] h-[23px] shrink-0 rounded-full border z-10 mt-0.5',
+                    dotClass(event.type),
+                  ].join(' ')}
+                  aria-hidden="true"
+                />
+                <div className="flex-1 rounded bg-neutral-900 border border-neutral-800 overflow-hidden">
+                  <button
+                    onClick={() => setExpandedId(isExpanded ? null : event.id)}
+                    className="w-full px-3 py-2 flex items-center gap-3 text-left hover:bg-neutral-800/60 transition-colors duration-75 group"
+                    aria-expanded={isExpanded}
+                  >
+                    <span className="text-xs font-mono text-neutral-300 min-w-[140px]">{event.type}</span>
+                    <span className="text-xs font-mono text-neutral-600 w-10 shrink-0">
+                      #{event.sequenceNumber}
+                    </span>
+                    {summary && (
+                      <span className="text-xs text-neutral-500 truncate flex-1">{summary}</span>
+                    )}
+                    <span className="ml-auto text-xs font-mono text-neutral-600 shrink-0">
+                      {new Date(event.timestamp).toISOString().slice(11, 23)}
+                    </span>
+                    <svg
+                      width="12"
+                      height="12"
+                      viewBox="0 0 12 12"
+                      fill="none"
+                      xmlns="http://www.w3.org/2000/svg"
+                      aria-hidden="true"
+                      className={[
+                        'shrink-0 text-neutral-600 transition-transform duration-100',
+                        isExpanded ? 'rotate-180' : '',
+                      ].join(' ')}
+                    >
+                      <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </button>
+
+                  {isExpanded && (
+                    <div className="border-t border-neutral-800 bg-neutral-950 overflow-auto max-h-[320px]">
+                      <pre className="text-xs font-mono text-neutral-300 whitespace-pre-wrap break-words leading-relaxed p-3">
+                        {JSON.stringify(event.payload, null, 2)}
+                      </pre>
+                    </div>
+                  )}
                 </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       </div>
     </div>
