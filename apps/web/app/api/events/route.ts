@@ -1,37 +1,73 @@
-import { auth } from '@clerk/nextjs/server'
-import { NextRequest, NextResponse } from 'next/server'
-import type { CreateEventRequest, CreateEventResponse, ApiError } from '@agent-flight-recorder/contracts'
-import { createEvent } from '@/lib/services/events'
+import { type NextRequest, NextResponse } from 'next/server'
 
+import type { ApiError } from '@agent-flight-recorder/contracts'
+
+import { convex } from '@/lib/convexFunctions'
+import { getPublicClient, hashApiKey } from '@/lib/convexServer'
+
+// POST /api/events — batch append events from the SDK (x-api-key auth)
 export async function POST(req: NextRequest) {
-  const { userId, orgId } = await auth()
-  if (!userId || !orgId) {
-    return NextResponse.json<ApiError>({ code: 'UNAUTHORIZED', message: 'Authentication required' }, { status: 401 })
+  const apiKey = req.headers.get('x-api-key')
+  if (!apiKey) {
+    return NextResponse.json<ApiError>(
+      { code: 'UNAUTHORIZED', message: 'API key required' },
+      { status: 401 }
+    )
   }
 
-  let body: CreateEventRequest
+  let body: Record<string, unknown>
   try {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     body = await req.json()
   } catch {
-    return NextResponse.json<ApiError>({ code: 'INVALID_BODY', message: 'Request body must be valid JSON' }, { status: 400 })
+    return NextResponse.json<ApiError>(
+      { code: 'BAD_REQUEST', message: 'Invalid JSON body' },
+      { status: 400 }
+    )
   }
 
-  if (!body.runId) {
-    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'runId is required' }, { status: 422 })
-  }
-  if (!body.type) {
-    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'type is required' }, { status: 422 })
-  }
-  if (body.sequenceNumber == null) {
-    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'sequenceNumber is required' }, { status: 422 })
-  }
-  if (body.timestamp == null) {
-    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'timestamp is required' }, { status: 422 })
-  }
-  if (body.payload == null) {
-    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'payload is required' }, { status: 422 })
+  const events = body['events']
+  if (!Array.isArray(events) || events.length === 0) {
+    return NextResponse.json<ApiError>(
+      { code: 'VALIDATION_ERROR', message: 'events must be a non-empty array' },
+      { status: 422 }
+    )
   }
 
-  const result = await createEvent(body)
-  return NextResponse.json<CreateEventResponse>(result, { status: 201 })
+  // Validate required fields
+  for (const evt of events as Record<string, unknown>[]) {
+    if (!evt['runId']) return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'Each event must have runId' }, { status: 422 })
+    if (!evt['type']) return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'Each event must have type' }, { status: 422 })
+    if (evt['sequenceNumber'] == null) return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'Each event must have sequenceNumber' }, { status: 422 })
+    if (evt['timestamp'] == null) return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'Each event must have timestamp' }, { status: 422 })
+    if (evt['payload'] == null) return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'Each event must have payload' }, { status: 422 })
+  }
+
+  try {
+    const client = getPublicClient()
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const result = await client.mutation(convex.sdk_ingest.sdkCreateEvents, {
+      apiKeyHash: hashApiKey(apiKey),
+      events: (events as Record<string, unknown>[]).map((evt) => ({
+        runId: evt['runId'] as string,
+        type: evt['type'] as string,
+        sequenceNumber: evt['sequenceNumber'] as number,
+        timestamp: evt['timestamp'] as number,
+        payload: evt['payload'],
+        ...(evt['parentEventId'] !== undefined && { parentEventId: evt['parentEventId'] as string }),
+      })),
+    })
+
+    const res = result as { eventIds: string[] }
+    return NextResponse.json({ eventIds: res.eventIds }, { status: 201 })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Internal error'
+    if (message === 'Unauthorized') {
+      return NextResponse.json<ApiError>(
+        { code: 'UNAUTHORIZED', message: 'Invalid API key' },
+        { status: 401 }
+      )
+    }
+    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
+  }
 }

@@ -1,11 +1,17 @@
+import { notFound } from 'next/navigation'
 import { Suspense } from 'react'
+
 import type { Metadata } from 'next'
-import { LoadingState } from '@/components/ui/LoadingState'
-import { RunHeader } from '@/components/runs/RunHeader'
-import { Timeline } from '@/components/runs/Timeline'
-import { EventInspector } from '@/components/runs/EventInspector'
+
 import { ArtifactList } from '@/components/runs/ArtifactList'
 import { CommentThread } from '@/components/runs/CommentThread'
+import { EventInspector } from '@/components/runs/EventInspector'
+import { RunHeader } from '@/components/runs/RunHeader'
+import { Timeline } from '@/components/runs/Timeline'
+import { ErrorState } from '@/components/ui/ErrorState'
+import { LoadingState } from '@/components/ui/LoadingState'
+import { listEvents } from '@/lib/services/events'
+import { getRun } from '@/lib/services/runs'
 
 export const metadata: Metadata = { title: 'Run Detail' }
 
@@ -23,25 +29,52 @@ interface RunDetailPageProps {
   searchParams: { tab?: string }
 }
 
-export default function RunDetailPage({ params, searchParams }: RunDetailPageProps) {
+export default async function RunDetailPage({ params, searchParams }: RunDetailPageProps) {
   const { runId } = params
+
   const activeTab: TabId =
-    (searchParams.tab as TabId | undefined) &&
-    TABS.some((t) => t.id === searchParams.tab)
+    (searchParams.tab as TabId | undefined) && TABS.some((t) => t.id === searchParams.tab)
       ? (searchParams.tab as TabId)
       : 'timeline'
+
+  // Fetch run and events server-side
+  let runData: Awaited<ReturnType<typeof getRun>> | null = null
+  let eventsData: Awaited<ReturnType<typeof listEvents>> | null = null
+  let fetchError: string | null = null
+
+  try {
+    runData = await getRun(runId)
+    eventsData = await listEvents({ runId, limit: 500 })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    if (msg.toLowerCase().includes('not found')) notFound()
+    fetchError = msg
+  }
+
+  if (fetchError) {
+    return (
+      <div className="p-6">
+        <ErrorState title="Failed to load run" message={fetchError} />
+      </div>
+    )
+  }
+
+  if (!runData) return null
+
+  const { run } = runData
+  const events = eventsData?.events ?? []
 
   return (
     <div className="flex flex-col h-full">
       {/* Run header */}
-      <Suspense fallback={<LoadingState message="Loading run..." />}>
-        <RunHeader
-          runId={runId}
-          status="pending"
-          agentName="—"
-          startedAt={Date.now()}
-        />
-      </Suspense>
+      <RunHeader
+        runId={runId}
+        status={run.status}
+        agentName={run.agentId}
+        startedAt={run.startedAt}
+        endedAt={run.endedAt}
+        triggeredBy={run.triggeredBy}
+      />
 
       {/* Tab bar */}
       <div className="border-b border-neutral-800 px-6">
@@ -72,12 +105,12 @@ export default function RunDetailPage({ params, searchParams }: RunDetailPagePro
       <div className="flex-1 overflow-y-auto">
         {activeTab === 'timeline' && (
           <Suspense fallback={<LoadingState message="Loading timeline..." />}>
-            <Timeline runId={runId} />
+            <Timeline runId={runId} events={events} />
           </Suspense>
         )}
         {activeTab === 'events' && (
           <Suspense fallback={<LoadingState message="Loading events..." />}>
-            <EventInspector runId={runId} />
+            <EventInspector runId={runId} events={events} />
           </Suspense>
         )}
         {activeTab === 'artifacts' && (

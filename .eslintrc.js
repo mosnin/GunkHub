@@ -70,9 +70,8 @@ module.exports = {
   },
   settings: {
     'import/resolver': {
-      typescript: {
-        alwaysTryTypes: true,
-        project: ['apps/*/tsconfig.json', 'packages/*/tsconfig.json'],
+      node: {
+        extensions: ['.ts', '.tsx', '.js', '.jsx'],
       },
     },
   },

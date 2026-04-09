@@ -1,12 +1,13 @@
 import { auth } from '@clerk/nextjs/server'
+
 import type { AuthContext } from '@agent-flight-recorder/contracts'
 
 /**
  * Get the current auth context from Clerk.
  * Throws if the user is not authenticated or org context is missing.
  */
-export async function getCurrentAuth(): Promise<AuthContext> {
-  const session = await auth()
+export function getCurrentAuth(): AuthContext {
+  const session = auth()
 
   if (!session.userId) {
     throw new Error('Not authenticated')

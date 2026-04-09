@@ -1,6 +1,7 @@
 'use client'
 
 import type { Run } from '@agent-flight-recorder/contracts'
+
 import { Badge } from '@/components/ui/Badge'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { LoadingState } from '@/components/ui/LoadingState'

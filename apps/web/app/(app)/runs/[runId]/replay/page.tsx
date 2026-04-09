@@ -1,4 +1,5 @@
 import type { Metadata } from 'next'
+
 import { ReplayViewer } from '@/components/runs/ReplayViewer'
 
 export const metadata: Metadata = { title: 'Replay' }

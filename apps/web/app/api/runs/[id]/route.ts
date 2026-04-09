@@ -1,6 +1,8 @@
 import { auth } from '@clerk/nextjs/server'
-import { NextRequest, NextResponse } from 'next/server'
-import type { GetRunResponse, ApiError } from '@agent-flight-recorder/contracts'
+import { type NextRequest, NextResponse } from 'next/server'
+
+import type { ApiError, GetRunResponse } from '@agent-flight-recorder/contracts'
+
 import { getRun } from '@/lib/services/runs'
 
 interface RouteParams {
@@ -8,16 +10,22 @@ interface RouteParams {
 }
 
 export async function GET(_req: NextRequest, { params }: RouteParams) {
-  const { userId, orgId } = await auth()
+  const { userId, orgId } = auth()
   if (!userId || !orgId) {
-    return NextResponse.json<ApiError>({ code: 'UNAUTHORIZED', message: 'Authentication required' }, { status: 401 })
+    return NextResponse.json<ApiError>(
+      { code: 'UNAUTHORIZED', message: 'Authentication required' },
+      { status: 401 }
+    )
   }
 
-  const result = await getRun(params.id)
-
-  if (!result.run.id) {
-    return NextResponse.json<ApiError>({ code: 'NOT_FOUND', message: 'Run not found' }, { status: 404 })
+  try {
+    const result = await getRun(params.id)
+    return NextResponse.json<GetRunResponse>(result)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Internal error'
+    if (message.includes('not found') || message.includes('Not found')) {
+      return NextResponse.json<ApiError>({ code: 'NOT_FOUND', message: 'Run not found' }, { status: 404 })
+    }
+    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
   }
-
-  return NextResponse.json<GetRunResponse>(result)
 }

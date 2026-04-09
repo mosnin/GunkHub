@@ -1,16 +1,19 @@
 import { auth } from '@clerk/nextjs/server'
-import { NextRequest, NextResponse } from 'next/server'
-import type { CreateCommentRequest, CreateCommentResponse, ApiError } from '@agent-flight-recorder/contracts'
+import { type NextRequest, NextResponse } from 'next/server'
+
+import type { ApiError, CreateCommentRequest, CreateCommentResponse } from '@agent-flight-recorder/contracts'
+
 import { createComment } from '@/lib/services/comments'
 
 export async function POST(req: NextRequest) {
-  const { userId, orgId } = await auth()
+  const { userId, orgId } = auth()
   if (!userId || !orgId) {
     return NextResponse.json<ApiError>({ code: 'UNAUTHORIZED', message: 'Authentication required' }, { status: 401 })
   }
 
   let body: CreateCommentRequest
   try {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     body = await req.json()
   } catch {
     return NextResponse.json<ApiError>({ code: 'INVALID_BODY', message: 'Request body must be valid JSON' }, { status: 400 })

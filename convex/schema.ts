@@ -127,4 +127,16 @@ export default defineSchema({
   })
     .index("by_clerk_user", ["clerkUserId"])
     .index("by_org", ["orgId"]),
+
+  api_keys: defineTable({
+    orgId: v.id("organizations"),
+    keyHash: v.string(),      // SHA-256 hex hash of the raw API key
+    name: v.string(),         // human-readable label (e.g. "CI key", "dev key")
+    createdBy: v.string(),    // Clerk user ID who created it
+    createdAt: v.number(),
+    lastUsedAt: v.optional(v.number()),
+    revokedAt: v.optional(v.number()),
+  })
+    .index("by_org", ["orgId"])
+    .index("by_key_hash", ["keyHash"]),
 });

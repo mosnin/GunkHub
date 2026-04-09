@@ -1,4 +1,5 @@
 import type { RunStatus } from '@agent-flight-recorder/contracts'
+
 import { Badge } from '@/components/ui/Badge'
 import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
 

@@ -1,0 +1,35 @@
+// Typed Convex function references — used instead of generated api types.
+// These paths match the file:function naming convention Convex uses.
+// When convex/_generated/ is available (after `npx convex dev`), use api.* instead.
+
+import { makeFunctionReference } from 'convex/server'
+
+type Q = 'query'
+type M = 'mutation'
+
+export const convex = {
+  organizations: {
+    getOrganization: makeFunctionReference<Q>('organizations:getOrganization'),
+  },
+  runs: {
+    listRuns: makeFunctionReference<Q>('runs:listRuns'),
+    getRun: makeFunctionReference<Q>('runs:getRun'),
+    createRun: makeFunctionReference<M>('runs:createRun'),
+  },
+  events: {
+    listEvents: makeFunctionReference<Q>('events:listEvents'),
+    createEvent: makeFunctionReference<M>('events:createEvent'),
+  },
+  artifacts: {
+    listArtifacts: makeFunctionReference<Q>('artifacts:listArtifacts'),
+  },
+  comments: {
+    listComments: makeFunctionReference<Q>('comments:listComments'),
+    createComment: makeFunctionReference<M>('comments:createComment'),
+  },
+  sdk_ingest: {
+    sdkCreateRun: makeFunctionReference<M>('sdk_ingest:sdkCreateRun'),
+    sdkCreateEvents: makeFunctionReference<M>('sdk_ingest:sdkCreateEvents'),
+    sdkUpdateRunStatus: makeFunctionReference<M>('sdk_ingest:sdkUpdateRunStatus'),
+  },
+} as const

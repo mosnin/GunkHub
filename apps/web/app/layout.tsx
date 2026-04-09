@@ -1,14 +1,9 @@
-import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
 import { ClerkProvider } from '@clerk/nextjs'
+
 import { Providers } from './providers'
 import './globals.css'
 
-const inter = Inter({
-  subsets: ['latin'],
-  variable: '--font-inter',
-  display: 'swap',
-})
+import type { Metadata } from 'next'
 
 export const metadata: Metadata = {
   title: {
@@ -24,7 +19,7 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className={inter.variable}>
+    <html lang="en">
       <body className="bg-neutral-950 text-neutral-100 font-sans antialiased min-h-screen">
         <ClerkProvider>
           <Providers>{children}</Providers>

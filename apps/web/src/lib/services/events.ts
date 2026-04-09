@@ -1,37 +1,65 @@
 import type {
-  ListEventsRequest,
-  ListEventsResponse,
   CreateEventRequest,
   CreateEventResponse,
+  Event,
+  ListEventsRequest,
+  ListEventsResponse,
 } from '@agent-flight-recorder/contracts'
 
-/**
- * List events for a run.
- * TODO: Replace with Convex query/mutation call
- */
-export async function listEvents(params: ListEventsRequest): Promise<ListEventsResponse> {
-  void params
+import { convex } from '@/lib/convexFunctions'
+import { getAuthedClient } from '@/lib/convexServer'
+
+function mapEvent(doc: Record<string, unknown>): Event {
   return {
-    events: [],
-    nextCursor: undefined,
+    id: doc._id as string,
+    runId: doc.runId as string,
+    orgId: doc.orgId as string,
+    type: doc.type as Event['type'],
+    sequenceNumber: doc.sequenceNumber as number,
+    timestamp: doc.timestamp as number,
+    payload: doc.payload as Event['payload'],
+    ...(doc.parentEventId !== undefined && { parentEventId: doc.parentEventId as string }),
   }
 }
 
 /**
- * Create a new event.
- * TODO: Replace with Convex query/mutation call
+ * List events for a run in sequence order.
+ * Requires Clerk session with org membership on the run's org.
+ */
+export async function listEvents(params: ListEventsRequest): Promise<ListEventsResponse> {
+  const client = await getAuthedClient()
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await client.query(convex.events.listEvents, {
+    runId: params.runId,
+    ...(params.limit !== undefined && { limit: params.limit }),
+    ...(params.cursor !== undefined && { cursor: params.cursor }),
+    ...(params.types !== undefined && { types: params.types }),
+  })
+
+  const res = result as { events: Record<string, unknown>[]; nextCursor?: string }
+  return {
+    events: (res.events ?? []).map(mapEvent),
+    nextCursor: res.nextCursor,
+  }
+}
+
+/**
+ * Create a new event. Used by the web UI (Clerk auth).
+ * For SDK-initiated events use the /api/events ingestion route with x-api-key.
  */
 export async function createEvent(req: CreateEventRequest): Promise<CreateEventResponse> {
-  return {
-    event: {
-      id: `evt_${Date.now()}`,
-      runId: req.runId,
-      orgId: '',
-      type: req.type,
-      sequenceNumber: req.sequenceNumber,
-      timestamp: req.timestamp,
-      payload: req.payload,
-      parentEventId: req.parentEventId,
-    },
-  }
+  const client = await getAuthedClient()
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await client.mutation(convex.events.createEvent, {
+    runId: req.runId,
+    type: req.type,
+    sequenceNumber: req.sequenceNumber,
+    timestamp: req.timestamp,
+    payload: req.payload,
+    ...(req.parentEventId !== undefined && { parentEventId: req.parentEventId }),
+  })
+
+  return { event: mapEvent(doc as Record<string, unknown>) }
 }

@@ -1,6 +1,8 @@
 import { auth } from '@clerk/nextjs/server'
-import { NextRequest, NextResponse } from 'next/server'
-import type { ListEventsResponse, ApiError, EventType } from '@agent-flight-recorder/contracts'
+import { type NextRequest, NextResponse } from 'next/server'
+
+import type { ApiError, EventType, ListEventsResponse } from '@agent-flight-recorder/contracts'
+
 import { listEvents } from '@/lib/services/events'
 
 interface RouteParams {
@@ -8,7 +10,7 @@ interface RouteParams {
 }
 
 export async function GET(req: NextRequest, { params }: RouteParams) {
-  const { userId, orgId } = await auth()
+  const { userId, orgId } = auth()
   if (!userId || !orgId) {
     return NextResponse.json<ApiError>({ code: 'UNAUTHORIZED', message: 'Authentication required' }, { status: 401 })
   }

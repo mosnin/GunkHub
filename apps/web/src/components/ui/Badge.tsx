@@ -1,5 +1,6 @@
-import { cn } from '@/lib/utils'
 import type { RunStatus } from '@agent-flight-recorder/contracts'
+
+import { cn } from '@/lib/utils'
 
 interface BadgeProps {
   status: RunStatus
@@ -34,9 +35,7 @@ const statusConfig: Record<RunStatus, { label: string; className: string }> = {
 }
 
 export function Badge({ status, className }: BadgeProps) {
-  // statusConfig is keyed by RunStatus — the lookup is always defined
-  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-  const config = statusConfig[status]!
+  const config = statusConfig[status]
   return (
     <span
       className={cn(

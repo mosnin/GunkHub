@@ -1,4 +1,5 @@
 import type { Metadata } from 'next'
+
 import { PageHeader } from '@/components/layout/PageHeader'
 import { EmptyState } from '@/components/ui/EmptyState'
 

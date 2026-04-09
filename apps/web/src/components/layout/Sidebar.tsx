@@ -1,8 +1,9 @@
 'use client'
 
+import { UserButton } from '@clerk/nextjs'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { UserButton } from '@clerk/nextjs'
+
 import { cn } from '@/lib/utils'
 
 interface NavItem {

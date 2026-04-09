@@ -1,7 +1,8 @@
 import type { Metadata } from 'next'
+
 import { PageHeader } from '@/components/layout/PageHeader'
-import { Tabs } from '@/components/ui/Tabs'
 import { LoadingState } from '@/components/ui/LoadingState'
+import { Tabs } from '@/components/ui/Tabs'
 
 export const metadata: Metadata = { title: 'Agent' }
 
