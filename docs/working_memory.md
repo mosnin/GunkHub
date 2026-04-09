@@ -2,13 +2,13 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-09 (Prompt 1 — Initial Foundation)
+Last updated: 2026-04-09 (Prompt 3 — Explainability Layer)
 
 ---
 
 ## 1. Current State
 
-Prompt 1 (Initial Foundation) is complete. The following has been built:
+Prompt 3 (Explainability Layer) is complete. The following summarizes the full state after Prompts 1–3.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
@@ -25,23 +25,37 @@ Prompt 1 (Initial Foundation) is complete. The following has been built:
 - `events.ts` — EventType union, all payload shapes, EventPayload discriminated union
 - `status.ts` — RunStatus, RunStatusValues, isTerminalStatus()
 - `api.ts` — All API request/response types
-- `replay.ts` — ReplayProjection, ReplayFrame
+- `replay.ts` — ReplayProjection, ReplayFrame, FailureSummary, FailurePoint, ReplayActor, FrameStatus
 - `diff.ts` — RunDiff, EventDiff, DiffSummary, FieldChange
 
 **packages/sdk is implemented (except HTTP transport).** The `Recorder` class, `Events` builders, `buildEvent` helper, `HttpTransport` (stubbed), `Transport` interface, all types. The SDK is functional end-to-end when a `MockTransport` is injected (as in tests).
+
+**apps/web explainability layer is implemented (Prompt 3):**
+- `apps/web/src/lib/replay/projection.ts` — `buildReplayProjection(run, events): ReplayProjection` (pure, deterministic)
+- `apps/web/src/lib/replay/failure.ts` — `buildFailureSummary(run, events): FailureSummary` (pure, deterministic)
+- `apps/web/src/lib/replay/diff.ts` — `buildRunDiff(leftRunId, rightRunId, leftEvents, rightEvents): RunDiff` (pure, deterministic)
+- `apps/web/src/lib/replay/index.ts` — re-exports all three functions
 
 **apps/web components and service layer are scaffolded** (many are stubs):
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
 - Run components: RunList, RunHeader, Timeline, EventInspector, DiffViewer, ReplayViewer, ArtifactList, CommentThread
-- Service layer stubs: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts` — all return empty/fake data with TODO comments
-- No Next.js pages exist yet (no `app/` directory)
+- Service layer stubs: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`
+- No Next.js pages exist yet (no `app/` directory) — gap from Prompt 2
 
-**Tests scaffolded:**
+**Tests (as of Prompt 3):**
 - `tests/unit/sdk.test.ts` — Recorder tests with MockTransport, passing
-- `tests/unit/contracts.test.ts` — Type shape and EventType coverage tests
+- `tests/unit/contracts.test.ts` — Type shape and EventType coverage tests, passing
+- `tests/unit/replay.test.ts` — buildReplayProjection algorithm tests (10 test groups)
+- `tests/unit/failure.test.ts` — buildFailureSummary algorithm tests (8 test groups)
+- `tests/unit/diff.test.ts` — buildRunDiff algorithm tests (10 test groups)
 - `tests/integration/api.test.ts` — Stub, marked as TODO
 - `tests/fixtures/runs.ts` — Sample run/event fixture data
+- `tests/fixtures/events.ts` — 6 scenario fixtures for explainability algorithm tests
+
+**Architecture decisions recorded:**
+- ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
+- ADR-0005: On-demand replay and diff projection strategy (Prompt 3)
 
 ---
 
@@ -91,11 +105,13 @@ Prompt 1 (Initial Foundation) is complete. The following has been built:
 
 - [ ] **No Next.js pages exist.** The `apps/web/src/app/` directory is missing. All routes need to be created. At minimum: layout, sign-in, dashboard, project list, run list, run detail.
 
-**MEDIUM PRIORITY (Prompt 3):**
+**RESOLVED IN PROMPT 3:**
 
-- [ ] **Replay computation belongs where?** ReplayProjection is a contract type. Is it computed in the web app service layer, in a Convex query, or in the browser? Decision affects where `elapsed_ms` arithmetic lives.
+- [x] **Replay computation belongs where?** Decided: web app service layer, computed on-demand at request time. See ADR-0005. Implemented in `apps/web/src/lib/replay/`.
 
-- [ ] **RunDiff alignment strategy.** Events from two runs are aligned by `sequenceNumber` in the current diff contract. Is this correct? If two agent versions have different tool call sequences (different lengths), alignment-by-sequence-number will produce noisy diffs. May need alignment by event type or semantic proximity.
+- [x] **RunDiff alignment strategy.** Decided: position-based alignment by sequenceNumber. Events at the same index position are compared. Extra events in the longer run are surfaced as added/removed. Documented in ADR-0005.
+
+**MEDIUM PRIORITY (Prompt 4):**
 
 - [ ] **Blob storage implementation.** The `BlobStorageAdapter` stub needs a real implementation. Vercel Blob is the likely first choice — but `BLOB_READ_WRITE_TOKEN` must be in `.env.example` before this is wired up.
 
@@ -121,12 +137,17 @@ Prompt 1 (Initial Foundation) is complete. The following has been built:
 | `apps/web/src/lib/services/runs.ts` | Returns empty/fake data | Real Convex calls via `ConvexHttpClient` or Convex React hooks |
 | `apps/web/src/lib/services/events.ts` | Returns empty array | Same |
 | `apps/web/src/lib/services/comments.ts` | Returns empty array | Same |
-| `convex/helpers/storage.ts` — `BlobStorageAdapter` | Interface only, no implementation | Vercel Blob implementation (Prompt 3) |
+| `convex/helpers/storage.ts` — `BlobStorageAdapter` | Interface only, no implementation | Vercel Blob implementation (Prompt 4) |
 | `convex/comments.ts` | File likely exists with no mutations | Need `createComment`, `resolveComment`, `listComments` |
 | `convex/organizations.ts` | Partially implemented | Need `createOrg`, `getOrgByClerkId` |
 | `convex/projects.ts` | Partially implemented | Need `listProjects`, `createProject` |
 | `apps/web/src/app/` | Does not exist | All Next.js pages and layouts |
 | `tests/integration/api.test.ts` | All tests are stubs | Real integration tests against dev Convex |
+
+**Fully implemented in Prompt 3 (no longer stubs):**
+- `apps/web/src/lib/replay/projection.ts` — `buildReplayProjection` complete
+- `apps/web/src/lib/replay/failure.ts` — `buildFailureSummary` complete
+- `apps/web/src/lib/replay/diff.ts` — `buildRunDiff` complete
 
 ---
 

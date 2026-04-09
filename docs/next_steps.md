@@ -1,201 +1,130 @@
-# Next Steps — Prompt 2 Specification
+# Next Steps — Prompt 4 Specification
 
 **Document type:** Exact specification for the next build session.
-**Current state:** Prompt 1 (Initial Foundation) complete.
-**This document:** Defines what Prompt 2 must accomplish, in scope, out of scope, and acceptance criteria.
+**Current state:** Prompt 3 (Explainability Layer) complete.
+**This document:** Defines what Prompt 4 must accomplish, in scope, out of scope, and acceptance criteria.
 
 ---
 
-## 1. What Prompt 2 Should Accomplish
+## 1. What Prompt 4 Should Accomplish
 
-Prompt 2 must transform the scaffolded foundation into a working application that:
+Prompt 4 must transform the explainability layer into a usable product by wiring the replay, diff, and failure summary algorithms into real UI pages, completing the project and agent management views, implementing the event detail page, and filling remaining gaps in the management layer.
 
-1. Can be run locally with `pnpm dev` (web app serves real pages)
-2. Has a functioning ingestion pipeline (SDK → API routes → Convex)
-3. Shows real data from Convex in the UI (not stub returns)
-4. Has a complete developer setup story (`.env.example`, CI workflow)
-
-The test for "Prompt 2 succeeded": an engineer can instrument a TypeScript script with the SDK, run it, and see the resulting run appear in the web UI with all events visible.
+The test for "Prompt 4 succeeded": an engineer can open the web UI, navigate to a completed run, step through its events in the replay view, inspect any event's full payload, compare two runs side-by-side in the diff view, and see a clear failure summary when a run fails.
 
 ---
 
-## 2. Recommended Scope for Prompt 2
+## 2. Recommended Scope for Prompt 4
 
-### 2A. Create the Next.js App Router pages (CRITICAL PATH)
+### 2A. Wire replay and diff into the UI (CRITICAL PATH)
 
-The `apps/web/src/app/` directory must be created with the following routes:
+The algorithms exist in `apps/web/src/lib/replay/`. They must now be called from API routes and consumed by the UI components.
 
-```
-app/
-├── layout.tsx                          Root layout (ClerkProvider + ConvexProvider)
-├── page.tsx                            Landing / redirect to sign-in
-├── sign-in/[[...sign-in]]/page.tsx     Clerk sign-in page
-├── sign-up/[[...sign-up]]/page.tsx     Clerk sign-up page
-├── (dashboard)/
-│   ├── layout.tsx                      Authenticated layout with AppShell/Sidebar
-│   ├── page.tsx                        Dashboard — recent runs, org summary
-│   ├── projects/
-│   │   ├── page.tsx                    Project list
-│   │   └── [projectSlug]/
-│   │       ├── page.tsx                Project detail — agent list, recent runs
-│   │       └── [agentSlug]/
-│   │           └── page.tsx            Agent detail — version list, run list
-│   └── runs/
-│       ├── page.tsx                    All runs (org-wide, filterable)
-│       └── [runId]/
-│           ├── page.tsx                Run detail — event timeline, metadata
-│           └── events/
-│               └── [eventId]/
-│                   └── page.tsx        Event detail — full payload inspector
-```
+**Replay endpoint and viewer:**
 
-Each page must have loading, empty, and error states. Use `loading.tsx` and `error.tsx` where appropriate.
+Create `apps/web/src/app/api/runs/[runId]/replay/route.ts`:
+- `GET /api/runs/[runId]/replay` — fetches all events for the run, calls `buildReplayProjection`, returns `ReplayProjection` as JSON
+- Auth: validate API key or Clerk session; scope to org
+- Pagination: fetch events in pages if needed (runs with >100 events require multiple Convex fetches)
 
-### 2B. Wire the service layer to real Convex calls
+Wire `apps/web/src/components/runs/ReplayViewer.tsx`:
+- Accept `ReplayProjection` as a prop
+- Render a list of `ReplayFrame` entries with actor badges, status indicators, elapsed_ms, and payloadPreview
+- Add step-through navigation: Previous / Next buttons advance the "active frame" index
+- Keyboard navigation: left/right arrow keys step through frames
+- Highlight the active frame visually (border, background tint)
 
-Replace all stubs in `apps/web/src/lib/services/` with real Convex calls:
+**Diff endpoint and viewer:**
 
-**`lib/services/runs.ts`:**
-- `listRuns(params)` → calls `api.runs.listRuns` via Convex
-- `getRun(id)` → calls `api.runs.getRun` via Convex
-- `createRun(req)` → calls `api.runs.createRun` via Convex
-- `updateRunStatus(id, status)` → calls `api.runs.updateRunStatus` via Convex
+Create `apps/web/src/app/api/diff/route.ts`:
+- `GET /api/diff?left=[runId]&right=[runId]` — fetches events for both runs, calls `buildRunDiff`, returns `RunDiff` as JSON
+- Auth: validate org membership; both runs must belong to the caller's org
 
-**`lib/services/events.ts`:**
-- `listEvents(params)` → calls `api.events.listEvents` via Convex
-- `getEvent(id)` → calls `api.events.getEvent` via Convex
+Wire `apps/web/src/components/runs/DiffViewer.tsx`:
+- Accept `RunDiff` as a prop
+- Render events side-by-side: left column (baseline), right column (comparison)
+- Color-code by `EventDiff.kind`: same=neutral, added=green, removed=red, changed=yellow
+- For `kind="changed"`, list the `FieldChange` entries showing `path`, `left`, and `right` values
+- Show `summary.statusChanged` banner at the top if the terminal event type differs
 
-**`lib/services/comments.ts`:**
-- `listComments(targetId, targetType)` → calls `api.comments.listComments` via Convex
-- `createComment(req)` → calls `api.comments.createComment` via Convex
+**Failure summary component:**
 
-For server components: use `ConvexHttpClient` with the server-side Clerk token.
-For client components (interactive UI): use `useQuery` and `useMutation` Convex React hooks.
+Wire `apps/web/src/components/runs/FailureSummary.tsx`:
+- Accept `FailureSummary` as a prop
+- Only render when `hasFailure=true`
+- Show primary failure: event type, reason, error message (if available), sequence number
+- Show `allFailurePoints` as a collapsible list
+- Show `cannotInfer` warning banner when applicable
+- Show `isIncomplete` indicator when the run has no terminal event
 
-### 2C. Implement the ingestion API routes
+### 2B. Event detail page
 
-Create `apps/web/src/app/api/` with the following route handlers:
+Create `apps/web/src/app/(dashboard)/runs/[runId]/events/[eventId]/page.tsx`:
+- Fetch the event by ID from Convex
+- Render full payload in a `CodeBlock` (syntax-highlighted JSON)
+- Show all event metadata: type, sequenceNumber, timestamp, actor (computed), parentEventId (as a link)
+- Show parent event chain as breadcrumbs (if parentEventId exists, link to that event's detail page)
+- Handle loading, empty, and error states
 
-```
-api/
-├── runs/
-│   ├── route.ts                        POST — create run
-│   └── [runId]/
-│       └── status/
-│           └── route.ts                PATCH — update run status
-└── events/
-    └── route.ts                        POST — batch append events
-```
+### 2C. Project and agent management UI
 
-Each route handler must:
-1. Validate the API key from the `x-api-key` header (see API key decision below)
-2. Parse and validate the request body using Zod schemas derived from `packages/contracts`
-3. Call the corresponding Convex mutation
-4. Return the appropriate response or error shape (`ApiError`)
+Create the following pages (stubs are acceptable if time is tight, but should render real data):
 
-### 2D. Implement `HttpTransport` in the SDK
+**Project list:**
+`apps/web/src/app/(dashboard)/projects/page.tsx`
+- List all projects for the org from Convex
+- Show: project name, slug, agent count, most recent run status and timestamp
+- Link each project to its detail page
 
-`packages/sdk/src/transport.ts` — implement all three methods:
+**Project detail:**
+`apps/web/src/app/(dashboard)/projects/[projectSlug]/page.tsx`
+- Show project name, description, slug
+- List agents in the project
+- Show recent runs across all agents
 
-**`createRun(req, auth)`:**
-```
-POST {endpoint}/api/runs
-Headers: x-api-key: {auth.apiKey}
-Body: CreateRunRequest
-Returns: CreateRunResponse
-```
+**Agent detail:**
+`apps/web/src/app/(dashboard)/projects/[projectSlug]/[agentSlug]/page.tsx`
+- Show agent name, description
+- List agent versions (immutable snapshots) with changelogs
+- List recent runs for this agent, filterable by status
 
-**`sendEvents(events, auth)`:**
-```
-POST {endpoint}/api/events
-Headers: x-api-key: {auth.apiKey}
-Body: { events: CreateEventRequest[] }
-Returns: { eventIds: string[] }
-```
+These pages require implementing the following Convex functions if not yet done:
+- `convex/projects.ts` — `createProject`, `getProject`
+- `convex/agents.ts` — `listAgents`, `getAgent`, `createAgent`
 
-**`updateRunStatus(runId, status, endedAt, auth)`:**
-```
-PATCH {endpoint}/api/runs/{runId}/status
-Headers: x-api-key: {auth.apiKey}
-Body: { status, endedAt }
-Returns: void
-```
+### 2D. Run comparison UI flow
 
-Add retry logic using `defaultRetryStrategy`. Add error wrapping that returns `TransportResponse` (never throws). Add `debug` logging if `config.options?.debug` is true.
+Add a "Compare" flow to the runs list page:
+- Select a baseline run (checkbox or "Set as baseline" button)
+- Select a second run (another checkbox or "Compare to baseline")
+- Navigate to `/runs/compare?left=[runId]&right=[runId]`
 
-### 2E. Resolve the API key authentication decision
+Create `apps/web/src/app/(dashboard)/runs/compare/page.tsx`:
+- Fetch both runs and their events
+- Call `buildRunDiff` via the diff API endpoint
+- Render the `DiffViewer` component
 
-**Decision required:** Choose between two options:
+### 2E. API key management UI
 
-**Option A: Use Clerk organization tokens directly.**
-- The SDK caller provides a Clerk org-scoped token as the `apiKey`.
-- The Next.js API route validates it against Clerk's verify endpoint.
-- Pro: No additional infrastructure. Con: Clerk tokens expire, SDK must handle refresh.
+If deferred from Prompt 2, implement now:
 
-**Option B: Implement an `api_keys` table in Convex.**
-- Add table: `api_keys` with fields `orgId`, `keyHash`, `name`, `createdAt`, `lastUsedAt`, `revokedAt?`.
-- The Next.js API route hashes the incoming key and looks it up in Convex.
-- Pro: Long-lived, revocable, multiple keys per org. Con: More infrastructure.
+Create `apps/web/src/app/(dashboard)/settings/api-keys/page.tsx`:
+- List all API keys for the org (name, created date, last used, revocation status)
+- Button to create a new key (shows the key once on creation, then only a masked prefix)
+- Button to revoke an existing key
 
-**Recommendation:** Option B. API keys are the standard pattern for machine-to-machine auth. Implement a minimal version: `api_keys` table, `createApiKey` mutation, `validateApiKey` helper used in API routes. UI for key management can come in Prompt 3.
+This requires:
+- `api_keys` table in Convex schema (if not already added in Prompt 2)
+- `convex/api_keys.ts` — `listApiKeys`, `createApiKey`, `revokeApiKey`
+- `apps/web/src/app/api/settings/api-keys/route.ts` — GET/POST handlers
 
-### 2F. Create the missing developer setup files
+### 2F. Blob storage wiring (if not done in Prompt 2/3)
 
-**`.env.example`** — must contain all required environment variables with explanations:
-
-```bash
-# Clerk
-NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
-CLERK_SECRET_KEY=sk_test_...
-
-# Convex
-NEXT_PUBLIC_CONVEX_URL=https://....convex.cloud
-CONVEX_DEPLOYMENT=dev:...  # from npx convex dev
-
-# Blob Storage (stub for v1 — not required until Prompt 3)
-# BLOB_READ_WRITE_TOKEN=
-```
-
-**`.github/workflows/ci.yml`** — CI pipeline that runs on every push and PR:
-
-```yaml
-name: CI
-on: [push, pull_request]
-jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with: { version: 9 }
-      - uses: actions/setup-node@v4
-        with: { node-version: 20, cache: pnpm }
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
-      - run: pnpm build
-      - run: pnpm lint
-      - run: pnpm test
-```
-
-### 2G. Implement missing Convex mutations
-
-**`convex/comments.ts`** — add:
-- `createComment({ targetId, targetType, content })` — creates a Comment record after auth check
-- `resolveComment({ commentId })` — sets `resolvedAt`, `resolvedBy`
-- `editComment({ commentId, content })` — sets `content`, `updatedAt`
-
-**`convex/organizations.ts`** — add:
-- `createOrg({ clerkOrgId, name, slug })` — called by Clerk webhook on org creation
-- `getOrgByClerkId({ clerkOrgId })` — look up org by Clerk org ID
-
-**`convex/projects.ts`** — add:
-- `createProject({ orgId, name, slug, description? })` — creates a Project
-- `getProject({ projectId })` — get project, verify membership
-
-**`convex/agents.ts`** — create file with:
-- `listAgents({ projectId })` — list agents for a project
-- `getAgent({ agentId })` — get agent, verify membership
-- `createAgent({ projectId, name, slug, description? })` — creates an Agent
+Implement `BlobStorageAdapter` using Vercel Blob:
+- Concrete implementation in `convex/helpers/storage.ts` (or a separate file)
+- Wire the artifact upload path: SDK detects >10 KB payload → calls `/api/artifacts/upload` → stores in Vercel Blob → creates artifact record in Convex → ships pointer event
+- Add `BLOB_READ_WRITE_TOKEN` to `.env.example` if not already present
+- Add artifact list display in the run detail page using the existing `ArtifactList` component
 
 ---
 
@@ -203,115 +132,84 @@ jobs:
 
 | File | What Needs to Change |
 |------|---------------------|
-| `apps/web/src/app/layout.tsx` | Create: root layout with ClerkProvider + ConvexProviderWithClerk |
-| `apps/web/src/app/(dashboard)/layout.tsx` | Create: auth-protected layout with AppShell |
-| `apps/web/src/app/(dashboard)/page.tsx` | Create: dashboard page — recent runs query |
-| `apps/web/src/app/(dashboard)/runs/page.tsx` | Create: run list page with status filter |
-| `apps/web/src/app/(dashboard)/runs/[runId]/page.tsx` | Create: run detail + event timeline |
-| `apps/web/src/app/api/runs/route.ts` | Create: POST handler for run creation |
-| `apps/web/src/app/api/runs/[runId]/status/route.ts` | Create: PATCH handler for status update |
-| `apps/web/src/app/api/events/route.ts` | Create: POST handler for event batch |
-| `apps/web/src/lib/services/runs.ts` | Replace stubs with real Convex calls |
-| `apps/web/src/lib/services/events.ts` | Replace stubs with real Convex calls |
-| `apps/web/src/lib/services/comments.ts` | Replace stubs with real Convex calls |
-| `packages/sdk/src/transport.ts` — `HttpTransport` | Implement createRun, sendEvents, updateRunStatus |
-| `convex/comments.ts` | Add createComment, resolveComment, editComment |
-| `convex/organizations.ts` | Add createOrg, getOrgByClerkId |
-| `convex/projects.ts` | Add createProject, getProject (full) |
-| `convex/agents.ts` | Create file with listAgents, getAgent, createAgent |
-| `.env.example` | Create with all required vars documented |
-| `.github/workflows/ci.yml` | Create CI pipeline |
+| `apps/web/src/app/api/runs/[runId]/replay/route.ts` | Create: GET handler calling buildReplayProjection |
+| `apps/web/src/app/api/diff/route.ts` | Create: GET handler with ?left=&right= calling buildRunDiff |
+| `apps/web/src/components/runs/ReplayViewer.tsx` | Implement: step-through navigation, frame rendering |
+| `apps/web/src/components/runs/DiffViewer.tsx` | Implement: side-by-side diff with color-coded kinds |
+| `apps/web/src/components/runs/FailureSummary.tsx` | Implement: failure callout with primaryFailure + allFailurePoints |
+| `apps/web/src/app/(dashboard)/runs/[runId]/events/[eventId]/page.tsx` | Create: event detail page with full payload |
+| `apps/web/src/app/(dashboard)/projects/page.tsx` | Create: project list page |
+| `apps/web/src/app/(dashboard)/projects/[projectSlug]/page.tsx` | Create: project detail page |
+| `apps/web/src/app/(dashboard)/projects/[projectSlug]/[agentSlug]/page.tsx` | Create: agent detail page |
+| `apps/web/src/app/(dashboard)/runs/compare/page.tsx` | Create: side-by-side run comparison page |
+| `apps/web/src/app/(dashboard)/settings/api-keys/page.tsx` | Create: API key management page |
+| `convex/agents.ts` | Create/complete: listAgents, getAgent, createAgent |
+| `convex/projects.ts` | Complete: createProject, getProject |
+| `convex/api_keys.ts` | Create: listApiKeys, createApiKey, revokeApiKey |
+| `convex/helpers/storage.ts` | Implement: BlobStorageAdapter using Vercel Blob |
+| `tests/integration/api.test.ts` | Replace stubs with real integration tests |
 
 ---
 
-## 4. What Must NOT Be Done in Prompt 2
+## 4. What Must NOT Be Done in Prompt 4
 
-The following are explicitly out of scope. Do not implement them.
-
-**Replay:** The `ReplayViewer` component is scaffolded but the playback logic must not be implemented. Replay requires a working run detail page first (Prompt 2), then replay logic (Prompt 3).
-
-**Diff:** The `DiffViewer` component is scaffolded but the diff computation must not be implemented. Diff requires the replay infrastructure as a prerequisite.
-
-**Blob storage implementation:** The `BlobStorageAdapter` interface exists. Do not implement a concrete adapter. The payload externalization path (>10 KB → blob) must not be connected yet. Focus on the core event pipeline first.
-
-**API key management UI:** Even if the `api_keys` table is added in Prompt 2 (Option B), there should be no UI for creating or listing API keys. This is a Prompt 3 feature.
-
-**Agent version management UI:** AgentVersion creation and version history display are not required in Prompt 2. The schema supports it, but no UI pages should be built for it.
-
-**Multi-page navigation for projects/agents:** The project list and agent detail pages may be deferred to Prompt 3 if scope is tight. The minimum viable page set for Prompt 2 is: dashboard, run list, run detail.
-
-**Real-time subscriptions:** Convex supports real-time subscriptions via `useQuery`. Do not add live-updating behavior in Prompt 2. Fetch data on load. Real-time will be a v2 feature.
+- **Do not add real-time event streaming.** Convex subscriptions for live run monitoring are a v2 feature.
+- **Do not add analytics dashboards.** Aggregate metrics (failure rate, p95 duration) are explicitly out of scope for v1.
+- **Do not add webhooks or external integrations.** No Slack, no PagerDuty, no email notifications in v1.
+- **Do not change the event log immutability rules.** No update or delete mutations for events, under any circumstances.
+- **Do not add AI-powered failure analysis.** Failure summary is and must remain deterministic heuristic — no LLM calls for explaining failures.
 
 ---
 
-## 5. Acceptance Criteria for Prompt 2
+## 5. Acceptance Criteria for Prompt 4
 
-Prompt 2 is complete when all of the following are true:
+Prompt 4 is complete when all of the following are true:
 
-1. **`pnpm dev` starts without errors.** The web app serves the dashboard page. No unhandled exceptions in the browser console on first load.
+1. **Replay viewer is wired and interactive.** Given a completed run URL, an engineer can navigate to the run detail page, click into replay mode, and step through events frame-by-frame using keyboard or mouse.
 
-2. **Authentication works.** An unauthenticated user is redirected to sign-in. After signing in with Clerk, the dashboard loads and shows the user's organization context.
+2. **Failure summary renders on failed runs.** When viewing a run with `status="failed"`, the failure summary callout is visible, shows the primary failure event, and links to the relevant event in the timeline.
 
-3. **SDK can record a run end-to-end.** A test script using `Recorder` + real `HttpTransport` can call `startRun()`, `recordEvent('custom', ...)`, and `endRun()` without throwing. The run appears in the Convex database (verifiable via Convex dashboard).
+3. **Diff viewer shows real data.** Given two run IDs, the diff page fetches both runs' events, computes the diff, and renders added/removed/changed events with field-level changes visible.
 
-4. **Run list page shows real data.** The `/runs` page queries Convex and renders a list of runs (even if empty) with proper empty state. It does not return stub data.
+4. **Event detail page renders full payload.** Clicking an event in the timeline navigates to the event detail page, which shows the complete payload as formatted JSON using `CodeBlock`.
 
-5. **Run detail page renders all events.** Given a run ID in the URL, the page fetches the run and its events from Convex and renders them using the Timeline component. All event types render without crashing.
+5. **Project and agent pages render real data.** The project list shows real projects from Convex. Agent detail shows agent versions with changelogs.
 
-6. **API routes return proper error shapes.** A request to `POST /api/runs` with no auth header returns `{ code: "UNAUTHORIZED", message: "..." }` with status 401. A request with a valid API key and malformed body returns `{ code: "VALIDATION_ERROR", ... }` with status 400.
+6. **API key management is functional.** An admin can create a new API key, see its value once, and revoke an existing key. Revoked keys are rejected by the API routes.
 
 7. **`pnpm typecheck` passes with zero errors across all packages.**
 
 8. **`./scripts/validate.sh` passes all three checks** (typecheck, build, lint).
 
-9. **CI workflow runs and passes on a push to a feature branch.** The `.github/workflows/ci.yml` triggers and all steps complete green.
+9. **All unit tests in `tests/unit/` pass.** The replay, failure, and diff tests added in Prompt 3 must pass against the real algorithm implementations.
 
-10. **`.env.example` is complete.** Every environment variable consumed by any package is documented in `.env.example` with a brief description and example value.
-
----
-
-## 6. Recommended Scope for Prompt 3 (Replay and Diff)
-
-After Prompt 2 delivers a working end-to-end pipeline, Prompt 3 should focus on:
-
-**Replay implementation:**
-- Implement `ReplayProjection` computation in the web app service layer (fetch events, compute `elapsed_ms`, return frames)
-- Wire `ReplayViewer` component to the computed projection
-- Add keyboard navigation (arrow keys step through events)
-- Add timeline scrubber with accurate proportional timestamps
-- Validate that `run.started` is always frame 0
-
-**Diff implementation:**
-- Implement `RunDiff` computation: fetch both runs' events, align by sequenceNumber, deep-compare payloads
-- Wire `DiffViewer` component to show `added`, `removed`, `changed`, `same` events
-- Highlight changed fields within `FieldChange[]` using the CodeBlock component
-- Add a "diff two runs" UI: select baseline run, select comparison run, show diff
-
-**Blob storage:**
-- Implement `BlobStorageAdapter` using Vercel Blob
-- Add `BLOB_READ_WRITE_TOKEN` to `.env.example`
-- Wire the artifact upload path: SDK detects >10 KB payload → calls `/api/artifacts/upload` → stores in blob → creates artifact record in Convex → ships pointer event
-
-**Additional pages:**
-- Project list page with agent counts and recent run status
-- Agent detail page with version history
-- Event detail page (full payload inspector for a single event)
-
-**API key management:**
-- If deferred from Prompt 2: UI to create and list API keys
-- Revocation flow
+10. **Integration tests cover at least the replay and diff API routes.** `tests/integration/api.test.ts` must have real (not stubbed) tests for `GET /api/runs/[runId]/replay` and `GET /api/diff`.
 
 ---
 
-## 7. Long-Term Roadmap Outline
+## 6. Known Technical Debt to Address in Prompt 4
+
+1. **Payload comparison is order-sensitive** (JSON.stringify). If field-order-insensitive comparison is needed for reliable diffs, sort object keys before stringifying in `buildRunDiff`. This is a minor improvement but reduces false-positive diffs.
+
+2. **No request timeout on Convex event pagination.** If a run has thousands of events and the Convex fetch is slow, the replay endpoint will wait indefinitely. Add a timeout or pagination limit.
+
+3. **`parentEventId` links in the replay viewer are not yet clickable.** The ReplayFrame renders depth but doesn't link parent frames. Add a "Jump to parent" interaction.
+
+4. **`apps/web/src/app/` is still missing several pages from Prompt 2 scope.** At minimum, the dashboard and run list pages should exist before Prompt 4 adds new pages on top of them.
+
+5. **Integration tests still stubbed.** All tests in `tests/integration/api.test.ts` are marked TODO. These should test the full SDK → API routes → Convex path against a dev deployment.
+
+---
+
+## 7. Long-Term Roadmap (unchanged from Prompt 1)
 
 ### v1.0 (Prompts 1–4): Core Debuggability
 
 The minimum viable product. An engineer can record, inspect, replay, and diff agent runs.
 
 - Prompts 1–2: Foundation, ingestion pipeline, basic UI
-- Prompt 3: Replay, diff, blob storage
-- Prompt 4: Polish, edge cases, org/project/agent management UI, integration tests, documentation
+- Prompt 3: Replay, diff, failure summary algorithms and tests
+- Prompt 4: Polish, UI wiring, project/agent management, integration tests, documentation
 
 ### v1.1: Reliability and Usability Improvements
 
@@ -338,132 +236,3 @@ After product-market fit is established:
 - Webhook integrations: Slack on run failure, PagerDuty escalation
 - SSO: SAML, enterprise identity providers
 - Data retention policies: automatic run expiry, selective replay archiving
-
----
-
-## What Prompt 2 Should Accomplish
-
-Connect the skeleton to real data. After Prompt 2, a developer with valid Clerk and Convex credentials should be able to:
-
-1. Sign in with Clerk
-2. See their organization's projects, agents, and runs
-3. Create a run via the API
-4. Record events via the API
-5. See runs and events in the web UI
-
----
-
-## Recommended Scope for Prompt 2
-
-### A. Convex integration in the web app
-
-Replace the service stubs in `apps/web/src/lib/services/` with real Convex client calls.
-
-**Files to implement:**
-- `apps/web/src/lib/services/runs.ts` — replace placeholder returns with `useQuery(api.runs.listRuns, ...)` and `useMutation(api.runs.createRun)`
-- `apps/web/src/lib/services/events.ts` — wire to `api.events.listEvents`
-- `apps/web/src/lib/services/comments.ts` — wire to `api.comments.listComments` + `createComment`
-
-**Pattern:** Use Convex React hooks in client components, server-side `fetchQuery` in server components.
-
-### B. Real run creation endpoint
-
-Implement `POST /api/runs` fully:
-- Extract orgId from Clerk auth
-- Validate agentId belongs to caller's org
-- Call Convex `createRun` mutation via server-side client
-- Return real run ID
-
-**Files to implement:**
-- `apps/web/app/api/runs/route.ts` — replace service stub call with Convex server client
-- `apps/web/app/api/events/route.ts` — implement event creation with Convex
-
-### C. Real event ingestion
-
-Implement `POST /api/events` fully:
-- Validate run belongs to caller's org
-- Call Convex `createEvent` mutation
-- Enforce immutability (no update/delete paths)
-- Handle batch event submissions
-
-### D. Convex auth setup
-
-Configure Convex to verify Clerk JWTs:
-- Add `convex/auth.config.ts` with Clerk JWKS URL
-- Update `getAuthContext` in `convex/auth.ts` to read from `ctx.auth`
-- Test auth flow end-to-end
-
-### E. Wire RunList component to real data
-
-Replace placeholder in `apps/web/app/(app)/runs/page.tsx`:
-- Convert page to use Convex `useQuery` for runs
-- Show real run data in RunList component
-- Add pagination support
-
-### F. Organization bootstrap on sign-in
-
-When a user signs in, create their Convex org record if it doesn't exist:
-- Add Clerk webhook handler at `apps/web/app/api/webhooks/clerk/route.ts`
-- Handle `organization.created` event
-- Call Convex `createOrganization` mutation
-
----
-
-## What Must NOT Be Done in Prompt 2
-
-- Do not implement replay logic (Prompt 3)
-- Do not implement diff logic (Prompt 3)
-- Do not implement production blob storage (Prompt 4)
-- Do not add real-time event streaming
-- Do not add analytics or metrics
-- Do not implement SDK HTTP transport (Prompt 2 or 3)
-
----
-
-## Acceptance Criteria for Prompt 2
-
-1. `POST /api/runs` creates a real run in Convex
-2. `POST /api/events` creates real events in Convex, scoped to org
-3. Run list page shows real data from Convex
-4. Authentication gates all API routes and pages
-5. Cross-org data access is impossible
-6. All 79 existing tests still pass
-7. No TypeScript errors
-
----
-
-## Prompt 3 Scope: Replay and Diff
-
-After Prompt 2, the third prompt should implement:
-
-1. **Replay projection** — compute `ReplayProjection` from event log
-   - `GET /api/runs/[id]/replay` endpoint
-   - `ReplayViewer` component wired to real data
-   - Timeline animation (play/pause/step)
-
-2. **Diff projection** — compute `RunDiff` from two runs
-   - `GET /api/diff?left=[runId]&right=[runId]` endpoint
-   - `DiffViewer` component wired to real data
-   - Visual diff (added/removed/changed events highlighted)
-
-3. **EventInspector** — fully interactive event tree
-   - Left panel: event list with type badges
-   - Right panel: payload viewer using CodeBlock
-   - Click to navigate events
-
----
-
-## Long-Term Roadmap
-
-| Prompt | Goal |
-|--------|------|
-| 1 | Foundation (this prompt) |
-| 2 | Real data flow and ingestion |
-| 3 | Replay and diff projections |
-| 4 | SDK HTTP transport implementation |
-| 5 | Artifact upload and viewer |
-| 6 | Comment threads wired to data |
-| 7 | Dashboard with real metrics |
-| 8 | Blob storage production implementation |
-| 9 | Agent version management |
-| 10 | Performance optimization and production readiness |

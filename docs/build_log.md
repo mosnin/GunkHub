@@ -2,6 +2,40 @@
 
 ---
 
+## Prompt 3 — Explainability Layer (replay, failure summary, diff)
+
+**Date:** 2026-04-09
+
+### What changed
+- packages/contracts v0.1.0 → v0.2.0: extended ReplayFrame (actor, status, payloadPreview, depth), added FailureSummary/FailurePoint types, added GetReplayResponse/GetDiffResponse API types
+- apps/web/src/lib/replay/: pure deterministic algorithms for projection (projection.ts), failure analysis (failure.ts), and run comparison (diff.ts)
+- apps/web/src/lib/services/replay.ts + diff.ts: service layer fetching all events and computing projections
+- apps/web/app/api/runs/[id]/replay/route.ts + app/api/diff/route.ts: new GET endpoints
+- apps/web/src/components/runs/ReplayViewer.tsx: interactive step-through replay UI
+- apps/web/src/components/runs/DiffViewer.tsx: side-by-side run comparison UI
+- apps/web/src/components/runs/FailureSummary.tsx: failure callout panel
+- tests/fixtures/events.ts: 6 scenario fixtures (successful run, failed tool, failed LLM, partial run, nested events, diverging runs for diff)
+- tests/unit/replay.test.ts, failure.test.ts, diff.test.ts: algorithm unit tests
+- docs/adrs/0005_on_demand_replay.md: decision record for projection strategy
+
+### Why on-demand computation
+Event counts for v1 are small. On-demand computation avoids cache invalidation complexity and keeps the event log as the only source of truth. See ADR-0005.
+
+### Known edge cases
+- Runs with >1000 events require multiple pagination fetches (handled but adds latency)
+- Circular parentEventId chains are guarded but must not appear in well-formed data
+- Payload comparison is order-sensitive (JSON.stringify) — field reordering looks like a diff
+
+### Recommendation for Prompt 4
+1. Project/agent management UI (list projects, agents, versions)
+2. Event detail page (full payload inspector for a single event)
+3. Run tagging and metadata search
+4. API key management UI (revoke, rotate)
+5. Run comparison flow from the runs list (select two runs → diff)
+6. Blob storage wiring for large payloads
+
+---
+
 ## Session: Prompt 1 — Initial Foundation
 
 **Date:** 2026-04-09

@@ -565,10 +565,11 @@ export const runAEvents: Event[] = [
       type: 'tool.call',
       name: 'get_user_profile',
       input: { user_id: '99' },
-      call_id: 'call-006a',
+      // Same call_id as run B so positions 1-4 are payload-identical
+      call_id: 'call-006',
     },
   },
-  // Position 5: success case — tool.result
+  // Position 5: success case — tool.result (divergence point vs run B which has tool.error)
   {
     id: 'evt-055',
     runId: 'run-006a',
@@ -579,12 +580,12 @@ export const runAEvents: Event[] = [
     parentEventId: 'evt-054',
     payload: {
       type: 'tool.result',
-      call_id: 'call-006a',
+      call_id: 'call-006',
       output: { id: '99', name: 'Alice', email: 'alice@example.com' },
       duration_ms: 88,
     },
   },
-  // Position 6: success case — run.completed
+  // Position 6: success case — run.completed (divergence continues vs run B which has run.failed)
   {
     id: 'evt-056',
     runId: 'run-006a',
@@ -653,10 +654,11 @@ export const runBEvents: Event[] = [
       type: 'tool.call',
       name: 'get_user_profile',
       input: { user_id: '99' },
-      call_id: 'call-006b',
+      // Same call_id as run A so positions 1-4 are identical
+      call_id: 'call-006',
     },
   },
-  // Position 5: failure case — tool.error (divergence point)
+  // Position 5: failure case — tool.error (divergence point vs run A which has tool.result)
   {
     id: 'evt-065',
     runId: 'run-006b',
@@ -671,7 +673,7 @@ export const runBEvents: Event[] = [
         message: 'User not found: id=99',
         code: 'NOT_FOUND',
       },
-      call_id: 'call-006b',
+      call_id: 'call-006',
     },
   },
   // Position 6: failure case — run.failed (divergence continues)
