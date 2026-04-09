@@ -1,21 +1,25 @@
 /**
  * basic_run.ts
  *
- * Demonstrates the full SDK lifecycle using HttpTransport (real HTTP calls) and
- * MockTransport (no server required, safe to run locally).
+ * Demonstrates the full SDK lifecycle using FlightRecorder (real HTTP calls)
+ * and MockTransport (no server required, safe to run locally).
  *
  * --- Run against a live server ---
- *   AFR_API_KEY=your-key AFR_AGENT_ID=your-agent-id \
+ *   AFR_API_KEY=your-key AFR_AGENT_ID=your-agent-id AFR_BASE_URL=http://localhost:3000 \
  *   pnpm tsx packages/sdk/examples/basic_run.ts --live
  *
  * --- Run with MockTransport (no server needed) ---
  *   pnpm tsx packages/sdk/examples/basic_run.ts
+ *
+ * --- Run with FlightRecorder (needs server) ---
+ *   pnpm tsx packages/sdk/examples/basic_run.ts --flight-recorder
  */
 
 import {
   Recorder,
   Events,
   HttpTransport,
+  FlightRecorder,
   type Transport,
   type TransportAuth,
 } from '@agent-flight-recorder/sdk'
@@ -71,11 +75,11 @@ class MockTransport implements Transport {
 }
 
 // ---------------------------------------------------------------------------
-// Happy-path run
+// Happy-path run using Recorder + MockTransport
 // ---------------------------------------------------------------------------
 
 async function runHappyPath(transport: Transport) {
-  console.log('\n=== Happy-path run ===\n')
+  console.log('\n=== Happy-path run (Recorder + MockTransport) ===\n')
 
   const recorder = new Recorder(
     {
@@ -160,7 +164,7 @@ async function runHappyPath(transport: Transport) {
 // ---------------------------------------------------------------------------
 
 async function runErrorPath(transport: Transport) {
-  console.log('\n=== Error-path run ===\n')
+  console.log('\n=== Error-path run (Recorder + MockTransport) ===\n')
 
   const recorder = new Recorder(
     {
@@ -189,63 +193,76 @@ async function runErrorPath(transport: Transport) {
 }
 
 // ---------------------------------------------------------------------------
-// HttpTransport quick-start (reference snippet — not executed in this example)
+// FlightRecorder example — uses the high-level API against a real server.
+// Only executed when --flight-recorder or --live flags are passed.
 // ---------------------------------------------------------------------------
-//
-// To use the SDK against a real server, swap in HttpTransport:
-//
-//   import { Recorder, Events, HttpTransport } from '@agent-flight-recorder/sdk'
-//
-//   const transport = new HttpTransport('http://localhost:3000')
-//
-//   const recorder = new Recorder(
-//     {
-//       endpoint: 'http://localhost:3000',
-//       apiKey: process.env.AFR_API_KEY ?? 'your-api-key-here',
-//       agentId: process.env.AFR_AGENT_ID ?? 'your-agent-id-here',
-//       sdkVersion: '0.1.0',  // optional, included in run metadata
-//     },
-//     transport
-//   )
-//
-//   async function runAgent() {
-//     await recorder.startRun({ triggeredBy: 'script' })
-//
-//     recorder.recordEvent('custom', {
-//       name: 'agent.step',
-//       data: { message: 'Hello from Agent Flight Recorder!' }
-//     })
-//
-//     await recorder.flush()
-//     await recorder.endRun({ result: 'success' })
-//
-//     console.log('Run recorded! Check the dashboard to see it.')
-//   }
-//
-//   runAgent().catch(console.error)
+
+async function runFlightRecorder() {
+  console.log('\n=== FlightRecorder example (live server) ===\n')
+
+  const recorder = new FlightRecorder({
+    apiKey: process.env['AFR_API_KEY'] ?? 'test-key',
+    baseUrl: process.env['AFR_BASE_URL'] ?? 'http://localhost:3000',
+    agentId: process.env['AFR_AGENT_ID'] ?? 'test-agent',
+  })
+
+  const run = await recorder.startRun({
+    metadata: { model: 'gpt-4o', temperature: 0.7 },
+    tags: ['example', 'demo'],
+    triggeredBy: 'manual',
+  })
+
+  console.log(`Run started: ${run.runId}`)
+
+  // Record a sequence of events
+  await run.recordEvent('RUN_STARTED', { source: 'basic_run example' })
+  await run.recordEvent('LLM_REQUEST', {
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: 'Hello, agent!' }],
+  })
+  await run.recordEvent('LLM_RESPONSE', {
+    model: 'gpt-4o',
+    content: 'Hello! How can I help you today?',
+    usage: { promptTokens: 10, completionTokens: 15 },
+  })
+  await run.recordEvent('RUN_COMPLETED', { duration_ms: 1234 })
+
+  await run.complete()
+
+  console.log(`Run completed: ${run.runId}`)
+  console.log(
+    `View at: ${process.env['AFR_BASE_URL'] ?? 'http://localhost:3000'}/runs/${run.runId}`
+  )
+}
 
 // ---------------------------------------------------------------------------
-// Entry point — selects transport based on --live flag
+// Entry point — selects transport based on CLI flags
 // ---------------------------------------------------------------------------
 
 ;(async () => {
   const useLive = process.argv.includes('--live')
+  const useFlightRecorder = process.argv.includes('--flight-recorder')
 
-  let transport: Transport
-  if (useLive) {
-    console.log('Using HttpTransport (live server at http://localhost:3000)')
-    transport = new HttpTransport('http://localhost:3000')
+  if (useFlightRecorder || useLive) {
+    console.log('Using FlightRecorder (live server at', process.env['AFR_BASE_URL'] ?? 'http://localhost:3000', ')')
+    try {
+      await runFlightRecorder()
+      console.log('\nFlightRecorder example completed successfully.')
+    } catch (err) {
+      console.error('FlightRecorder example failed:', err)
+      process.exit(1)
+    }
   } else {
     console.log('Using MockTransport (no server required)')
-    transport = new MockTransport()
-  }
+    const transport = new MockTransport()
 
-  try {
-    await runHappyPath(transport)
-    await runErrorPath(transport)
-    console.log('\nAll examples completed successfully.')
-  } catch (err) {
-    console.error('Example failed:', err)
-    process.exit(1)
+    try {
+      await runHappyPath(transport)
+      await runErrorPath(transport)
+      console.log('\nAll examples completed successfully.')
+    } catch (err) {
+      console.error('Example failed:', err)
+      process.exit(1)
+    }
   }
 })()
