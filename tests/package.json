@@ -1,0 +1,17 @@
+{
+  "name": "@agent-flight-recorder/tests",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@agent-flight-recorder/contracts": "workspace:*",
+    "@agent-flight-recorder/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

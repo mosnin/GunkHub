@@ -1,0 +1,239 @@
+# Build Log — Agent Flight Recorder
+
+---
+
+## Session: Prompt 1 — Initial Foundation
+
+**Date:** 2026-04-09
+**Session ID:** Prompt 1
+**Teams:** A (Repo Architecture), B (Data + Contracts), C (Web App), D (SDK + Quality)
+**Goal:** Lay the complete foundation — monorepo, schema, contracts, SDK skeleton, web app skeleton, tests.
+
+---
+
+## Decisions Made
+
+1. **pnpm as the package manager (not npm or yarn).**
+   Rationale: pnpm's symlink-based `node_modules` is significantly faster and disk-efficient in monorepos. pnpm workspaces are native and well-supported. Version pinned to 9.x in `package.json` `packageManager` field and `engines` constraint.
+
+2. **Turborepo as the build orchestrator (not Nx or Lerna).**
+   Rationale: Turborepo has minimal configuration, fast incremental builds via content hashing, and native pnpm workspace integration. It does not require per-package task runners or complex configuration.
+
+3. **TypeScript strict mode enforced at the base tsconfig level.**
+   All packages extend `tsconfig.base.json` which sets `strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`. These are not negotiable on a new project — fixing them later is extremely painful.
+
+4. **`packages/contracts` has zero runtime dependencies.**
+   Rationale: Contracts are imported by the SDK (runs in customer's Node process), by the web app (runs in Vercel), and by Convex (runs in Convex runtime). Adding a runtime dependency (e.g. Zod) to contracts would add that dependency to all three environments. Zod may be added in Prompt 2 for API validation, but must be kept tree-shakeable.
+
+5. **EventType is a string literal union, not an enum.**
+   Rationale: TypeScript string literal unions are the idiomatic choice for discriminated unions. Enums have footguns (reverse mapping, ambient declarations, emit issues). String literals serialize naturally to JSON without transformation.
+
+6. **`events.payload` uses `v.any()` in Convex schema.**
+   Rationale: Convex's validator DSL cannot express a discriminated union of complex objects without extreme verbosity and duplication. The contract types enforce the shape at the TypeScript level. Runtime validation of event payloads is the SDK's responsibility (it constructs the payload with typed builders).
+
+7. **Run status transitions are enforced in the `updateRunStatus` mutation.**
+   Rationale: Status transitions are business logic, not schema constraints. Encoding them in the mutation means they are enforced regardless of which caller invokes the mutation. The valid transitions are: `pending → running | cancelled`, `running → completed | failed | cancelled | timed_out`. Terminal states cannot be transitioned.
+
+8. **`requireOrgMembership()` is called in every mutation, not just `getAuthContext()`.**
+   Rationale: `getAuthContext()` only verifies the user is authenticated and the org exists. It does not verify the user is a member of that org. A sophisticated attacker who knows an `orgId` Convex ID could potentially bypass the auth check if only `getAuthContext()` were called. `requireOrgMembership()` adds the membership check.
+
+9. **Sequence numbers are SDK-assigned, not server-assigned.**
+   Rationale: If sequence numbers were server-assigned, the SDK would need a round-trip to the server before buffering each event. That would serialize event recording and add latency. SDK-assigned sequence numbers allow buffering with no server round-trips. The server validates contiguity on receive.
+
+10. **`AgentVersion` is immutable once created — there is no `updateAgentVersion`.**
+    Rationale: An AgentVersion represents a point-in-time snapshot of agent configuration. If it could be mutated, historical runs would no longer accurately reflect the configuration that produced them. Immutability is a correctness requirement, not a preference.
+
+11. **`comments` use a `targetId: string` + `targetType: "run" | "event"` union rather than two separate nullable foreign keys.**
+    Rationale: Two nullable FKs (`runId?`, `eventId?`) require a check constraint to ensure exactly one is set. The string+discriminant approach is simpler in Convex (which has no check constraints) and maps naturally to the UI, which shows comments on either entity type without different code paths.
+
+12. **No React UI component library (no shadcn, Radix, MUI).**
+    Rationale: Agent Flight Recorder is a technical tool with a specific visual language (calm, dense, high-signal). External component libraries impose design opinions that are hard to override. Tailwind primitives give full control. This decision also keeps the dependency surface small and avoids version conflict issues.
+
+13. **SDK `Transport` interface is injectable (dependency injection pattern).**
+    Rationale: Unit testing the `Recorder` without a real HTTP endpoint requires injecting a mock transport. Without DI, every test would need to spin up a server or intercept `fetch`. The `MockTransport` pattern is clean and fast.
+
+14. **`Recorder` maintains a single active run context.**
+    Rationale: The common use case is one agent run per Recorder instance. Supporting concurrent runs would complicate the API (every method would need a `runId` parameter) and the buffer (separate buffers per run). If concurrent runs are needed, the caller should instantiate multiple Recorders.
+
+15. **`FlushResult` always returns success/failure explicitly — no thrown exceptions.**
+    Rationale: The SDK runs inside customer agent code. If `flush()` throws, the exception propagates into the agent, potentially crashing it. Returning a `FlushResult` with `errors[]` lets the SDK surface the failure without affecting the agent's execution path. The caller can inspect `result.errors` and decide how to proceed.
+
+16. **`scripts/validate.sh` runs typecheck → build → lint in that order.**
+    Rationale: Typecheck is the fastest signal that something is wrong. Building before typechecking would waste CI time if there are type errors. Lint runs last because it catches style issues, not correctness issues — style issues are lower priority than build failures.
+
+17. **`by_agent_started` and `by_project_started` indexes on the `runs` table.**
+    Rationale: The most common query patterns are "list runs for this agent, newest first" and "list runs for this project, newest first". The compound index on `(agentId, startedAt)` enables efficient time-range queries without a full table scan.
+
+18. **`parentEventId` on the events table enables a DAG, not just a flat list.**
+    Rationale: Real agent executions are not flat sequences. A single LLM response may trigger multiple tool calls, each of which makes HTTP requests. `parentEventId` lets the UI reconstruct the execution tree for the inspector view while `sequenceNumber` preserves the canonical timeline order.
+
+---
+
+## Files Created
+
+### Team A — Repo Architecture
+
+- `package.json` — workspace root, pnpm config, Turborepo scripts
+- `pnpm-workspace.yaml` — workspace package globs
+- `tsconfig.base.json` — strict TypeScript base config
+- `.eslintrc.json` (root) — ESLint config with import rules
+- `.prettierrc` — Prettier config
+- `turbo.json` — Turborepo pipeline config
+- `CLAUDE.md` — Project constitution (system boundaries, entity model, rules for future sessions)
+- `README.md` — Developer onboarding
+- `scripts/validate.sh` — CI validation gate (typecheck → build → lint)
+- `scripts/seed.ts` — Dev database seeding (stub)
+- `scripts/validate.ts` — Validate script TypeScript runner
+- `.env.example` — (MISSING — not created in Prompt 1, must be created in Prompt 2)
+- `.github/workflows/ci.yml` — (MISSING — not created in Prompt 1, must be created in Prompt 2)
+
+### Team B — Data + Contracts
+
+**packages/contracts:**
+- `packages/contracts/package.json`
+- `packages/contracts/tsconfig.json`
+- `packages/contracts/src/entities.ts` — Organization, Project, Agent, AgentVersion, Run, Event, Artifact, Comment
+- `packages/contracts/src/events.ts` — EventType union, all payload shapes, EventPayload
+- `packages/contracts/src/status.ts` — RunStatus, RunStatusValues, isTerminalStatus()
+- `packages/contracts/src/api.ts` — All API request/response shapes
+- `packages/contracts/src/replay.ts` — ReplayProjection, ReplayFrame
+- `packages/contracts/src/diff.ts` — RunDiff, EventDiff, DiffSummary, FieldChange
+- `packages/contracts/src/artifacts.ts` — Artifact types (if separate from entities)
+- `packages/contracts/src/index.ts` — Re-exports all public types
+
+**convex/:**
+- `convex/schema.ts` — All 8 table definitions with indexes (COMPLETE)
+- `convex/auth.ts` — `getAuthContext()`, `requireOrgMembership()` (COMPLETE)
+- `convex/runs.ts` — `listRuns`, `getRun`, `createRun`, `updateRunStatus` (COMPLETE)
+- `convex/events.ts` — `listEvents`, `getEvent`, `createEvent` (COMPLETE)
+- `convex/artifacts.ts` — `listArtifacts`, `createArtifact` (COMPLETE)
+- `convex/comments.ts` — LIST query implemented; CREATE/RESOLVE mutations (STUB)
+- `convex/organizations.ts` — `getOrg` (STUB — needs createOrg, getOrgByClerkId)
+- `convex/projects.ts` — `listProjects` (STUB — needs createProject)
+- `convex/helpers/pagination.ts` — `DEFAULT_PAGE_SIZE`, `MAX_PAGE_SIZE` (COMPLETE)
+- `convex/helpers/storage.ts` — `BlobStorageAdapter` interface (INTERFACE ONLY — no implementation)
+
+### Team C — Web App
+
+**apps/web — structure:**
+- `apps/web/package.json`
+- `apps/web/tsconfig.json`
+- `apps/web/next.config.js`
+- `apps/web/tailwind.config.ts`
+- `apps/web/postcss.config.js`
+
+**apps/web/src/lib:**
+- `apps/web/src/lib/env.ts` — Env var validation at startup (COMPLETE)
+- `apps/web/src/lib/auth.ts` — Clerk auth helpers for Next.js (STUB)
+- `apps/web/src/lib/utils.ts` — Utility functions (STUB)
+- `apps/web/src/lib/services/runs.ts` — Run service layer (STUB — returns fake data)
+- `apps/web/src/lib/services/events.ts` — Event service layer (STUB — returns empty array)
+- `apps/web/src/lib/services/comments.ts` — Comment service layer (STUB — returns empty array)
+
+**apps/web/src/components/ui:**
+- `Badge.tsx` — Status badges with color variants
+- `Button.tsx` — Button with primary/secondary/ghost variants
+- `Card.tsx` — Container card
+- `CodeBlock.tsx` — Syntax-highlighted code viewer
+- `EmptyState.tsx` — Empty data state with message and action
+- `ErrorState.tsx` — Error state with message and retry action
+- `LoadingState.tsx` — Loading spinner/skeleton
+- `Tabs.tsx` — Tab navigation component
+
+**apps/web/src/components/layout:**
+- `AppShell.tsx` — Root layout with sidebar
+- `PageHeader.tsx` — Page title + breadcrumbs
+- `Sidebar.tsx` — Navigation sidebar
+
+**apps/web/src/components/runs:**
+- `RunList.tsx` — Table of runs with status badges and timestamps
+- `RunHeader.tsx` — Run detail header with status, timing, metadata
+- `Timeline.tsx` — Chronological event list with type icons
+- `EventInspector.tsx` — Per-event payload viewer (collapsible)
+- `DiffViewer.tsx` — Side-by-side run diff (STUB — no diff computation)
+- `ReplayViewer.tsx` — Step-through replay player (STUB — no playback logic)
+- `ArtifactList.tsx` — List of artifacts with download links
+- `CommentThread.tsx` — Comment list and compose form
+
+**apps/web/src/app/ — MISSING.** No Next.js pages exist. This is the most critical gap for Prompt 2.
+
+### Team D — SDK + Quality
+
+**packages/sdk:**
+- `packages/sdk/package.json`
+- `packages/sdk/tsconfig.json`
+- `packages/sdk/src/index.ts` — Public exports (COMPLETE)
+- `packages/sdk/src/recorder.ts` — Recorder class (COMPLETE)
+- `packages/sdk/src/events.ts` — Events builders, buildEvent (COMPLETE)
+- `packages/sdk/src/transport.ts` — Transport interface, HttpTransport (STUB — all methods throw)
+- `packages/sdk/src/types.ts` — RecorderConfig, RunContext, FlushResult, etc. (COMPLETE)
+
+**tests:**
+- `tests/vitest.config.ts`
+- `tests/unit/sdk.test.ts` — Recorder tests with MockTransport (PASSING)
+- `tests/unit/contracts.test.ts` — Contract type coverage tests (PASSING)
+- `tests/integration/api.test.ts` — (STUB — all tests marked TODO)
+- `tests/fixtures/runs.ts` — Sample run and event data (COMPLETE)
+
+**docs:**
+- `docs/product_spec.md` — Full product specification (COMPLETE)
+- `docs/adrs/0001_repo_shape.md` — (written in Prompt 1)
+- `docs/adrs/0002_event_log_is_canonical.md` — (written in Prompt 1)
+- `docs/adrs/0003_tenancy_boundary.md` — (written in Prompt 1)
+- `docs/adrs/0004_shared_contracts_package.md` — (written in Prompt 1)
+
+---
+
+## Deviations from Original Spec
+
+1. **No `.env.example` was created.** Environment variables are referenced in `apps/web/src/lib/env.ts` but a template `.env.example` was not created. Must be created in Prompt 2 before other developers can set up the project.
+
+2. **No GitHub Actions CI workflow was created.** `scripts/validate.sh` exists and is the validation gate, but there is no `.github/workflows/ci.yml` that runs it on pull requests. Must be created in Prompt 2.
+
+3. **`convex/comments.ts` mutations are incomplete.** The `createComment` and `resolveComment` mutations were not implemented in Prompt 1. The list query exists.
+
+4. **`apps/web/src/app/` does not exist.** The Next.js App Router requires this directory to serve pages. Zero pages exist. The web app cannot be run as a server yet.
+
+5. **SDK `HttpTransport` is entirely stubbed.** All three methods throw. The SDK is functional end-to-end with a mock transport (tests pass), but cannot make real HTTP calls until Prompt 2 implements the API routes and the transport.
+
+6. **No API key management system.** The `RecorderConfig` accepts an `apiKey`, and the `Transport` auth interface carries it, but there is no `api_keys` table in Convex and no API key issuance flow. Prompt 2 must decide: use Clerk tokens or implement a separate API key system.
+
+---
+
+## Risks Identified
+
+1. **API key auth gap.** The SDK sends an `apiKey` but there is no system to issue or validate API keys. If we use Clerk org tokens directly, the SDK must manage token refresh. If we use opaque API keys, we need the `api_keys` table. This is the most critical architectural decision remaining.
+
+2. **Convex `v.any()` for event payloads is a runtime validation gap.** Large, malformed payloads can be stored without error. The SDK's typed builders mitigate this, but untrusted ingest (e.g. from a compromised API key) could store arbitrary data in the events table. Payload validation at the API route layer (Zod) is the mitigation.
+
+3. **No test environment for Convex.** Integration tests need a Convex dev deployment to run against. Without one, all integration tests are stubs and cannot catch schema/mutation regressions. This is acceptable for Prompt 1 (foundation) but must be resolved before the project grows.
+
+4. **`apps/web` has no pages yet.** The web app is not runnable. This is expected for Prompt 1 but means there has been no end-to-end validation of the auth or Convex integration from the browser. Prompt 2 must create pages and perform manual smoke testing.
+
+5. **Blob storage is a no-op.** Large payloads will either fail silently or be stored in-line (violating the 10 KB rule) until the `BlobStorageAdapter` is implemented. If anyone uses the SDK with large payloads before Prompt 3, they will hit issues.
+
+6. **`turbo.json` pipeline ordering must be validated.** If the `dependsOn` declarations in `turbo.json` are incorrect, packages may be built out of order. This would cause stale type artifacts and confusing TypeScript errors. Must be verified when Prompt 2 adds actual build steps.
+
+---
+
+## Completed vs Stubbed
+
+| Area | Completed | Stubbed |
+|------|-----------|---------|
+| Monorepo config | pnpm workspace, Turborepo, TypeScript, ESLint, Prettier, validate.sh | .env.example, CI workflow |
+| Convex schema | All 8 tables, all indexes | — |
+| Convex auth | getAuthContext(), requireOrgMembership() | — |
+| Convex runs | listRuns, getRun, createRun, updateRunStatus | — |
+| Convex events | listEvents, getEvent, createEvent | — |
+| Convex artifacts | listArtifacts, createArtifact | — |
+| Convex comments | (list query) | createComment, resolveComment |
+| Convex organizations | — | createOrg, getOrgByClerkId |
+| Convex projects | — | createProject, listProjects (full) |
+| Blob storage | BlobStorageAdapter interface | Concrete implementation |
+| packages/contracts | All entity types, all event types, API shapes, replay/diff projections | — |
+| packages/sdk | Recorder class, Events builders, types, Transport interface | HttpTransport implementation |
+| apps/web components | All UI primitives, layout, run-specific components | — |
+| apps/web service layer | Service function signatures, type imports | Real Convex calls |
+| apps/web pages | — | All pages (app/ directory missing) |
+| Unit tests | sdk.test.ts (passing), contracts.test.ts (passing) | integration/api.test.ts |
+| Documentation | product_spec.md, all 4 ADRs, this build log, working_memory.md, architecture.md, product_model.md, next_steps.md | — |
