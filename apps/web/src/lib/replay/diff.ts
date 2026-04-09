@@ -1,5 +1,4 @@
-import type { RunDiff, EventDiff, FieldChange } from "@agent-flight-recorder/contracts";
-import type { Event } from "@agent-flight-recorder/contracts";
+import type { Event, EventDiff, FieldChange, RunDiff } from "@agent-flight-recorder/contracts";
 
 /**
  * Performs deep equality comparison of two values using JSON.stringify.

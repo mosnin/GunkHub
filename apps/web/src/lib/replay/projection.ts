@@ -147,6 +147,7 @@ function derivePayloadPreview(type: string, payload: unknown): string {
       // Extract the first string-valued field from the payload as a fallback.
       for (const key of Object.keys(p)) {
         if (key === "type") continue;
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         const val = p[key];
         if (typeof val === "string" && val.length > 0) {
           preview = val;
@@ -233,8 +234,11 @@ export function buildReplayProjection(run: Run, events: Event[]): ReplayProjecti
   const sorted = [...events].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
 
   // 2. Reference timestamp is the first event.
-  const firstTimestamp = sorted[0]!.timestamp;
-  const lastTimestamp = sorted[sorted.length - 1]!.timestamp;
+  // sorted is non-empty (checked above), so these accesses are safe.
+  const firstEvent = sorted[0];
+  const lastEvent = sorted[sorted.length - 1];
+  const firstTimestamp = firstEvent !== undefined ? firstEvent.timestamp : 0;
+  const lastTimestamp = lastEvent !== undefined ? lastEvent.timestamp : 0;
 
   // 4. Total duration.
   const duration_ms = sorted.length > 1 ? lastTimestamp - firstTimestamp : 0;
@@ -242,7 +246,8 @@ export function buildReplayProjection(run: Run, events: Event[]): ReplayProjecti
   // 5. Build an ID-to-index map for O(1) parent lookups.
   const idToIndex = new Map<string, number>();
   for (let i = 0; i < sorted.length; i++) {
-    idToIndex.set(sorted[i]!.id, i);
+    const ev = sorted[i];
+    if (ev !== undefined) idToIndex.set(ev.id, i);
   }
 
   // Build frames.

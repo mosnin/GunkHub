@@ -1,5 +1,4 @@
-import type { FailureSummary, FailurePoint, FailureReason } from "@agent-flight-recorder/contracts";
-import type { Event, Run } from "@agent-flight-recorder/contracts";
+import type { Event, FailurePoint, FailureReason, FailureSummary, Run } from "@agent-flight-recorder/contracts";
 
 /**
  * Extracts an error message string from an event payload using a best-effort
