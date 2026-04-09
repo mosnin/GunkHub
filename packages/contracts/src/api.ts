@@ -83,6 +83,23 @@ export interface CreateCommentResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Replay and diff endpoints
+// ---------------------------------------------------------------------------
+
+export interface GetReplayResponse {
+  projection: import("./replay.js").ReplayProjection;
+  failureSummary: import("./replay.js").FailureSummary;
+}
+
+export interface GetDiffResponse {
+  diff: import("./diff.js").RunDiff;
+  /** True if the runs cannot be fairly compared (e.g. both in-progress) */
+  incomparable: boolean;
+  /** Human-readable explanation when incomparable is true */
+  incomparableReason?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Error shape
 // ---------------------------------------------------------------------------
 
