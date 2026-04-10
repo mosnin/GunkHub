@@ -2,6 +2,52 @@
 
 ---
 
+## Prompt 11 — 2026-04-10: Operational Quality Pass (Filter Performance, GC Visibility, Tag Consistency, CI Gate)
+
+### What changed
+
+**Team A — Run filter performance (ADR-0015)**
+- `convex/schema.ts`: added `.index("by_org_status_started", ["orgId", "status", "startedAt"])` to the `runs` table
+- `convex/runs.ts`: rewrote `listRuns` query branching from a 4-branch + in-memory-filter pattern to a 6-branch pattern that pushes `startedAfter` into index range queries for every applicable filter combination. The sole remaining in-memory `.filter()` is the `orgId` safety check.
+- `tests/unit/run_filter.test.ts` (NEW): 14 tests documenting the expected index selection for each filter scenario and verifying pagination constants
+- `docs/adrs/0015_run_filter_index.md` (NEW): compound index justification, consequences, known limitations
+
+**Team B — Artifact GC visibility**
+- `convex/artifact_gc.ts`: replaced the single `errors` counter with three separated counters (`blobErrors`, `checkErrors`, `recordErrors`); each catch block logs the artifact ID and storage key; blob delete failures emit a clear "will be retried in next GC run" warning; added bounded-batch log when more candidates remain
+- `tests/unit/artifact_gc.test.ts`: added 3 tests documenting the safety invariants for the error categorization behavior (total: 10 tests in file)
+- `docs/operations_runbook.md`: added "Artifact GC outcomes" section explaining log format, counter meanings, escalation thresholds
+
+**Team C — Tag editing consistency**
+- `apps/web/src/components/runs/RunHeader.tsx`: added `savedTags` state that tracks the last successfully persisted tag set; read-only view renders `savedTags` instead of stale `tags` prop; success branch updates `savedTags` before exiting edit mode; Cancel/Escape and error revert use `savedTags` as the reset target
+
+**Team D — CI release gate**
+- `.github/workflows/ci.yml`: integration-test job now `needs: [test]` (was `[build]`); added "Report integration test configuration" step that emits a visible notice/warning depending on whether secrets are present; added "Verify integration tests were not silently skipped on main" step that fails on `main` branch when `CONVEX_TEST_URL` is absent
+- `docs/ops/ci_setup.md`: documented the release gate policy — secrets-present runs tests and fails on failure; secrets-absent on feature branches warns; secrets-absent on `main` blocks the job
+- `docs/release_readiness.md`: updated test count, deferred items list (removed resolved items), added filter/GC/tag/CI sections reflecting current state
+
+### Why these fit the architecture
+- Run filter index: Convex compound indexes are the correct mechanism for combining equality and range filters. Adding at schema definition time costs one extra index write per run insert but makes every filtered read O(result set) rather than O(org runs).
+- GC visibility: better logging is zero-cost at runtime and materially improves operator response time when GC has issues. Safety invariant (blob delete failure → record preserved) is unchanged.
+- Tag consistency: `savedTags` client state is the minimal correct fix — no server round-trip, no prop callback, no refactor. The read-only view always shows what was last successfully saved.
+- CI gate: making integration test skip visible (not silent) closes a discipline gap. The `main` branch hard-fail ensures integration coverage is required for release.
+
+### Hard-to-reverse decisions
+- `by_org_status_started` index: adding is easy; removing requires schema migration and re-deployment. Justified — it is cheaper to add now than retroactively on a live system with existing runs.
+- CI gate on `main`: once set, contributors need to be aware that pushing to `main` without secrets configured blocks CI. Documented in `docs/ops/ci_setup.md`.
+
+### Known residual risks
+- `agentId + status + date` filter still applies `status` in-memory (acceptable — agent-scoped run counts are small)
+- GC processes one bounded page per daily run; large backlogs clear over multiple days
+- Tag editing: if the `tags` prop changes via an external re-render while `savedTags` differs, `savedTags` is authoritative (correct behavior — shows what was last saved by this client)
+
+### Recommendation for Prompt 12
+1. Artifact download link: `GET /api/artifacts/[id]/download` with auth — closes the last major UI gap (artifacts visible but not retrievable)
+2. Keyboard navigation in run Timeline and EventInspector (↑/↓ arrow keys, Enter to expand)
+3. Shareable event URL: `?event=<sequenceNumber>` query param deep-links to a specific event
+4. Run stuck/timed-out: automated timeout job for runs stuck in `running` state > N hours (low risk, operators currently need to patch manually)
+
+---
+
 ## Prompt 10 — 2026-04-10: Scale & Production Safety (Event Pagination, Diff Bounding, GC Indexing, Org Bootstrap Tests)
 
 ### What changed

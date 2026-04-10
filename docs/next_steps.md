@@ -1,125 +1,124 @@
-# Next Steps — Prompt 11 Specification
+# Next Steps — Prompt 12 Specification
 
 **Document type:** Exact specification for the next build session.
-**Current state:** Prompt 10 complete.
-**This document:** Defines what Prompt 11 should accomplish, based on remaining gaps after Prompt 10.
+**Current state:** Prompt 11 complete.
+**This document:** Defines what Prompt 12 should accomplish, based on remaining gaps after Prompt 11.
 
 ---
 
-## 1. What Was Accomplished in Prompt 10
+## 1. What Was Accomplished in Prompt 11
 
-Prompt 10 closed scale and production safety gaps:
+Prompt 11 was an operational quality pass:
 
-- **Event pagination** — Timeline and EventInspector load 200 events at a time, with a "Load more" button fetching subsequent pages via `/api/runs/[id]/events?cursor=X&limit=200`. Reduces initial payload from 500 to 200 events.
-- **Diff boundedness** — `fetchAllEvents` caps at `MAX_EVENTS_PER_DIFF = 10_000`; `RunDiff.truncated` propagates to DiffViewer as an orange warning banner. ADR-0013 documents the decision.
-- **Artifact GC scaling** — `getOrphanCandidates` rewritten from `.collect()` full scan to indexed range query on `by_created_at` with `paginate({ numItems: GC_CANDIDATE_PAGE_SIZE })`. ADR-0014 documents the decision.
-- **Org bootstrap tests** — 15 unit tests in `org_bootstrap.test.ts` prove `upsertOrganization`, `upsertMembership`, and `clerkRoleToInternal` correctness. ADR-0012 formalizes the pipeline.
-- **Contracts bumped to 0.6.0** — `RunDiff.truncated` is the additive change.
+- **Run filter performance** — `listRuns` now uses index range queries for `startedAfter`. New compound index `by_org_status_started = ["orgId", "status", "startedAt"]` handles combined status+date filter in O(result set) rather than O(org runs). ADR-0015.
+- **GC visibility** — `cleanOrphanedArtifacts` now separates errors into `blobErrors`, `checkErrors`, `recordErrors`; logs artifact ID and storage key on failure; emits "will retry next GC run" warning on blob delete failure; logs bounded-batch message when more candidates remain. Operations runbook updated with GC outcomes section.
+- **Tag editing consistency** — `RunHeader` adds `savedTags` state updated on successful save. Read-only view renders `savedTags` instead of stale SSR prop. Cancel/Escape/error revert all use `savedTags` as the reset target.
+- **CI release gate** — integration-test job now requires unit tests first (`needs: [test]`). Explicit notice/warning emitted on every run showing whether secrets are configured. Hard fail on `main` branch when `CONVEX_TEST_URL` is absent. `docs/ops/ci_setup.md` and `docs/release_readiness.md` updated.
 
 ---
 
-## 2. What Prompt 11 Should Accomplish
+## 2. What Prompt 12 Should Accomplish
 
 Items are listed in priority order.
 
-### 2A. Run detail: keyboard navigation and shareable event URL
+### 2A. Artifact download link (HIGH — last major UI gap)
 
-Engineers debugging a run need to move through events quickly and share deep links to a specific event.
+Artifacts are visible in ArtifactList but not retrievable. Engineers must use Convex dashboard to find the storage key and manually fetch.
 
 Changes needed:
 
-1. **Keyboard navigation in Timeline and EventInspector.** When a Timeline or EventInspector is focused, arrow keys (↑/↓) move the selection. Enter expands/collapses the focused event. This requires managing a `focusedIndex` integer state alongside `expandedId`/`selectedId`.
+1. `GET /api/artifacts/[id]/download` route:
+   - Clerk session auth (same pattern as other routes)
+   - Query artifact record from Convex; verify it belongs to caller's org
+   - Fetch blob from Vercel Blob storage using `BLOB_STORE_TOKEN`
+   - Stream response with `Content-Type` from artifact `mimeType` field and `Content-Disposition: attachment; filename="<artifact.name>"`
+   - Return 401 if unauthenticated, 404 if artifact not found or wrong org, 502 if blob fetch fails
 
-2. **Deep-link URL for selected event.** Add a `?event=<sequenceNumber>` query parameter to the run detail URL. When `?event=` is present, the EventInspector should auto-select that event on mount. The Timeline should scroll the row into view. Changing the selected event updates the URL without a full navigation (use `history.replaceState` or Next.js `router.replace`).
-
-3. **Copy event URL button.** In the EventInspector right panel header, add a small clipboard icon button. On click, copies the current URL (including `?event=`) to the clipboard. Show a brief "Copied!" confirmation.
+2. `ArtifactList.tsx`: add a download icon button per artifact row that navigates to the download route.
 
 Acceptance criteria:
-- Arrow keys navigate events in the timeline and inspector.
-- `?event=5` in the URL pre-selects event with sequenceNumber 5.
-- The copy button copies the canonical URL.
+- Clicking download triggers a file download in the browser.
+- 404 returned if artifact doesn't belong to caller's org.
+- 401 returned if unauthenticated.
+
+### 2B. Keyboard navigation in Timeline and EventInspector (MEDIUM)
+
+Engineers debug runs by scanning events. Mouse-only navigation in a list of 200+ events is slow.
+
+Changes needed:
+
+1. **Timeline**: when the list is focused, ↑/↓ move a highlighted row; Enter expands/collapses. Manage `focusedIndex` state alongside `expandedId`.
+2. **EventInspector**: same — ↑/↓ navigate the left event list; selection updates the right payload panel.
+
+Acceptance criteria:
+- Arrow keys navigate events.
+- No change to mouse interaction.
+- No new dependencies.
+
+### 2C. Shareable event URL (LOW — quality of life)
+
+Engineers share a link to a specific event in a run for debugging collaboration.
+
+Changes needed:
+
+1. Add `?event=<sequenceNumber>` query param to the run detail URL.
+2. EventInspector auto-selects that event on mount when `?event=` is present.
+3. A "Copy event link" button in the EventInspector right panel header copies the current URL including `?event=`.
+4. Changing the selected event updates the URL without full navigation (`history.replaceState`).
+
+Acceptance criteria:
+- `?event=5` pre-selects event with `sequenceNumber 5`.
+- Copy button copies canonical URL including `?event=`.
 - `pnpm typecheck` passes.
 
-### 2B. Run search — full-text tag and metadata filter
+### 2D. Run stuck-in-running timeout (LOW — operator quality of life)
 
-The runs list currently filters by status, date range, and agent. Engineers cannot search by tag value or metadata key/value.
-
-Changes needed:
-
-1. `listRuns` in `convex/runs.ts` gains an optional `tag?: string` filter — adds `.filter((q) => q.includes(q.field("tags"), args.tag))` to the existing query chain.
-2. `ListRunsRequest` in `packages/contracts/src/api.ts` gains `tag?: string` (non-breaking additive). Bump contracts to 0.7.0.
-3. `apps/web/app/(app)/runs/page.tsx` gains a tag search input field. Value is reflected in `?tag=` URL query param. Works alongside existing filters.
-
-Acceptance criteria:
-- Typing a tag value into the search field and pressing Enter filters the run list to runs containing that exact tag.
-- The URL updates to include `?tag=<value>`.
-- `pnpm typecheck` passes after contracts version bump.
-
-### 2C. Run detail page: event count and total duration in header
-
-The `RunHeader` currently shows status, agent name, start time, elapsed duration, and tags. It does not show how many events the run produced.
+Runs that crash without calling `run.complete()` or `run.fail()` stay in `running` forever. Operators currently patch manually via the Convex dashboard.
 
 Changes needed:
 
-1. `RunHeader` accepts an optional `eventCount?: number` prop.
-2. `apps/web/app/(app)/runs/[runId]/page.tsx` passes `eventsData?.events.length` (plus any loaded extra pages — just the initial count is acceptable for now).
-3. Display `eventCount` in the header row as a small `N events` pill.
+1. Add `STALE_RUN_TIMEOUT_MS` constant (e.g., 24 hours) to `convex/helpers/pagination.ts`.
+2. Add `expireStaleRuns` internalAction that queries runs with `status = "running"` and `startedAt < cutoff`, then calls `updateRunStatus` with `status = "timed_out"`.
+3. Add a daily cron entry in `convex/crons.ts` for `expireStaleRuns` (at 03:00 UTC, distinct from GC at 02:00).
+4. Update the operations runbook — remove the manual Convex dashboard patch instructions, replace with "runs auto-expire after 24 hours".
 
 Acceptance criteria:
-- Run header shows an event count when `eventCount` is provided.
-- Component still renders correctly when `eventCount` is undefined (existing runs).
-
-### 2D. Artifact download link in ArtifactList
-
-`ArtifactList` shows artifact metadata (name, size, MIME type, checksum) but provides no way to download the artifact.
-
-Changes needed:
-
-1. Add a `GET /api/artifacts/[id]/download` route that:
-   - Authenticates via Clerk session (same as other API routes).
-   - Queries the artifact record from Convex, checks org membership.
-   - Issues a `fetch` to the blob storage URL with `BLOB_STORE_TOKEN`.
-   - Streams the response body back to the client with the correct `Content-Type` and `Content-Disposition: attachment` header.
-2. `ArtifactList` gains a small download icon button per artifact row that navigates to this route.
-
-Acceptance criteria:
-- Clicking the download button triggers a file download in the browser.
-- The download route returns 404 if the artifact does not belong to the caller's org.
-- The download route returns 401 if unauthenticated.
+- Runs stuck in `running` for > 24 hours are transitioned to `timed_out` by the daily cron.
+- The status transition uses the existing `updateRunStatus` mutation (enforces valid transitions).
+- `pnpm typecheck` passes.
 
 ---
 
-## 3. What Must NOT Be Done in Prompt 11
+## 3. What Must NOT Be Done in Prompt 12
 
 - Do not add real-time event streaming.
 - Do not add analytics dashboards or aggregate metrics.
-- Do not change event log immutability rules — no `updateEvent` or `deleteEvent`.
-- Do not implement multi-region ingestion.
+- Do not change event log immutability rules.
+- Do not redesign replay, diff, or the SDK.
 - Do not add billing or usage metering.
-- Do not remove the `by_created_at` index from artifacts without a migration plan.
-- Do not add new required fields to `RecorderConfig` without a major SDK version bump.
+- Do not add new background processing services beyond the stale-run timeout cron.
 
 ---
 
-## 4. Acceptance Criteria for Prompt 11
+## 4. Acceptance Criteria for Prompt 12
 
-1. Timeline and EventInspector support ↑/↓ keyboard navigation.
-2. `?event=<N>` in the URL pre-selects the event; copy button writes canonical URL to clipboard.
-3. `?tag=` filter is reflected in URL and passed to `listRuns`; contracts bumped to 0.7.0.
-4. Run header shows an optional event count pill.
-5. `GET /api/artifacts/[id]/download` returns the blob with correct headers; 401/404 guards in place.
-6. `pnpm typecheck` passes with zero errors.
-7. `./scripts/validate.sh` passes all three checks.
-8. All prior tests still pass (>= 426 total, no regressions).
+1. `GET /api/artifacts/[id]/download` returns the blob with correct headers; 401/404 guards in place; ArtifactList has download button.
+2. Timeline and EventInspector support ↑/↓ keyboard navigation.
+3. `?event=<N>` pre-selects the event; copy button writes canonical URL to clipboard.
+4. Stale runs auto-expire via daily cron after 24 hours.
+5. `pnpm typecheck` passes with zero errors.
+6. `./scripts/validate.sh` passes all three checks.
+7. All prior tests still pass (>= 443 total, no regressions).
+8. `docs/build_log.md`, `docs/working_memory.md`, `docs/next_steps.md` updated.
 
 ---
 
-## 5. Known Technical Debt After Prompt 10
+## 5. Known Technical Debt After Prompt 11
 
-1. **Event pagination loads more on demand but does not virtualize the list.** For runs with tens of thousands of events and heavy "load more" usage, the DOM can grow large. A virtual scroll list (e.g., `react-window`) is the long-term fix — acceptable for v1.
-2. **Diff comparison is position-based and order-sensitive.** JSON.stringify field comparison treats `{a:1,b:2}` and `{b:2,a:1}` as different. Documented in ADR-0005 as acceptable for v1.
-3. **GC processes one page per daily run.** Large orphan backlogs accumulate over multiple days. Acceptable — steady state has no backlog after the first sweep.
-4. **`BLOB_STORE_TOKEN` must be set in Convex env vars separately from Next.js env vars.** If missing, blob records are cleaned but storage blobs remain. Documented in ops runbook.
-5. **ArtifactList has no download affordance** — no way to retrieve the externalized payload from the UI. Fix in Prompt 11 (see 2D).
-6. **No keyboard navigation in Timeline/EventInspector.** Fixed in Prompt 11 (see 2A).
-7. **Run list has no tag search.** Fixed in Prompt 11 (see 2B).
+1. **Artifact download not available from UI** — engineers must use Convex dashboard to retrieve blobs. Fix in Prompt 12 (2A).
+2. **No keyboard navigation** in Timeline/EventInspector. Fix in Prompt 12 (2B).
+3. **No shareable event URL** for deep-linking to a specific event. Fix in Prompt 12 (2C).
+4. **Runs stuck in `running` require manual Convex dashboard patch.** Fix in Prompt 12 (2D).
+5. **Event list is not virtualized** — 10,000+ events loaded via "Load more" may cause sluggish scroll. Acceptable for v1; virtual scroll (react-window) is v1.1.
+6. **`agentId + status + date` filter still applies status in-memory** — acceptable because agent-scoped run counts are small. Would require a `by_agent_status_started` index to fix cleanly.
+7. **GC processes one page per daily run** — large orphan backlogs clear over multiple days. Acceptable at v1 scale.

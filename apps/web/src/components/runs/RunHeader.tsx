@@ -55,6 +55,7 @@ function CopyButton({ value }: { value: string }) {
 export function RunHeader({ runId, status, agentName, startedAt, endedAt, triggeredBy, tags, metadata }: RunHeaderProps) {
   const [isEditing, setIsEditing] = useState(false)
   const [draftTags, setDraftTags] = useState<string[]>(tags ?? [])
+  const [savedTags, setSavedTags] = useState<string[]>(tags ?? [])
   const [tagInput, setTagInput] = useState('')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
@@ -80,7 +81,7 @@ export function RunHeader({ runId, status, agentName, startedAt, endedAt, trigge
       commitInput()
     } else if (e.key === 'Escape') {
       setIsEditing(false)
-      setDraftTags(tags ?? [])
+      setDraftTags(savedTags)
       setTagInput('')
       setErrorMsg(null)
     }
@@ -92,9 +93,10 @@ export function RunHeader({ runId, status, agentName, startedAt, endedAt, trigge
       const err = await updateRunTagsAction(runId, draftTags)
       if (err) {
         setErrorMsg(err)
-        // Revert to original tags on error
-        setDraftTags(tags ?? [])
+        // Revert to last known-good saved state on error
+        setDraftTags(savedTags)
       } else {
+        setSavedTags(draftTags)
         setIsEditing(false)
       }
     })
@@ -179,7 +181,7 @@ export function RunHeader({ runId, status, agentName, startedAt, endedAt, trigge
               type="button"
               onClick={() => {
                 setIsEditing(false)
-                setDraftTags(tags ?? [])
+                setDraftTags(savedTags)
                 setTagInput('')
                 setErrorMsg(null)
               }}
@@ -197,7 +199,7 @@ export function RunHeader({ runId, status, agentName, startedAt, endedAt, trigge
         ) : (
           <>
             {/* Read-only tag chips */}
-            {(tags ?? []).map((tag) => (
+            {savedTags.map((tag) => (
               <span
                 key={tag}
                 className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono text-neutral-500 bg-neutral-900 border border-neutral-800"
@@ -210,7 +212,7 @@ export function RunHeader({ runId, status, agentName, startedAt, endedAt, trigge
             <button
               type="button"
               onClick={() => {
-                setDraftTags(tags ?? [])
+                setDraftTags(savedTags)
                 setIsEditing(true)
               }}
               className="inline-flex items-center gap-0.5 text-xs text-neutral-700 hover:text-neutral-500 transition-colors font-mono"
@@ -233,7 +235,7 @@ export function RunHeader({ runId, status, agentName, startedAt, endedAt, trigge
                   strokeLinejoin="round"
                 />
               </svg>
-              {(tags ?? []).length === 0 ? 'Add tags' : 'Edit'}
+              {savedTags.length === 0 ? 'Add tags' : 'Edit'}
             </button>
           </>
         )}

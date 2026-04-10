@@ -35,49 +35,52 @@ export const listRuns = query({
     let runsQuery;
 
     if (args.agentId !== undefined) {
-      runsQuery = ctx.db
-        .query("runs")
-        .withIndex("by_agent_started", (q) =>
+      // Agent filter — use by_agent_started for date range support
+      if (args.startedAfter !== undefined) {
+        runsQuery = ctx.db.query("runs").withIndex("by_agent_started", (q) =>
+          q.eq("agentId", args.agentId!).gte("startedAt", args.startedAfter!),
+        );
+      } else {
+        runsQuery = ctx.db.query("runs").withIndex("by_agent_started", (q) =>
           q.eq("agentId", args.agentId!),
         );
+      }
     } else if (args.projectId !== undefined) {
-      runsQuery = ctx.db
-        .query("runs")
-        .withIndex("by_project_started", (q) =>
+      // Project filter — use by_project_started for date range support
+      if (args.startedAfter !== undefined) {
+        runsQuery = ctx.db.query("runs").withIndex("by_project_started", (q) =>
+          q.eq("projectId", args.projectId!).gte("startedAt", args.startedAfter!),
+        );
+      } else {
+        runsQuery = ctx.db.query("runs").withIndex("by_project_started", (q) =>
           q.eq("projectId", args.projectId!),
         );
+      }
+    } else if (args.status !== undefined && args.startedAfter !== undefined) {
+      // Combined status + date range — use new compound index
+      runsQuery = ctx.db.query("runs").withIndex("by_org_status_started", (q) =>
+        q.eq("orgId", args.orgId).eq("status", args.status!).gte("startedAt", args.startedAfter!),
+      );
     } else if (args.status !== undefined) {
-      runsQuery = ctx.db
-        .query("runs")
-        .withIndex("by_org_status", (q) =>
-          q.eq("orgId", args.orgId).eq("status", args.status!),
-        );
+      // Status filter only
+      runsQuery = ctx.db.query("runs").withIndex("by_org_status", (q) =>
+        q.eq("orgId", args.orgId).eq("status", args.status!),
+      );
+    } else if (args.startedAfter !== undefined) {
+      // Date range only — use existing by_org_started
+      runsQuery = ctx.db.query("runs").withIndex("by_org_started", (q) =>
+        q.eq("orgId", args.orgId).gte("startedAt", args.startedAfter!),
+      );
     } else {
-      runsQuery = ctx.db
-        .query("runs")
-        .withIndex("by_org", (q) => q.eq("orgId", args.orgId));
+      // No filters — all runs for org
+      runsQuery = ctx.db.query("runs").withIndex("by_org", (q) =>
+        q.eq("orgId", args.orgId),
+      );
     }
 
-    // Apply additional filters in memory for combined predicates
-    const filtered = runsQuery.filter((q) => {
-      let condition = q.eq(q.field("orgId"), args.orgId);
-      if (args.projectId !== undefined) {
-        condition = q.and(
-          condition,
-          q.eq(q.field("projectId"), args.projectId),
-        );
-      }
-      if (args.agentId !== undefined) {
-        condition = q.and(condition, q.eq(q.field("agentId"), args.agentId));
-      }
-      if (args.status !== undefined) {
-        condition = q.and(condition, q.eq(q.field("status"), args.status));
-      }
-      if (args.startedAfter !== undefined) {
-        condition = q.and(condition, q.gte(q.field("startedAt"), args.startedAfter));
-      }
-      return condition;
-    });
+    // Keep orgId safety check only — other conditions are now covered by index selection.
+    // This prevents cross-org data leakage in case an invalid agentId or projectId is passed.
+    const filtered = runsQuery.filter((q) => q.eq(q.field("orgId"), args.orgId));
 
     const page = await filtered.paginate({ numItems: limit, cursor: args.cursor ?? null });
 

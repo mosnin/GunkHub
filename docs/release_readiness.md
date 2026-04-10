@@ -1,7 +1,7 @@
 # Release Readiness — v1
 
 **Date:** 2026-04-10
-**Status:** Release Candidate
+**Status:** Release Candidate — Prompt 11 (operational quality pass)
 
 ---
 
@@ -65,9 +65,22 @@
 
 ### Test coverage
 
-- **356 tests passing** in the `tests/` workspace (unit + integration stubs).
-- **260 SDK tests passing** in the `packages/sdk` package.
+- **426+ tests passing** across `tests/` and `packages/sdk` workspaces.
+- Unit tests cover replay, diff (including truncation), failure summary, storage, transport, artifact GC, and org bootstrap.
 - All unit tests use `MockTransport` or in-memory stubs — no network calls, instant.
+- Real-Convex integration tests (`tests/integration/api.test.ts`) run in CI when secrets are configured. Skipped gracefully otherwise. Merging to `main` requires secrets to be present.
+
+### Filter performance
+
+- **Run list filters use compound indexes** — `startedAfter` (date range) filter uses index range queries rather than in-memory filtering. New compound index `by_org_status_started = ["orgId", "status", "startedAt"]` handles combined status+date filter efficiently (ADR-0015).
+
+### GC and operator visibility
+
+- **Artifact GC** — daily cron processes artifacts oldest-first via `by_created_at` index, bounded at 100 per run. Blob delete failures preserve the Convex record and are retried on the next daily run. GC logs classify errors as `blobErrors`, `checkErrors`, `recordErrors` for operator diagnostics. See the Operations Runbook.
+
+### UI consistency
+
+- **Tag editing** — post-save tag state is consistent with the saved value without requiring a server re-render. The component tracks `savedTags` state updated on successful save.
 
 ---
 
@@ -77,26 +90,28 @@
   calling `/api/events`. If a payload exceeds the limit, the API returns HTTP 413 and
   the SDK surfaces that error to the caller. Auto-externalization (upload to
   `/api/artifacts/upload` then replace payload with pointer) is v1.1 scope.
-- **Automatic artifact garbage collection** — artifacts orphaned by failed or retried
-  requests are not cleaned up automatically. No GC policy is implemented.
 - **Background projection verification** — no scheduled job verifies run sequence
   integrity in production. Integrity checks are on-demand only (via the CLI script).
-- **Run search and filtering UI** — the runs list shows all runs without filtering.
-  Status and date range filters are v1.1 scope.
-- **Tags and metadata display** — `tags` and `metadata` fields are stored in Convex
-  but not displayed in the UI.
 - **Live run monitoring** — no real-time event streaming. The run detail page does not
   auto-refresh while a run is in progress.
 - **RBAC beyond basic membership** — roles (`admin`, `member`, `viewer`) are stored
-  on `user_memberships` but not enforced beyond the basic membership check.
+  on `user_memberships` and enforced on write mutations (admin required for tag edits,
+  API key creation). Viewer-vs-member distinction on read paths is v1.1 scope.
 - **Vercel Blob SDK package** — the `VercelBlobAdapter` uses native `fetch` directly
   to avoid adding `@vercel/blob` as a dependency. If the Vercel Blob REST API changes,
   update `apps/web/src/lib/storage/vercel.ts`.
-- **Integration tests against live Convex** — all tests in `tests/integration/api.test.ts`
-  test API response shapes against static fixtures. Real integration tests require a
-  live Convex deployment.
-- **Comments mutations** — `createComment` exists but `resolveComment` is not wired
-  into the UI.
+- **Artifact download from UI** — artifacts are visible in the ArtifactList but not
+  directly downloadable. A `/api/artifacts/[id]/download` route is v1.1 scope.
+- **Event virtualization** — the Timeline and EventInspector load events in pages of
+  200 via "Load more", but do not virtualize the DOM list. Runs with 10,000+ events
+  loaded incrementally may have sluggish scroll performance.
+
+**Resolved since initial release candidate:**
+- Artifact GC implemented and running (ADR-0011, ADR-0014)
+- Run list filtering by status, date range, and agent — all implemented with compound indexes (ADR-0015)
+- Tags display and inline editing in RunHeader
+- Comments with resolve/show-resolved UI
+- Integration tests run in CI with explicit release gate on main
 
 ---
 

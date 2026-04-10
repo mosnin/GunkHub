@@ -191,11 +191,14 @@ jobs:
   integration-test:
     name: Integration Tests (Real Convex)
     runs-on: ubuntu-latest
-    needs: [build]
+    # Requires unit tests to pass before running integration tests.
+    needs: [test]
     # Required secrets: CONVEX_TEST_URL, TEST_API_KEY, TEST_AGENT_ID
     # These must be configured on the repository (Settings → Secrets and variables → Actions).
     # The tests use a permanent "ci-test" Convex deployment to avoid setup/teardown flakiness.
-    # If secrets are absent the describe.skipIf guard will skip all real-Convex tests gracefully.
+    # When secrets are present: real-Convex integration tests run and failures block the job.
+    # When secrets are absent: the describe.skipIf guard skips real-Convex tests gracefully,
+    #   but a subsequent step explicitly reports the skip status so it is visible in CI.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -235,9 +238,25 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Report integration test configuration
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.CONVEX_TEST_URL }}" ]; then
+            echo "::notice title=Integration Tests::Secrets are present — real-Convex integration tests WILL run."
+          else
+            echo "::warning title=Integration Tests::CONVEX_TEST_URL secret is not set. Real-Convex integration tests will be SKIPPED. See docs/ops/ci_setup.md to provision secrets."
+          fi
+
       - name: Run integration tests
         env:
           CONVEX_TEST_URL: ${{ secrets.CONVEX_TEST_URL }}
           TEST_API_KEY: ${{ secrets.TEST_API_KEY }}
           TEST_AGENT_ID: ${{ secrets.TEST_AGENT_ID }}
         run: pnpm test --reporter=verbose tests/integration/api.test.ts
+
+      - name: Verify integration tests were not silently skipped on main
+        if: github.ref == 'refs/heads/main' && secrets.CONVEX_TEST_URL == ''
+        shell: bash
+        run: |
+          echo "::error title=Release Gate::Merging to main requires real-Convex integration tests. CONVEX_TEST_URL is not set. See docs/ops/ci_setup.md."
+          exit 1

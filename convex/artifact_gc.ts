@@ -125,7 +125,13 @@ export const cleanOrphanedArtifacts = internalAction({
     // Fetch one page of orphan candidates (oldest first via by_created_at index).
     // Processing is intentionally bounded per GC run; remaining candidates are
     // processed in subsequent daily invocations.
-    const { candidates } = await ctx.runQuery(_getOrphanCandidates, {});
+    const { candidates, nextCursor } = await ctx.runQuery(_getOrphanCandidates, {});
+
+    if (nextCursor !== undefined) {
+      console.log(
+        `Artifact GC: ${candidates.length} candidates in this batch; additional candidates will be processed in future GC runs.`
+      );
+    }
 
     const blobToken = process.env["BLOB_STORE_TOKEN"];
     if (!blobToken) {
@@ -137,7 +143,9 @@ export const cleanOrphanedArtifacts = internalAction({
 
     let cleaned = 0;
     let skipped = 0;
-    let errors = 0;
+    let blobErrors = 0;
+    let checkErrors = 0;
+    let recordErrors = 0;
 
     for (const artifact of candidates) {
       let referenced: boolean;
@@ -150,7 +158,7 @@ export const cleanOrphanedArtifacts = internalAction({
         console.error(
           `Artifact GC: could not check references for artifact ${String(artifact._id)}: ${String(err)}`,
         );
-        errors++;
+        checkErrors++;
         continue;
       }
 
@@ -179,7 +187,8 @@ export const cleanOrphanedArtifacts = internalAction({
           console.error(
             `Artifact GC: blob DELETE failed for artifact ${String(artifact._id)} (key=${artifact.storageKey}): ${String(err)}`,
           );
-          errors++;
+          console.warn(`Artifact GC: artifact ${String(artifact._id)} will be retried in the next scheduled GC run`);
+          blobErrors++;
           continue; // Leave the Convex record so the next run can retry
         }
       }
@@ -194,13 +203,14 @@ export const cleanOrphanedArtifacts = internalAction({
         console.error(
           `Artifact GC: Convex record delete failed for artifact ${String(artifact._id)}: ${String(err)}`,
         );
-        errors++;
+        recordErrors++;
       }
     }
 
     console.log(
-      `Artifact GC: batch=${candidates.length} cleaned=${cleaned} skipped=${skipped} errors=${errors}`,
+      `Artifact GC: batch=${candidates.length} cleaned=${cleaned} skipped=${skipped} ` +
+        `blobErrors=${blobErrors} checkErrors=${checkErrors} recordErrors=${recordErrors}`,
     );
-    return { batch: candidates.length, cleaned, skipped, errors };
+    return { batch: candidates.length, cleaned, skipped, blobErrors, checkErrors, recordErrors };
   },
 });

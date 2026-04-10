@@ -2,17 +2,17 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 10 — Scale & Production Safety)
+Last updated: 2026-04-10 (Prompt 11 — Operational Quality Pass)
 
 ---
 
 ## 1. Current State
 
-Prompts 1–10 complete. The following summarizes the full state after Prompt 10.
+Prompts 1–11 complete. The following summarizes the full state after Prompt 11.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
-**Convex schema is fully defined** (`convex/schema.ts`). All tables defined: `organizations`, `projects`, `agents`, `agent_versions`, `runs`, `events`, `artifacts`, `comments`, `user_memberships`, `api_keys`. New in Prompt 10: `artifacts` gains `.index("by_created_at", ["createdAt"])` for efficient GC range queries.
+**Convex schema is fully defined** (`convex/schema.ts`). All tables defined: `organizations`, `projects`, `agents`, `agent_versions`, `runs`, `events`, `artifacts`, `comments`, `user_memberships`, `api_keys`. Prompt 10: `artifacts` gains `by_created_at`. Prompt 11: `runs` gains `by_org_status_started = ["orgId", "status", "startedAt"]` for efficient combined status+date filtering (ADR-0015).
 
 **Convex queries and mutations are implemented** (not stubbed) for:
 - `convex/runs.ts` — `listRuns`, `getRun`, `createRun`, `updateRunStatus`, `updateRunTags`
@@ -216,7 +216,14 @@ Key new exports (Prompt 10):
 - `tests/unit/org_bootstrap.test.ts` — 15 tests proving org bootstrap correctness (ADR-0012)
 - `tests/unit/artifact_gc.test.ts` — 7 tests proving GC correctness (ADR-0014)
 
-**Test count (Prompt 10):** 426 passing, 5 skipped (all green)
+**Fully implemented in Prompt 11 (operational quality pass):**
+- `convex/runs.ts` — `listRuns` uses index range queries for `startedAfter`; compound index `by_org_status_started` handles status+date combined filter efficiently (ADR-0015)
+- `convex/artifact_gc.ts` — error counters separated into `blobErrors`/`checkErrors`/`recordErrors`; per-artifact failure logs; bounded-batch log when more candidates remain
+- `apps/web/src/components/runs/RunHeader.tsx` — `savedTags` state prevents post-save display revert
+- `.github/workflows/ci.yml` — integration-test job needs `[test]`; explicit notice/warning on secret presence; hard fail on `main` when secrets absent
+- `docs/release_readiness.md`, `docs/operations_runbook.md`, `docs/ops/ci_setup.md` updated
+
+**Test count (Prompt 11):** 443 passing, 5 skipped (14 test files, all green)
 
 ---
 

@@ -74,7 +74,8 @@ export default defineSchema({
     .index("by_org_status", ["orgId", "status"])
     .index("by_agent_started", ["agentId", "startedAt"])
     .index("by_project_started", ["projectId", "startedAt"])
-    .index("by_org_started", ["orgId", "startedAt"]),
+    .index("by_org_started", ["orgId", "startedAt"])
+    .index("by_org_status_started", ["orgId", "status", "startedAt"]),
 
   // IMMUTABILITY: Events must never be updated or deleted. This table is append-only.
   events: defineTable({

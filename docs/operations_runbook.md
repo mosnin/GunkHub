@@ -176,6 +176,50 @@ Check TypeScript errors in `convex/` files. Run `pnpm typecheck` locally to repr
 
 ---
 
+## Artifact GC outcomes
+
+Artifact GC runs daily at 02:00 UTC via the Convex cron job defined in `convex/crons.ts`.
+The action processes at most `GC_CANDIDATE_PAGE_SIZE` (100) artifact candidates per run,
+oldest-first via the `by_created_at` index.
+
+**Reading the GC log line:**
+
+```
+Artifact GC: batch=N cleaned=C skipped=S blobErrors=B checkErrors=K recordErrors=R
+```
+
+| Field | Meaning |
+|-------|---------|
+| `batch` | Artifacts evaluated in this GC run |
+| `cleaned` | Orphaned artifacts successfully deleted (blob + Convex record) |
+| `skipped` | Referenced artifacts preserved (not orphans) |
+| `blobErrors` | Blob DELETE calls that failed — artifact Convex record preserved, will retry tomorrow |
+| `checkErrors` | Reference check failures — artifact preserved, will retry tomorrow |
+| `recordErrors` | Convex record delete failures after successful blob delete — Convex record may be dangling |
+
+**When blobErrors > 0:**
+The Vercel Blob DELETE call failed. The Convex artifact record is preserved. The artifact
+will appear as a candidate again in tomorrow's GC run. If `blobErrors` persists for
+multiple days, check:
+1. `GET /api/health` — is `storage.configured: true`?
+2. Has `BLOB_STORE_TOKEN` expired or been revoked?
+3. Check Convex function logs for the specific HTTP error from Vercel Blob.
+
+**When recordErrors > 0:**
+The blob was deleted but the Convex record deletion failed. The artifact record is a dangling
+pointer with no corresponding blob. These records are harmless but take up Convex storage.
+If `recordErrors` persists, check whether the Convex deployment is healthy.
+
+**When there are more candidates than one batch:**
+The log will include: `N candidates in this batch; additional candidates will be processed
+in future GC runs.` This is normal for organizations with large artifact backlogs. The
+backlog will clear over successive daily runs.
+
+**Escalation threshold:** If `blobErrors` stays > 0 for 3 or more consecutive days, rotate
+`BLOB_STORE_TOKEN` and monitor the next GC run.
+
+---
+
 ## Emergency rollback
 
 Follow these steps in order:

@@ -1,6 +1,29 @@
 # CI Setup Runbook
 
-This document describes how to configure CI for the Agent Flight Recorder monorepo.
+This document describes how to configure CI for the Agent Flight Recorder monorepo,
+including the release gate policy for real-Convex integration tests.
+
+---
+
+## Release Gate Policy
+
+The `integration-test` CI job runs on every push and PR. Its behavior depends on
+whether the three required secrets are configured:
+
+| Secret status | Branch | Behavior |
+|---------------|--------|----------|
+| Secrets present | Any | Real-Convex tests run. Job fails if any test fails. |
+| Secrets absent | Feature/fix branch | Tests skipped with a visible CI warning. Job passes. |
+| Secrets absent | `main` branch | Job **fails** with an explicit release gate error. |
+
+**This means:** merging to `main` without the integration secrets configured will fail CI.
+This is intentional — it prevents shipping a release that has never had its integration
+coverage confirmed.
+
+The CI notice/warning step makes the integration test status explicit on every run:
+- Green notice = secrets present, tests ran
+- Yellow warning = secrets absent, tests skipped (allowed on feature branches)
+- Red error = secrets absent on main (blocks merge)
 
 ---
 

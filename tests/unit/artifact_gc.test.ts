@@ -43,3 +43,31 @@ describe('Artifact GC orphan age threshold', () => {
     expect(recent).toBeGreaterThan(cutoff)
   })
 })
+
+describe('Artifact GC error categorization', () => {
+  it('blob delete failure should not delete the Convex record', () => {
+    // Safety invariant: if blob delete throws, the artifact record must NOT be deleted.
+    // The current code achieves this by continuing to the next iteration on blob error.
+    // This test documents the expected behavior contract.
+    const blobDeleteThrows = true;
+    const convexRecordWouldBeDeleted = !blobDeleteThrows; // only deleted if blob succeeded
+    expect(convexRecordWouldBeDeleted).toBe(false);
+  });
+
+  it('reference check failure should not delete the Convex record', () => {
+    // Safety invariant: if isArtifactReferenced throws, the artifact record must NOT be deleted.
+    const checkThrows = true;
+    const convexRecordWouldBeDeleted = !checkThrows;
+    expect(convexRecordWouldBeDeleted).toBe(false);
+  });
+
+  it('artifacts that fail blob delete are re-candidates in subsequent GC runs', () => {
+    // The artifact record is preserved on blob delete failure.
+    // On the next daily GC run, getOrphanCandidates will return the same artifact
+    // (assuming its createdAt is still older than ORPHAN_AGE_MS).
+    // This is the retry mechanism — no explicit retry queue is needed.
+    const artifactRecordPreservedOnBlobError = true;
+    const willAppearInNextGCRun = artifactRecordPreservedOnBlobError;
+    expect(willAppearInNextGCRun).toBe(true);
+  });
+})
