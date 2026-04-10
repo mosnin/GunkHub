@@ -53,7 +53,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
 
   try {
     runData = await getRun(runId)
-    eventsData = await listEvents({ runId, limit: 500 })
+    eventsData = await listEvents({ runId, limit: 200 })
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     if (msg.toLowerCase().includes('not found')) notFound()
@@ -92,6 +92,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
 
   const { run } = runData
   const events = eventsData?.events ?? []
+  const initialNextCursor = eventsData?.nextCursor
 
   return (
     <div className="flex flex-col h-full">
@@ -146,12 +147,12 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
       <div className="flex-1 overflow-y-auto">
         {activeTab === 'timeline' && (
           <Suspense fallback={<LoadingState message="Loading timeline..." />}>
-            <Timeline runId={runId} events={events} />
+            <Timeline runId={runId} events={events} initialNextCursor={initialNextCursor} />
           </Suspense>
         )}
         {activeTab === 'events' && (
           <Suspense fallback={<LoadingState message="Loading events..." />}>
-            <EventInspector runId={runId} events={events} />
+            <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} />
           </Suspense>
         )}
         {activeTab === 'artifacts' && (

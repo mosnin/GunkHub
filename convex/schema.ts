@@ -102,7 +102,8 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_run", ["runId"])
-    .index("by_run_checksum", ["runId", "checksum"]),
+    .index("by_run_checksum", ["runId", "checksum"])
+    .index("by_created_at", ["createdAt"]),
 
   comments: defineTable({
     orgId: v.id("organizations"),

@@ -29,4 +29,10 @@ export interface RunDiff {
   rightRunId: string;
   eventDiffs: EventDiff[];
   summary: DiffSummary;
+  /**
+   * True when one or both runs exceeded MAX_EVENTS_PER_DIFF and the comparison
+   * was capped. The diff is still valid for the compared slice; events beyond
+   * the limit are not included. Non-breaking additive field.
+   */
+  truncated?: boolean;
 }

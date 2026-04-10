@@ -1,8 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useTransition } from 'react'
 
-import type { Event } from '@agent-flight-recorder/contracts'
+import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts'
 
 import { EmptyState } from '@/components/ui/EmptyState'
 import { LoadingState } from '@/components/ui/LoadingState'
@@ -10,6 +10,7 @@ import { LoadingState } from '@/components/ui/LoadingState'
 interface TimelineProps {
   runId: string
   events?: Event[]
+  initialNextCursor?: string
   loading?: boolean
 }
 
@@ -61,14 +62,37 @@ function payloadSummary(event: Event): string {
   return ''
 }
 
-export function Timeline({ runId: _runId, events, loading }: TimelineProps) {
+export function Timeline({ runId, events, initialNextCursor, loading }: TimelineProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [extraEvents, setExtraEvents] = useState<Event[]>([])
+  const [cursor, setCursor] = useState<string | undefined>(initialNextCursor)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [isPending, startTransition] = useTransition()
+
+  function handleLoadMore() {
+    if (!cursor) return
+    setLoadError(null)
+    startTransition(async () => {
+      try {
+        const params = new URLSearchParams({ cursor, limit: '200' })
+        const res = await fetch(`/api/runs/${runId}/events?${params.toString()}`)
+        if (!res.ok) throw new Error(`Failed to load events (${res.status})`)
+        const data = (await res.json()) as ListEventsResponse
+        setExtraEvents((prev) => [...prev, ...data.events])
+        setCursor(data.nextCursor)
+      } catch (err) {
+        setLoadError(err instanceof Error ? err.message : 'Failed to load more events')
+      }
+    })
+  }
 
   if (loading) {
     return <LoadingState message="Loading timeline..." />
   }
 
-  if (!events || events.length === 0) {
+  const allEvents = [...(events ?? []), ...extraEvents]
+
+  if (allEvents.length === 0) {
     return (
       <div className="px-6 py-4">
         <EmptyState title="No events" description="No events have been recorded for this run yet." />
@@ -82,7 +106,7 @@ export function Timeline({ runId: _runId, events, loading }: TimelineProps) {
         {/* Vertical rail */}
         <div className="absolute left-[11px] top-3 bottom-3 w-px bg-neutral-800" aria-hidden="true" />
         <div className="flex flex-col gap-1.5">
-          {events.map((event) => {
+          {allEvents.map((event) => {
             const isExpanded = expandedId === event.id
             const summary = payloadSummary(event)
 
@@ -140,6 +164,24 @@ export function Timeline({ runId: _runId, events, loading }: TimelineProps) {
           })}
         </div>
       </div>
+
+      {/* Load more / error */}
+      {(cursor !== undefined || loadError !== null) && (
+        <div className="mt-4 flex flex-col items-center gap-2">
+          {loadError && (
+            <p className="text-xs text-red-400">{loadError}</p>
+          )}
+          {cursor && (
+            <button
+              onClick={handleLoadMore}
+              disabled={isPending}
+              className="px-4 py-1.5 text-xs font-mono rounded border border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors duration-100"
+            >
+              {isPending ? 'Loading…' : 'Load more events'}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   )
 }

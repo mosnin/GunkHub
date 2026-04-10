@@ -2,6 +2,74 @@
 
 ---
 
+## Prompt 10 — 2026-04-10: Scale & Production Safety (Event Pagination, Diff Bounding, GC Indexing, Org Bootstrap Tests)
+
+### What changed
+
+**Team A — Org bootstrap tests and ADR**
+- `tests/unit/org_bootstrap.test.ts` (NEW): 15 unit tests covering `upsertOrganization` (idempotency, slug/name update, not-found), `upsertMembership` (insert, role upsert, org not found), and `clerkRoleToInternal` mapping
+- `tests/integration/api.test.ts`: new `describe` block for org bootstrap integration tests (skipped when env vars absent)
+- `docs/adrs/0012_org_bootstrap.md` (NEW): documents the Clerk webhook → `upsertOrganization` + `upsertMembership` pipeline, idempotency guarantees, and the decision to use `by_clerk_org_id` index for deduplication
+
+**Team B — Run event pagination UI**
+- `apps/web/app/(app)/runs/[runId]/page.tsx`: reduced initial event load from `limit: 500` to `limit: 200`; captures `nextCursor` from `listEvents` response and passes it to Timeline and EventInspector
+- `apps/web/src/components/runs/Timeline.tsx`: added `initialNextCursor` prop, `extraEvents`/`cursor`/`loadError` state, `handleLoadMore` async function, and "Load more events" button at bottom of list; fetches from `/api/runs/[id]/events?cursor=X&limit=200`
+- `apps/web/src/components/runs/EventInspector.tsx`: same load-more pattern; "Load more…" link appears at bottom of the left event list panel
+
+**Team C — Diff boundedness**
+- `packages/contracts/src/diff.ts`: added `truncated?: boolean` to `RunDiff` (non-breaking additive field); contracts bumped to 0.6.0
+- `apps/web/src/lib/replay/diff.ts`: added `MAX_EVENTS_PER_DIFF = 10_000` export constant
+- `apps/web/src/lib/services/diff.ts`: `fetchAllEvents` exits the pagination loop when `allDocs.length >= MAX_EVENTS_PER_DIFF`; sets `truncated: true` in the returned object; propagated via `{ ...diff, truncated: true }` in `getRunDiff`
+- `apps/web/src/components/runs/DiffViewer.tsx`: orange truncation warning banner shown when `diff.truncated === true`
+- `tests/unit/diff.test.ts`: new tests covering truncated diff detection, partial comparison correctness, and `truncated` flag propagation
+- `docs/adrs/0013_diff_boundedness.md` (NEW): cap rationale, service-layer responsibility, UI disclosure requirement
+
+**Team D — Artifact GC scaling**
+- `convex/schema.ts`: added `.index("by_created_at", ["createdAt"])` to the `artifacts` table
+- `convex/artifact_gc.ts`: `getOrphanCandidates` rewritten from `.collect()` full scan to indexed range query `q.lt("createdAt", cutoff)` with `.paginate({ numItems: GC_CANDIDATE_PAGE_SIZE })`; returns `{ candidates, nextCursor }` for bounded batch processing
+- `convex/helpers/pagination.ts`: added `GC_CANDIDATE_PAGE_SIZE = 100` constant
+- `tests/unit/artifact_gc.test.ts` (NEW): 7 tests covering orphan detection, referenced artifact skip, blob token absent path, and error resilience
+- `docs/adrs/0014_artifact_gc_scaling.md` (NEW): index choice, full-scan rejection, bounded batch design
+
+### Why these fit the architecture
+- Event pagination uses the existing `/api/runs/[id]/events` route — no new API surface; the route already supports cursor/limit params
+- Diff cap applied in service layer, not in pure `buildRunDiff` — keeps the pure function testable in isolation with full arrays
+- GC indexed query uses user-defined `createdAt` field (Convex does not allow indexing `_creationTime`); the index is minimal and targeted
+
+### Hard-to-reverse decisions
+- Contracts 0.6.0 bump: `RunDiff.truncated` is additive and non-breaking; consumers that do not check the flag see the same diff they always did
+- `by_created_at` index on artifacts: low-cost addition; no schema migration required for existing records
+
+### Known residual risks
+- `getOrphanCandidates` processes only one page per GC run; very large orphan backlogs are processed across multiple daily runs (acceptable — steady state has no backlog)
+- Diff truncation is silent in the API response unless the caller checks `truncated`; the UI banner is the disclosure mechanism
+
+---
+
+## Prompt 9 — 2026-04-10: Org Bootstrap, CommentThread, Replay Truncation, CI Integration Tests, Agent Filter
+
+### What changed
+- `convex/organizations.ts`: added `upsertMembership` mutation (idempotent insert/update of `user_memberships` rows; resolves org by `clerkOrgId` before inserting)
+- `apps/web/app/api/webhooks/clerk/route.ts`: `handleOrganizationMembershipCreated` now calls both `upsertOrganization` and `upsertMembership`; `organizationMembership.updated` case merged into same handler; `clerkRoleToInternal` helper maps Clerk role strings to internal role union
+- `apps/web/src/lib/actions/comments.ts` (NEW): `createCommentAction` and `resolveCommentAction` server actions
+- `apps/web/src/components/runs/CommentThread.tsx`: full implementation — unresolved list, resolved collapsible section ("Show/Hide N resolved"), compose form, optimistic resolve with revert on error, error banners
+- `packages/contracts/src/replay.ts`: added `truncated?: boolean` to `ReplayProjection`
+- `convex/helpers/pagination.ts`: added `MAX_EVENTS_PER_REPLAY = 10_000`
+- `apps/web/src/lib/replay/projection.ts`: `buildReplayProjection` slices to first 10,000 events by `sequenceNumber` and sets `truncated: true` when the run exceeds the limit
+- `apps/web/src/components/runs/ReplayViewer.tsx`: orange warning banner when `projection.truncated === true`
+- `.github/workflows/ci.yml`: added `integration-test` job with `CONVEX_TEST_URL`, `TEST_API_KEY`, `TEST_AGENT_ID` from repository secrets
+- `docs/ops/ci_setup.md` (NEW): CI runbook for secret provisioning and `TEST_AGENT_ID` setup
+- `convex/agents.ts`: added `listDistinctAgents(orgId)` query
+- `apps/web/src/lib/services/agents.ts` (NEW): `listDistinctAgents()` service function
+- `apps/web/app/(app)/runs/page.tsx`: agent filter dropdown with URL-reflected `?agentId=` param
+- `packages/contracts/package.json`: bumped 0.4.0 → 0.5.0 (agentId filter on ListRunsRequest)
+
+### Hard-to-reverse decisions
+- `upsertMembership` is idempotent: duplicate webhook deliveries are safe; role updates patch existing rows
+- Replay truncation at 10,000 events is consistent with diff bound — same limit for predictability
+
+---
+
 ## Prompt 8 — 2026-04-10: Artifact GC, RBAC, Tag Editing, Real Integration Tests
 
 ### What changed

@@ -243,6 +243,13 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
         </div>
       </div>
 
+      {/* Truncation warning */}
+      {diff.truncated && (
+        <div className="px-4 py-2 bg-orange-950/40 border border-orange-900/50 rounded-md text-xs text-orange-400 font-medium">
+          This comparison is partial. Each run was capped at 10,000 events — the displayed diff may not represent the full difference.
+        </div>
+      )}
+
       {/* Incomparable notice */}
       {incomparable && (
         <div className="rounded-md bg-amber-950/30 border border-amber-900/60 px-4 py-3 text-sm text-amber-300">

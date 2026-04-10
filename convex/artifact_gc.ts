@@ -14,6 +14,7 @@ import { internalAction, internalMutation, internalQuery } from "convex/server";
 import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 import type { Id } from "convex/_generated/dataModel";
+import { GC_CANDIDATE_PAGE_SIZE } from "./helpers/pagination.js";
 
 /** 24 hours in milliseconds. Artifacts younger than this are never considered orphans. */
 const ORPHAN_AGE_MS = 24 * 60 * 60 * 1000;
@@ -25,15 +26,31 @@ const _isArtifactReferenced = makeFunctionReference<"query">("artifact_gc:isArti
 const _deleteArtifactRecord = makeFunctionReference<"mutation">("artifact_gc:deleteArtifactRecord");
 
 /**
- * Returns all artifact records whose _creationTime is older than ORPHAN_AGE_MS.
+ * Returns one page of artifact records whose createdAt is older than ORPHAN_AGE_MS,
+ * ordered oldest-first via the by_created_at index. At most GC_CANDIDATE_PAGE_SIZE
+ * candidates are returned per call. Pass the returned nextCursor to page forward.
+ *
  * These are candidates for orphan detection — not guaranteed to be orphaned yet.
  */
 export const getOrphanCandidates = internalQuery({
-  args: {},
-  handler: async (ctx) => {
+  args: {
+    cursor: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
     const cutoff = Date.now() - ORPHAN_AGE_MS;
-    const all = await ctx.db.query("artifacts").collect();
-    return all.filter((a) => a._creationTime < cutoff);
+
+    const page = await ctx.db
+      .query("artifacts")
+      .withIndex("by_created_at", (q) => q.lt("createdAt", cutoff))
+      .paginate({
+        numItems: GC_CANDIDATE_PAGE_SIZE,
+        cursor: args.cursor ?? null,
+      });
+
+    return {
+      candidates: page.page,
+      nextCursor: page.isDone ? undefined : page.continueCursor,
+    };
   },
 });
 
@@ -105,7 +122,10 @@ export const deleteArtifactRecord = internalMutation({
 export const cleanOrphanedArtifacts = internalAction({
   args: {},
   handler: async (ctx) => {
-    const candidates = await ctx.runQuery(_getOrphanCandidates, {});
+    // Fetch one page of orphan candidates (oldest first via by_created_at index).
+    // Processing is intentionally bounded per GC run; remaining candidates are
+    // processed in subsequent daily invocations.
+    const { candidates } = await ctx.runQuery(_getOrphanCandidates, {});
 
     const blobToken = process.env["BLOB_STORE_TOKEN"];
     if (!blobToken) {
@@ -179,8 +199,8 @@ export const cleanOrphanedArtifacts = internalAction({
     }
 
     console.log(
-      `Artifact GC: candidates=${candidates.length} cleaned=${cleaned} skipped=${skipped} errors=${errors}`,
+      `Artifact GC: batch=${candidates.length} cleaned=${cleaned} skipped=${skipped} errors=${errors}`,
     );
-    return { candidates: candidates.length, cleaned, skipped, errors };
+    return { batch: candidates.length, cleaned, skipped, errors };
   },
 });

@@ -1,6 +1,13 @@
 import type { Event, EventDiff, FieldChange, RunDiff } from "@agent-flight-recorder/contracts";
 
 /**
+ * Maximum number of events to compare per run in a diff computation.
+ * Mirrors MAX_EVENTS_PER_REPLAY for consistency.
+ * Runs exceeding this limit will have their diffs truncated.
+ */
+export const MAX_EVENTS_PER_DIFF = 10_000;
+
+/**
  * Performs deep equality comparison of two values using JSON.stringify.
  *
  * v1 payload comparison uses JSON.stringify deep equality. Field order matters.

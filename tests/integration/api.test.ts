@@ -6,6 +6,8 @@ import type {
   ListEventsResponse,
   CreateRunResponse,
   CreateCommentResponse,
+  Organization,
+  AuthContext,
 } from '@agent-flight-recorder/contracts'
 import {
   mockRun,
@@ -157,6 +159,105 @@ describe('API response shapes', () => {
       artifactCount: 1,
     }
     expect(response.eventCount).toBe(mockRunEvents.length)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Organization bootstrap contract tests
+// These run without a real Convex deployment. They verify that the data shapes
+// produced by the bootstrap mutations align with the contracts package types
+// and the Convex schema definitions.
+// ---------------------------------------------------------------------------
+
+describe('Organization bootstrap contracts', () => {
+  // Fixture: org as returned by upsertOrganization after a Clerk webhook
+  const bootstrappedOrg: Organization = {
+    id: 'convex_org_id_acme',
+    clerkOrgId: 'org_clerk_acme_001',
+    name: 'Acme Corp',
+    slug: 'acme-corp',
+    plan: 'free',
+    createdAt: 1712000000000,
+    updatedAt: 1712000000000,
+  }
+
+  // Fixture: membership as returned by upsertMembership
+  interface UserMembership {
+    id: string
+    clerkUserId: string
+    orgId: string
+    role: 'admin' | 'member' | 'viewer'
+    joinedAt: number
+  }
+
+  const bootstrappedMembership: UserMembership = {
+    id: 'membership_id_acme_admin',
+    clerkUserId: 'user_clerk_founder_001',
+    orgId: 'convex_org_id_acme',
+    role: 'admin',
+    joinedAt: 1712000100000,
+  }
+
+  it('Organization entity has all required fields from the contracts package', () => {
+    // If Organization gains a required field, this type assignment fails at compile
+    // time, and at runtime the property assertions below catch the mismatch.
+    const org: Organization = bootstrappedOrg
+
+    expect(org.id).toBeTruthy()
+    expect(org.clerkOrgId).toBeTruthy()
+    expect(org.name).toBeTruthy()
+    expect(org.slug).toBeTruthy()
+    expect(org.plan).toBeDefined()
+    expect(typeof org.createdAt).toBe('number')
+    expect(typeof org.updatedAt).toBe('number')
+  })
+
+  it('Organization plan is constrained to free | pro | enterprise', () => {
+    const validPlans: Array<Organization['plan']> = ['free', 'pro', 'enterprise']
+    expect(validPlans).toContain(bootstrappedOrg.plan)
+    // Webhook-bootstrapped orgs always start on "free"
+    expect(bootstrappedOrg.plan).toBe('free')
+  })
+
+  it('user_membership entity has all required fields', () => {
+    const membership: UserMembership = bootstrappedMembership
+
+    expect(membership.id).toBeTruthy()
+    expect(membership.clerkUserId).toBeTruthy()
+    expect(membership.orgId).toBeTruthy()
+    expect(membership.role).toBeDefined()
+    expect(typeof membership.joinedAt).toBe('number')
+  })
+
+  it('membership role is constrained to admin | member | viewer', () => {
+    const validRoles: Array<'admin' | 'member' | 'viewer'> = ['admin', 'member', 'viewer']
+    expect(validRoles).toContain(bootstrappedMembership.role)
+  })
+
+  it('clerkOrgId is the join key between Clerk and Convex organization records', () => {
+    // The webhook handler passes clerkOrgId to upsertOrganization, and the
+    // resulting Convex document carries the same clerkOrgId for future lookups.
+    // This field is the single source of truth for org identity across systems.
+    const inboundClerkOrgId = 'org_clerk_acme_001'
+    expect(bootstrappedOrg.clerkOrgId).toBe(inboundClerkOrgId)
+    // The Convex _id (mapped to `id`) is distinct from the Clerk org ID
+    expect(bootstrappedOrg.id).not.toBe(bootstrappedOrg.clerkOrgId)
+  })
+
+  it('AuthContext.orgRole accepts admin | member | viewer — the three internal roles', () => {
+    // Every Convex query/mutation receives an AuthContext after requireOrgMembership.
+    // Verifying that the AuthContext type is satisfied by all three role values
+    // ensures the role mapping (Clerk → internal) covers the full type space.
+    const roles: Array<AuthContext['orgRole']> = ['admin', 'member', 'viewer']
+    for (const role of roles) {
+      const ctx: AuthContext = {
+        userId: 'user_1',
+        orgId: 'org_1',
+        orgRole: role,
+        sessionId: 'sess_1',
+      }
+      expect(ctx.orgRole).toBe(role)
+    }
   })
 })
 

@@ -10,6 +10,7 @@ import type {
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient } from '@/lib/convexServer'
 import { buildRunDiff } from '@/lib/replay'
+import { MAX_EVENTS_PER_DIFF } from '@/lib/replay/diff'
 
 function mapRun(doc: Record<string, unknown>): Run {
   return {
@@ -41,11 +42,11 @@ function mapEvent(doc: Record<string, unknown>): Event {
   }
 }
 
-/** Fetch all events for a run, paginating through the full log. */
+/** Fetch events for a run up to MAX_EVENTS_PER_DIFF. Returns truncated=true if the run has more. */
 async function fetchAllEvents(
   client: Awaited<ReturnType<typeof getAuthedClient>>,
   runId: string
-): Promise<Event[]> {
+): Promise<{ events: Event[]; truncated: boolean }> {
   const allDocs: Record<string, unknown>[] = []
   let cursor: string | undefined = undefined
   do {
@@ -58,9 +59,10 @@ async function fetchAllEvents(
     const typedPage = page as { events: Record<string, unknown>[]; nextCursor?: string }
     allDocs.push(...typedPage.events)
     cursor = typedPage.nextCursor
-  } while (cursor !== undefined)
+  } while (cursor !== undefined && allDocs.length < MAX_EVENTS_PER_DIFF)
 
-  return allDocs.map(mapEvent)
+  const truncated = cursor !== undefined // exited early due to limit
+  return { events: allDocs.slice(0, MAX_EVENTS_PER_DIFF).map(mapEvent), truncated }
 }
 
 /**
@@ -82,11 +84,12 @@ export async function getRunDiff(leftRunId: string, rightRunId: string): Promise
   void mapRun(leftRunDoc as Record<string, unknown>)
   void mapRun(rightRunDoc as Record<string, unknown>)
 
-  // Fetch all events for both runs in parallel.
-  const [leftEvents, rightEvents] = await Promise.all([
-    fetchAllEvents(client, leftRunId),
-    fetchAllEvents(client, rightRunId),
-  ])
+  // Fetch events for both runs in parallel, capped at MAX_EVENTS_PER_DIFF each.
+  const [{ events: leftEvents, truncated: leftTruncated }, { events: rightEvents, truncated: rightTruncated }] =
+    await Promise.all([
+      fetchAllEvents(client, leftRunId),
+      fetchAllEvents(client, rightRunId),
+    ])
 
   // Determine comparability.
   if (leftEvents.length === 0 || rightEvents.length === 0) {
@@ -104,5 +107,8 @@ export async function getRunDiff(leftRunId: string, rightRunId: string): Promise
   }
 
   const diff = buildRunDiff(leftRunId, rightRunId, leftEvents, rightEvents)
-  return { diff, incomparable: false }
+  return {
+    diff: { ...diff, ...(leftTruncated || rightTruncated ? { truncated: true } : {}) },
+    incomparable: false,
+  }
 }

@@ -2,25 +2,29 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 8 — Artifact GC, RBAC, Tag Editing, Real Integration Tests)
+Last updated: 2026-04-10 (Prompt 10 — Scale & Production Safety)
 
 ---
 
 ## 1. Current State
 
-Prompt 5 (Release Candidate) is complete. The following summarizes the full state after Prompts 1–5.
+Prompts 1–10 complete. The following summarizes the full state after Prompt 10.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
-**Convex schema is fully defined** (`convex/schema.ts`). All 8 tables are defined: `organizations`, `projects`, `agents`, `agent_versions`, `runs`, `events`, `artifacts`, `comments`, `user_memberships`. All indexes are in place. The schema is the ground truth for data shape.
+**Convex schema is fully defined** (`convex/schema.ts`). All tables defined: `organizations`, `projects`, `agents`, `agent_versions`, `runs`, `events`, `artifacts`, `comments`, `user_memberships`, `api_keys`. New in Prompt 10: `artifacts` gains `.index("by_created_at", ["createdAt"])` for efficient GC range queries.
 
 **Convex queries and mutations are implemented** (not stubbed) for:
-- `convex/runs.ts` — `listRuns`, `getRun`, `createRun`, `updateRunStatus`
+- `convex/runs.ts` — `listRuns`, `getRun`, `createRun`, `updateRunStatus`, `updateRunTags`
 - `convex/events.ts` — `listEvents`, `getEvent`, `createEvent`
 - `convex/artifacts.ts` — `listArtifacts`, `createArtifact`
-- Auth helpers: `getAuthContext()`, `requireOrgMembership()` in `convex/auth.ts`
+- `convex/organizations.ts` — `upsertOrganization`, `upsertMembership`, `getOrg`, `listOrgs`
+- `convex/comments.ts` — `listComments`, `createComment`, `resolveComment`
+- `convex/agents.ts` — `listDistinctAgents`
+- `convex/artifact_gc.ts` — `getOrphanCandidates` (indexed range + paginate), `isArtifactReferenced`, `deleteArtifactRecord`, `cleanOrphanedArtifacts`
+- Auth helpers: `getAuthContext()`, `requireOrgMembership()` with `minimumRole` in `convex/auth.ts`
 
-**packages/contracts is fully defined.** All shared types:
+**packages/contracts is fully defined** (v0.6.0). All shared types:
 - `entities.ts` — Organization, Project, Agent, AgentVersion, Run, Event, Artifact, Comment
 - `events.ts` — EventType union, all payload shapes, EventPayload discriminated union (includes `ExternalizedPayload`)
 - `status.ts` — RunStatus, RunStatusValues, isTerminalStatus()
@@ -33,52 +37,44 @@ Key new exports (Prompt 6):
 - `ExternalizedPayload` — pointer type for externalized event payloads, member of `EventPayload` union
 - `PAYLOAD_EXTERNALIZATION_THRESHOLD` — imported by SDK to determine when to externalize
 
-**packages/sdk is fully implemented.** The `Recorder` class, `Events` builders, `buildEvent` helper, `HttpTransport` (complete with auto-externalization, retry, timeout), `Transport` interface, all types. The SDK is functional end-to-end with either a real `HttpTransport` or an injected `MockTransport`.
+Key new exports (Prompt 10):
+- `RunDiff.truncated?: boolean` — set when either run exceeded `MAX_EVENTS_PER_DIFF`
+- `MAX_EVENTS_PER_DIFF = 10_000` — exported from `apps/web/src/lib/replay/diff.ts`
 
-**apps/web production storage layer is implemented (Prompt 5):**
+**packages/sdk is fully implemented.** The `Recorder` class, `Events` builders, `buildEvent` helper, `HttpTransport` (complete with auto-externalization, retry, timeout, per-sendEvents upload cache), `Transport` interface, all types. Functional end-to-end with real `HttpTransport` or injected `MockTransport`.
+
+**apps/web production storage layer is implemented:**
 - `apps/web/src/lib/storage/vercel.ts` — `VercelBlobAdapter` production implementation via native fetch, activated when `BLOB_STORE_TOKEN` env var is present
-- `apps/web/src/lib/storage/index.ts` — `getStorageAdapter()` updated to use `BLOB_STORE_TOKEN` presence (not `BLOB_STORAGE_PROVIDER`) to select the active adapter
-- `apps/web/src/lib/replay/verify.ts` — `verifyProjectionIntegrity(run, events): ProjectionVerifyResult` pure function for sequence integrity checks
+- `apps/web/src/lib/storage/index.ts` — `getStorageAdapter()` factory
+- `apps/web/src/lib/replay/verify.ts` — `verifyProjectionIntegrity(run, events): ProjectionVerifyResult`
 - `apps/web/app/api/health/route.ts` — `GET /api/health` operator endpoint
-- `apps/web/src/lib/health.ts` — shared health data function (Prompt 6: extracted from route to eliminate server-side loopback HTTP call)
+- `apps/web/src/lib/health.ts` — shared health data function
 - `apps/web/src/components/runs/SystemHealthPanel.tsx` — health UI component
 - `scripts/rebuild-projection.ts` — CLI script for event integrity verification
 
-**apps/web hardening layer is implemented (Prompt 4):**
-- `apps/web/src/lib/storage/` — `BlobStorageAdapter` interface, `StubBlobStorageAdapter`, `getStorageAdapter()` factory, `PAYLOAD_EXTERNALIZATION_THRESHOLD` (10 KB), `sha256Hex`
-- `apps/web/app/api/events/route.ts` — 10 KB payload size guard (HTTP 413)
-- `apps/web/app/api/artifacts/upload/route.ts` — SDK artifact externalization endpoint (API key auth)
-- `convex/sdk_ingest.ts` — idempotent event insert + `sdkCreateArtifact` mutation
-- Event detail page, ArtifactList wired to real data, getArtifactUrl helper
-
-**apps/web explainability layer is implemented (Prompt 3):**
-- `apps/web/src/lib/replay/projection.ts` — `buildReplayProjection(run, events): ReplayProjection` (pure, deterministic)
-- `apps/web/src/lib/replay/failure.ts` — `buildFailureSummary(run, events): FailureSummary` (pure, deterministic)
-- `apps/web/src/lib/replay/diff.ts` — `buildRunDiff(leftRunId, rightRunId, leftEvents, rightEvents): RunDiff` (pure, deterministic)
-- `apps/web/src/lib/replay/index.ts` — re-exports all three functions
-
-**apps/web components and service layer are scaffolded** (many are stubs):
+**apps/web components and service layer — all implemented (not stubs):**
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
-- Run components: RunList, RunHeader, Timeline, EventInspector, DiffViewer, ReplayViewer, ArtifactList, CommentThread
-- Service layer stubs: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`
-- No Next.js pages exist yet (no `app/` directory) — gap from Prompt 2
+- Run components: RunList, RunHeader, Timeline (with load-more pagination), EventInspector (with load-more pagination), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList, CommentThread (resolve, show/hide resolved, compose)
+- Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`
+- Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags)
+- API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/health`, `/api/webhooks/clerk`
 
-**Tests (as of Prompt 5):**
-- `tests/unit/sdk.test.ts` — Recorder tests with MockTransport, passing
-- `tests/unit/contracts.test.ts` — Type shape and EventType coverage tests, passing
-- `tests/unit/replay.test.ts` — buildReplayProjection algorithm tests (10 test groups)
-- `tests/unit/failure.test.ts` — buildFailureSummary algorithm tests (8 test groups)
-- `tests/unit/diff.test.ts` — buildRunDiff algorithm tests (10 test groups)
-- `tests/unit/storage.test.ts` — BlobStorageAdapter, sha256Hex, PAYLOAD_EXTERNALIZATION_THRESHOLD (28 tests, updated in Prompt 5 for new BLOB_STORE_TOKEN-based adapter selection)
-- `tests/unit/projection-verify.test.ts` — verifyProjectionIntegrity (68 tests, Prompt 5)
-- `tests/unit/flight-recorder.test.ts` — FlightRecorder and RunRecorder HTTP transport tests (33 tests)
-- `tests/unit/transport-externalization.test.ts` — HttpTransport payload externalization tests (26 tests, Prompt 6)
-- `tests/unit/artifact-dedup.test.ts` — Artifact deduplication foundation, SDK retry idempotency, boundary correctness (11 tests, Prompt 7)
-- `tests/integration/api.test.ts` — API response shape tests (16 tests)
-- `tests/fixtures/runs.ts` — Sample run/event fixture data
-- `tests/fixtures/events.ts` — 6 scenario fixtures for explainability algorithm tests
-- **Total: 393 tests in tests/ workspace, all passing; 260 SDK tests, all passing (653 total)**
+**Tests (as of Prompt 10):**
+- `tests/unit/sdk.test.ts` — Recorder tests with MockTransport
+- `tests/unit/contracts.test.ts` — Type shape and EventType coverage tests
+- `tests/unit/replay.test.ts` — buildReplayProjection algorithm tests
+- `tests/unit/failure.test.ts` — buildFailureSummary algorithm tests
+- `tests/unit/diff.test.ts` — buildRunDiff algorithm tests (includes truncation tests from Prompt 10)
+- `tests/unit/storage.test.ts` — BlobStorageAdapter, sha256Hex, PAYLOAD_EXTERNALIZATION_THRESHOLD
+- `tests/unit/projection-verify.test.ts` — verifyProjectionIntegrity
+- `tests/unit/flight-recorder.test.ts` — FlightRecorder and RunRecorder HTTP transport tests
+- `tests/unit/transport-externalization.test.ts` — HttpTransport payload externalization tests
+- `tests/unit/artifact-dedup.test.ts` — Artifact deduplication tests
+- `tests/unit/org_bootstrap.test.ts` (NEW Prompt 10) — 15 tests for upsertOrganization, upsertMembership, clerkRoleToInternal
+- `tests/unit/artifact_gc.test.ts` (NEW Prompt 10) — 7 tests for GC orphan detection and bounded batch
+- `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
+- **Total: 426 passing, 5 skipped (all tests green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -87,7 +83,11 @@ Key new exports (Prompt 6):
 - ADR-0007: Ingestion idempotency — (runId, sequenceNumber) dedup, returns existing ID (Prompt 4)
 - ADR-0008: VercelBlobAdapter design — native fetch, no @vercel/blob SDK dependency (Prompt 5)
 - ADR-0009: SDK-side payload externalization and `ExternalizedPayload` pointer representation (Prompt 6)
-- ADR-0010: Artifact deduplication key strategy — `(runId, checksum)` compound index for idempotent `sdkCreateArtifact` (Prompt 7)
+- ADR-0010: Artifact deduplication key strategy — `(runId, checksum)` compound index (Prompt 7)
+- ADR-0011: Artifact GC — orphan definition, safety rationale, BLOB_STORE_TOKEN requirement (Prompt 8)
+- ADR-0012: Org bootstrap — Clerk webhook → upsertOrganization + upsertMembership pipeline (Prompt 10)
+- ADR-0013: Diff boundedness — MAX_EVENTS_PER_DIFF cap in service layer, truncated flag, UI disclosure (Prompt 10)
+- ADR-0014: Artifact GC scaling — by_created_at index, paginated bounded batch (Prompt 10)
 
 ---
 
@@ -198,9 +198,25 @@ Key new exports (Prompt 6):
 - RBAC `minimumRole` enforcement on `createApiKey`, `revokeApiKey`, `updateRunTags`, `createProject` (`convex/auth.ts`)
 - Inline tag editing in `RunHeader` (add/remove chips, Enter/comma to commit, Save/Cancel, error feedback via server action)
 - SDK per-`sendEvents` upload cache in `HttpTransport._uploadArtifact` — prevents redundant blob PUT on same payload within a single call
-- Real Convex integration test suite in `tests/integration/api.test.ts` (skipped gracefully when `CONVEX_TEST_URL`/`TEST_API_KEY`/`TEST_AGENT_ID` not set); covers create-run, send-events, idempotency (ADR-0007), 413 path (ADR-0006), and GET /api/runs
+- Real Convex integration test suite in `tests/integration/api.test.ts` (skipped gracefully when `CONVEX_TEST_URL`/`TEST_API_KEY`/`TEST_AGENT_ID` not set)
 
-**Test count (Prompt 8):** 393 passing in `tests/` workspace + 260 SDK tests = 653 total (integration real-Convex tests skipped in standard CI — counted when env vars are present)
+**Fully implemented in Prompt 9 (no longer stubs):**
+- `convex/organizations.ts` — `upsertOrganization` + `upsertMembership` mutations (idempotent, webhook-safe)
+- `apps/web/app/api/webhooks/clerk/route.ts` — full membership bootstrap on `organizationMembership.created` and `organizationMembership.updated`
+- `apps/web/src/lib/actions/comments.ts` — `createCommentAction`, `resolveCommentAction`
+- `apps/web/src/components/runs/CommentThread.tsx` — full resolve/compose/show-resolved UI
+- `buildReplayProjection` truncation at 10,000 events with `ReplayProjection.truncated`
+- CI integration test job in `.github/workflows/ci.yml`
+- Agent filter dropdown on runs list page with URL-reflected `?agentId=`
+
+**Fully implemented in Prompt 10 (no longer stubs / scale gaps):**
+- Event pagination in Timeline and EventInspector — "Load more" button fetches next page via `/api/runs/[id]/events` cursor
+- Diff bounded at `MAX_EVENTS_PER_DIFF = 10_000` with `RunDiff.truncated` and DiffViewer warning banner
+- `getOrphanCandidates` uses indexed range query (`by_created_at`) with paginated bounded batch instead of full scan
+- `tests/unit/org_bootstrap.test.ts` — 15 tests proving org bootstrap correctness (ADR-0012)
+- `tests/unit/artifact_gc.test.ts` — 7 tests proving GC correctness (ADR-0014)
+
+**Test count (Prompt 10):** 426 passing, 5 skipped (all green)
 
 ---
 

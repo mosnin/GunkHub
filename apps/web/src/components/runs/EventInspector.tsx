@@ -1,8 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useTransition } from 'react'
 
-import type { Event } from '@agent-flight-recorder/contracts'
+import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts'
 
 import { CodeBlock } from '@/components/ui/CodeBlock'
 import { EmptyState } from '@/components/ui/EmptyState'
@@ -11,6 +11,7 @@ import { LoadingState } from '@/components/ui/LoadingState'
 interface EventInspectorProps {
   runId: string
   events?: Event[]
+  initialNextCursor?: string
   loading?: boolean
 }
 
@@ -80,14 +81,37 @@ function ExternalizedPayloadView({ payload }: { payload: {
   )
 }
 
-export function EventInspector({ runId: _runId, events, loading }: EventInspectorProps) {
+export function EventInspector({ runId, events, initialNextCursor, loading }: EventInspectorProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [extraEvents, setExtraEvents] = useState<Event[]>([])
+  const [cursor, setCursor] = useState<string | undefined>(initialNextCursor)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [isPending, startTransition] = useTransition()
+
+  function handleLoadMore() {
+    if (!cursor) return
+    setLoadError(null)
+    startTransition(async () => {
+      try {
+        const params = new URLSearchParams({ cursor, limit: '200' })
+        const res = await fetch(`/api/runs/${runId}/events?${params.toString()}`)
+        if (!res.ok) throw new Error(`Failed to load events (${res.status})`)
+        const data = (await res.json()) as ListEventsResponse
+        setExtraEvents((prev) => [...prev, ...data.events])
+        setCursor(data.nextCursor)
+      } catch (err) {
+        setLoadError(err instanceof Error ? err.message : 'Failed to load more events')
+      }
+    })
+  }
 
   if (loading) {
     return <LoadingState message="Loading events..." />
   }
 
-  if (!events || events.length === 0) {
+  const allEvents = [...(events ?? []), ...extraEvents]
+
+  if (allEvents.length === 0) {
     return (
       <div className="p-6">
         <EmptyState title="No events" description="No events have been recorded for this run yet." />
@@ -95,7 +119,7 @@ export function EventInspector({ runId: _runId, events, loading }: EventInspecto
     )
   }
 
-  const selectedEvent = events.find((e) => e.id === selectedId) ?? events[0] ?? null
+  const selectedEvent = allEvents.find((e) => e.id === selectedId) ?? allEvents[0] ?? null
 
   return (
     <div className="flex h-full min-h-[400px]">
@@ -105,7 +129,7 @@ export function EventInspector({ runId: _runId, events, loading }: EventInspecto
           <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Events</p>
         </div>
         <ul className="divide-y divide-neutral-800/60">
-          {events.map((evt) => (
+          {allEvents.map((evt) => (
             <li
               key={evt.id}
               onClick={() => setSelectedId(evt.id)}
@@ -124,6 +148,24 @@ export function EventInspector({ runId: _runId, events, loading }: EventInspecto
             </li>
           ))}
         </ul>
+
+        {/* Load more */}
+        {(cursor !== undefined || loadError !== null) && (
+          <div className="px-3 py-2 border-t border-neutral-800 flex flex-col gap-1">
+            {loadError && (
+              <p className="text-xs text-red-400">{loadError}</p>
+            )}
+            {cursor && (
+              <button
+                onClick={handleLoadMore}
+                disabled={isPending}
+                className="text-xs font-mono text-neutral-500 hover:text-neutral-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors duration-100"
+              >
+                {isPending ? 'Loading…' : 'Load more…'}
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Right panel — event payload */}

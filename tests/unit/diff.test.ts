@@ -1,12 +1,12 @@
 import { describe, it, expect } from 'vitest'
-import { buildRunDiff } from '../../apps/web/src/lib/replay/diff.js'
+import { buildRunDiff, MAX_EVENTS_PER_DIFF } from '../../apps/web/src/lib/replay/diff.js'
 import {
   runARef,
   runBRef,
   runAEvents,
   runBEvents,
 } from '../fixtures/events.js'
-import type { Event } from '@agent-flight-recorder/contracts'
+import type { Event, RunDiff } from '@agent-flight-recorder/contracts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -507,5 +507,53 @@ describe('buildRunDiff — structural invariants', () => {
     const resultReversed = buildRunDiff('run-l', 'run-r', leftReversed, rightEvents)
     // Both should produce the same number of diffs with the same kinds
     expect(resultOrdered.eventDiffs.map(d => d.kind)).toEqual(resultReversed.eventDiffs.map(d => d.kind))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Diff truncation
+// ---------------------------------------------------------------------------
+
+describe('Diff truncation', () => {
+  it('RunDiff accepts truncated: true', () => {
+    const diff: RunDiff = {
+      leftRunId: 'run-a',
+      rightRunId: 'run-b',
+      eventDiffs: [],
+      summary: { added: 0, removed: 0, changed: 0, same: 0, statusChanged: false },
+      truncated: true,
+    }
+    expect(diff.truncated).toBe(true)
+  })
+
+  it('RunDiff truncated defaults to undefined when not set', () => {
+    const diff: RunDiff = {
+      leftRunId: 'run-a',
+      rightRunId: 'run-b',
+      eventDiffs: [],
+      summary: { added: 0, removed: 0, changed: 0, same: 0, statusChanged: false },
+    }
+    expect(diff.truncated).toBeUndefined()
+  })
+
+  it('MAX_EVENTS_PER_DIFF is 10000', () => {
+    expect(MAX_EVENTS_PER_DIFF).toBe(10_000)
+  })
+
+  it('MAX_EVENTS_PER_DIFF is positive', () => {
+    expect(MAX_EVENTS_PER_DIFF).toBeGreaterThan(0)
+  })
+
+  it('buildRunDiff on truncated input still produces valid summary', () => {
+    // Even when events are truncated to MAX_EVENTS_PER_DIFF, buildRunDiff
+    // should produce a consistent summary for the subset it receives.
+    const events = Array.from({ length: 5 }, (_, i) =>
+      makeEvent({ sequenceNumber: i + 1, type: 'tool.call', runId: 'run-a' })
+    )
+    const diff = buildRunDiff('run-a', 'run-b', events, events)
+    expect(diff.summary.same).toBe(5)
+    expect(diff.summary.added).toBe(0)
+    expect(diff.summary.changed).toBe(0)
+    expect(diff.truncated).toBeUndefined() // buildRunDiff itself doesn't set truncated
   })
 })
