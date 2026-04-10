@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState, useTransition } from 'react'
 
-import { createAgentAction } from '@/lib/actions/agents'
 import { Button } from '@/components/ui/Button'
+import { createAgentAction } from '@/lib/actions/agents'
 
 interface CreateAgentModalProps {
   isOpen: boolean

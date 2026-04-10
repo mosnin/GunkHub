@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState, useTransition } from 'react'
 
-import { createProjectAction } from '@/lib/actions/projects'
 import { Button } from '@/components/ui/Button'
+import { createProjectAction } from '@/lib/actions/projects'
 
 interface CreateProjectModalProps {
   isOpen: boolean

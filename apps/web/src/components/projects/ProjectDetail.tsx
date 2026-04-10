@@ -1,16 +1,16 @@
 'use client'
 
-import { useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
+import { useState } from 'react'
 
 import type { Agent, Project } from '@agent-flight-recorder/contracts'
 
+import { CreateAgentModal } from '@/components/projects/CreateAgentModal'
 import { Button } from '@/components/ui/Button'
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
 import { EmptyState } from '@/components/ui/EmptyState'
-import { CreateAgentModal } from '@/components/projects/CreateAgentModal'
 
 interface ProjectDetailProps {
   project: Project
@@ -45,7 +45,8 @@ export function ProjectDetail({ project, agents }: ProjectDetailProps) {
     router.push(`/agents/${a.id}`)
   }
 
-  const firstAgentId = agents.length > 0 ? agents[0]!.id : '<create-an-agent-above>'
+  const firstAgent = agents[0]
+  const firstAgentId = firstAgent != null ? firstAgent.id : '<create-an-agent-above>'
   const sdkSnippet = buildSdkSnippet(firstAgentId)
 
   return (
@@ -150,8 +151,8 @@ export function ProjectDetail({ project, agents }: ProjectDetailProps) {
           <div className="px-5 py-4 border-b border-neutral-800">
             <p className="text-sm font-medium text-neutral-200">Record runs for this project</p>
             <p className="mt-0.5 text-xs text-neutral-500">
-              {agents.length > 0
-                ? `Using agent: ${agents[0]!.name}`
+              {firstAgent != null
+                ? `Using agent: ${firstAgent.name}`
                 : 'Create an agent above to get the agent ID for this snippet.'}
             </p>
           </div>

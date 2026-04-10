@@ -2,6 +2,52 @@
 
 ---
 
+## Prompt 13 — First-success onboarding path
+
+**Date:** 2026-04-10
+**Status:** Complete
+
+### What was built
+
+- **Project creation UI** — `CreateProjectModal` + `ProjectsList` + projects page. Admins can create projects from the UI with auto-generated slugs.
+- **Agent creation UI** — `CreateAgentModal` + project detail page shows agents table with create button.
+- **Org-wide agents page** — lists all agents across projects with links to runs.
+- **Agent detail page** — shows agent ID, last run link, and SDK setup snippet.
+- **Dashboard onboarding** — four-step Getting Started guide replaces hardcoded SDK snippet.
+- **API key management** — `ApiKeysSection` rewritten: loads existing keys on mount, name input before generate, two-phase revoke (Revoke → Confirm? → DELETE /api/api-keys/[id]).
+- **SDK setup snippet** — `SdkSetupSnippet` component on settings page with install command and copy-ready code block.
+- **Service layer** — `services/projects.ts`, `services/agents.ts` additions (`listAgents`, `listAgentsByOrg`, `createAgent`).
+- **Server actions** — `actions/projects.ts` (`createProjectAction`), `actions/agents.ts` (`createAgentAction`).
+- **API key revoke route** — `DELETE /api/api-keys/[id]` wraps `revokeApiKey` Convex mutation.
+- **`listAgentsByOrg` Convex query** — new query on `by_org` index for org-wide agent listing.
+
+### Files added or changed (Prompt 13)
+
+```
+convex/agents.ts                                        (listAgentsByOrg query)
+apps/web/src/lib/convexFunctions.ts                     (projects section, agents additions)
+apps/web/src/lib/services/projects.ts                   (NEW)
+apps/web/src/lib/services/agents.ts                     (listAgents, listAgentsByOrg, createAgent)
+apps/web/src/lib/actions/projects.ts                    (NEW)
+apps/web/src/lib/actions/agents.ts                      (NEW)
+apps/web/app/api/api-keys/[id]/route.ts                 (NEW — DELETE revoke)
+apps/web/app/(app)/projects/page.tsx                    (real list + CreateProjectModal)
+apps/web/app/(app)/projects/[projectId]/page.tsx        (real detail + CreateAgentModal)
+apps/web/app/(app)/agents/page.tsx                      (org-wide agent list)
+apps/web/app/(app)/agents/[agentId]/page.tsx            (agent detail + SDK snippet)
+apps/web/app/(app)/dashboard/page.tsx                   (stepped onboarding guide)
+apps/web/src/components/projects/CreateProjectModal.tsx (NEW)
+apps/web/src/components/projects/CreateAgentModal.tsx   (NEW)
+apps/web/src/components/projects/ProjectsList.tsx       (NEW)
+apps/web/src/components/projects/ProjectDetail.tsx      (NEW)
+apps/web/src/components/settings/ApiKeysSection.tsx     (rewritten)
+apps/web/src/components/settings/SdkSetupSnippet.tsx    (NEW)
+apps/web/app/(app)/settings/page.tsx                    (SdkSetupSnippet added)
+tests/unit/projects_agents.test.ts                      (NEW)
+```
+
+---
+
 ## Prompt 12 — 2026-04-10: Artifact Download, Keyboard Navigation, Event Deep Links, Stale Run Expiry
 
 ### What changed

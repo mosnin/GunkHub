@@ -1,132 +1,112 @@
-# Next Steps — Prompt 13 Specification
+# Next Steps — v1 Complete / v1.1 Candidates
 
-**Document type:** Exact specification for the next build session.
-**Current state:** Prompt 12 complete.
-**This document:** Defines what Prompt 13 should accomplish, based on remaining gaps after Prompt 12.
-
----
-
-## 1. What Was Accomplished in Prompt 12
-
-Prompt 12 closed the last major UI and operational gaps:
-
-- **Artifact download** — `GET /api/artifacts/[id]/download` streams blobs with Clerk session auth and Convex org verification. ArtifactList has a per-row download link. ADR-0016.
-- **Stale run expiry** — `expireStaleRuns` internalAction + daily cron at 03:00 UTC auto-transitions runs stuck in `running` for >24 hours to `timed_out`. Operations runbook updated. ADR-0017.
-- **Keyboard navigation** — Timeline: ArrowUp/Down/Enter navigate and expand events. EventInspector: ArrowUp/Down in the left event list. Both have focus-ring highlights. Mouse interaction unchanged.
-- **Event deep links** — `?event=<sequenceNumber>` pre-selects an event in EventInspector on load. Selection updates URL via `history.replaceState`. "Copy link" button in right panel header. ADR-0018.
+**Document type:** State summary and v1.1 candidate list.
+**Current state:** Prompt 13 complete. v1 is feature-complete.
 
 ---
 
-## 2. What Prompt 13 Should Accomplish
+## v1 is complete
 
-Items are listed in priority order. Prompt 13 is a hardening and polish pass — v1 is feature-complete; the remaining items close operational, SDK, and UX gaps that will be felt early in a production deployment.
+Prompts 1–13 have closed all items from the original v1 specification. The system is
+feature-complete as defined:
 
-### 2A. SDK auto-externalization (HIGH — relieves a production footgun)
-
-Currently, if a caller sends an event payload >10 KB via the SDK, the API returns HTTP 413 and the SDK surfaces the error to the caller. The caller must manually externalize the payload. This is a footgun in production.
-
-Changes needed:
-
-1. In `packages/sdk/src/transport.ts`, in the `sendEvents` method:
-   - Before calling `POST /api/events`, scan each event's payload for byte size.
-   - If any payload exceeds `PAYLOAD_EXTERNALIZATION_THRESHOLD` (10,240 bytes), call `_uploadArtifact` for that payload and replace the event payload with the returned `ExternalizedPayload` pointer.
-   - This is the same path `HttpTransport` already uses — check whether `_uploadArtifact` is called correctly for individual event payloads in addition to the existing call site.
-2. Add unit tests in `tests/unit/transport-externalization.test.ts` proving auto-externalization fires for >10 KB payloads and leaves <10 KB payloads untouched.
-3. Update `docs/release_readiness.md` to mark SDK auto-externalization as resolved (remove from deferred list).
-
-Acceptance criteria:
-- Sending an event with a 15 KB payload via the SDK results in a successful event record (not a 413).
-- Sending an event with a 5 KB payload skips the upload step.
-- `pnpm typecheck` passes.
-
-### 2B. Artifact download error UX (MEDIUM — prevents blank download on 404/502)
-
-When the download route returns 404 or 502, the browser silently downloads a JSON error body with a `.download` link. Engineers don't know what went wrong.
-
-Changes needed:
-
-1. Update `ArtifactList.tsx`:
-   - Convert to a `'use client'` component.
-   - Replace the plain `<a download>` anchor with a button that calls `fetch` on click.
-   - If the fetch response is not ok (non-2xx), read the JSON body and show an inline error message (e.g., a toast or an inline `<p className="text-red-400">` under the row).
-   - If ok, trigger browser download via a `Blob` URL (`URL.createObjectURL`) and `<a>` programmatic click.
-2. The download route itself does not change.
-
-Acceptance criteria:
-- Successful download triggers file download with correct filename.
-- 404 (artifact not found or wrong org) shows a human-readable error message in the UI.
-- 502 (blob storage unavailable) shows an error message.
-- No new npm dependencies.
-
-### 2C. Run detail breadcrumb navigation (LOW — discoverability)
-
-Engineers navigating to a run detail page from search results or a shared URL have no way to navigate back to the project or agent without using the browser Back button.
-
-Changes needed:
-
-1. `apps/web/app/(app)/runs/[runId]/page.tsx`:
-   - Read `run.projectId` and `run.agentId` from the run data.
-   - Render a breadcrumb above the `RunHeader`: `Organization → Project → Agent → Run <id>`
-   - Link Organization to `/`, Project to `/projects/[projectId]`, Agent to `/agents/[agentId]`.
-2. No new pages needed — the links can 404 gracefully until those pages are implemented.
-
-Acceptance criteria:
-- Breadcrumb is visible on run detail page.
-- Each segment is a link.
-- `pnpm typecheck` passes.
-
-### 2D. Convex schema validation check in CI (LOW — catches drift early)
-
-Currently, `pnpm typecheck` catches TypeScript errors in Convex functions but not schema validator mismatches (e.g., a field in `schema.ts` that differs from the corresponding field in `packages/contracts`). These drift silently.
-
-Changes needed:
-
-1. Add `scripts/check-schema-drift.ts` — a script that:
-   - Reads `convex/schema.ts` and `packages/contracts/src/entities.ts`.
-   - For each entity, verifies the field names match between the Convex schema definition and the contracts type.
-   - Reports mismatches as errors and exits with code 1.
-2. Call this script from `scripts/validate.sh` as a fourth check (after lint).
-3. The script should be zero-dependency (no new packages) and run with `pnpm tsx`.
-
-Acceptance criteria:
-- `./scripts/validate.sh` runs the drift check as part of its four-step suite.
-- If a field is added to `schema.ts` but not to `contracts`, the check reports it.
-- `pnpm typecheck` passes.
+- Canonical, immutable event log (Convex) with org tenancy enforcement
+- SDK recording pipeline (`FlightRecorder` / `RunRecorder` / `Recorder`) with HttpTransport, retry, batching, per-request timeout
+- Payload externalization to blob storage (>10 KB threshold, ArtifactPointer)
+- Replay projection, failure summary, and run diff — on-demand, no materialized state
+- Web UI: run list (with filters), run detail (timeline, event inspector, diff, replay, comments, artifacts, tags)
+- Keyboard navigation and event deep links in the run detail view
+- Artifact download (`GET /api/artifacts/[id]/download`) with Clerk auth and org verification
+- Artifact GC (daily cron, bounded batch, `by_created_at` index)
+- Stale run expiry (daily cron at 03:00 UTC, `timed_out` status)
+- API key management: create (named, hashed), revoke (two-phase confirm), list
+- Project and agent creation from UI (admin-gated via Convex RBAC)
+- Org-wide agents page and agent detail page with SDK setup snippet
+- Dashboard onboarding guide (four-step Getting Started flow)
+- Clerk webhook bootstrap for org and membership records
+- Health endpoint (`GET /api/health`) for operator monitoring
+- CI gate: integration tests on feature branches (graceful skip), hard fail on main when secrets absent
+- 482 tests passing, 5 skipped (16 test files)
 
 ---
 
-## 3. What Must NOT Be Done in Prompt 13
+## v1.1 Candidates
 
-- Do not add real-time event streaming or live run monitoring.
-- Do not add analytics dashboards or aggregate metrics.
-- Do not change event log immutability rules.
-- Do not redesign replay, diff, or the SDK recording interface.
-- Do not add billing or usage metering.
-- Do not add new background processing services beyond what exists.
-- Do not add the `by_status` global index to the runs table unless the 2D schema drift check reveals it is needed.
+The following items were explicitly deferred from v1. They are candidates for the next
+session. They are listed in rough priority order.
+
+### HIGH
+
+**1. SDK auto-externalization**
+The SDK does not detect payloads >10 KB before calling `POST /api/events`. If a payload
+exceeds the limit, the API returns HTTP 413 and the error surfaces to the caller. The
+SDK should scan each event payload's byte size before sending, automatically upload
+oversized payloads to `POST /api/artifacts/upload`, and replace the payload field with
+an `ExternalizedPayload` pointer — exactly as `HttpTransport._uploadArtifact` already
+does. This is a production footgun; callers sending large LLM response payloads will hit
+413 without knowing why.
+
+Files to change: `packages/sdk/src/transport.ts`, `tests/unit/transport-externalization.test.ts`.
+
+**2. Artifact download error UX**
+The download link in `ArtifactList` is a plain `<a download>` anchor. When the download
+route returns 404 (artifact not found or wrong org) or 502 (blob storage unavailable),
+the browser silently downloads a JSON error body. Convert `ArtifactList` to a
+`'use client'` component, replace the anchor with a button that calls `fetch` on click,
+and show an inline error message on non-2xx responses.
+
+Files to change: `apps/web/src/components/runs/ArtifactList.tsx`.
+
+### MEDIUM
+
+**3. Run detail breadcrumb navigation**
+Engineers navigating to a run detail page from search results or a shared URL have no
+way to navigate back to the project or agent without using the browser Back button. Add
+a breadcrumb row above `RunHeader`: `Organization → Project → Agent → Run <id>`, each
+segment linked to its respective page.
+
+Files to change: `apps/web/app/(app)/runs/[runId]/page.tsx`.
+
+**4. Convex schema drift check**
+The Convex schema in `convex/schema.ts` and the contracts in `packages/contracts/src/entities.ts`
+can diverge silently — TypeScript catches type mismatches within a package but not
+cross-package field name drift. Add `scripts/check-schema-drift.ts` (zero-dependency,
+runs with `pnpm tsx`) that reads both files and reports field name mismatches. Add it
+to `scripts/validate.sh` as a fourth check step.
+
+### LOW
+
+**5. Event list virtualization**
+The Timeline and EventInspector load events in pages of 200 via "Load more" but do not
+virtualize the DOM list. Runs with 10,000+ events loaded incrementally may have sluggish
+scroll performance. Consider `react-window` for the event list rows.
+
+**6. Background projection verification**
+No scheduled job verifies run sequence integrity in production. Integrity checks are
+on-demand only via `scripts/rebuild-projection.ts`. A daily Convex cron that samples
+recently-completed runs and flags sequence gaps would improve operational confidence.
+
+**7. Live run monitoring**
+The run detail page does not auto-refresh while a run is in progress. Polling (via
+`setInterval`) or Convex real-time subscriptions could provide a live view. Not required
+for the "make failures explainable" use case — runs are typically inspected after the
+fact — but useful for long-running agents.
+
+**8. RBAC viewer-vs-member on read paths**
+Roles (`admin`, `member`, `viewer`) are stored on `user_memberships` and enforced on
+write mutations. The read path distinction (viewers cannot write, members can) is not
+yet enforced on read queries. Low risk at v1 scale (all org members can read all data);
+needed before external-facing use cases.
 
 ---
 
-## 4. Acceptance Criteria for Prompt 13
+## What must NOT be added in v1.1
 
-1. SDK auto-externalization: payloads >10 KB are uploaded before `/api/events`; 413 is never surfaced to callers sending large payloads.
-2. Artifact download error UX: 404/502 shows an inline error message; successful download triggers browser file download.
-3. Run breadcrumb: visible and linked on run detail page.
-4. Schema drift check: `./scripts/validate.sh` runs the check; reports field mismatches correctly.
-5. `pnpm typecheck` passes with zero errors.
-6. `./scripts/validate.sh` passes all checks.
-7. All prior tests still pass (>= 451 total, no regressions).
-8. `docs/build_log.md`, `docs/working_memory.md`, `docs/next_steps.md` updated.
-
----
-
-## 5. Known Technical Debt After Prompt 12
-
-1. **SDK does not auto-externalize large payloads** — API returns 413; caller must handle. Fix in Prompt 13 (2A).
-2. **Artifact download UX on error** — browser silently downloads JSON error body. Fix in Prompt 13 (2B).
-3. **No breadcrumb on run detail page** — no back-navigation to project or agent. Fix in Prompt 13 (2C).
-4. **No schema drift check** — contracts and Convex schema can drift silently. Fix in Prompt 13 (2D).
-5. **Event list is not virtualized** — 10,000+ events loaded via "Load more" may cause sluggish scroll. Acceptable for v1; virtual scroll (react-window) is v1.1.
-6. **`agentId + status + date` filter still applies status in-memory** — acceptable because agent-scoped run counts are small. Would require a `by_agent_status_started` index to fix cleanly.
-7. **GC processes one page per daily run** — large orphan backlogs clear over multiple days. Acceptable at v1 scale.
-8. **Stale run expiry uses a full-table scan** — no global `by_status` index. Acceptable at v1 run volumes.
+- Real-time collaboration or live streaming of events to multiple viewers
+- Analytics dashboards, aggregate metrics, or usage statistics
+- Agent marketplace or agent registry
+- Policy engine, compliance features, or audit log export
+- Multi-region or distributed ingestion infrastructure
+- Billing, usage metering, or subscription management
+- Webhooks or external integrations (Slack, PagerDuty, etc.)
+- Mobile application

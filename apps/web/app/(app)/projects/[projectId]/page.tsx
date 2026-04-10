@@ -1,7 +1,7 @@
 import { notFound } from 'next/navigation'
 
-import type { Metadata } from 'next'
 import type { Agent, Project } from '@agent-flight-recorder/contracts'
+import type { Metadata } from 'next'
 
 import { ProjectDetail } from '@/components/projects/ProjectDetail'
 import { listAgents } from '@/lib/services/agents'

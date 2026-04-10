@@ -1,7 +1,7 @@
-import type { Metadata } from 'next'
 import Link from 'next/link'
 
 import type { Agent } from '@agent-flight-recorder/contracts'
+import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
 import { EmptyState } from '@/components/ui/EmptyState'

@@ -2,13 +2,13 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 12 — Artifact Download, Keyboard Nav, Event Deep Links, Stale Run Expiry)
+Last updated: 2026-04-10 (Prompt 13 — First-success onboarding path)
 
 ---
 
 ## 1. Current State
 
-Prompts 1–12 complete. The following summarizes the full state after Prompt 12.
+Prompts 1–13 complete. The following summarizes the full state after Prompt 13.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
@@ -20,7 +20,7 @@ Prompts 1–12 complete. The following summarizes the full state after Prompt 12
 - `convex/artifacts.ts` — `listArtifacts`, `createArtifact`, `getArtifact` (Prompt 12)
 - `convex/organizations.ts` — `upsertOrganization`, `upsertMembership`, `getOrg`, `listOrgs`
 - `convex/comments.ts` — `listComments`, `createComment`, `resolveComment`
-- `convex/agents.ts` — `listDistinctAgents`
+- `convex/agents.ts` — `listDistinctAgents`, `listAgentsByOrg` (NEW Prompt 13, `by_org` index)
 - `convex/artifact_gc.ts` — `getOrphanCandidates` (indexed range + paginate), `isArtifactReferenced`, `deleteArtifactRecord`, `cleanOrphanedArtifacts`
 - `convex/stale_runs.ts` (NEW Prompt 12) — `listStaleRuns`, `markRunTimedOut`, `expireStaleRuns`
 - Auth helpers: `getAuthContext()`, `requireOrgMembership()` with `minimumRole` in `convex/auth.ts`
@@ -57,11 +57,13 @@ Key new exports (Prompt 10):
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
 - Run components: RunList, RunHeader, Timeline (with load-more pagination, keyboard navigation), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (with download link per row), CommentThread (resolve, show/hide resolved, compose)
-- Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`
-- Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags)
-- API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (NEW Prompt 12), `/api/health`, `/api/webhooks/clerk`
+- Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`, `lib/services/projects.ts` (NEW Prompt 13)
+- Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags), `lib/actions/projects.ts` (createProjectAction, NEW Prompt 13), `lib/actions/agents.ts` (createAgentAction, NEW Prompt 13)
+- API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (Prompt 12), `/api/api-keys/[id]` (DELETE revoke, NEW Prompt 13), `/api/health`, `/api/webhooks/clerk`
+- UI components (Prompt 13): `CreateProjectModal`, `CreateAgentModal`, `ProjectsList`, `ProjectDetail`, `ApiKeysSection` (rewritten), `SdkSetupSnippet`
+- Pages (Prompt 13): projects list, project detail with agents table, org-wide agents list, agent detail with SDK snippet, dashboard onboarding guide
 
-**Tests (as of Prompt 12):**
+**Tests (as of Prompt 13):**
 - `tests/unit/sdk.test.ts` — Recorder tests with MockTransport
 - `tests/unit/contracts.test.ts` — Type shape and EventType coverage tests
 - `tests/unit/replay.test.ts` — buildReplayProjection algorithm tests
@@ -72,12 +74,13 @@ Key new exports (Prompt 10):
 - `tests/unit/flight-recorder.test.ts` — FlightRecorder and RunRecorder HTTP transport tests
 - `tests/unit/transport-externalization.test.ts` — HttpTransport payload externalization tests
 - `tests/unit/artifact-dedup.test.ts` — Artifact deduplication tests
-- `tests/unit/org_bootstrap.test.ts` (NEW Prompt 10) — 15 tests for upsertOrganization, upsertMembership, clerkRoleToInternal
-- `tests/unit/artifact_gc.test.ts` (NEW Prompt 10) — 10 tests for GC orphan detection, bounded batch, and error categorization
-- `tests/unit/run_filter.test.ts` (NEW Prompt 11) — 14 tests for index selection and filter scenarios
-- `tests/unit/stale_runs.test.ts` (NEW Prompt 12) — 8 tests for stale run timeout config, cutoff arithmetic, and safety invariants
+- `tests/unit/org_bootstrap.test.ts` (Prompt 10) — 15 tests for upsertOrganization, upsertMembership, clerkRoleToInternal
+- `tests/unit/artifact_gc.test.ts` (Prompt 10) — 10 tests for GC orphan detection, bounded batch, and error categorization
+- `tests/unit/run_filter.test.ts` (Prompt 11) — 14 tests for index selection and filter scenarios
+- `tests/unit/stale_runs.test.ts` (Prompt 12) — 8 tests for stale run timeout config, cutoff arithmetic, and safety invariants
+- `tests/unit/projects_agents.test.ts` (NEW Prompt 13) — 31 tests for slug generation, name validation, two-phase revoke state machine, and loadKeys fetch logic
 - `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
-- **Total: 451 passing, 5 skipped (15 test files, all green)**
+- **Total: 482 passing, 5 skipped (16 test files, all green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -230,6 +233,27 @@ Key new exports (Prompt 10):
 - `.github/workflows/ci.yml` — integration-test job needs `[test]`; explicit notice/warning on secret presence; hard fail on `main` when secrets absent
 - `docs/release_readiness.md`, `docs/operations_runbook.md`, `docs/ops/ci_setup.md` updated
 
+**Fully implemented in Prompt 13 (first-success onboarding path):**
+- `convex/agents.ts` — `listAgentsByOrg` query on `by_org` index for org-wide agent listing
+- `apps/web/src/lib/services/projects.ts` — `listProjects`, `getProject`, `createProject` with slug generation
+- `apps/web/src/lib/services/agents.ts` — `listAgents`, `listAgentsByOrg`, `createAgent`
+- `apps/web/src/lib/actions/projects.ts` — `createProjectAction` server action with name validation
+- `apps/web/src/lib/actions/agents.ts` — `createAgentAction` server action with name validation
+- `apps/web/app/api/api-keys/[id]/route.ts` — `DELETE /api/api-keys/[id]` revoke route
+- `apps/web/src/components/projects/CreateProjectModal.tsx` — project creation modal with auto-slug
+- `apps/web/src/components/projects/CreateAgentModal.tsx` — agent creation modal within a project
+- `apps/web/src/components/projects/ProjectsList.tsx` — org projects list component
+- `apps/web/src/components/projects/ProjectDetail.tsx` — project detail with agents table
+- `apps/web/src/components/settings/ApiKeysSection.tsx` — rewritten: loads keys on mount, name field, two-phase revoke
+- `apps/web/src/components/settings/SdkSetupSnippet.tsx` — install command + code snippet for settings page
+- `apps/web/app/(app)/projects/page.tsx` — real projects list page with CreateProjectModal
+- `apps/web/app/(app)/projects/[projectId]/page.tsx` — project detail with agents table + CreateAgentModal
+- `apps/web/app/(app)/agents/page.tsx` — org-wide agents list with project links
+- `apps/web/app/(app)/agents/[agentId]/page.tsx` — agent detail with last run link and SDK snippet
+- `apps/web/app/(app)/dashboard/page.tsx` — four-step Getting Started onboarding guide
+- `apps/web/app/(app)/settings/page.tsx` — SdkSetupSnippet added
+- `tests/unit/projects_agents.test.ts` — 31 tests for slug logic, name validation, revoke state machine, fetch mock
+
 **Fully implemented in Prompt 12 (artifact download, keyboard nav, deep links, stale run expiry):**
 - `convex/artifacts.ts` — `getArtifact` query (by ID, org-scoped via requireOrgMembership)
 - `convex/stale_runs.ts` — `listStaleRuns`, `markRunTimedOut`, `expireStaleRuns` for daily auto-expiry of stuck runs
@@ -346,3 +370,18 @@ Events can have a `parentEventId` referencing another event in the same run. Thi
 
 **Turborepo task ordering.**
 `pnpm build` via Turborepo builds `packages/contracts` and `packages/sdk` before `apps/web`. If you add a new package dependency, update `turbo.json` (root level) to declare it in the `dependsOn` field. Otherwise Turborepo may build in the wrong order and produce stale type artifacts.
+
+---
+
+## 8. Prompt 14 Candidates (v1.1 deferred items)
+
+The following items were explicitly deferred from v1 and are candidates for the next session:
+
+1. **SDK auto-externalization** — SDK does not yet detect payloads >10 KB before calling `/api/events`. API returns HTTP 413; caller must handle. Auto-externalize (upload to `/api/artifacts/upload`, replace payload with pointer) before shipping `POST /api/events`.
+2. **Artifact download error UX** — download link is a plain `<a download>` anchor. On 404/502 the browser silently downloads a JSON error body. Convert to `'use client'` with programmatic fetch and inline error display.
+3. **Run detail breadcrumb navigation** — no back-navigation from run detail to project or agent without browser Back button. Add `Organization → Project → Agent → Run <id>` breadcrumb with links.
+4. **Convex schema drift check** — contracts and Convex schema can drift silently. Add `scripts/check-schema-drift.ts` and call it from `validate.sh` as a fourth check.
+5. **Event list virtualization** — Timeline and EventInspector load events in pages of 200 but do not virtualize the DOM. Runs with 10,000+ events may have sluggish scroll. Consider react-window.
+6. **Background projection verification** — no scheduled job verifies run sequence integrity in production. Currently on-demand only via `rebuild-projection.ts`.
+7. **Live run monitoring** — no real-time event streaming. Run detail page does not auto-refresh while a run is in progress.
+8. **RBAC viewer-vs-member on read paths** — roles stored and enforced on writes; read path distinction is deferred.

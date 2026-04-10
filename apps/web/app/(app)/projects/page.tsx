@@ -1,6 +1,5 @@
-import type { Metadata } from 'next'
-
 import type { Project } from '@agent-flight-recorder/contracts'
+import type { Metadata } from 'next'
 
 import { ProjectsList } from '@/components/projects/ProjectsList'
 import { ErrorState } from '@/components/ui/ErrorState'

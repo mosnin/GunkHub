@@ -1,7 +1,7 @@
 # Release Readiness — v1
 
 **Date:** 2026-04-10
-**Status:** Release Candidate — Prompt 12 (artifact download, keyboard nav, event deep links, stale run expiry)
+**Status:** v1 Feature Complete — Prompt 13 (onboarding path: project/agent creation, API key management, SDK snippet, dashboard guide)
 
 ---
 
@@ -65,7 +65,7 @@
 
 ### Test coverage
 
-- **451+ tests passing** across `tests/` and `packages/sdk` workspaces.
+- **482+ tests passing** across `tests/` and `packages/sdk` workspaces (16 test files, 5 skipped).
 - Unit tests cover replay, diff (including truncation), failure summary, storage, transport, artifact GC, and org bootstrap.
 - All unit tests use `MockTransport` or in-memory stubs — no network calls, instant.
 - Real-Convex integration tests (`tests/integration/api.test.ts`) run in CI when secrets are configured. Skipped gracefully otherwise. Merging to `main` requires secrets to be present.
@@ -117,6 +117,12 @@
 - Stale run auto-expiry — daily cron transitions stuck `running` runs to `timed_out` after 24 h (ADR-0017)
 - Keyboard navigation in Timeline and EventInspector (ADR-0018)
 - Shareable event URL — `?event=<sequenceNumber>` deep link with copy-link button (ADR-0018)
+- Project creation from UI — `CreateProjectModal`, projects page, auto-slug generation, admin-gated via Convex mutation (Prompt 13)
+- Agent creation from UI — `CreateAgentModal`, project detail page with agents table (Prompt 13)
+- API key management — load existing keys on mount, name input before generate, two-phase revoke (`DELETE /api/api-keys/[id]`) (Prompt 13)
+- SDK setup snippet — `SdkSetupSnippet` component on settings page with install command and copy-ready code block (Prompt 13)
+- Org-wide agents page — `listAgentsByOrg` query on `by_org` index, agents page with project links (Prompt 13)
+- Dashboard onboarding guide — four-step Getting Started flow replaces hardcoded SDK snippet (Prompt 13)
 
 ---
 

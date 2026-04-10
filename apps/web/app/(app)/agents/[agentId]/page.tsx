@@ -1,13 +1,11 @@
+import Link from 'next/link'
 import { notFound } from 'next/navigation'
 
-import type { Metadata } from 'next'
-import Link from 'next/link'
-
 import type { Agent } from '@agent-flight-recorder/contracts'
+import type { Metadata } from 'next'
 
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
-import { listAgents } from '@/lib/services/agents'
 import { getProject } from '@/lib/services/projects'
 
 export const metadata: Metadata = { title: 'Agent' }

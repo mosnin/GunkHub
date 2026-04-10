@@ -1,13 +1,13 @@
 'use client'
 
-import { useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { useState } from 'react'
 
 import type { Project } from '@agent-flight-recorder/contracts'
 
+import { CreateProjectModal } from '@/components/projects/CreateProjectModal'
 import { Button } from '@/components/ui/Button'
 import { EmptyState } from '@/components/ui/EmptyState'
-import { CreateProjectModal } from '@/components/projects/CreateProjectModal'
 
 interface ProjectsListProps {
   projects: Project[]
