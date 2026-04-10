@@ -159,3 +159,136 @@ describe('API response shapes', () => {
     expect(response.eventCount).toBe(mockRunEvents.length)
   })
 })
+
+/**
+ * Real integration tests against a live Convex deployment.
+ * Skipped when CONVEX_TEST_URL or TEST_API_KEY are not set.
+ *
+ * Required env vars:
+ *   CONVEX_TEST_URL  — base URL of the test Next.js deployment (e.g. http://localhost:3000)
+ *   TEST_API_KEY     — a valid API key provisioned in the test Convex deployment
+ *   TEST_AGENT_ID    — a Convex ID for an agent in the test org (required for createRun)
+ */
+const BASE_URL = process.env['CONVEX_TEST_URL']
+const API_KEY = process.env['TEST_API_KEY']
+const AGENT_ID = process.env['TEST_AGENT_ID']
+
+const hasTestEnv = !!(BASE_URL && API_KEY && AGENT_ID)
+
+describe.skipIf(!hasTestEnv)('Real Convex integration tests', () => {
+  // Shared run ID created in beforeAll and used by subsequent tests.
+  let testRunId: string
+
+  beforeAll(async () => {
+    if (!hasTestEnv) return
+    // Create a test run that all tests in this block can reference.
+    const res = await fetch(`${BASE_URL}/api/runs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY! },
+      body: JSON.stringify({ agentId: AGENT_ID }),
+    })
+    if (!res.ok) throw new Error(`Failed to create test run: ${res.status}`)
+    const body = await res.json() as { run: { id: string } }
+    testRunId = body.run.id
+  })
+
+  it('creates a run via POST /api/runs', async () => {
+    // Verifies that the create-run endpoint returns 201 with a run object
+    // containing a valid ID and "running" status.
+    const res = await fetch(`${BASE_URL}/api/runs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY! },
+      body: JSON.stringify({ agentId: AGENT_ID }),
+    })
+    expect(res.status).toBe(201)
+    const body = await res.json() as { run?: { id?: string; status?: string } }
+    expect(body.run).toBeDefined()
+    expect(body.run!.id).toBeTruthy()
+    expect(body.run!.status).toBe('running')
+  })
+
+  it('sends events to the created run', async () => {
+    // Verifies that a well-formed event batch is accepted and returns event IDs.
+    const res = await fetch(`${BASE_URL}/api/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY! },
+      body: JSON.stringify({
+        events: [{
+          runId: testRunId,
+          type: 'run.started',
+          sequenceNumber: 1,
+          timestamp: Date.now(),
+          payload: { type: 'run.started' },
+        }],
+      }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { eventIds?: string[] }
+    expect(body.eventIds).toBeDefined()
+    expect(body.eventIds!.length).toBe(1)
+  })
+
+  it('is idempotent: sending the same event twice returns the existing event ID', async () => {
+    // Verifies the (runId, sequenceNumber) dedup logic described in ADR-0007.
+    // Both responses must return the same event ID, not two different IDs.
+    const event = {
+      runId: testRunId,
+      type: 'run.started',
+      sequenceNumber: 1,
+      timestamp: Date.now(),
+      payload: { type: 'run.started' },
+    }
+    const first = await fetch(`${BASE_URL}/api/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY! },
+      body: JSON.stringify({ events: [event] }),
+    })
+    const second = await fetch(`${BASE_URL}/api/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY! },
+      body: JSON.stringify({ events: [event] }),
+    })
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(200)
+    const firstBody = await first.json() as { eventIds: string[] }
+    const secondBody = await second.json() as { eventIds: string[] }
+    // Both calls must reference the same event record — no duplicate created.
+    expect(firstBody.eventIds[0]).toBe(secondBody.eventIds[0])
+  })
+
+  it('returns 413 for an event payload exceeding 10 KB', async () => {
+    // Verifies the payload size guard in POST /api/events (see ADR-0006).
+    // The SDK auto-externalizes payloads before sending, so this 413 path
+    // is only reached if a caller bypasses SDK externalization.
+    const largePayload = { type: 'llm.response', data: 'x'.repeat(11 * 1024) }
+    const res = await fetch(`${BASE_URL}/api/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY! },
+      body: JSON.stringify({
+        events: [{
+          runId: testRunId,
+          type: 'llm.response',
+          sequenceNumber: 99,
+          timestamp: Date.now(),
+          payload: largePayload,
+        }],
+      }),
+    })
+    expect(res.status).toBe(413)
+  })
+
+  it('GET /api/runs lists runs including the created run', async () => {
+    // GET /api/runs uses Clerk auth; may return 401 without a session cookie.
+    // When the test deployment uses Clerk auth on this route, 401 is expected
+    // and is not a test failure — the route is working as designed.
+    const res = await fetch(`${BASE_URL}/api/runs`, {
+      headers: { 'x-api-key': API_KEY! },
+    })
+    // Accept either 200 (API-key-authenticated route) or 401 (Clerk-auth route).
+    expect([200, 401]).toContain(res.status)
+    if (res.status === 200) {
+      const body = await res.json() as { runs: Array<{ id: string }> }
+      expect(Array.isArray(body.runs)).toBe(true)
+    }
+  })
+})

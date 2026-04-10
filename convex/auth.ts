@@ -9,6 +9,13 @@ export interface AuthContextResult {
   clerkOrgId: string;
 }
 
+/** Role rank for hierarchy checks: higher = more privileged. */
+const ROLE_RANK: Record<string, number> = {
+  viewer: 0,
+  member: 1,
+  admin: 2,
+};
+
 /**
  * Extracts and validates the auth context from a Convex query or mutation ctx.
  * Throws "Unauthorized" if the caller is not authenticated.
@@ -56,6 +63,7 @@ export async function getAuthContext(
 export async function requireOrgMembership(
   ctx: QueryCtx | MutationCtx,
   orgId: Id<"organizations">,
+  options?: { minimumRole?: "admin" | "member" | "viewer" },
 ): Promise<void> {
   const { userId } = await getAuthContext(ctx);
 
@@ -67,5 +75,15 @@ export async function requireOrgMembership(
 
   if (!membership) {
     throw new Error("Unauthorized: not a member of this organization");
+  }
+
+  // Role enforcement: if a minimum role is specified, verify the caller meets it.
+  const minimumRole = options?.minimumRole ?? "viewer";
+  const actualRank = ROLE_RANK[membership.role] ?? 0;
+  const minimumRank = ROLE_RANK[minimumRole] ?? 0;
+  if (actualRank < minimumRank) {
+    throw new Error(
+      `Forbidden: this action requires the "${minimumRole}" role or higher`,
+    );
   }
 }

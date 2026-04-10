@@ -49,7 +49,7 @@ export const createProject = mutation({
     description: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    await requireOrgMembership(ctx, args.orgId);
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "admin" });
 
     // Enforce slug uniqueness within the org
     const existing = await ctx.db

@@ -2,6 +2,45 @@
 
 ---
 
+## Prompt 8 — 2026-04-10: Artifact GC, RBAC, Tag Editing, Real Integration Tests
+
+### What changed
+- `convex/crons.ts` (NEW): daily scheduled job at 02:00 UTC triggers artifact GC action
+- `convex/artifact_gc.ts` (NEW): internal GC action detects orphaned artifacts (no referencing event, older than 24h), deletes blob via Vercel Blob DELETE, removes Convex record; logs candidate/cleaned/skipped/error counts
+- `convex/auth.ts`: `requireOrgMembership` gains optional `minimumRole: "admin"|"member"|"viewer"` parameter (defaults to "viewer" — preserves all existing callers)
+- `convex/api_keys.ts`: `createApiKey`, `revokeApiKey` now require `minimumRole: "admin"`
+- `convex/runs.ts`: `updateRunTags` requires `minimumRole: "admin"`; `createRun` requires `minimumRole: "member"`
+- `convex/projects.ts`: `createProject` requires `minimumRole: "admin"`
+- `apps/web/app/(app)/runs/[runId]/actions.ts` (NEW): Next.js server action for tag updates (returns error string or null)
+- `apps/web/src/components/runs/RunHeader.tsx`: inline tag edit affordance (add/remove chips, Enter/comma to commit, Save/Cancel, error display); uses `useTransition` for optimistic-style save
+- `packages/sdk/src/transport.ts`: per-`sendEvents` upload cache prevents redundant blob PUT calls when the same oversized payload appears more than once in a single batch
+- `tests/integration/api.test.ts`: real integration test suite added (skipped when `CONVEX_TEST_URL` not set); covers create-run, send-events, idempotency, 413 path
+- `.env.example`: documents `CONVEX_TEST_URL`, `TEST_API_KEY`, `TEST_AGENT_ID`
+- `docs/adrs/0011_artifact_gc.md` (NEW): orphan definition, safety rationale, BLOB_STORE_TOKEN requirement
+
+### Why these fit the architecture
+- GC job runs inside Convex as an `internalAction` — no new services, no new infra
+- Role model uses the existing `user_memberships.role` field — smallest sufficient RBAC for v1
+- Tag editing uses a server action (not an API route) — keeps the write path in the SSR layer
+- Integration tests skip gracefully without env vars — no CI breakage
+
+### Hard-to-reverse decisions
+- RBAC enforcement: once deployed, callers without admin role will receive Forbidden on createApiKey, revokeApiKey, updateRunTags, createProject. SDK callers use API key auth (not affected).
+
+### Known residual risks
+- GC requires `BLOB_STORE_TOKEN` set in Convex env vars (separate from Next.js env vars); if not set, Convex records are deleted but blobs remain
+- Tag edit optimistic state diverges from server on slow re-renders (acceptable for v1)
+- Integration tests require manual env setup; not enabled in default CI
+
+### Recommendation for Prompt 9
+1. Complete `createOrg`, `getOrgByClerkId` stubs in `convex/organizations.ts` — needed for the full onboarding flow
+2. Wire `resolveComment` into the UI
+3. Add request timeout on Convex event pagination (> 10,000 events blocks replay endpoint)
+4. Consider compound `["orgId", "status", "startedAt"]` index on `runs` for efficient combined filtering
+5. Enable integration tests in CI via a dedicated test Convex deployment
+
+---
+
 ## Prompt 7 — Artifact Deduplication, Externalized Payload Rendering, Run List Filtering, Tags
 
 **Date:** 2026-04-10

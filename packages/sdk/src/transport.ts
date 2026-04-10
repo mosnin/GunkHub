@@ -223,13 +223,41 @@ export class HttpTransport implements Transport {
 
     // Pre-externalize any events whose payload exceeds the threshold.
     // Done before the retry loop so we don't re-upload on retry.
+    //
+    // uploadCache: prevents redundant blob PUT calls when the same oversized
+    // payload appears more than once in a single sendEvents call. Keyed by the
+    // full serialized payload string. Scope is this call only — the Map is
+    // declared as a local const and is GC'd when sendEvents returns.
+    const uploadCache = new Map<string, {
+      artifactId: string
+      storageKey: string
+      storageBucket: string
+      checksum: string
+      size: number
+    }>()
+
     const processedEvents: CreateEventRequest[] = []
     for (const event of events) {
       const serialized = JSON.stringify(event.payload)
       if (serialized.length > PAYLOAD_EXTERNALIZATION_THRESHOLD) {
-        // Upload the oversized payload as an artifact first
+        // Check the per-call cache before issuing a PUT to blob storage
+        const cached = uploadCache.get(serialized)
+        if (cached) {
+          processedEvents.push({
+            ...event,
+            payload: {
+              type: '_externalized' as const,
+              originalType: event.type,
+              _artifact: cached,
+            } satisfies ExternalizedPayload,
+          })
+          continue
+        }
+
+        // Cache miss — upload the oversized payload as an artifact first
         try {
           const pointer = await this._uploadArtifact(event.runId, event.type, serialized, auth)
+          uploadCache.set(serialized, pointer)
           processedEvents.push({
             ...event,
             payload: {

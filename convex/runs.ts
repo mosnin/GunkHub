@@ -121,7 +121,7 @@ export const createRun = mutation({
     sdkVersion: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    await requireOrgMembership(ctx, args.orgId);
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "member" });
 
     const now = Date.now();
     const runId = await ctx.db.insert("runs", {
@@ -218,7 +218,7 @@ export const updateRunTags = mutation({
     const run = await ctx.db.get(args.runId);
     if (!run) throw new Error("Run not found");
 
-    await requireOrgMembership(ctx, run.orgId);
+    await requireOrgMembership(ctx, run.orgId, { minimumRole: "admin" });
 
     // Normalize: trim whitespace, deduplicate, discard empty strings
     const normalized = [...new Set(args.tags.map((t) => t.trim()).filter(Boolean))];

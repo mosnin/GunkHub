@@ -2,7 +2,7 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 7 — Artifact Deduplication, Externalized Payload Rendering, Run List Filtering)
+Last updated: 2026-04-10 (Prompt 8 — Artifact GC, RBAC, Tag Editing, Real Integration Tests)
 
 ---
 
@@ -192,6 +192,15 @@ Key new exports (Prompt 6):
 - `apps/web/src/components/runs/EventInspector.tsx` — `_externalized` payload rendering via `ExternalizedPayloadView`
 - `apps/web/src/components/runs/RunHeader.tsx` — tags chips (expandable) + collapsible metadata key-value panel
 - `apps/web/src/components/runs/RunList.tsx` — tags chips column (max 3 + overflow count)
+
+**Fully implemented in Prompt 8 (no longer stubs):**
+- Convex daily GC cron for orphaned artifacts (`convex/crons.ts`, `convex/artifact_gc.ts`)
+- RBAC `minimumRole` enforcement on `createApiKey`, `revokeApiKey`, `updateRunTags`, `createProject` (`convex/auth.ts`)
+- Inline tag editing in `RunHeader` (add/remove chips, Enter/comma to commit, Save/Cancel, error feedback via server action)
+- SDK per-`sendEvents` upload cache in `HttpTransport._uploadArtifact` — prevents redundant blob PUT on same payload within a single call
+- Real Convex integration test suite in `tests/integration/api.test.ts` (skipped gracefully when `CONVEX_TEST_URL`/`TEST_API_KEY`/`TEST_AGENT_ID` not set); covers create-run, send-events, idempotency (ADR-0007), 413 path (ADR-0006), and GET /api/runs
+
+**Test count (Prompt 8):** 393 passing in `tests/` workspace + 260 SDK tests = 653 total (integration real-Convex tests skipped in standard CI — counted when env vars are present)
 
 ---
 

@@ -17,7 +17,7 @@ export const createApiKey = mutation({
   },
   handler: async (ctx, args) => {
     const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, args.orgId);
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "admin" });
 
     const now = Date.now();
     const keyId = await ctx.db.insert("api_keys", {
@@ -70,7 +70,7 @@ export const revokeApiKey = mutation({
       throw new Error("API key not found");
     }
 
-    await requireOrgMembership(ctx, key.orgId);
+    await requireOrgMembership(ctx, key.orgId, { minimumRole: "admin" });
 
     if (key.revokedAt !== undefined) {
       throw new Error("API key is already revoked");

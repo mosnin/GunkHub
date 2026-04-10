@@ -1,9 +1,10 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useTransition } from 'react'
 
 import type { RunStatus } from '@agent-flight-recorder/contracts'
 
+import { updateRunTagsAction } from '@/lib/actions/runs'
 import { Badge } from '@/components/ui/Badge'
 import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
 
@@ -52,6 +53,53 @@ function CopyButton({ value }: { value: string }) {
 }
 
 export function RunHeader({ runId, status, agentName, startedAt, endedAt, triggeredBy, tags, metadata }: RunHeaderProps) {
+  const [isEditing, setIsEditing] = useState(false)
+  const [draftTags, setDraftTags] = useState<string[]>(tags ?? [])
+  const [tagInput, setTagInput] = useState('')
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
+  const [isPending, startTransition] = useTransition()
+
+  function commitInput() {
+    const val = tagInput.trim()
+    if (!val) {
+      setTagInput('')
+      return
+    }
+    const normalized = [...new Set([...draftTags, val])]
+    setDraftTags(normalized)
+    setTagInput('')
+  }
+
+  function removeTag(tag: string) {
+    setDraftTags((prev) => prev.filter((t) => t !== tag))
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault()
+      commitInput()
+    } else if (e.key === 'Escape') {
+      setIsEditing(false)
+      setDraftTags(tags ?? [])
+      setTagInput('')
+      setErrorMsg(null)
+    }
+  }
+
+  function handleSave() {
+    setErrorMsg(null)
+    startTransition(async () => {
+      const err = await updateRunTagsAction(runId, draftTags)
+      if (err) {
+        setErrorMsg(err)
+        // Revert to original tags on error
+        setDraftTags(tags ?? [])
+      } else {
+        setIsEditing(false)
+      }
+    })
+  }
+
   return (
     <div className="px-6 py-4 border-b border-neutral-800 bg-neutral-950">
       {/* Main row */}
@@ -83,19 +131,113 @@ export function RunHeader({ runId, status, agentName, startedAt, endedAt, trigge
         )}
       </div>
 
-      {/* Tags row — only rendered when tags exist */}
-      {tags && tags.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5 mt-2">
-          {tags.map((tag) => (
-            <span
-              key={tag}
-              className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono text-neutral-500 bg-neutral-900 border border-neutral-800"
+      {/* Tags row — read or edit mode */}
+      <div className="flex flex-wrap items-center gap-1.5 mt-2 min-h-[1.5rem]">
+        {isEditing ? (
+          <>
+            {/* Draft tag chips with remove button */}
+            {draftTags.map((tag) => (
+              <span
+                key={tag}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono text-neutral-400 bg-neutral-900 border border-neutral-700"
+              >
+                {tag}
+                <button
+                  type="button"
+                  onClick={() => removeTag(tag)}
+                  className="text-neutral-600 hover:text-neutral-300 transition-colors"
+                  aria-label={`Remove tag ${tag}`}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+
+            {/* Tag input */}
+            <input
+              type="text"
+              value={tagInput}
+              onChange={(e) => setTagInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              onBlur={commitInput}
+              placeholder="Add tag…"
+              className="bg-transparent text-xs font-mono text-neutral-300 placeholder-neutral-700 border-b border-neutral-700 focus:border-neutral-500 outline-none w-24 py-0.5"
+              autoFocus
+              disabled={isPending}
+            />
+
+            {/* Save / Cancel */}
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={isPending}
+              className="text-xs font-mono text-primary-400 hover:text-primary-300 disabled:text-neutral-600 transition-colors"
             >
-              {tag}
-            </span>
-          ))}
-        </div>
-      )}
+              {isPending ? 'Saving…' : 'Save'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setIsEditing(false)
+                setDraftTags(tags ?? [])
+                setTagInput('')
+                setErrorMsg(null)
+              }}
+              disabled={isPending}
+              className="text-xs font-mono text-neutral-600 hover:text-neutral-400 disabled:text-neutral-700 transition-colors"
+            >
+              Cancel
+            </button>
+
+            {/* Error feedback */}
+            {errorMsg && (
+              <span className="text-xs text-red-500 font-mono">{errorMsg}</span>
+            )}
+          </>
+        ) : (
+          <>
+            {/* Read-only tag chips */}
+            {(tags ?? []).map((tag) => (
+              <span
+                key={tag}
+                className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono text-neutral-500 bg-neutral-900 border border-neutral-800"
+              >
+                {tag}
+              </span>
+            ))}
+
+            {/* Edit affordance — always shown so the user can add tags even when empty */}
+            <button
+              type="button"
+              onClick={() => {
+                setDraftTags(tags ?? [])
+                setIsEditing(true)
+              }}
+              className="inline-flex items-center gap-0.5 text-xs text-neutral-700 hover:text-neutral-500 transition-colors font-mono"
+              aria-label="Edit tags"
+              title="Edit tags"
+            >
+              <svg
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+                aria-hidden="true"
+              >
+                <path
+                  d="M7 1L9 3L3 9H1V7L7 1Z"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+              {(tags ?? []).length === 0 ? 'Add tags' : 'Edit'}
+            </button>
+          </>
+        )}
+      </div>
 
       {/* Metadata — collapsible details, only when metadata has keys */}
       {metadata && Object.keys(metadata).length > 0 && (
