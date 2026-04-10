@@ -1,126 +1,143 @@
-# Next Steps — Prompt 5 Specification
+# Next Steps — Prompt 6 Specification
 
 **Document type:** Exact specification for the next build session.
-**Current state:** Prompt 4 (Hardening) complete.
-**This document:** Defines what Prompt 5 should accomplish, based on remaining gaps after Prompt 4.
+**Current state:** Prompt 5 (Release Candidate) complete.
+**This document:** Defines what Prompt 6 should accomplish, based on remaining gaps after Prompt 5.
 
 ---
 
-## 1. What Was Accomplished in Prompt 4
+## 1. What Was Accomplished in Prompt 5
 
-Prompt 4 hardened the ingestion pipeline and blob storage layer:
+Prompt 5 completed the production storage layer and prepared for release:
 
-- **Payload size enforcement**: Events with JSON payload > 10 KB are rejected at the API boundary (HTTP 413). Documented in ADR-0006.
-- **Ingestion idempotency**: `sdkCreateEvents` now deduplicates by `(runId, sequenceNumber)` — safe retries return the existing event ID. Documented in ADR-0007.
-- **Blob storage interface**: `BlobStorageAdapter` interface, `sha256Hex` checksum helper, `PAYLOAD_EXTERNALIZATION_THRESHOLD` constant. Stub adapter for dev/test.
-- **Artifact upload endpoint**: `POST /api/artifacts/upload` — externalizes large payloads, records artifact in Convex, returns pointer.
-- **Artifact service + UI**: `listArtifacts`, `getArtifactUrl` wired to Convex; ArtifactList renders real data.
-- **Event detail page**: Full payload viewer with breadcrumb, metadata panel, parent event link.
-- **28 new unit tests** for storage layer (288 total, all passing).
-- **Two new ADRs** (0006, 0007) documenting the externalization and idempotency decisions.
+- **VercelBlobAdapter**: production blob storage via native fetch — no `@vercel/blob` package. Activated by `BLOB_STORE_TOKEN` env var presence.
+- **`verifyProjectionIntegrity`**: pure function for checking run event sequence integrity (contiguity, duplicates, projection validity). Used by CLI script and future background jobs.
+- **`scripts/rebuild-projection.ts`**: CLI tool for on-demand integrity checks.
+- **`GET /api/health`**: operator endpoint reporting storage adapter and configuration status.
+- **SystemHealthPanel**: web UI component surfacing health endpoint data.
+- **ADR-0008**: decision record for VercelBlobAdapter design.
+- **Deployment docs**: `deployment_checklist.md`, `release_readiness.md`, `operations_runbook.md`.
+- **68 new tests** for `verifyProjectionIntegrity` (356 total in tests/ workspace, all passing).
+- **2 storage tests fixed** to reflect the updated `getStorageAdapter()` behavior.
 
 ---
 
-## 2. What Prompt 5 Should Accomplish
+## 2. What Prompt 6 Should Accomplish
 
-### 2A. Vercel Blob production adapter (CRITICAL PATH for production)
+### 2A. SDK auto-externalization (CRITICAL PATH)
 
-The `StubBlobStorageAdapter` is in-memory — data is lost on process restart. To run in production:
+Currently the SDK does nothing special for large payloads — `/api/events` returns
+HTTP 413 and the SDK surfaces that as an error to the caller. The SDK must self-heal:
 
-1. Implement `VercelBlobAdapter` in `apps/web/src/lib/storage/vercel.ts`:
-   - Uses `@vercel/blob` package (`put()` for upload, `url()` for signed URL)
-   - `BLOB_READ_WRITE_TOKEN` env var must be set
-2. Wire it into `getStorageAdapter()` when `BLOB_STORAGE_PROVIDER=vercel`
-3. Add `BLOB_READ_WRITE_TOKEN` and `BLOB_STORAGE_PROVIDER` to `.env.example`
-4. Add SDK helper: when payload exceeds threshold, auto-upload before shipping event
-   - This lives in `packages/sdk/src/transport.ts` — check payload size in `flushEvents()`
-   - If > threshold, call `/api/artifacts/upload` first, replace payload with pointer
+1. In `packages/sdk/src/transport.ts` → `HttpTransport.flushEvents()`, for each event
+   whose payload serializes to > 10,240 bytes (the `PAYLOAD_EXTERNALIZATION_THRESHOLD`):
+   a. Call `POST /api/artifacts/upload` with the full payload as the body.
+   b. Store the returned `{ storageKey, storageBucket, checksum, size }` pointer.
+   c. Replace the event's `payload` with a compact pointer object:
+      `{ _artifact: { id, storageKey, storageBucket, checksum, size } }`
+   d. Ship the compact event via the normal `POST /api/events` route.
+2. Add the `/api/artifacts/upload` URL to `RecorderConfig` or derive it from `baseUrl`.
+3. Unit tests in `tests/unit/` (or `packages/sdk/tests/`) using mock fetch:
+   - Large payload triggers upload call before events call.
+   - Small payload does NOT trigger upload call.
+   - Upload failure surfaces correctly in `FlushResult.errors`.
 
-### 2B. SDK auto-externalization
+### 2B. Artifact garbage collection
 
-Currently the SDK does nothing special for large payloads — the API route rejects them. The SDK should detect large payloads and automatically externalize them:
+Artifacts can be orphaned when:
+- An upload to `/api/artifacts/upload` succeeds but the subsequent `/api/events` call fails.
+- A run is aborted before the artifact pointer event is sent.
 
-- In `HttpTransport.flushEvents()`, for each event whose payload serializes to > 10 KB:
-  1. Call `POST /api/artifacts/upload` with the full payload
-  2. Replace the event's `payload` with a compact `{ _artifact: { id, storageKey, storageBucket, checksum, size } }` pointer
-  3. Ship the compact event via the normal `/api/events` route
-- Unit tests in `packages/sdk/tests/transport.test.ts`
+Add a Convex scheduled job (`convex/crons.ts`) that runs daily and:
+1. Queries `artifacts` records older than 24 hours with no matching event referencing their `id`.
+2. Deletes the orphaned blob from Vercel Blob storage via the REST API.
+3. Removes the orphaned artifact record from Convex.
+
+Document the retention policy in `docs/adrs/0009_artifact_gc.md`.
 
 ### 2C. Run search and filtering UI
 
-The runs list (`apps/web/app/(app)/runs/page.tsx`) currently shows all runs without filtering. Add:
+The runs list (`apps/web/app/(app)/runs/page.tsx`) shows all runs without filtering.
+Add:
 
-- Status filter dropdown: pending | running | completed | failed | cancelled | timed_out | (all)
-- Date range filter: last 24h | last 7 days | last 30 days | custom
-- Agent filter (if multiple agents in org)
-- Keyboard shortcut to focus search
+- **Status filter**: dropdown with options: All | pending | running | completed | failed | cancelled | timed_out.
+- **Date range filter**: buttons for Last 24h | Last 7 days | Last 30 days, plus a custom date range picker.
+- **Agent filter**: dropdown listing distinct agents in the org (only if the org has > 1 agent).
+- Keyboard shortcut `Cmd+K` to focus the filter bar.
 
-Requires updating `convex/runs.ts → listRuns` to accept optional status and date range parameters.
+Requires updating `convex/runs.ts → listRuns` to accept optional `status: RunStatus | undefined` and `startedAfter: number | undefined` parameters. Update the existing `listRuns` query — do not add a new query function.
 
-### 2D. Run tagging and metadata display
+### 2D. Tags and metadata display
 
-Runs have `tags: string[]` and `metadata: Record<string, unknown>` fields stored in Convex but not displayed anywhere in the UI. Add:
+Runs have `tags: string[]` and `metadata: Record<string, unknown>` stored in Convex
+but not displayed anywhere.
 
-- Tags displayed as chips on the run list and run detail header
-- Metadata displayed in a collapsible panel on the run detail page
-- Ability to add/edit tags from the run detail page (Convex mutation: `updateRunTags`)
+- **Run list**: display tags as small chips on each run row (max 3 visible, "+N more" overflow).
+- **Run detail header**: display all tags as chips, expandable.
+- **Run detail**: add a collapsible "Metadata" panel below the run header showing metadata as a key-value table.
+- **Edit tags**: on the run detail page, allow adding and removing tags. Requires a new Convex mutation `updateRunTags(runId, tags)` in `convex/runs.ts`.
 
-### 2E. API key management UI (if not in Prompt 2/3)
+### 2E. Integration tests with real Convex
 
-`apps/web/app/(app)/settings/page.tsx` should include:
+`tests/integration/api.test.ts` currently tests response shapes against static
+fixtures. Replace the stubs with real integration tests:
 
-- List of API keys for the org: name, created date, last used, revocation status
-- Create new key: enter name → receive key value once → show masked prefix thereafter
-- Revoke key button with confirmation dialog
+- Use a Convex test deployment (the `CONVEX_DEPLOY_KEY` for a test deployment).
+- Test the full path: `POST /api/runs` → `POST /api/events` → `GET /api/runs/:id/replay`.
+- Test the artifact upload path: `POST /api/artifacts/upload` → verify artifact record in Convex.
+- Test the 413 path: submit an event with a payload > 10 KB → verify HTTP 413.
+- Test idempotency: submit the same event twice → verify only one record in Convex.
 
-This requires:
-- `convex/api_keys.ts` — `listApiKeys`, `createApiKey`, `revokeApiKey` (check if already implemented from Prompt 2)
-- The raw key value is shown exactly once after creation (then only the hash is stored)
+These tests require `CONVEX_TEST_URL` and `TEST_API_KEY` env vars. Add them to `.env.example`.
 
-### 2F. Integration test environment
+### 2F. RBAC enforcement beyond basic membership
 
-`tests/integration/api.test.ts` currently tests API response shapes against static fixtures. Real integration tests should test the full SDK → API routes → Convex path. This requires:
+The `user_memberships` table stores `role: "admin" | "member" | "viewer"`. Currently
+all authenticated members can perform all operations regardless of role.
 
-- A Convex dev deployment (not possible without live credentials in CI)
-- Alternative: mock the Convex client in integration tests to verify route handler logic end-to-end
-- At minimum: test the artifact upload route, the events route (including 413 on large payload), and the replay route
+Add role checks to the following mutations:
+- `admin` only: `createApiKey`, `revokeApiKey`, `updateRunTags`, `createProject`
+- `member` and above: `createRun`, `createEvent` (already via API key, so may not apply)
+- `viewer`: read-only access — cannot call any write mutation
 
-### 2G. Operational scripts
-
-Add `scripts/benchmark.ts` to measure projection computation at scale:
-- Generate N events (configurable, default 1000)
-- Run `buildReplayProjection`, `buildFailureSummary`, `buildRunDiff` and report timing
-- Used to verify ADR-0005 assumption ("small event counts, computation dominated by fetch latency")
+Enforce role checks in `convex/auth.ts → requireOrgMembership()` by adding an optional
+`minimumRole` parameter. Update all mutations that should be admin-only to pass
+`minimumRole: "admin"`.
 
 ---
 
-## 3. What Must NOT Be Done in Prompt 5
+## 3. What Must NOT Be Done in Prompt 6
 
 - Do not add real-time event streaming.
-- Do not add analytics dashboards.
+- Do not add analytics dashboards or aggregate metrics.
 - Do not add webhooks or external integrations.
-- Do not change the event log immutability rules.
+- Do not change the event log immutability rules (no `updateEvent` or `deleteEvent`).
 - Do not add AI-powered failure analysis.
 - Do not implement multi-region ingestion.
+- Do not add billing or usage metering.
 
 ---
 
-## 4. Acceptance Criteria for Prompt 5
+## 4. Acceptance Criteria for Prompt 6
 
-1. `StubBlobStorageAdapter` replaced with `VercelBlobAdapter` for `BLOB_STORAGE_PROVIDER=vercel`.
-2. SDK auto-externalizes payloads > 10 KB before calling `/api/events`.
+1. SDK auto-externalizes payloads > 10 KB — no more 413 errors for well-behaved callers.
+2. Artifact GC job removes orphaned blobs older than 24 hours.
 3. Run list supports status and date range filtering.
-4. Tags and metadata visible in run list and detail.
-5. `pnpm typecheck` passes with zero errors.
-6. `./scripts/validate.sh` passes all three checks.
-7. All tests pass (≥ 288 passing, no regressions).
+4. Tags displayed in run list and run detail; editable from run detail.
+5. Integration tests run against a live Convex test deployment with no stubs.
+6. Admin-only mutations enforce the `admin` role requirement.
+7. `pnpm typecheck` passes with zero errors.
+8. `./scripts/validate.sh` passes all three checks.
+9. All tests pass (>= 356 in tests/ workspace + 260 SDK = 616 total, no regressions).
 
 ---
 
-## 5. Known Technical Debt After Prompt 4
+## 5. Known Technical Debt After Prompt 5
 
-1. **`StubBlobStorageAdapter` is in-memory.** Not suitable for production. Data is lost on restart. Implement Vercel Blob adapter in Prompt 5.
-2. **SDK does not auto-externalize large payloads.** The API route enforces the limit, but the SDK will get 413 errors and fail instead of self-healing. Add auto-externalization in SDK transport.
-3. **`payload` field comparison is order-sensitive.** JSON.stringify in the diff algorithm treats `{a:1,b:2}` and `{b:2,a:1}` as different. Acceptable for v1 — documented in ADR-0005.
-4. **No request timeout on Convex event pagination.** Very large runs (>10,000 events) will block the replay endpoint indefinitely. Mitigate with `Cache-Control` headers or projection timeout.
-5. **`comments` mutations are minimal.** `createComment` exists but `resolveComment` is not wired into the UI.
+1. **SDK does not auto-externalize large payloads.** API returns 413. SDK callers must handle manually. Fix in Prompt 6 (see 2A).
+2. **No artifact GC.** Orphaned blobs accumulate. Fix in Prompt 6 (see 2B).
+3. **No RBAC enforcement beyond basic membership.** All members can write. Fix in Prompt 6 (see 2F).
+4. **Integration tests are fixture-based stubs.** No real Convex coverage in CI. Fix in Prompt 6 (see 2E).
+5. **`payload` field comparison is order-sensitive in diff.** JSON.stringify treats `{a:1,b:2}` and `{b:2,a:1}` as different. Acceptable for v1 — documented in ADR-0005.
+6. **No request timeout on Convex event pagination.** Very large runs (> 10,000 events) will block the replay endpoint indefinitely.
+7. **`comments` mutations are minimal.** `resolveComment` is not wired into the UI.
