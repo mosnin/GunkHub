@@ -130,6 +130,19 @@ export const sdkCreateEvents = mutation({
         );
       }
 
+      const existing = await ctx.db
+        .query("events")
+        .withIndex("by_run", (q) =>
+          q.eq("runId", runId).eq("sequenceNumber", evt.sequenceNumber)
+        )
+        .unique();
+
+      if (existing !== null) {
+        // Idempotent: already stored — return existing ID
+        eventIds.push(existing._id);
+        continue;
+      }
+
       const parentEventId = evt.parentEventId
         ? (evt.parentEventId as Id<"events">)
         : undefined;

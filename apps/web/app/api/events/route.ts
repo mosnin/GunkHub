@@ -43,6 +43,21 @@ export async function POST(req: NextRequest) {
     if (evt['payload'] == null) return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'Each event must have payload' }, { status: 422 })
   }
 
+  const MAX_PAYLOAD_BYTES = 10 * 1024 // 10 KB
+
+  for (const evt of events as Record<string, unknown>[]) {
+    const payloadJson = JSON.stringify(evt['payload'])
+    if (payloadJson.length > MAX_PAYLOAD_BYTES) {
+      return NextResponse.json<ApiError>(
+        {
+          code: 'PAYLOAD_TOO_LARGE',
+          message: `Event payload at sequenceNumber ${String(evt['sequenceNumber'])} exceeds the 10 KB limit (${String(payloadJson.length)} bytes). Externalize large payloads as artifacts before shipping events.`,
+        },
+        { status: 413 }
+      )
+    }
+  }
+
   try {
     const client = getPublicClient()
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
