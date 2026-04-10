@@ -1,11 +1,12 @@
 import Link from 'next/link'
 import { notFound } from 'next/navigation'
 
-import type { Agent } from '@agent-flight-recorder/contracts'
+import type { Agent, AgentVersion } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
+import { VersionSection } from '@/components/agents/VersionSection'
 import { getProject } from '@/lib/services/projects'
 
 export const metadata: Metadata = { title: 'Agent' }
@@ -30,7 +31,10 @@ async function findAgent(agentId: string): Promise<Agent | null> {
   return agents.find((a) => a.id === agentId) ?? null
 }
 
-function buildSdkSnippet(agentId: string): string {
+function buildSdkSnippet(agentId: string, latestVersionId?: string): string {
+  const versionLine = latestVersionId
+    ? `  agentVersionId: '${latestVersionId}',`
+    : `  // agentVersionId: 'YOUR_VERSION_ID',  // create a version below`
   return `import { FlightRecorder } from '@agent-flight-recorder/sdk'
 
 const recorder = new FlightRecorder({
@@ -40,6 +44,7 @@ const recorder = new FlightRecorder({
 
 const run = await recorder.startRun({
   agentId: '${agentId}',
+${versionLine}
 })
 try {
   // your agent logic
@@ -69,7 +74,16 @@ export default async function AgentPage({ params }: Props) {
     // Non-fatal: fall back to project ID in breadcrumb
   }
 
-  const sdkSnippet = buildSdkSnippet(agent.id)
+  // Fetch versions — non-fatal if it fails
+  let versions: AgentVersion[] = []
+  try {
+    const { listAgentVersions } = await import('@/lib/services/agent_versions')
+    versions = await listAgentVersions(params.agentId)
+  } catch {
+    // Non-fatal: show empty version list
+  }
+
+  const sdkSnippet = buildSdkSnippet(agent.id, versions[0]?.id)
 
   return (
     <div className="p-6 max-w-4xl mx-auto">
@@ -83,7 +97,7 @@ export default async function AgentPage({ params }: Props) {
           href={`/projects/${agent.projectId}`}
           className="hover:text-neutral-300 transition-colors"
         >
-          {projectName ?? agent.projectId.slice(0, 12) + '…'}
+          {projectName ?? agent.projectId.slice(0, 12) + '\u2026'}
         </Link>
         <span>/</span>
         <span className="text-neutral-300">{agent.name}</span>
@@ -115,6 +129,11 @@ export default async function AgentPage({ params }: Props) {
         <p className="text-xs font-medium text-neutral-500 mb-1">Agent ID</p>
         <p className="text-xs font-mono text-neutral-300 break-all">{agent.id}</p>
       </div>
+
+      {/* Versions section */}
+      <section className="mb-8">
+        <VersionSection agentId={agent.id} versions={versions} />
+      </section>
 
       {/* SDK Setup */}
       <Card>
