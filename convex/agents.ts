@@ -42,6 +42,25 @@ export const listDistinctAgents = query({
 });
 
 /**
+ * List all agents belonging to an organization (not filtered by project).
+ */
+export const listAgentsByOrg = query({
+  args: {
+    orgId: v.id("organizations"),
+  },
+  handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+
+    const agents = await ctx.db
+      .query("agents")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .collect();
+
+    return agents;
+  },
+});
+
+/**
  * List all agents belonging to a project.
  */
 export const listAgents = query({
