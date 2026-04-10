@@ -23,21 +23,6 @@ function StatCard({ label, value }: { label: string; value: string }) {
 
 const SDK_INSTALL = `npm install @agent-flight-recorder/sdk`
 
-const SDK_USAGE = `import { FlightRecorder } from '@agent-flight-recorder/sdk'
-
-const recorder = new FlightRecorder({
-  apiKey: process.env.AFR_API_KEY,
-})
-
-// Wrap your agent run
-const run = await recorder.startRun({ agentId: 'my-agent' })
-try {
-  // ... your agent logic ...
-  await run.complete({ output: result })
-} catch (err) {
-  await run.fail({ error: err })
-}`
-
 export default async function DashboardPage() {
   let runs: Run[] = []
   let error: string | null = null
@@ -77,36 +62,82 @@ export default async function DashboardPage() {
               <RunList runs={runs} />
             </div>
           ) : (
-            /* Quickstart — only show when there are no runs yet */
+            /* Getting Started guide — only show when there are no runs yet */
             <div className="mt-8">
-              <h2 className="text-sm font-semibold text-neutral-300 mb-4">Quick Start</h2>
+              <h2 className="text-sm font-semibold text-neutral-300 mb-4">Getting Started</h2>
               <Card>
                 <div className="px-5 py-4 border-b border-neutral-800">
-                  <p className="text-sm font-medium text-neutral-200">Install the SDK</p>
+                  <p className="text-sm font-medium text-neutral-200">Record your first run in 4 steps</p>
                   <p className="mt-0.5 text-xs text-neutral-500">
-                    Instrument your agent in minutes. No run recorded yet — follow the steps below.
+                    No run recorded yet. Follow the steps below.
                   </p>
                 </div>
-                <div className="px-5 py-4 flex flex-col gap-4">
-                  <div>
-                    <p className="text-xs font-medium text-neutral-500 mb-2 uppercase tracking-wider">1. Install</p>
-                    <CodeBlock content={SDK_INSTALL} language="bash" maxHeight="60px" />
+                <div className="px-5 py-5 flex flex-col gap-5">
+                  {/* Step 1 */}
+                  <div className="flex items-start gap-3">
+                    <div className="w-5 h-5 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center shrink-0 mt-0.5">
+                      <span className="text-[10px] font-mono font-bold text-neutral-400">1</span>
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-neutral-300">Create a project</p>
+                      <p className="mt-0.5 text-xs text-neutral-500">
+                        Projects group your agents and their runs.
+                      </p>
+                      <a
+                        href="/projects"
+                        className="mt-1.5 inline-flex text-xs text-primary-400 hover:text-primary-300 underline underline-offset-2 transition-colors duration-100"
+                      >
+                        Go to Projects →
+                      </a>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-xs font-medium text-neutral-500 mb-2 uppercase tracking-wider">2. Record a run</p>
-                    <CodeBlock content={SDK_USAGE} language="typescript" maxHeight="240px" />
+
+                  {/* Step 2 */}
+                  <div className="flex items-start gap-3">
+                    <div className="w-5 h-5 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center shrink-0 mt-0.5">
+                      <span className="text-[10px] font-mono font-bold text-neutral-400">2</span>
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-neutral-300">Create an agent</p>
+                      <p className="mt-0.5 text-xs text-neutral-500">
+                        Within your project, create an agent to represent the code you&#39;re instrumenting.
+                      </p>
+                    </div>
                   </div>
-                  <div className="pt-1">
-                    <p className="text-xs text-neutral-600">
-                      Need an API key?{' '}
+
+                  {/* Step 3 */}
+                  <div className="flex items-start gap-3">
+                    <div className="w-5 h-5 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center shrink-0 mt-0.5">
+                      <span className="text-[10px] font-mono font-bold text-neutral-400">3</span>
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-neutral-300">Generate an API key</p>
+                      <p className="mt-0.5 text-xs text-neutral-500">
+                        The SDK uses this key to authenticate when recording runs.
+                      </p>
                       <a
                         href="/settings"
-                        className="text-neutral-400 hover:text-neutral-200 underline underline-offset-2 transition-colors duration-100"
+                        className="mt-1.5 inline-flex text-xs text-primary-400 hover:text-primary-300 underline underline-offset-2 transition-colors duration-100"
                       >
-                        Generate one in Settings
+                        Go to Settings →
                       </a>
-                      .
-                    </p>
+                    </div>
+                  </div>
+
+                  {/* Step 4 */}
+                  <div className="flex items-start gap-3">
+                    <div className="w-5 h-5 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center shrink-0 mt-0.5">
+                      <span className="text-[10px] font-mono font-bold text-neutral-400">4</span>
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-neutral-300">Install the SDK and record a run</p>
+                      <p className="mt-0.5 text-xs text-neutral-500">
+                        Install the SDK, add your agent ID from the project page, and record your first run.
+                      </p>
+                      <div className="mt-2">
+                        <CodeBlock content={SDK_INSTALL} language="bash" maxHeight="60px" />
+                      </div>
+                    </div>
                   </div>
                 </div>
               </Card>
