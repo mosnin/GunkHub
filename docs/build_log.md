@@ -2,6 +2,37 @@
 
 ---
 
+## Prompt 4 — Hardening: Blob Storage, Ingestion Idempotency, Artifact UI
+
+**Date:** 2026-04-10
+
+### What changed
+
+- `apps/web/src/lib/storage/` — `BlobStorageAdapter` interface, `sha256Hex`, `PAYLOAD_EXTERNALIZATION_THRESHOLD` constant, `StubBlobStorageAdapter` (in-memory, dev/test), `getStorageAdapter()` factory
+- `apps/web/app/api/events/route.ts` — 10 KB payload size check: events with JSON payload > 10 240 bytes rejected with HTTP 413 PAYLOAD_TOO_LARGE
+- `apps/web/app/api/artifacts/upload/route.ts` — POST endpoint: externalize a large payload to blob storage and record the artifact in Convex; API key auth; enforces minimum payload size
+- `convex/sdk_ingest.ts` — `sdkCreateEvents`: idempotent insert; duplicate (runId, sequenceNumber) returns existing ID instead of inserting; `sdkCreateArtifact`: API-key-authenticated artifact creation
+- `apps/web/src/lib/services/artifacts.ts` — `listArtifacts`, `getArtifactUrl` wired to Convex; used by run detail page
+- `apps/web/src/components/runs/ArtifactList.tsx` — renders real artifact data passed from run detail page
+- `apps/web/app/(app)/runs/[runId]/events/[eventId]/page.tsx` — event detail page: full payload JSON, metadata, parent event link
+- `apps/web/src/lib/convexFunctions.ts` — added `sdk_ingest.sdkCreateArtifact` function reference
+- `tests/unit/storage.test.ts` — 28 new unit tests for threshold constant, sha256Hex, StubBlobStorageAdapter, getStorageAdapter
+- `docs/adrs/0006_artifact_externalization.md` — decision record for payload externalization policy
+- `docs/adrs/0007_ingestion_idempotency.md` — decision record for duplicate event handling
+
+### Decisions made
+
+- Idempotency key for events: `(runId, sequenceNumber)` — natural key matching how the SDK assigns sequence numbers. O(1) lookup via existing `by_run` Convex index. See ADR-0007.
+- Threshold: 10,240 bytes (10 × 1024). Measured by `JSON.stringify(payload).length`. Enforced at the API route boundary. See ADR-0006.
+- Blob storage is provider-agnostic. `StubBlobStorageAdapter` handles local dev and CI. Production adapter (Vercel Blob) deferred to v1.1 when `BLOB_READ_WRITE_TOKEN` is available.
+- Checksum (SHA-256) computed before upload, stored on artifact record for integrity verification.
+
+### Test count
+
+288 tests passing (was 260 after Prompt 3; +28 in Prompt 4).
+
+---
+
 ## Prompt 3 — Explainability Layer (replay, failure summary, diff)
 
 **Date:** 2026-04-09

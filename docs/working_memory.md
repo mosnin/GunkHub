@@ -2,13 +2,13 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-09 (Prompt 3 — Explainability Layer)
+Last updated: 2026-04-10 (Prompt 4 — Hardening)
 
 ---
 
 ## 1. Current State
 
-Prompt 3 (Explainability Layer) is complete. The following summarizes the full state after Prompts 1–3.
+Prompt 4 (Hardening) is complete. The following summarizes the full state after Prompts 1–4.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
@@ -30,6 +30,13 @@ Prompt 3 (Explainability Layer) is complete. The following summarizes the full s
 
 **packages/sdk is implemented (except HTTP transport).** The `Recorder` class, `Events` builders, `buildEvent` helper, `HttpTransport` (stubbed), `Transport` interface, all types. The SDK is functional end-to-end when a `MockTransport` is injected (as in tests).
 
+**apps/web hardening layer is implemented (Prompt 4):**
+- `apps/web/src/lib/storage/` — `BlobStorageAdapter` interface, `StubBlobStorageAdapter`, `getStorageAdapter()` factory, `PAYLOAD_EXTERNALIZATION_THRESHOLD` (10 KB), `sha256Hex`
+- `apps/web/app/api/events/route.ts` — 10 KB payload size guard (HTTP 413)
+- `apps/web/app/api/artifacts/upload/route.ts` — SDK artifact externalization endpoint (API key auth)
+- `convex/sdk_ingest.ts` — idempotent event insert + `sdkCreateArtifact` mutation
+- Event detail page, ArtifactList wired to real data, getArtifactUrl helper
+
 **apps/web explainability layer is implemented (Prompt 3):**
 - `apps/web/src/lib/replay/projection.ts` — `buildReplayProjection(run, events): ReplayProjection` (pure, deterministic)
 - `apps/web/src/lib/replay/failure.ts` — `buildFailureSummary(run, events): FailureSummary` (pure, deterministic)
@@ -43,19 +50,23 @@ Prompt 3 (Explainability Layer) is complete. The following summarizes the full s
 - Service layer stubs: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`
 - No Next.js pages exist yet (no `app/` directory) — gap from Prompt 2
 
-**Tests (as of Prompt 3):**
+**Tests (as of Prompt 4):**
 - `tests/unit/sdk.test.ts` — Recorder tests with MockTransport, passing
 - `tests/unit/contracts.test.ts` — Type shape and EventType coverage tests, passing
 - `tests/unit/replay.test.ts` — buildReplayProjection algorithm tests (10 test groups)
 - `tests/unit/failure.test.ts` — buildFailureSummary algorithm tests (8 test groups)
 - `tests/unit/diff.test.ts` — buildRunDiff algorithm tests (10 test groups)
-- `tests/integration/api.test.ts` — Stub, marked as TODO
+- `tests/unit/storage.test.ts` — BlobStorageAdapter, sha256Hex, PAYLOAD_EXTERNALIZATION_THRESHOLD (28 tests, Prompt 4)
+- `tests/integration/api.test.ts` — API response shape tests (16 tests)
 - `tests/fixtures/runs.ts` — Sample run/event fixture data
 - `tests/fixtures/events.ts` — 6 scenario fixtures for explainability algorithm tests
+- **Total: 288 tests, all passing**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
 - ADR-0005: On-demand replay and diff projection strategy (Prompt 3)
+- ADR-0006: Artifact externalization policy — 10 KB threshold, blob storage, ArtifactPointer (Prompt 4)
+- ADR-0007: Ingestion idempotency — (runId, sequenceNumber) dedup, returns existing ID (Prompt 4)
 
 ---
 
@@ -137,7 +148,7 @@ Prompt 3 (Explainability Layer) is complete. The following summarizes the full s
 | `apps/web/src/lib/services/runs.ts` | Returns empty/fake data | Real Convex calls via `ConvexHttpClient` or Convex React hooks |
 | `apps/web/src/lib/services/events.ts` | Returns empty array | Same |
 | `apps/web/src/lib/services/comments.ts` | Returns empty array | Same |
-| `convex/helpers/storage.ts` — `BlobStorageAdapter` | Interface only, no implementation | Vercel Blob implementation (Prompt 4) |
+| `apps/web/src/lib/storage/stub.ts` — `StubBlobStorageAdapter` | In-memory dev/test implementation (Prompt 4) | Vercel Blob production adapter (Prompt 5) |
 | `convex/comments.ts` | File likely exists with no mutations | Need `createComment`, `resolveComment`, `listComments` |
 | `convex/organizations.ts` | Partially implemented | Need `createOrg`, `getOrgByClerkId` |
 | `convex/projects.ts` | Partially implemented | Need `listProjects`, `createProject` |

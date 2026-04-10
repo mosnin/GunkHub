@@ -1,238 +1,126 @@
-# Next Steps — Prompt 4 Specification
+# Next Steps — Prompt 5 Specification
 
 **Document type:** Exact specification for the next build session.
-**Current state:** Prompt 3 (Explainability Layer) complete.
-**This document:** Defines what Prompt 4 must accomplish, in scope, out of scope, and acceptance criteria.
+**Current state:** Prompt 4 (Hardening) complete.
+**This document:** Defines what Prompt 5 should accomplish, based on remaining gaps after Prompt 4.
 
 ---
 
-## 1. What Prompt 4 Should Accomplish
+## 1. What Was Accomplished in Prompt 4
 
-Prompt 4 must transform the explainability layer into a usable product by wiring the replay, diff, and failure summary algorithms into real UI pages, completing the project and agent management views, implementing the event detail page, and filling remaining gaps in the management layer.
+Prompt 4 hardened the ingestion pipeline and blob storage layer:
 
-The test for "Prompt 4 succeeded": an engineer can open the web UI, navigate to a completed run, step through its events in the replay view, inspect any event's full payload, compare two runs side-by-side in the diff view, and see a clear failure summary when a run fails.
+- **Payload size enforcement**: Events with JSON payload > 10 KB are rejected at the API boundary (HTTP 413). Documented in ADR-0006.
+- **Ingestion idempotency**: `sdkCreateEvents` now deduplicates by `(runId, sequenceNumber)` — safe retries return the existing event ID. Documented in ADR-0007.
+- **Blob storage interface**: `BlobStorageAdapter` interface, `sha256Hex` checksum helper, `PAYLOAD_EXTERNALIZATION_THRESHOLD` constant. Stub adapter for dev/test.
+- **Artifact upload endpoint**: `POST /api/artifacts/upload` — externalizes large payloads, records artifact in Convex, returns pointer.
+- **Artifact service + UI**: `listArtifacts`, `getArtifactUrl` wired to Convex; ArtifactList renders real data.
+- **Event detail page**: Full payload viewer with breadcrumb, metadata panel, parent event link.
+- **28 new unit tests** for storage layer (288 total, all passing).
+- **Two new ADRs** (0006, 0007) documenting the externalization and idempotency decisions.
 
 ---
 
-## 2. Recommended Scope for Prompt 4
+## 2. What Prompt 5 Should Accomplish
 
-### 2A. Wire replay and diff into the UI (CRITICAL PATH)
+### 2A. Vercel Blob production adapter (CRITICAL PATH for production)
 
-The algorithms exist in `apps/web/src/lib/replay/`. They must now be called from API routes and consumed by the UI components.
+The `StubBlobStorageAdapter` is in-memory — data is lost on process restart. To run in production:
 
-**Replay endpoint and viewer:**
+1. Implement `VercelBlobAdapter` in `apps/web/src/lib/storage/vercel.ts`:
+   - Uses `@vercel/blob` package (`put()` for upload, `url()` for signed URL)
+   - `BLOB_READ_WRITE_TOKEN` env var must be set
+2. Wire it into `getStorageAdapter()` when `BLOB_STORAGE_PROVIDER=vercel`
+3. Add `BLOB_READ_WRITE_TOKEN` and `BLOB_STORAGE_PROVIDER` to `.env.example`
+4. Add SDK helper: when payload exceeds threshold, auto-upload before shipping event
+   - This lives in `packages/sdk/src/transport.ts` — check payload size in `flushEvents()`
+   - If > threshold, call `/api/artifacts/upload` first, replace payload with pointer
 
-Create `apps/web/src/app/api/runs/[runId]/replay/route.ts`:
-- `GET /api/runs/[runId]/replay` — fetches all events for the run, calls `buildReplayProjection`, returns `ReplayProjection` as JSON
-- Auth: validate API key or Clerk session; scope to org
-- Pagination: fetch events in pages if needed (runs with >100 events require multiple Convex fetches)
+### 2B. SDK auto-externalization
 
-Wire `apps/web/src/components/runs/ReplayViewer.tsx`:
-- Accept `ReplayProjection` as a prop
-- Render a list of `ReplayFrame` entries with actor badges, status indicators, elapsed_ms, and payloadPreview
-- Add step-through navigation: Previous / Next buttons advance the "active frame" index
-- Keyboard navigation: left/right arrow keys step through frames
-- Highlight the active frame visually (border, background tint)
+Currently the SDK does nothing special for large payloads — the API route rejects them. The SDK should detect large payloads and automatically externalize them:
 
-**Diff endpoint and viewer:**
+- In `HttpTransport.flushEvents()`, for each event whose payload serializes to > 10 KB:
+  1. Call `POST /api/artifacts/upload` with the full payload
+  2. Replace the event's `payload` with a compact `{ _artifact: { id, storageKey, storageBucket, checksum, size } }` pointer
+  3. Ship the compact event via the normal `/api/events` route
+- Unit tests in `packages/sdk/tests/transport.test.ts`
 
-Create `apps/web/src/app/api/diff/route.ts`:
-- `GET /api/diff?left=[runId]&right=[runId]` — fetches events for both runs, calls `buildRunDiff`, returns `RunDiff` as JSON
-- Auth: validate org membership; both runs must belong to the caller's org
+### 2C. Run search and filtering UI
 
-Wire `apps/web/src/components/runs/DiffViewer.tsx`:
-- Accept `RunDiff` as a prop
-- Render events side-by-side: left column (baseline), right column (comparison)
-- Color-code by `EventDiff.kind`: same=neutral, added=green, removed=red, changed=yellow
-- For `kind="changed"`, list the `FieldChange` entries showing `path`, `left`, and `right` values
-- Show `summary.statusChanged` banner at the top if the terminal event type differs
+The runs list (`apps/web/app/(app)/runs/page.tsx`) currently shows all runs without filtering. Add:
 
-**Failure summary component:**
+- Status filter dropdown: pending | running | completed | failed | cancelled | timed_out | (all)
+- Date range filter: last 24h | last 7 days | last 30 days | custom
+- Agent filter (if multiple agents in org)
+- Keyboard shortcut to focus search
 
-Wire `apps/web/src/components/runs/FailureSummary.tsx`:
-- Accept `FailureSummary` as a prop
-- Only render when `hasFailure=true`
-- Show primary failure: event type, reason, error message (if available), sequence number
-- Show `allFailurePoints` as a collapsible list
-- Show `cannotInfer` warning banner when applicable
-- Show `isIncomplete` indicator when the run has no terminal event
+Requires updating `convex/runs.ts → listRuns` to accept optional status and date range parameters.
 
-### 2B. Event detail page
+### 2D. Run tagging and metadata display
 
-Create `apps/web/src/app/(dashboard)/runs/[runId]/events/[eventId]/page.tsx`:
-- Fetch the event by ID from Convex
-- Render full payload in a `CodeBlock` (syntax-highlighted JSON)
-- Show all event metadata: type, sequenceNumber, timestamp, actor (computed), parentEventId (as a link)
-- Show parent event chain as breadcrumbs (if parentEventId exists, link to that event's detail page)
-- Handle loading, empty, and error states
+Runs have `tags: string[]` and `metadata: Record<string, unknown>` fields stored in Convex but not displayed anywhere in the UI. Add:
 
-### 2C. Project and agent management UI
+- Tags displayed as chips on the run list and run detail header
+- Metadata displayed in a collapsible panel on the run detail page
+- Ability to add/edit tags from the run detail page (Convex mutation: `updateRunTags`)
 
-Create the following pages (stubs are acceptable if time is tight, but should render real data):
+### 2E. API key management UI (if not in Prompt 2/3)
 
-**Project list:**
-`apps/web/src/app/(dashboard)/projects/page.tsx`
-- List all projects for the org from Convex
-- Show: project name, slug, agent count, most recent run status and timestamp
-- Link each project to its detail page
+`apps/web/app/(app)/settings/page.tsx` should include:
 
-**Project detail:**
-`apps/web/src/app/(dashboard)/projects/[projectSlug]/page.tsx`
-- Show project name, description, slug
-- List agents in the project
-- Show recent runs across all agents
-
-**Agent detail:**
-`apps/web/src/app/(dashboard)/projects/[projectSlug]/[agentSlug]/page.tsx`
-- Show agent name, description
-- List agent versions (immutable snapshots) with changelogs
-- List recent runs for this agent, filterable by status
-
-These pages require implementing the following Convex functions if not yet done:
-- `convex/projects.ts` — `createProject`, `getProject`
-- `convex/agents.ts` — `listAgents`, `getAgent`, `createAgent`
-
-### 2D. Run comparison UI flow
-
-Add a "Compare" flow to the runs list page:
-- Select a baseline run (checkbox or "Set as baseline" button)
-- Select a second run (another checkbox or "Compare to baseline")
-- Navigate to `/runs/compare?left=[runId]&right=[runId]`
-
-Create `apps/web/src/app/(dashboard)/runs/compare/page.tsx`:
-- Fetch both runs and their events
-- Call `buildRunDiff` via the diff API endpoint
-- Render the `DiffViewer` component
-
-### 2E. API key management UI
-
-If deferred from Prompt 2, implement now:
-
-Create `apps/web/src/app/(dashboard)/settings/api-keys/page.tsx`:
-- List all API keys for the org (name, created date, last used, revocation status)
-- Button to create a new key (shows the key once on creation, then only a masked prefix)
-- Button to revoke an existing key
+- List of API keys for the org: name, created date, last used, revocation status
+- Create new key: enter name → receive key value once → show masked prefix thereafter
+- Revoke key button with confirmation dialog
 
 This requires:
-- `api_keys` table in Convex schema (if not already added in Prompt 2)
-- `convex/api_keys.ts` — `listApiKeys`, `createApiKey`, `revokeApiKey`
-- `apps/web/src/app/api/settings/api-keys/route.ts` — GET/POST handlers
+- `convex/api_keys.ts` — `listApiKeys`, `createApiKey`, `revokeApiKey` (check if already implemented from Prompt 2)
+- The raw key value is shown exactly once after creation (then only the hash is stored)
 
-### 2F. Blob storage wiring (if not done in Prompt 2/3)
+### 2F. Integration test environment
 
-Implement `BlobStorageAdapter` using Vercel Blob:
-- Concrete implementation in `convex/helpers/storage.ts` (or a separate file)
-- Wire the artifact upload path: SDK detects >10 KB payload → calls `/api/artifacts/upload` → stores in Vercel Blob → creates artifact record in Convex → ships pointer event
-- Add `BLOB_READ_WRITE_TOKEN` to `.env.example` if not already present
-- Add artifact list display in the run detail page using the existing `ArtifactList` component
+`tests/integration/api.test.ts` currently tests API response shapes against static fixtures. Real integration tests should test the full SDK → API routes → Convex path. This requires:
 
----
+- A Convex dev deployment (not possible without live credentials in CI)
+- Alternative: mock the Convex client in integration tests to verify route handler logic end-to-end
+- At minimum: test the artifact upload route, the events route (including 413 on large payload), and the replay route
 
-## 3. Specific Files That Need Implementation
+### 2G. Operational scripts
 
-| File | What Needs to Change |
-|------|---------------------|
-| `apps/web/src/app/api/runs/[runId]/replay/route.ts` | Create: GET handler calling buildReplayProjection |
-| `apps/web/src/app/api/diff/route.ts` | Create: GET handler with ?left=&right= calling buildRunDiff |
-| `apps/web/src/components/runs/ReplayViewer.tsx` | Implement: step-through navigation, frame rendering |
-| `apps/web/src/components/runs/DiffViewer.tsx` | Implement: side-by-side diff with color-coded kinds |
-| `apps/web/src/components/runs/FailureSummary.tsx` | Implement: failure callout with primaryFailure + allFailurePoints |
-| `apps/web/src/app/(dashboard)/runs/[runId]/events/[eventId]/page.tsx` | Create: event detail page with full payload |
-| `apps/web/src/app/(dashboard)/projects/page.tsx` | Create: project list page |
-| `apps/web/src/app/(dashboard)/projects/[projectSlug]/page.tsx` | Create: project detail page |
-| `apps/web/src/app/(dashboard)/projects/[projectSlug]/[agentSlug]/page.tsx` | Create: agent detail page |
-| `apps/web/src/app/(dashboard)/runs/compare/page.tsx` | Create: side-by-side run comparison page |
-| `apps/web/src/app/(dashboard)/settings/api-keys/page.tsx` | Create: API key management page |
-| `convex/agents.ts` | Create/complete: listAgents, getAgent, createAgent |
-| `convex/projects.ts` | Complete: createProject, getProject |
-| `convex/api_keys.ts` | Create: listApiKeys, createApiKey, revokeApiKey |
-| `convex/helpers/storage.ts` | Implement: BlobStorageAdapter using Vercel Blob |
-| `tests/integration/api.test.ts` | Replace stubs with real integration tests |
+Add `scripts/benchmark.ts` to measure projection computation at scale:
+- Generate N events (configurable, default 1000)
+- Run `buildReplayProjection`, `buildFailureSummary`, `buildRunDiff` and report timing
+- Used to verify ADR-0005 assumption ("small event counts, computation dominated by fetch latency")
 
 ---
 
-## 4. What Must NOT Be Done in Prompt 4
+## 3. What Must NOT Be Done in Prompt 5
 
-- **Do not add real-time event streaming.** Convex subscriptions for live run monitoring are a v2 feature.
-- **Do not add analytics dashboards.** Aggregate metrics (failure rate, p95 duration) are explicitly out of scope for v1.
-- **Do not add webhooks or external integrations.** No Slack, no PagerDuty, no email notifications in v1.
-- **Do not change the event log immutability rules.** No update or delete mutations for events, under any circumstances.
-- **Do not add AI-powered failure analysis.** Failure summary is and must remain deterministic heuristic — no LLM calls for explaining failures.
-
----
-
-## 5. Acceptance Criteria for Prompt 4
-
-Prompt 4 is complete when all of the following are true:
-
-1. **Replay viewer is wired and interactive.** Given a completed run URL, an engineer can navigate to the run detail page, click into replay mode, and step through events frame-by-frame using keyboard or mouse.
-
-2. **Failure summary renders on failed runs.** When viewing a run with `status="failed"`, the failure summary callout is visible, shows the primary failure event, and links to the relevant event in the timeline.
-
-3. **Diff viewer shows real data.** Given two run IDs, the diff page fetches both runs' events, computes the diff, and renders added/removed/changed events with field-level changes visible.
-
-4. **Event detail page renders full payload.** Clicking an event in the timeline navigates to the event detail page, which shows the complete payload as formatted JSON using `CodeBlock`.
-
-5. **Project and agent pages render real data.** The project list shows real projects from Convex. Agent detail shows agent versions with changelogs.
-
-6. **API key management is functional.** An admin can create a new API key, see its value once, and revoke an existing key. Revoked keys are rejected by the API routes.
-
-7. **`pnpm typecheck` passes with zero errors across all packages.**
-
-8. **`./scripts/validate.sh` passes all three checks** (typecheck, build, lint).
-
-9. **All unit tests in `tests/unit/` pass.** The replay, failure, and diff tests added in Prompt 3 must pass against the real algorithm implementations.
-
-10. **Integration tests cover at least the replay and diff API routes.** `tests/integration/api.test.ts` must have real (not stubbed) tests for `GET /api/runs/[runId]/replay` and `GET /api/diff`.
+- Do not add real-time event streaming.
+- Do not add analytics dashboards.
+- Do not add webhooks or external integrations.
+- Do not change the event log immutability rules.
+- Do not add AI-powered failure analysis.
+- Do not implement multi-region ingestion.
 
 ---
 
-## 6. Known Technical Debt to Address in Prompt 4
+## 4. Acceptance Criteria for Prompt 5
 
-1. **Payload comparison is order-sensitive** (JSON.stringify). If field-order-insensitive comparison is needed for reliable diffs, sort object keys before stringifying in `buildRunDiff`. This is a minor improvement but reduces false-positive diffs.
-
-2. **No request timeout on Convex event pagination.** If a run has thousands of events and the Convex fetch is slow, the replay endpoint will wait indefinitely. Add a timeout or pagination limit.
-
-3. **`parentEventId` links in the replay viewer are not yet clickable.** The ReplayFrame renders depth but doesn't link parent frames. Add a "Jump to parent" interaction.
-
-4. **`apps/web/src/app/` is still missing several pages from Prompt 2 scope.** At minimum, the dashboard and run list pages should exist before Prompt 4 adds new pages on top of them.
-
-5. **Integration tests still stubbed.** All tests in `tests/integration/api.test.ts` are marked TODO. These should test the full SDK → API routes → Convex path against a dev deployment.
+1. `StubBlobStorageAdapter` replaced with `VercelBlobAdapter` for `BLOB_STORAGE_PROVIDER=vercel`.
+2. SDK auto-externalizes payloads > 10 KB before calling `/api/events`.
+3. Run list supports status and date range filtering.
+4. Tags and metadata visible in run list and detail.
+5. `pnpm typecheck` passes with zero errors.
+6. `./scripts/validate.sh` passes all three checks.
+7. All tests pass (≥ 288 passing, no regressions).
 
 ---
 
-## 7. Long-Term Roadmap (unchanged from Prompt 1)
+## 5. Known Technical Debt After Prompt 4
 
-### v1.0 (Prompts 1–4): Core Debuggability
-
-The minimum viable product. An engineer can record, inspect, replay, and diff agent runs.
-
-- Prompts 1–2: Foundation, ingestion pipeline, basic UI
-- Prompt 3: Replay, diff, failure summary algorithms and tests
-- Prompt 4: Polish, UI wiring, project/agent management, integration tests, documentation
-
-### v1.1: Reliability and Usability Improvements
-
-After v1.0 ships:
-- Payload externalization fully wired (real blob storage)
-- Run search by metadata fields and tags
-- Improved error state design
-- SDK Python port (if demand exists)
-- Copy-to-clipboard on run ID, event ID, payload values
-- Keyboard navigation through event timeline
-
-### v2.0: Real-Time and Analytics
-
-After product-market fit is established:
-- Live run monitoring: real-time event stream as a run executes
-- Aggregate analytics: failure rate by agent, p95 duration by event type
-- Comparison dashboards: version A vs version B aggregate metrics
-- Ingest layer extraction: standalone ingest service for high-throughput production use
-
-### v3.0: Collaboration and Governance
-
-- Team annotations: shared comment threads, resolution workflows
-- Audit log export (compliance)
-- Webhook integrations: Slack on run failure, PagerDuty escalation
-- SSO: SAML, enterprise identity providers
-- Data retention policies: automatic run expiry, selective replay archiving
+1. **`StubBlobStorageAdapter` is in-memory.** Not suitable for production. Data is lost on restart. Implement Vercel Blob adapter in Prompt 5.
+2. **SDK does not auto-externalize large payloads.** The API route enforces the limit, but the SDK will get 413 errors and fail instead of self-healing. Add auto-externalization in SDK transport.
+3. **`payload` field comparison is order-sensitive.** JSON.stringify in the diff algorithm treats `{a:1,b:2}` and `{b:2,a:1}` as different. Acceptable for v1 — documented in ADR-0005.
+4. **No request timeout on Convex event pagination.** Very large runs (>10,000 events) will block the replay endpoint indefinitely. Mitigate with `Cache-Control` headers or projection timeout.
+5. **`comments` mutations are minimal.** `createComment` exists but `resolveComment` is not wired into the UI.

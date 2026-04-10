@@ -38,5 +38,6 @@ export const convex = {
     sdkCreateRun: makeFunctionReference<M>('sdk_ingest:sdkCreateRun'),
     sdkCreateEvents: makeFunctionReference<M>('sdk_ingest:sdkCreateEvents'),
     sdkUpdateRunStatus: makeFunctionReference<M>('sdk_ingest:sdkUpdateRunStatus'),
+    sdkCreateArtifact: makeFunctionReference<M>('sdk_ingest:sdkCreateArtifact'),
   },
 } as const

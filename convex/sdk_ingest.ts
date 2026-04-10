@@ -213,3 +213,70 @@ export const sdkUpdateRunStatus = mutation({
     });
   },
 });
+
+/**
+ * Record an artifact whose content has already been uploaded to blob storage.
+ * Authenticates via API key hash (same pattern as sdkCreateEvents).
+ */
+export const sdkCreateArtifact = mutation({
+  args: {
+    apiKeyHash: v.string(),
+    runId: v.string(),
+    eventId: v.optional(v.string()),
+    name: v.string(),
+    mimeType: v.string(),
+    size: v.number(),
+    storageKey: v.string(),
+    storageBucket: v.string(),
+    checksum: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const apiKey = await ctx.db
+      .query("api_keys")
+      .withIndex("by_key_hash", (q) => q.eq("keyHash", args.apiKeyHash))
+      .unique();
+
+    if (!apiKey || apiKey.revokedAt !== undefined) {
+      throw new Error("Unauthorized");
+    }
+
+    const runId = args.runId as Id<"runs">;
+    const run = await ctx.db.get(runId);
+
+    if (!run) {
+      throw new Error("Run not found");
+    }
+
+    // Cross-org protection
+    if (run.orgId !== apiKey.orgId) {
+      throw new Error("Unauthorized");
+    }
+
+    const eventId = args.eventId ? (args.eventId as Id<"events">) : undefined;
+
+    // Validate that the eventId belongs to the same run when provided.
+    if (eventId !== undefined) {
+      const event = await ctx.db.get(eventId);
+      if (!event || event.runId !== runId) {
+        throw new Error("Event not found or does not belong to the given run");
+      }
+    }
+
+    const artifactId = await ctx.db.insert("artifacts", {
+      runId,
+      orgId: run.orgId,
+      eventId,
+      name: args.name,
+      mimeType: args.mimeType,
+      size: args.size,
+      storageKey: args.storageKey,
+      storageBucket: args.storageBucket,
+      checksum: args.checksum,
+      createdAt: Date.now(),
+    });
+
+    const artifact = await ctx.db.get(artifactId);
+    if (!artifact) throw new Error("Failed to create artifact");
+    return artifact;
+  },
+});
