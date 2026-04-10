@@ -8,9 +8,15 @@ type Q = 'query'
 type M = 'mutation'
 
 export const convex = {
+  agents: {
+    listAgents: makeFunctionReference<Q>('agents:listAgents'),
+    getAgent: makeFunctionReference<Q>('agents:getAgent'),
+    listDistinctAgents: makeFunctionReference<Q>('agents:listDistinctAgents'),
+  },
   organizations: {
     getOrganization: makeFunctionReference<Q>('organizations:getOrganization'),
     upsertOrganization: makeFunctionReference<M>('organizations:upsertOrganization'),
+    upsertMembership: makeFunctionReference<M>('organizations:upsertMembership'),
   },
   api_keys: {
     createApiKey: makeFunctionReference<M>('api_keys:createApiKey'),
@@ -34,6 +40,7 @@ export const convex = {
   comments: {
     listComments: makeFunctionReference<Q>('comments:listComments'),
     createComment: makeFunctionReference<M>('comments:createComment'),
+    resolveComment: makeFunctionReference<M>('comments:resolveComment'),
   },
   sdk_ingest: {
     sdkCreateRun: makeFunctionReference<M>('sdk_ingest:sdkCreateRun'),

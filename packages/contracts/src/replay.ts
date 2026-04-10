@@ -57,6 +57,12 @@ export interface ReplayProjection {
   isComplete: boolean;
   /** Whether the run terminated with a failure */
   isFailed: boolean;
+  /**
+   * True when the event log exceeds the MAX_EVENTS_PER_REPLAY limit and only the
+   * first N events were included in this projection. The caller should surface a
+   * warning to the user. Non-breaking additive field — defaults to false/absent.
+   */
+  truncated?: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,86 @@
+# CI Setup Runbook
+
+This document describes how to configure CI for the Agent Flight Recorder monorepo.
+
+---
+
+## Integration Test Secrets
+
+The real-Convex integration tests (`tests/integration/api.test.ts`) require three
+repository secrets. Without them, the `describe.skipIf` guard skips the real-Convex
+describe block gracefully — local developer runs without these env vars still pass.
+
+### Required secrets (repository Settings → Secrets and variables → Actions)
+
+| Secret name       | Description |
+|-------------------|-------------|
+| `CONVEX_TEST_URL` | Full HTTPS URL of the permanent `ci-test` Convex deployment (e.g. `https://ci-test-<id>.convex.cloud`). **Use a dedicated deployment — do NOT share with production.** |
+| `TEST_API_KEY`    | A pre-provisioned API key for the ci-test deployment. The key must have `member` role or higher in the test org. |
+| `TEST_AGENT_ID`   | Convex document ID of a pre-created `agents` record in the ci-test deployment. Used as the `agentId` for test run creation. |
+
+### Provisioning `TEST_AGENT_ID`
+
+The `TEST_AGENT_ID` is not automatically created. You must provision it manually:
+
+1. Deploy the Convex backend to the `ci-test` deployment:
+   ```
+   npx convex deploy --deployment ci-test
+   ```
+
+2. Open the Convex dashboard for the `ci-test` deployment.
+
+3. Create a test organization and project via the Clerk dashboard for the test environment,
+   then confirm the Clerk webhook fires and a record appears in the `organizations` table.
+
+4. Use the Convex dashboard Data browser to create:
+   - A `projects` record under the test org
+   - An `agents` record under that project
+
+5. Copy the `_id` of the agents record. Set it as the `TEST_AGENT_ID` secret.
+
+6. Create an API key via the web UI or Convex dashboard, hash it with SHA-256, and insert it
+   into the `api_keys` table. Set the raw key as `TEST_API_KEY`.
+
+### Permanent deployment policy
+
+The CI integration tests use a **permanent** `ci-test` Convex deployment. Do not use
+ephemeral per-PR deployments — setup/teardown timing between Convex provisioning and
+the test runner has historically caused flaky failures.
+
+The `ci-test` deployment is shared across all PRs. Tests are designed to be idempotent
+(duplicate `sequenceNumber` returns the existing event ID) so concurrent PR runs do not
+corrupt each other's state.
+
+---
+
+## Environment Variables for Standard CI Jobs
+
+Standard CI jobs (typecheck, lint, build, test) do not require real secrets. Dummy
+values are injected via the `env:` block in `.github/workflows/ci.yml`:
+
+```yaml
+env:
+  NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_ci_placeholder
+  NEXT_PUBLIC_CONVEX_URL: https://ci-placeholder.convex.cloud
+```
+
+Do not remove these — the env validation in `apps/web/src/lib/env.ts` runs at
+build time and will fail if these vars are absent.
+
+---
+
+## GC Cron: `BLOB_STORE_TOKEN` in Convex Environment
+
+The artifact GC cron (`convex/artifact_gc.ts`) requires `BLOB_STORE_TOKEN` to be set
+as a **Convex environment variable** (not a Next.js env var). If it is absent:
+
+- Convex artifact records will be deleted from the database on schedule.
+- The corresponding blobs will **not** be deleted from Vercel Blob storage.
+- Blobs will accumulate indefinitely until the token is set.
+
+To set it:
+```
+npx convex env set BLOB_STORE_TOKEN <your-vercel-blob-read-write-token>
+```
+
+This must be done for every Convex deployment (dev, ci-test, production) independently.

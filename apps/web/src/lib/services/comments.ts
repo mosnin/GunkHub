@@ -39,6 +39,18 @@ export async function listComments(
 }
 
 /**
+ * Resolve a comment by its ID.
+ * Requires Clerk session — resolvedBy is derived from the session.
+ */
+export async function resolveComment(commentId: string): Promise<Comment> {
+  const client = await getAuthedClient()
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await client.mutation(convex.comments.resolveComment, { commentId })
+  return mapComment(doc as Record<string, unknown>)
+}
+
+/**
  * Create a comment on a run or event.
  * Requires Clerk session — authorId is derived from the session, not the request body.
  */

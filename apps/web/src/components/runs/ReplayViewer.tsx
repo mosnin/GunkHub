@@ -151,6 +151,13 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
         Replay is a derived projection. The event log is not modified.
       </div>
 
+      {/* Truncation warning — shown when the run exceeds MAX_EVENTS_PER_REPLAY */}
+      {projection.truncated && (
+        <div className="px-4 py-2 bg-orange-950/40 border border-orange-900/50 rounded-md mx-6 mt-2 text-xs text-orange-400 font-medium shrink-0">
+          This run contains more than 10,000 events. Only the first 10,000 are shown in this replay.
+        </div>
+      )}
+
       {/* Controls bar */}
       <div className="flex items-center gap-3 px-6 py-3 border-b border-neutral-800 mt-3 shrink-0">
         <button

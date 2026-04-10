@@ -3,6 +3,45 @@ import { v } from "convex/values";
 import { requireOrgMembership } from "./auth.js";
 
 /**
+ * Return the distinct agents that have at least one run in the given org.
+ * Used to populate the agent filter dropdown on the runs list page.
+ */
+export const listDistinctAgents = query({
+  args: {
+    orgId: v.id("organizations"),
+  },
+  handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+
+    // Collect all runs for the org, then derive the distinct agent IDs.
+    // This approach avoids a separate cross-table join and is acceptable
+    // at v1 scale (orgId-scoped index keeps the scan bounded).
+    const runs = await ctx.db
+      .query("runs")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .collect();
+
+    const seenAgentIds = new Set<string>();
+    const agentIds: string[] = [];
+    for (const run of runs) {
+      const id = run.agentId as string;
+      if (!seenAgentIds.has(id)) {
+        seenAgentIds.add(id);
+        agentIds.push(id);
+      }
+    }
+
+    // Fetch the agent records for each distinct agentId.
+    const agents = await Promise.all(
+      agentIds.map((id) => ctx.db.get(id as Parameters<typeof ctx.db.get>[0])),
+    );
+
+    // Filter out any stale IDs where the agent record no longer exists.
+    return agents.filter(Boolean);
+  },
+});
+
+/**
  * List all agents belonging to a project.
  */
 export const listAgents = query({

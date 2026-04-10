@@ -4,8 +4,8 @@ import { useState, useTransition } from 'react'
 
 import type { RunStatus } from '@agent-flight-recorder/contracts'
 
-import { updateRunTagsAction } from '@/lib/actions/runs'
 import { Badge } from '@/components/ui/Badge'
+import { updateRunTagsAction } from '@/lib/actions/runs'
 import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
 
 interface RunHeaderProps {

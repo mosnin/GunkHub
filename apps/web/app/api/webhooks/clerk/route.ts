@@ -26,6 +26,18 @@ interface ClerkOrganizationMembershipData {
   public_user_data: {
     user_id: string
   }
+  /** Clerk role: "org:admin" or "org:member". Viewer role is set manually. */
+  role: string
+}
+
+/**
+ * Map a Clerk organization role to our internal role model.
+ * Clerk uses "org:admin" and "org:member". We use "admin", "member", "viewer".
+ * "viewer" is a local concept — Clerk does not have this role.
+ */
+function clerkRoleToInternal(clerkRole: string): 'admin' | 'member' | 'viewer' {
+  if (clerkRole === 'org:admin') return 'admin'
+  return 'member'
 }
 
 interface ClerkWebhookEvent {
@@ -97,7 +109,8 @@ export async function POST(req: Request) {
         await handleOrganizationUpsert(data)
         break
       }
-      case 'organizationMembership.created': {
+      case 'organizationMembership.created':
+      case 'organizationMembership.updated': {
         const data = event.data as unknown as ClerkOrganizationMembershipData
         await handleOrganizationMembershipCreated(data)
         break
@@ -133,17 +146,23 @@ async function handleOrganizationUpsert(data: ClerkOrganizationData) {
 async function handleOrganizationMembershipCreated(
   data: ClerkOrganizationMembershipData,
 ) {
-  // Ensure the org record exists before the membership is processed.
-  // In normal Clerk flow, organization.created fires first, but we handle
-  // the membership event defensively in case of delivery reordering.
   const org = data.organization
   const client = getPublicClient()
+
+  // Ensure the org record exists before creating the membership.
+  // In normal Clerk flow, organization.created fires first, but we handle
+  // reordered delivery defensively.
   await client.mutation(convex.organizations.upsertOrganization, {
     clerkOrgId: org.id,
     name: org.name,
     slug: org.slug,
   })
-  // Member-level user record creation (e.g. user_memberships) is deferred
-  // to when the user first authenticates via the Clerk JWT path, which
-  // already resolves org membership from the auth context.
+
+  // Create or update the user membership record in Convex.
+  // Without this row, requireOrgMembership rejects the user on every query/mutation.
+  await client.mutation(convex.organizations.upsertMembership, {
+    clerkUserId: data.public_user_data.user_id,
+    clerkOrgId: org.id,
+    role: clerkRoleToInternal(data.role),
+  })
 }

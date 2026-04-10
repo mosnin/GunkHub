@@ -1,7 +1,7 @@
 import { notFound } from 'next/navigation'
 import { Suspense } from 'react'
 
-import type { Artifact, FailureSummary } from '@agent-flight-recorder/contracts'
+import type { Artifact, Comment, FailureSummary } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { ArtifactList } from '@/components/runs/ArtifactList'
@@ -13,6 +13,7 @@ import { Timeline } from '@/components/runs/Timeline'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { LoadingState } from '@/components/ui/LoadingState'
 import { listArtifacts } from '@/lib/services/artifacts'
+import { listComments } from '@/lib/services/comments'
 import { listEvents } from '@/lib/services/events'
 import { getReplayProjection } from '@/lib/services/replay'
 import { getRun } from '@/lib/services/runs'
@@ -48,6 +49,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   let fetchError: string | null = null
   let failureSummary: FailureSummary | null = null
   let artifactsData: { artifacts: Artifact[] } = { artifacts: [] }
+  let commentsData: Comment[] = []
 
   try {
     runData = await getRun(runId)
@@ -70,6 +72,12 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
     artifactsData = await listArtifacts(runId)
   } catch {
     // Non-fatal: show empty artifact list if fetch fails
+  }
+
+  try {
+    commentsData = await listComments(runId, 'run')
+  } catch {
+    // Non-fatal: show empty comment thread if fetch fails
   }
 
   if (fetchError) {
@@ -153,7 +161,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         )}
         {activeTab === 'comments' && (
           <Suspense fallback={<LoadingState message="Loading comments..." />}>
-            <CommentThread targetId={runId} targetType="run" />
+            <CommentThread targetId={runId} targetType="run" initialComments={commentsData} />
           </Suspense>
         )}
       </div>

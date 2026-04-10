@@ -187,3 +187,57 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+
+  integration-test:
+    name: Integration Tests (Real Convex)
+    runs-on: ubuntu-latest
+    needs: [build]
+    # Required secrets: CONVEX_TEST_URL, TEST_API_KEY, TEST_AGENT_ID
+    # These must be configured on the repository (Settings → Secrets and variables → Actions).
+    # The tests use a permanent "ci-test" Convex deployment to avoid setup/teardown flakiness.
+    # If secrets are absent the describe.skipIf guard will skip all real-Convex tests gracefully.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Cache Turbo
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: ${{ runner.os }}-turbo-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run integration tests
+        env:
+          CONVEX_TEST_URL: ${{ secrets.CONVEX_TEST_URL }}
+          TEST_API_KEY: ${{ secrets.TEST_API_KEY }}
+          TEST_AGENT_ID: ${{ secrets.TEST_AGENT_ID }}
+        run: pnpm test --reporter=verbose tests/integration/api.test.ts

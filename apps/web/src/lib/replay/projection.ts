@@ -7,6 +7,13 @@ import type { Event, FrameStatus, ReplayActor, ReplayFrame, ReplayProjection, Ru
 export const MAX_REPLAY_DEPTH = 20;
 
 /**
+ * Maximum number of events to process in a single replay projection.
+ * Runs exceeding this limit will set truncated=true and only include
+ * the first MAX_EVENTS_PER_REPLAY events sorted by sequenceNumber.
+ */
+export const MAX_EVENTS_PER_REPLAY = 10_000;
+
+/**
  * Truncates a string to at most `maxLen` characters, appending "..." if truncated.
  */
 function truncate(s: string, maxLen: number): string {
@@ -230,7 +237,11 @@ export function buildReplayProjection(run: Run, events: Event[]): ReplayProjecti
   }
 
   // 1. Sort by sequenceNumber ascending.
-  const sorted = [...events].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+  const allSorted = [...events].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+
+  // Truncate to MAX_EVENTS_PER_REPLAY if necessary.
+  const truncated = allSorted.length > MAX_EVENTS_PER_REPLAY;
+  const sorted = truncated ? allSorted.slice(0, MAX_EVENTS_PER_REPLAY) : allSorted;
 
   // 2. Reference timestamp is the first event.
   // sorted is non-empty (checked above), so these accesses are safe.
@@ -283,5 +294,6 @@ export function buildReplayProjection(run: Run, events: Event[]): ReplayProjecti
     duration_ms,
     isComplete,
     isFailed,
+    ...(truncated && { truncated: true }),
   };
 }
