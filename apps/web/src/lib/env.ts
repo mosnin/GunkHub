@@ -5,6 +5,11 @@ export const env = {
   // Server-only — never sent to the browser
   CLERK_SECRET_KEY: process.env.CLERK_SECRET_KEY ?? '',
   CLERK_WEBHOOK_SECRET: process.env.CLERK_WEBHOOK_SECRET ?? '',
+  // Blob storage — optional for local dev; required in production for large payload externalization.
+  // When unset, the StubBlobStorageAdapter is used (in-memory, data lost on restart).
+  // See .env.example for setup instructions.
+  BLOB_STORE_TOKEN: process.env.BLOB_STORE_TOKEN ?? '',
+  BLOB_STORE_URL: process.env.BLOB_STORE_URL ?? '',
 }
 
 // Validate public vars at startup in the browser

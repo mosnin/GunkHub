@@ -2,13 +2,13 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 4 — Hardening)
+Last updated: 2026-04-10 (Prompt 5 — Release Candidate)
 
 ---
 
 ## 1. Current State
 
-Prompt 4 (Hardening) is complete. The following summarizes the full state after Prompts 1–4.
+Prompt 5 (Release Candidate) is complete. The following summarizes the full state after Prompts 1–5.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
@@ -30,6 +30,14 @@ Prompt 4 (Hardening) is complete. The following summarizes the full state after 
 
 **packages/sdk is implemented (except HTTP transport).** The `Recorder` class, `Events` builders, `buildEvent` helper, `HttpTransport` (stubbed), `Transport` interface, all types. The SDK is functional end-to-end when a `MockTransport` is injected (as in tests).
 
+**apps/web production storage layer is implemented (Prompt 5):**
+- `apps/web/src/lib/storage/vercel.ts` — `VercelBlobAdapter` production implementation via native fetch, activated when `BLOB_STORE_TOKEN` env var is present
+- `apps/web/src/lib/storage/index.ts` — `getStorageAdapter()` updated to use `BLOB_STORE_TOKEN` presence (not `BLOB_STORAGE_PROVIDER`) to select the active adapter
+- `apps/web/src/lib/replay/verify.ts` — `verifyProjectionIntegrity(run, events): ProjectionVerifyResult` pure function for sequence integrity checks
+- `apps/web/app/api/health/route.ts` — `GET /api/health` operator endpoint
+- `apps/web/src/components/runs/SystemHealthPanel.tsx` — health UI component
+- `scripts/rebuild-projection.ts` — CLI script for event integrity verification
+
 **apps/web hardening layer is implemented (Prompt 4):**
 - `apps/web/src/lib/storage/` — `BlobStorageAdapter` interface, `StubBlobStorageAdapter`, `getStorageAdapter()` factory, `PAYLOAD_EXTERNALIZATION_THRESHOLD` (10 KB), `sha256Hex`
 - `apps/web/app/api/events/route.ts` — 10 KB payload size guard (HTTP 413)
@@ -50,23 +58,26 @@ Prompt 4 (Hardening) is complete. The following summarizes the full state after 
 - Service layer stubs: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`
 - No Next.js pages exist yet (no `app/` directory) — gap from Prompt 2
 
-**Tests (as of Prompt 4):**
+**Tests (as of Prompt 5):**
 - `tests/unit/sdk.test.ts` — Recorder tests with MockTransport, passing
 - `tests/unit/contracts.test.ts` — Type shape and EventType coverage tests, passing
 - `tests/unit/replay.test.ts` — buildReplayProjection algorithm tests (10 test groups)
 - `tests/unit/failure.test.ts` — buildFailureSummary algorithm tests (8 test groups)
 - `tests/unit/diff.test.ts` — buildRunDiff algorithm tests (10 test groups)
-- `tests/unit/storage.test.ts` — BlobStorageAdapter, sha256Hex, PAYLOAD_EXTERNALIZATION_THRESHOLD (28 tests, Prompt 4)
+- `tests/unit/storage.test.ts` — BlobStorageAdapter, sha256Hex, PAYLOAD_EXTERNALIZATION_THRESHOLD (28 tests, updated in Prompt 5 for new BLOB_STORE_TOKEN-based adapter selection)
+- `tests/unit/projection-verify.test.ts` — verifyProjectionIntegrity (68 tests, Prompt 5)
+- `tests/unit/flight-recorder.test.ts` — FlightRecorder and RunRecorder HTTP transport tests (33 tests)
 - `tests/integration/api.test.ts` — API response shape tests (16 tests)
 - `tests/fixtures/runs.ts` — Sample run/event fixture data
 - `tests/fixtures/events.ts` — 6 scenario fixtures for explainability algorithm tests
-- **Total: 288 tests, all passing**
+- **Total: 356 tests in tests/ workspace, all passing; 260 SDK tests, all passing (616 total)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
 - ADR-0005: On-demand replay and diff projection strategy (Prompt 3)
 - ADR-0006: Artifact externalization policy — 10 KB threshold, blob storage, ArtifactPointer (Prompt 4)
 - ADR-0007: Ingestion idempotency — (runId, sequenceNumber) dedup, returns existing ID (Prompt 4)
+- ADR-0008: VercelBlobAdapter design — native fetch, no @vercel/blob SDK dependency (Prompt 5)
 
 ---
 

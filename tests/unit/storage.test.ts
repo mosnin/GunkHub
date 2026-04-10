@@ -178,9 +178,9 @@ describe('StubBlobStorageAdapter', () => {
 // ---------------------------------------------------------------------------
 
 describe('getStorageAdapter()', () => {
-  it('returns the stub adapter when BLOB_STORAGE_PROVIDER is unset', () => {
-    const original = process.env['BLOB_STORAGE_PROVIDER']
-    delete process.env['BLOB_STORAGE_PROVIDER']
+  it('returns an adapter when BLOB_STORE_TOKEN is unset (stub adapter for local dev)', () => {
+    const original = process.env['BLOB_STORE_TOKEN']
+    delete process.env['BLOB_STORE_TOKEN']
     try {
       const adapter = getStorageAdapter()
       expect(adapter).toBeDefined()
@@ -189,51 +189,53 @@ describe('getStorageAdapter()', () => {
       expect(typeof adapter.getUrl).toBe('function')
     } finally {
       if (original !== undefined) {
-        process.env['BLOB_STORAGE_PROVIDER'] = original
+        process.env['BLOB_STORE_TOKEN'] = original
       }
     }
   })
 
-  it('returns an adapter with upload and getUrl when BLOB_STORAGE_PROVIDER is some other non-vercel value', () => {
-    const original = process.env['BLOB_STORAGE_PROVIDER']
-    process.env['BLOB_STORAGE_PROVIDER'] = 's3'
+  it('returns an adapter with upload and getUrl when BLOB_STORE_TOKEN is unset', () => {
+    const original = process.env['BLOB_STORE_TOKEN']
+    delete process.env['BLOB_STORE_TOKEN']
     try {
       const adapter = getStorageAdapter()
       expect(typeof adapter.upload).toBe('function')
       expect(typeof adapter.getUrl).toBe('function')
     } finally {
       if (original !== undefined) {
-        process.env['BLOB_STORAGE_PROVIDER'] = original
-      } else {
-        delete process.env['BLOB_STORAGE_PROVIDER']
+        process.env['BLOB_STORE_TOKEN'] = original
       }
     }
   })
 
-  it('throws when BLOB_STORAGE_PROVIDER is "vercel"', () => {
-    const original = process.env['BLOB_STORAGE_PROVIDER']
-    process.env['BLOB_STORAGE_PROVIDER'] = 'vercel'
+  it('returns an adapter with upload and getUrl when BLOB_STORE_TOKEN is set (Vercel Blob path)', () => {
+    const original = process.env['BLOB_STORE_TOKEN']
+    process.env['BLOB_STORE_TOKEN'] = 'vercel_blob_rw_test_token'
     try {
-      expect(() => getStorageAdapter()).toThrow()
+      const adapter = getStorageAdapter()
+      expect(adapter).toBeDefined()
+      expect(typeof adapter.upload).toBe('function')
+      expect(typeof adapter.getUrl).toBe('function')
     } finally {
       if (original !== undefined) {
-        process.env['BLOB_STORAGE_PROVIDER'] = original
+        process.env['BLOB_STORE_TOKEN'] = original
       } else {
-        delete process.env['BLOB_STORAGE_PROVIDER']
+        delete process.env['BLOB_STORE_TOKEN']
       }
     }
   })
 
-  it('throws with a clear error message when BLOB_STORAGE_PROVIDER is "vercel"', () => {
-    const original = process.env['BLOB_STORAGE_PROVIDER']
-    process.env['BLOB_STORAGE_PROVIDER'] = 'vercel'
+  it('does not throw synchronously regardless of BLOB_STORE_TOKEN value', () => {
+    const original = process.env['BLOB_STORE_TOKEN']
+    // Both set and unset should not throw synchronously — adapter is always returned
+    process.env['BLOB_STORE_TOKEN'] = 'some-token'
     try {
-      expect(() => getStorageAdapter()).toThrow(/vercel/i)
+      expect(() => getStorageAdapter()).not.toThrow()
     } finally {
       if (original !== undefined) {
-        process.env['BLOB_STORAGE_PROVIDER'] = original
+        process.env['BLOB_STORE_TOKEN'] = original
       } else {
-        delete process.env['BLOB_STORAGE_PROVIDER']
+        delete process.env['BLOB_STORE_TOKEN']
       }
     }
   })

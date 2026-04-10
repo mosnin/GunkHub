@@ -2,6 +2,52 @@
 
 ---
 
+## Prompt 5 — Release Candidate: Production Storage, Projection Verification, Deployment Docs
+
+**Date:** 2026-04-10
+
+### What changed
+
+- `apps/web/src/lib/storage/vercel.ts` — `VercelBlobAdapter` production implementation using native `fetch` (no `@vercel/blob` package). Activated when `BLOB_STORE_TOKEN` env var is set.
+- `apps/web/src/lib/storage/index.ts` — `getStorageAdapter()` updated: uses `BLOB_STORE_TOKEN` presence (not `BLOB_STORAGE_PROVIDER`) to select Vercel Blob vs stub adapter.
+- `apps/web/src/lib/replay/verify.ts` — `verifyProjectionIntegrity(run, events)` pure function: checks sequence contiguity, detects duplicates, validates projection does not throw, produces `ProjectionVerifyResult` with structured error list and human-readable summary.
+- `scripts/rebuild-projection.ts` — CLI tool for verifying run event sequence integrity locally and in CI.
+- `apps/web/app/api/health/route.ts` — `GET /api/health` endpoint: returns storage adapter name, configured status, and timestamp. Operator health signal.
+- `apps/web/src/components/runs/SystemHealthPanel.tsx` — displays health endpoint data in the web UI.
+- `docs/adrs/0008_vercel_blob_adapter.md` — decision record for VercelBlobAdapter design (native fetch, no SDK dependency).
+- `tests/unit/projection-verify.test.ts` — 68 new unit tests for `verifyProjectionIntegrity`: valid cases, empty events, sequence gaps, duplicate detection, large runs (500 events), nested events, failed run failure summaries, summary string content, projection field correctness, and determinism guarantees.
+- `tests/unit/storage.test.ts` — updated 2 tests to match new `getStorageAdapter()` behavior (BLOB_STORE_TOKEN-based selection, no longer throws for BLOB_STORAGE_PROVIDER=vercel).
+- `docs/deployment_checklist.md` — step-by-step checklist for local dev → staging → production deployment.
+- `docs/release_readiness.md` — release candidate status document: what is ready, what is deferred, hard decisions, known gaps.
+- `docs/operations_runbook.md` — operational runbook for common production issues.
+- `.env.example` — `BLOB_STORE_TOKEN` and `BLOB_STORE_URL` documented (replaces `BLOB_READ_WRITE_TOKEN` and `BLOB_STORAGE_PROVIDER`).
+
+### Why these release decisions
+
+- **VercelBlobAdapter via native fetch**: avoids adding `@vercel/blob` as a dependency. The SDK must run in any Node.js environment. Keeping the blob adapter as a thin fetch wrapper with a single file to update if the API changes is the correct trade-off at v1 scale.
+- **`BLOB_STORE_TOKEN` presence as the selector signal**: simpler than a `BLOB_STORAGE_PROVIDER` enum. If you have a token, use Vercel Blob. If not, use the stub. No risk of misconfigured provider name.
+- **`verifyProjectionIntegrity` as a pure function**: aligns with the existing pattern of pure, deterministic algorithms for all projection work (ADR-0005). Makes it trivially testable and usable in both the web app and CLI scripts without dependency on any runtime context.
+- **Deployment docs as first-class artifacts**: the system is approaching production readiness. Deployment checklists and runbooks must exist before any production deployment attempt. They cannot be written retrospectively after an outage.
+
+### Hard-to-reverse decisions
+
+- **env var naming: `BLOB_STORE_TOKEN` (not `BLOB_READ_WRITE_TOKEN` or `BLOB_STORAGE_PROVIDER`)**: all deployments must use this exact var name. Changing it later requires coordination across all environments and any external tooling that sets the variable.
+- **No fallback if `BLOB_STORE_TOKEN` expires**: the adapter is selected at request time, not at server startup. A token expiry causes upload failures without a graceful fallback. This is acceptable for v1 (token TTLs are long) but must be addressed before high-volume production use.
+
+### Known gaps
+
+- SDK does not auto-externalize large payloads (> 10 KB). The API returns HTTP 413 — the SDK must be updated in v1.1 to call `/api/artifacts/upload` before `/api/events` for oversized payloads.
+- No automatic artifact garbage collection for orphaned or failed-upload artifacts.
+- Integration tests in `tests/integration/api.test.ts` remain fixture-based stubs; real Convex integration requires a live deployment.
+
+### Test count
+
+356 tests passing in `tests/` workspace (was 288 after Prompt 4, was 2 failing at Prompt 5 start due to `storage.test.ts` tests not reflecting the updated `getStorageAdapter()` behavior; fixed in Prompt 5).
+260 SDK tests passing in `packages/sdk`.
+Total: 616 tests, all green.
+
+---
+
 ## Prompt 4 — Hardening: Blob Storage, Ingestion Idempotency, Artifact UI
 
 **Date:** 2026-04-10

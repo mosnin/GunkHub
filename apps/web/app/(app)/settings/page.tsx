@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ApiKeysSection } from '@/components/settings/ApiKeysSection'
+import { SystemHealthPanel } from '@/components/settings/SystemHealthPanel'
 import { Card } from '@/components/ui/Card'
 
 export const metadata: Metadata = { title: 'Settings' }
@@ -67,6 +68,9 @@ export default function SettingsPage() {
             </p>
           </div>
         </Card>
+
+        {/* System Health — operator-facing storage and projection status */}
+        <SystemHealthPanel />
 
         {/* API Keys — functional UI (route handled by Team A at /api/api-keys) */}
         <ApiKeysSection />

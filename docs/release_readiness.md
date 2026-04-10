@@ -1,0 +1,141 @@
+# Release Readiness — v1
+
+**Date:** 2026-04-10
+**Status:** Release Candidate
+
+---
+
+## What is ready for v1
+
+### Data layer (Convex)
+
+- **Canonical event log** — immutable, append-only, Convex-backed. No `updateEvent`
+  or `deleteEvent` mutations exist. The event sequence is the ground truth.
+- **Idempotent event ingestion** — `sdkCreateEvents` deduplicates by
+  `(runId, sequenceNumber)`. Safe to retry on network failure without creating
+  duplicate events. Documented in ADR-0007.
+- **Org tenancy enforcement** — every Convex query and mutation filters by `orgId`.
+  No cross-org data leakage is possible via the query layer.
+- **Full entity hierarchy** — `organizations`, `projects`, `agents`, `agent_versions`,
+  `runs`, `events`, `artifacts`, `comments`, `user_memberships` all implemented with
+  correct indexes.
+
+### Ingestion pipeline (SDK + API)
+
+- **SDK recording pipeline** — `FlightRecorder` → `RunRecorder` → `recordEvent` →
+  `complete` / `fail`. Fully implemented with real HTTP transport (no stubs).
+- **Payload size enforcement** — events with JSON payload > 10,240 bytes are rejected
+  at `POST /api/events` with HTTP 413. Documented in ADR-0006.
+- **Artifact externalization path** — `POST /api/artifacts/upload` externalizes large
+  payloads to blob storage and records a pointer in Convex. API-key authenticated.
+- **Production blob storage adapter** — `VercelBlobAdapter` using native `fetch` (no
+  `@vercel/blob` package dependency). Activated when `BLOB_STORE_TOKEN` env var is set.
+
+### Auth
+
+- **Clerk integration** — sign-in, sign-up, org creation, and org membership all
+  handled by Clerk. Webhook bootstrap creates Convex org records on
+  `organization.created` events.
+- **API key authentication** — SDK-facing routes (`/api/runs`, `/api/events`,
+  `/api/artifacts/upload`) require `x-api-key` header. Keys are stored hashed in
+  Convex `api_keys` table.
+
+### Explainability layer (web)
+
+- **Replay projection** — `buildReplayProjection(run, events)` produces a
+  deterministic, on-demand projection with per-frame actor, status, elapsed time,
+  payload preview, and nesting depth. Pure function, no side effects.
+- **Failure summary** — `buildFailureSummary(run, events)` identifies failure points
+  from the event log. Deterministic heuristic — never AI inference.
+- **Run diff** — `buildRunDiff(leftRunId, rightRunId, leftEvents, rightEvents)` compares
+  two runs by sequence position. Surfaces added, removed, and changed events.
+- **Projection integrity verification** — `verifyProjectionIntegrity(run, events)`
+  checks sequence contiguity, detects duplicates, validates the projection does not
+  throw, and produces a human-readable summary. Used by the `rebuild-projection.ts`
+  script.
+- **On-demand computation** — no materialized projections. The event log is the only
+  source of truth. Projections are always rebuilt from canonical events. See ADR-0005.
+
+### Operator tooling
+
+- **Health endpoint** — `GET /api/health` returns the storage adapter name and
+  configuration status. Use this to verify the production adapter is active.
+- **Projection rebuild script** — `scripts/rebuild-projection.ts` verifies a run's
+  event sequence integrity from the command line.
+
+### Test coverage
+
+- **356 tests passing** in the `tests/` workspace (unit + integration stubs).
+- **260 SDK tests passing** in the `packages/sdk` package.
+- All unit tests use `MockTransport` or in-memory stubs — no network calls, instant.
+
+---
+
+## What is explicitly deferred to v1.1
+
+- **SDK auto-externalization** — the SDK does not yet detect payloads > 10 KB before
+  calling `/api/events`. If a payload exceeds the limit, the API returns HTTP 413 and
+  the SDK surfaces that error to the caller. Auto-externalization (upload to
+  `/api/artifacts/upload` then replace payload with pointer) is v1.1 scope.
+- **Automatic artifact garbage collection** — artifacts orphaned by failed or retried
+  requests are not cleaned up automatically. No GC policy is implemented.
+- **Background projection verification** — no scheduled job verifies run sequence
+  integrity in production. Integrity checks are on-demand only (via the CLI script).
+- **Run search and filtering UI** — the runs list shows all runs without filtering.
+  Status and date range filters are v1.1 scope.
+- **Tags and metadata display** — `tags` and `metadata` fields are stored in Convex
+  but not displayed in the UI.
+- **Live run monitoring** — no real-time event streaming. The run detail page does not
+  auto-refresh while a run is in progress.
+- **RBAC beyond basic membership** — roles (`admin`, `member`, `viewer`) are stored
+  on `user_memberships` but not enforced beyond the basic membership check.
+- **Vercel Blob SDK package** — the `VercelBlobAdapter` uses native `fetch` directly
+  to avoid adding `@vercel/blob` as a dependency. If the Vercel Blob REST API changes,
+  update `apps/web/src/lib/storage/vercel.ts`.
+- **Integration tests against live Convex** — all tests in `tests/integration/api.test.ts`
+  test API response shapes against static fixtures. Real integration tests require a
+  live Convex deployment.
+- **Comments mutations** — `createComment` exists but `resolveComment` is not wired
+  into the UI.
+
+---
+
+## Hard decisions
+
+**On-demand projections** — projections are recomputed at request time rather than
+materialized. This is correct for v1 scale (< 1,000 events per run). The computation
+is dominated by Convex fetch latency, not projection CPU time. Revisit if run sizes
+reach 50,000+ events or if replay endpoint p99 exceeds 2 seconds.
+
+**Blob storage via native fetch** — `VercelBlobAdapter` calls the Vercel Blob REST API
+directly rather than using the `@vercel/blob` npm package. This avoids adding a
+dependency that might break in edge runtimes or constrained environments. The trade-off
+is that if Vercel changes its Blob API, we update one file (`vercel.ts`).
+
+**No materialized projections** — keeping the event log as the sole source of truth is
+correct and testable. Materialized projections add a synchronization problem: what
+happens if the materialized view is stale? With on-demand projection, there is no
+stale-view problem.
+
+**`(runId, sequenceNumber)` as the idempotency key** — natural key matching how the
+SDK assigns sequence numbers. O(1) lookup via the existing `by_run` Convex index.
+Documented in ADR-0007.
+
+**env var naming** — `BLOB_STORE_TOKEN` (not `BLOB_READ_WRITE_TOKEN` or
+`BLOB_STORAGE_PROVIDER`) is the signal for activating the Vercel Blob adapter. The
+adapter is activated by the presence of the token, not by a separate provider flag.
+This is a simpler contract: if the token is set, use Vercel Blob; otherwise use the
+stub adapter. Changing this naming later would be a breaking env var change requiring
+coordination with all deployments.
+
+---
+
+## Known gaps and risks
+
+| Gap | Severity | Mitigation |
+|-----|----------|------------|
+| SDK does not auto-externalize large payloads | Medium | API returns HTTP 413; caller must handle and retry with smaller payload or use `/api/artifacts/upload` directly |
+| `BLOB_STORE_TOKEN` expiry has no fallback | High | Monitor token expiry; rotate before expiry; health endpoint will show `configured: false` if token is absent |
+| No run integrity verification in production | Low | Sequence gaps could appear if a Convex mutation fails mid-batch; use `rebuild-projection.ts` to check individual runs manually |
+| Large runs (> 10,000 events) may time out | Low | Replay endpoint fetches all events; no pagination timeout is enforced. Mitigate with per-run event count limits at the SDK level. |
+| `comments` mutations are minimal | Low | `resolveComment` is not wired into the UI; comments are appendable but not resolvable from the web |
