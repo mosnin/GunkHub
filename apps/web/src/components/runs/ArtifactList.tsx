@@ -47,6 +47,7 @@ export function ArtifactList({ artifacts, loading }: ArtifactListProps) {
               <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Size</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Created</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Storage Key</th>
+              <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Download</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-neutral-800/60">
@@ -58,6 +59,19 @@ export function ArtifactList({ artifacts, loading }: ArtifactListProps) {
                 <td className="px-4 py-3 text-neutral-500 tabular-nums">{formatDate(artifact.createdAt)}</td>
                 <td className="px-4 py-3 font-mono text-xs text-neutral-600 truncate max-w-xs" title={artifact.storageKey}>
                   {artifact.storageKey}
+                </td>
+                <td className="px-4 py-3">
+                  <a
+                    href={`/api/artifacts/${artifact.id}/download`}
+                    download
+                    title="Download artifact"
+                    className="inline-flex items-center justify-center w-7 h-7 rounded text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition-colors duration-75"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                      <path d="M7 1v8M4 6l3 3 3-3M2 11h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    <span className="sr-only">Download</span>
+                  </a>
                 </td>
               </tr>
             ))}

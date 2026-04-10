@@ -28,6 +28,21 @@ export const listArtifacts = query({
 });
 
 /**
+ * Look up a single artifact by its Convex ID, verifying org membership.
+ */
+export const getArtifact = query({
+  args: {
+    artifactId: v.id("artifacts"),
+  },
+  handler: async (ctx, args) => {
+    const artifact = await ctx.db.get(args.artifactId);
+    if (!artifact) return null;
+    await requireOrgMembership(ctx, artifact.orgId);
+    return artifact;
+  },
+});
+
+/**
  * Record an artifact that has already been uploaded to blob storage.
  * The caller provides the ArtifactPointer (storage coordinates) along with
  * run/event association metadata.

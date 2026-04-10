@@ -36,6 +36,7 @@ export const convex = {
   },
   artifacts: {
     listArtifacts: makeFunctionReference<Q>('artifacts:listArtifacts'),
+    getArtifact: makeFunctionReference<Q>('artifacts:getArtifact'),
   },
   comments: {
     listComments: makeFunctionReference<Q>('comments:listComments'),
