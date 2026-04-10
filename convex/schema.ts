@@ -46,6 +46,7 @@ export default defineSchema({
     version: v.string(),
     changelog: v.optional(v.string()),
     createdAt: v.number(),
+    configSnapshot: v.optional(v.any()),
   }).index("by_agent", ["agentId"]),
 
   runs: defineTable({

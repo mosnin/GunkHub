@@ -15,6 +15,11 @@ export const convex = {
     listAgentsByOrg: makeFunctionReference<Q>('agents:listAgentsByOrg'),
     createAgent: makeFunctionReference<M>('agents:createAgent'),
   },
+  agent_versions: {
+    createAgentVersion: makeFunctionReference<M>('agent_versions:createAgentVersion'),
+    listAgentVersions: makeFunctionReference<Q>('agent_versions:listAgentVersions'),
+    getAgentVersion: makeFunctionReference<Q>('agent_versions:getAgentVersion'),
+  },
   projects: {
     listProjects: makeFunctionReference<Q>('projects:listProjects'),
     getProject: makeFunctionReference<Q>('projects:getProject'),

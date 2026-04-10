@@ -36,6 +36,7 @@ export interface AgentVersion {
   /** Semver string, e.g. "1.2.3" */
   version: string;
   changelog?: string;
+  configSnapshot?: Record<string, unknown>;
   createdAt: number;
 }
 
