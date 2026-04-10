@@ -2,6 +2,53 @@
 
 ---
 
+## Prompt 12 — 2026-04-10: Artifact Download, Keyboard Navigation, Event Deep Links, Stale Run Expiry
+
+### What changed
+
+**Team A — Artifact download route (ADR-0016)**
+- `convex/artifacts.ts`: added `getArtifact` public query — looks up artifact by Convex ID and verifies org membership via `requireOrgMembership`; returns null if not found
+- `apps/web/src/lib/convexFunctions.ts`: added `getArtifact` function reference in the `artifacts` section
+- `apps/web/app/api/artifacts/[id]/download/route.ts` (NEW): GET handler — Clerk session auth (401 if missing), Convex artifact query with org verification (404 if wrong org), fetch-and-stream from Vercel Blob (`BLOB_STORE_URL/${storageKey}`) with `Authorization: Bearer ${BLOB_STORE_TOKEN}`, returns `Content-Type: mimeType` and `Content-Disposition: attachment; filename="<name>"`. Returns 502 if blob fetch fails.
+- `apps/web/src/components/runs/ArtifactList.tsx`: added "Download" column with `<a href="/api/artifacts/${id}/download" download>` anchor per artifact row (server component, no client-side JS required)
+- `docs/adrs/0016_artifact_download.md` (NEW): documents the two-layer auth model (Clerk + Convex org check) and the fetch-and-proxy trade-off
+
+**Team B — Stale run expiry (ADR-0017)**
+- `convex/helpers/pagination.ts`: added `STALE_RUN_TIMEOUT_MS = 86_400_000` (24 h) and `STALE_RUN_BATCH_SIZE = 100`
+- `convex/stale_runs.ts` (NEW): `listStaleRuns` internalQuery (full-table filter for `status="running"` AND `startedAt < cutoff`, bounded with `.take(STALE_RUN_BATCH_SIZE)`), `markRunTimedOut` internalMutation (idempotent: returns early if run is missing or already non-running, patches `{status:"timed_out", endedAt:Date.now()}`), `expireStaleRuns` internalAction (orchestrates query → mutation loop, logs `batch=N expired=E errors=X`)
+- `convex/crons.ts`: added `"expire-stale-runs"` daily cron at `{ hourUTC: 3, minuteUTC: 0 }` (distinct from artifact GC at 02:00)
+- `tests/unit/stale_runs.test.ts` (NEW): 8 tests covering timeout constant value, batch size bounds, cutoff arithmetic, and markRunTimedOut safety invariants
+- `docs/operations_runbook.md`: replaced manual-only "Run stuck in running" fix with automatic cron description + manual fallback; removed "no automated timeout in v1" note
+- `docs/adrs/0017_stale_run_expiry.md` (NEW): records context, decision, and consequences
+
+**Team C — Keyboard navigation + event deep links (ADR-0018)**
+- `apps/web/src/components/runs/Timeline.tsx`: added `focusedIndex` state and `useRef` on the events container div; `onKeyDown` handles ArrowUp/ArrowDown (move focus) and Enter (toggle expand); `onFocus` initializes `focusedIndex` to 0; focused row gets `ring-1 ring-neutral-600` highlight; mouse interaction unchanged
+- `apps/web/src/components/runs/EventInspector.tsx`: refactored into `EventInspector` (state owner) + `EventInspectorInner` (client component with `useEffect`) to satisfy Rules of Hooks around conditional early returns; new `initialEventSeq?: number` prop initializes `selectedId` from the event with matching `sequenceNumber`; `focusedIdx` state drives left-panel row highlight and keyboard nav (ArrowUp/Down updates both `focusedIdx` and `selectedId`); `useEffect` syncs `?event=<sequenceNumber>` into URL via `history.replaceState` on selection change; "Copy link" button in right panel header copies `window.location.href` to clipboard
+- `apps/web/app/(app)/runs/[runId]/page.tsx`: added `event?: string` to `RunDetailPageProps.searchParams`; parses as integer (`parseInt(..., 10) || undefined`); passes `initialEventSeq` to `<EventInspector>`
+- `docs/adrs/0018_event_deep_link.md` (NEW): documents `?event=<sequenceNumber>` URL contract, `history.replaceState` behavior, and tab composability
+
+### Why these fit the architecture
+- Artifact download: fetch-and-proxy (not redirect) is required to set `Content-Disposition: attachment` header. The Next.js route is the correct place for Clerk auth + Convex org verification — keeps the Convex layer unaware of HTTP session mechanics.
+- Stale run expiry: an `internalAction` with `internalMutation` avoids user-auth requirements on scheduled jobs, matches the artifact GC pattern, and is safe — `markRunTimedOut` is idempotent and never touches terminal runs.
+- Keyboard nav: `focusedIndex` / `focusedIdx` state is local to the component — no new store, no new dependency. Arrow-key navigation is the standard pattern for engineering tools with dense event lists.
+- Event deep link: `history.replaceState` (not `router.push`) avoids adding browser history entries per keystroke, which would make the Back button unusable. `?event=N` by sequence number (not Convex ID) is stable, human-readable, and safe to share.
+
+### Hard-to-reverse decisions
+- Download route URL shape (`/api/artifacts/[id]/download`): changing would break existing saved URLs and bookmarks. Chosen once, permanent.
+- `?event=<sequenceNumber>` URL contract: changing to event ID would break shared links. sequenceNumber is more stable and human-readable than Convex internal IDs.
+
+### Known residual risks
+- Blob traffic is proxied through Next.js serverless functions. For very large artifacts, this could hit Vercel's 4.5 MB function response body limit. Acceptable at v1 — large artifacts should be rare and users can download via `GET /api/artifacts/[id]/download` directly.
+- Stale run expiry uses a full-table scan (no global `by_status` index). At v1 run volumes this is acceptable; if the runs table grows to millions of records, a dedicated index would reduce overhead.
+
+### Recommendation for Prompt 13
+- v1 is feature-complete. Focus on hardening and operations:
+  1. Smoke test on staging with real artifact download flow end-to-end
+  2. Consider API versioning (`/api/v1/`) before external clients rely on current paths
+  3. SDK auto-externalization (payloads > 10 KB automatically uploaded before `/api/events`) — currently a 413 surfaces to the caller
+
+---
+
 ## Prompt 11 — 2026-04-10: Operational Quality Pass (Filter Performance, GC Visibility, Tag Consistency, CI Gate)
 
 ### What changed

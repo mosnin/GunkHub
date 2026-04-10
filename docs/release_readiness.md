@@ -1,7 +1,7 @@
 # Release Readiness — v1
 
 **Date:** 2026-04-10
-**Status:** Release Candidate — Prompt 11 (operational quality pass)
+**Status:** Release Candidate — Prompt 12 (artifact download, keyboard nav, event deep links, stale run expiry)
 
 ---
 
@@ -65,7 +65,7 @@
 
 ### Test coverage
 
-- **426+ tests passing** across `tests/` and `packages/sdk` workspaces.
+- **451+ tests passing** across `tests/` and `packages/sdk` workspaces.
 - Unit tests cover replay, diff (including truncation), failure summary, storage, transport, artifact GC, and org bootstrap.
 - All unit tests use `MockTransport` or in-memory stubs — no network calls, instant.
 - Real-Convex integration tests (`tests/integration/api.test.ts`) run in CI when secrets are configured. Skipped gracefully otherwise. Merging to `main` requires secrets to be present.
@@ -100,8 +100,9 @@
 - **Vercel Blob SDK package** — the `VercelBlobAdapter` uses native `fetch` directly
   to avoid adding `@vercel/blob` as a dependency. If the Vercel Blob REST API changes,
   update `apps/web/src/lib/storage/vercel.ts`.
-- **Artifact download from UI** — artifacts are visible in the ArtifactList but not
-  directly downloadable. A `/api/artifacts/[id]/download` route is v1.1 scope.
+- **Artifact download error UX** — the download link is a plain `<a download>` anchor.
+  If the route returns 404/502, the browser silently downloads a JSON error body.
+  Programmatic fetch with inline error display is v1.1 scope.
 - **Event virtualization** — the Timeline and EventInspector load events in pages of
   200 via "Load more", but do not virtualize the DOM list. Runs with 10,000+ events
   loaded incrementally may have sluggish scroll performance.
@@ -112,6 +113,10 @@
 - Tags display and inline editing in RunHeader
 - Comments with resolve/show-resolved UI
 - Integration tests run in CI with explicit release gate on main
+- Artifact download from UI — `GET /api/artifacts/[id]/download` with Clerk auth and org verification (ADR-0016)
+- Stale run auto-expiry — daily cron transitions stuck `running` runs to `timed_out` after 24 h (ADR-0017)
+- Keyboard navigation in Timeline and EventInspector (ADR-0018)
+- Shareable event URL — `?event=<sequenceNumber>` deep link with copy-link button (ADR-0018)
 
 ---
 
@@ -153,4 +158,6 @@ coordination with all deployments.
 | `BLOB_STORE_TOKEN` expiry has no fallback | High | Monitor token expiry; rotate before expiry; health endpoint will show `configured: false` if token is absent |
 | No run integrity verification in production | Low | Sequence gaps could appear if a Convex mutation fails mid-batch; use `rebuild-projection.ts` to check individual runs manually |
 | Large runs (> 10,000 events) may time out | Low | Replay endpoint fetches all events; no pagination timeout is enforced. Mitigate with per-run event count limits at the SDK level. |
-| `comments` mutations are minimal | Low | `resolveComment` is not wired into the UI; comments are appendable but not resolvable from the web |
+| `comments` mutations are minimal | Low | `resolveComment` is wired into the UI; `listComments` with `targetType` filter works. Full threading not in v1. |
+| Artifact download error UX | Low | 404/502 from download route causes browser to download JSON error body. Inline error display deferred to v1.1. |
+| Stale run expiry uses full-table scan | Low | No global `by_status` index; full `.filter()` scan per daily cron. Acceptable at v1 run volumes. |

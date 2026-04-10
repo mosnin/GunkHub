@@ -145,7 +145,6 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
     <EventInspectorInner
       allEvents={allEvents}
       selectedEvent={selectedEvent}
-      selectedId={selectedId}
       setSelectedId={setSelectedId}
       focusedIdx={focusedIdx}
       setFocusedIdx={setFocusedIdx}
@@ -161,7 +160,6 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
 interface EventInspectorInnerProps {
   allEvents: Event[]
   selectedEvent: Event | null
-  selectedId: string | null
   setSelectedId: (id: string | null) => void
   focusedIdx: number
   setFocusedIdx: (idx: number) => void
@@ -175,7 +173,6 @@ interface EventInspectorInnerProps {
 function EventInspectorInner({
   allEvents,
   selectedEvent,
-  selectedId,
   setSelectedId,
   focusedIdx,
   setFocusedIdx,

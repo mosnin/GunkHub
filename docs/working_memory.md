@@ -2,13 +2,13 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 11 — Operational Quality Pass)
+Last updated: 2026-04-10 (Prompt 12 — Artifact Download, Keyboard Nav, Event Deep Links, Stale Run Expiry)
 
 ---
 
 ## 1. Current State
 
-Prompts 1–11 complete. The following summarizes the full state after Prompt 11.
+Prompts 1–12 complete. The following summarizes the full state after Prompt 12.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
@@ -17,11 +17,12 @@ Prompts 1–11 complete. The following summarizes the full state after Prompt 11
 **Convex queries and mutations are implemented** (not stubbed) for:
 - `convex/runs.ts` — `listRuns`, `getRun`, `createRun`, `updateRunStatus`, `updateRunTags`
 - `convex/events.ts` — `listEvents`, `getEvent`, `createEvent`
-- `convex/artifacts.ts` — `listArtifacts`, `createArtifact`
+- `convex/artifacts.ts` — `listArtifacts`, `createArtifact`, `getArtifact` (Prompt 12)
 - `convex/organizations.ts` — `upsertOrganization`, `upsertMembership`, `getOrg`, `listOrgs`
 - `convex/comments.ts` — `listComments`, `createComment`, `resolveComment`
 - `convex/agents.ts` — `listDistinctAgents`
 - `convex/artifact_gc.ts` — `getOrphanCandidates` (indexed range + paginate), `isArtifactReferenced`, `deleteArtifactRecord`, `cleanOrphanedArtifacts`
+- `convex/stale_runs.ts` (NEW Prompt 12) — `listStaleRuns`, `markRunTimedOut`, `expireStaleRuns`
 - Auth helpers: `getAuthContext()`, `requireOrgMembership()` with `minimumRole` in `convex/auth.ts`
 
 **packages/contracts is fully defined** (v0.6.0). All shared types:
@@ -55,12 +56,12 @@ Key new exports (Prompt 10):
 **apps/web components and service layer — all implemented (not stubs):**
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
-- Run components: RunList, RunHeader, Timeline (with load-more pagination), EventInspector (with load-more pagination), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList, CommentThread (resolve, show/hide resolved, compose)
+- Run components: RunList, RunHeader, Timeline (with load-more pagination, keyboard navigation), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (with download link per row), CommentThread (resolve, show/hide resolved, compose)
 - Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`
 - Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags)
-- API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/health`, `/api/webhooks/clerk`
+- API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (NEW Prompt 12), `/api/health`, `/api/webhooks/clerk`
 
-**Tests (as of Prompt 10):**
+**Tests (as of Prompt 12):**
 - `tests/unit/sdk.test.ts` — Recorder tests with MockTransport
 - `tests/unit/contracts.test.ts` — Type shape and EventType coverage tests
 - `tests/unit/replay.test.ts` — buildReplayProjection algorithm tests
@@ -72,9 +73,11 @@ Key new exports (Prompt 10):
 - `tests/unit/transport-externalization.test.ts` — HttpTransport payload externalization tests
 - `tests/unit/artifact-dedup.test.ts` — Artifact deduplication tests
 - `tests/unit/org_bootstrap.test.ts` (NEW Prompt 10) — 15 tests for upsertOrganization, upsertMembership, clerkRoleToInternal
-- `tests/unit/artifact_gc.test.ts` (NEW Prompt 10) — 7 tests for GC orphan detection and bounded batch
+- `tests/unit/artifact_gc.test.ts` (NEW Prompt 10) — 10 tests for GC orphan detection, bounded batch, and error categorization
+- `tests/unit/run_filter.test.ts` (NEW Prompt 11) — 14 tests for index selection and filter scenarios
+- `tests/unit/stale_runs.test.ts` (NEW Prompt 12) — 8 tests for stale run timeout config, cutoff arithmetic, and safety invariants
 - `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
-- **Total: 426 passing, 5 skipped (all tests green)**
+- **Total: 451 passing, 5 skipped (15 test files, all green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -88,6 +91,10 @@ Key new exports (Prompt 10):
 - ADR-0012: Org bootstrap — Clerk webhook → upsertOrganization + upsertMembership pipeline (Prompt 10)
 - ADR-0013: Diff boundedness — MAX_EVENTS_PER_DIFF cap in service layer, truncated flag, UI disclosure (Prompt 10)
 - ADR-0014: Artifact GC scaling — by_created_at index, paginated bounded batch (Prompt 10)
+- ADR-0015: Run filter index — `by_org_status_started` compound index for combined status+date queries (Prompt 11)
+- ADR-0016: Artifact download — fetch-and-proxy route, two-layer auth (Clerk + Convex org check) (Prompt 12)
+- ADR-0017: Stale run expiry — daily cron at 03:00 UTC, internalAction pattern (Prompt 12)
+- ADR-0018: Event deep link — `?event=<sequenceNumber>` URL contract, history.replaceState (Prompt 12)
 
 ---
 
@@ -223,7 +230,20 @@ Key new exports (Prompt 10):
 - `.github/workflows/ci.yml` — integration-test job needs `[test]`; explicit notice/warning on secret presence; hard fail on `main` when secrets absent
 - `docs/release_readiness.md`, `docs/operations_runbook.md`, `docs/ops/ci_setup.md` updated
 
-**Test count (Prompt 11):** 443 passing, 5 skipped (14 test files, all green)
+**Fully implemented in Prompt 12 (artifact download, keyboard nav, deep links, stale run expiry):**
+- `convex/artifacts.ts` — `getArtifact` query (by ID, org-scoped via requireOrgMembership)
+- `convex/stale_runs.ts` — `listStaleRuns`, `markRunTimedOut`, `expireStaleRuns` for daily auto-expiry of stuck runs
+- `convex/crons.ts` — `expire-stale-runs` daily cron at 03:00 UTC
+- `convex/helpers/pagination.ts` — `STALE_RUN_TIMEOUT_MS` and `STALE_RUN_BATCH_SIZE` constants
+- `apps/web/app/api/artifacts/[id]/download/route.ts` — GET blob download with Clerk auth, Convex org check, fetch-and-proxy streaming
+- `apps/web/src/components/runs/ArtifactList.tsx` — download icon link per artifact row
+- `apps/web/src/components/runs/Timeline.tsx` — keyboard navigation (ArrowUp/Down/Enter, focusedIndex highlight)
+- `apps/web/src/components/runs/EventInspector.tsx` — keyboard nav in event list, `initialEventSeq` prop for deep link, `history.replaceState` URL sync, "Copy link" button
+- `apps/web/app/(app)/runs/[runId]/page.tsx` — parse `?event=<N>` searchParam, pass to EventInspector
+- `docs/operations_runbook.md` — stale run section updated to auto-expiry
+- ADRs 0016, 0017, 0018 added
+
+**Test count (Prompt 12):** 451 passing, 5 skipped (15 test files, all green)
 
 ---
 
