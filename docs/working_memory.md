@@ -2,7 +2,7 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 6 — SDK Auto-Externalization)
+Last updated: 2026-04-10 (Prompt 7 — Artifact Deduplication, Externalized Payload Rendering, Run List Filtering)
 
 ---
 
@@ -74,10 +74,11 @@ Key new exports (Prompt 6):
 - `tests/unit/projection-verify.test.ts` — verifyProjectionIntegrity (68 tests, Prompt 5)
 - `tests/unit/flight-recorder.test.ts` — FlightRecorder and RunRecorder HTTP transport tests (33 tests)
 - `tests/unit/transport-externalization.test.ts` — HttpTransport payload externalization tests (26 tests, Prompt 6)
+- `tests/unit/artifact-dedup.test.ts` — Artifact deduplication foundation, SDK retry idempotency, boundary correctness (11 tests, Prompt 7)
 - `tests/integration/api.test.ts` — API response shape tests (16 tests)
 - `tests/fixtures/runs.ts` — Sample run/event fixture data
 - `tests/fixtures/events.ts` — 6 scenario fixtures for explainability algorithm tests
-- **Total: 382 tests in tests/ workspace, all passing; 260 SDK tests, all passing (642 total)**
+- **Total: 393 tests in tests/ workspace, all passing; 260 SDK tests, all passing (653 total)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -86,6 +87,7 @@ Key new exports (Prompt 6):
 - ADR-0007: Ingestion idempotency — (runId, sequenceNumber) dedup, returns existing ID (Prompt 4)
 - ADR-0008: VercelBlobAdapter design — native fetch, no @vercel/blob SDK dependency (Prompt 5)
 - ADR-0009: SDK-side payload externalization and `ExternalizedPayload` pointer representation (Prompt 6)
+- ADR-0010: Artifact deduplication key strategy — `(runId, checksum)` compound index for idempotent `sdkCreateArtifact` (Prompt 7)
 
 ---
 
@@ -182,6 +184,14 @@ Key new exports (Prompt 6):
 - `packages/sdk/src/transport.ts` — `HttpTransport` complete: auto-externalization of oversized payloads via `_uploadArtifact`, retry loop for events, per-request timeout via `AbortController`
 - `apps/web/src/lib/health.ts` — shared health data function, no more server-side loopback HTTP call
 - `tests/unit/transport-externalization.test.ts` — 26 new tests for SDK payload externalization
+
+**Fully implemented in Prompt 7 (no longer stubs):**
+- `convex/sdk_ingest.ts` — artifact dedup via `(runId, checksum)` idempotency; `sdkCreateArtifact` returns existing record on duplicate instead of inserting
+- `convex/runs.ts` — `listRuns` with optional `startedAfter` parameter; new `updateRunTags` mutation
+- `apps/web/app/(app)/runs/page.tsx` — status dropdown + date range filter bar (Last 24h / 7 days / 30 days)
+- `apps/web/src/components/runs/EventInspector.tsx` — `_externalized` payload rendering via `ExternalizedPayloadView`
+- `apps/web/src/components/runs/RunHeader.tsx` — tags chips (expandable) + collapsible metadata key-value panel
+- `apps/web/src/components/runs/RunList.tsx` — tags chips column (max 3 + overflow count)
 
 ---
 

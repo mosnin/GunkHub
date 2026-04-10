@@ -23,6 +23,8 @@ export interface ListRunsRequest {
   projectId?: string;
   agentId?: string;
   status?: RunStatus;
+  /** Unix ms timestamp. Only runs started at or after this time are returned. */
+  startedAfter?: number;
   limit?: number;
   cursor?: string;
 }

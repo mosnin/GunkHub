@@ -73,7 +73,8 @@ export default defineSchema({
     .index("by_agent", ["agentId"])
     .index("by_org_status", ["orgId", "status"])
     .index("by_agent_started", ["agentId", "startedAt"])
-    .index("by_project_started", ["projectId", "startedAt"]),
+    .index("by_project_started", ["projectId", "startedAt"])
+    .index("by_org_started", ["orgId", "startedAt"]),
 
   // IMMUTABILITY: Events must never be updated or deleted. This table is append-only.
   events: defineTable({
@@ -99,7 +100,9 @@ export default defineSchema({
     storageBucket: v.string(),
     checksum: v.string(),
     createdAt: v.number(),
-  }).index("by_run", ["runId"]),
+  })
+    .index("by_run", ["runId"])
+    .index("by_run_checksum", ["runId", "checksum"]),
 
   comments: defineTable({
     orgId: v.id("organizations"),

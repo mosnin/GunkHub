@@ -1,129 +1,127 @@
-# Next Steps — Prompt 7 Specification
+# Next Steps — Prompt 8 Specification
 
 **Document type:** Exact specification for the next build session.
-**Current state:** Prompt 6 complete.
-**This document:** Defines what Prompt 7 should accomplish, based on remaining gaps after Prompt 6.
+**Current state:** Prompt 7 complete.
+**This document:** Defines what Prompt 8 should accomplish, based on remaining gaps after Prompt 7.
 
 ---
 
-## 1. What Was Accomplished in Prompt 6
+## 1. What Was Accomplished in Prompt 7
 
-Prompt 6 completed SDK auto-externalization and added targeted test coverage:
+Prompt 7 completed artifact deduplication, externalized payload rendering, run list
+filtering, and tags display:
 
-- **`HttpTransport.sendEvents()` auto-externalization**: for each event whose payload
-  serializes to > 10,240 bytes, the SDK calls `POST /api/artifacts/upload`, gets an
-  artifact pointer, replaces the event payload with an `ExternalizedPayload` pointer,
-  then ships the compact event to `POST /api/events`. Upload failures return
-  `{ success: false, retryable: false }` immediately; the events call is skipped.
-- **`ExternalizedPayload` in `packages/contracts`**: the pointer shape is now a member
-  of the `EventPayload` discriminated union, making it type-safe for all consumers.
-- **`PAYLOAD_EXTERNALIZATION_THRESHOLD`** imported from `packages/contracts/src/artifacts.ts`
-  — SDK and backend now share the exact same threshold value.
-- **`apps/web/src/lib/health.ts`**: shared health data function extracted to eliminate
-  the server-side loopback HTTP call in `SystemHealthPanel`.
-- **26 new unit tests** in `tests/unit/transport-externalization.test.ts`: small payload
-  passthrough (6), large payload externalization (8), mixed batches (4), upload failure
-  handling (4), pointer shape correctness (4).
-- **ADR-0009**: decision record for SDK-side externalization, pointer representation,
-  upload-outside-retry-loop rationale, and the known duplicate-artifact retry risk.
-- **Test count**: 382 passing in `tests/` workspace + 260 SDK tests = 642 total.
+- **Artifact dedup (`sdkCreateArtifact` idempotency)**: `by_run_checksum` compound index
+  added to `artifacts` table in `convex/schema.ts`. `sdkCreateArtifact` now queries the
+  index before inserting — if an artifact with the same `(runId, checksum)` exists, returns
+  the existing record. Duplicate artifact rows on retry are eliminated.
+- **`by_org_started` index** on `runs` table for efficient date-range queries.
+- **`listRuns` filter params**: optional `startedAfter: number` wired through contracts
+  (`ListRunsRequest` 0.4.0), service layer, and Convex query.
+- **`updateRunTags` mutation**: new Convex mutation in `convex/runs.ts` for admin/member
+  tag editing.
+- **Run list filter bar**: status dropdown + date range buttons (Last 24h / Last 7 days /
+  Last 30 days) with keyboard-accessible active state on the runs page.
+- **Tags in RunList**: chips column with max 3 visible and "+N more" overflow.
+- **Tags and metadata in RunHeader**: expandable tag chips and collapsible metadata
+  key-value panel.
+- **`ExternalizedPayload` rendering in `EventInspector`**: detects `_externalized` payload
+  type and renders `ExternalizedPayloadView` with artifact metadata and download link.
+- **11 new unit tests** in `tests/unit/artifact-dedup.test.ts`: threshold constant,
+  checksum consistency, SDK retry idempotency (same payload body on second send), boundary
+  tests (exact threshold not externalized; threshold+1 is externalized).
+- **ADR-0010**: decision record for `(runId, checksum)` dedup key strategy.
+- **Test count**: 393 passing in `tests/` workspace + 260 SDK tests = 653 total.
 
 ---
 
-## 2. What Prompt 7 Should Accomplish
+## 2. What Prompt 8 Should Accomplish
 
-### 2A. ADR-0009 cleanup: artifact deduplication on retry (CRITICAL)
+Items are listed in priority order. Items 1 and 2 directly address documented residual
+risks. Items 3–5 round out the v1 hardening surface.
 
-The retry risk documented in ADR-0009: if `_uploadArtifact` succeeds but `POST /api/events`
-fails permanently, a subsequent flush call uploads the same blob a second time and inserts
-a duplicate artifact record in Convex.
-
-Fix: add `(runId, checksum)` deduplication to `sdkCreateArtifact` in `convex/sdk_ingest.ts`.
-
-Specifically:
-1. Add a `by_run_checksum` index to the `artifacts` table in `convex/schema.ts`:
-   `by_run_checksum: ["runId", "checksum"]`.
-2. In `sdkCreateArtifact`, before inserting, query the `by_run_checksum` index for an
-   existing record with the same `(runId, checksum)`. If found, return the existing
-   `artifactId` instead of inserting a new record.
-3. Update `docs/adrs/0009_payload_externalization_sdk.md` to mark the retry risk as
-   "mitigated in Prompt 7".
-
-### 2B. Artifact garbage collection job
+### 2A. Artifact GC job (CRITICAL)
 
 Artifacts can be orphaned when a blob upload succeeds but the subsequent event insert
-fails permanently and is never retried. These orphaned records accumulate in Convex and
-the corresponding blobs occupy paid blob storage.
+fails permanently and is never retried. Orphaned records accumulate in Convex and the
+corresponding blobs occupy paid storage indefinitely.
 
 Add a Convex scheduled job in `convex/crons.ts`:
-1. Run daily (use Convex's `crons.daily(...)` API).
-2. Query `artifacts` records older than 24 hours.
-3. For each, check whether any event in the same run references `_artifact.artifactId`
-   matching this artifact record's `_id`. (Query `events` where
-   `payload._artifact.artifactId === artifact._id`.)
+
+1. Run daily using Convex's `crons.daily(...)` API.
+2. Query `artifacts` records with `_creationTime` older than 24 hours.
+3. For each artifact, check whether any event in the same run references
+   `payload._artifact.artifactId` matching this artifact's `_id`. Query the `events`
+   table scoped to the artifact's `runId`.
 4. If no referencing event is found, delete the blob from Vercel Blob via
    `DELETE https://blob.vercel-storage.com/{storageKey}` using `BLOB_STORE_TOKEN`.
 5. Delete the orphaned artifact record from Convex.
-6. Log how many records were cleaned up (Convex `console.log` is visible in the dashboard).
+6. Log how many records were cleaned up (Convex `console.log` is visible in the
+   dashboard and captured in logs).
 
-Document the retention policy in `docs/adrs/0010_artifact_gc.md`.
+Document the retention policy and GC design in `docs/adrs/0011_artifact_gc.md`.
 
-### 2C. Run list filtering UI
+### 2B. Tag editing UI on run detail
 
-The runs list (`apps/web/app/(app)/runs/page.tsx`) shows all runs without filtering.
-Add:
+`updateRunTags` mutation exists but is not wired into the UI. Add inline tag editing
+to `RunHeader`:
 
-- **Status filter**: dropdown — All | pending | running | completed | failed | cancelled | timed_out.
-- **Date range filter**: buttons for Last 24h | Last 7 days | Last 30 days (with active state).
-- **Agent filter**: dropdown listing distinct agents in the org (only if the org has > 1 agent).
-- Keyboard shortcut `Cmd+K` to focus the filter bar.
+- Clicking a "Edit tags" affordance opens an inline input with current tags pre-filled.
+- Adding a tag: type the tag name and press Enter or comma.
+- Removing a tag: click the × on the chip.
+- On save: call `updateRunTags` via a Next.js server action.
+- Enforce admin/member role at the server action layer — viewer role gets a 403.
+- Optimistic UI update: show the new tag list immediately, revert on error.
 
-Required backend change: update `convex/runs.ts → listRuns` to accept optional
-`status: RunStatus | undefined` and `startedAfter: number | undefined` parameters.
-Update the existing query — do not add a new query function.
-
-### 2D. Tags and metadata display
-
-Runs have `tags: string[]` and `metadata: Record<string, unknown>` stored in Convex
-but not displayed anywhere.
-
-- **Run list**: display tags as small chips on each run row (max 3 visible, "+N more" overflow).
-- **Run detail header**: display all tags as chips, expandable.
-- **Run detail**: collapsible "Metadata" panel below the run header showing metadata as a
-  key-value table.
-- **Edit tags**: on the run detail page, allow adding and removing tags. Requires a new
-  Convex mutation `updateRunTags(runId: Id<"runs">, tags: string[])` in `convex/runs.ts`.
-  Admin and member roles may edit tags; viewer role may not.
-
-### 2E. RBAC enforcement beyond basic membership
+### 2C. RBAC enforcement beyond basic membership
 
 The `user_memberships` table stores `role: "admin" | "member" | "viewer"`. Currently
-all authenticated members can perform all operations regardless of role.
+all authenticated members can call all mutations regardless of role.
 
-Add role checks to the following mutations:
+Add an optional `minimumRole: "admin" | "member" | "viewer"` parameter to
+`requireOrgMembership()` in `convex/auth.ts`. Default to `"viewer"` (any member can
+read; no write mutations default to viewer — caller must pass `minimumRole`).
+
+Apply role checks to the following mutations:
 - `admin` only: `createApiKey`, `revokeApiKey`, `updateRunTags`, `createProject`
-- `member` and above: all existing write mutations (currently unrestricted — add explicit check)
-- `viewer`: read-only — calling any write mutation returns an authorization error
+- `member` and above: all existing write mutations (`createRun`, `createEvent`,
+  `createArtifact`) — pass `minimumRole: "member"`
+- `viewer`: read-only — calling any write mutation that requires `"member"` or `"admin"`
+  returns `{ code: "FORBIDDEN", message: "Insufficient role" }`
 
-Enforce role checks in `convex/auth.ts → requireOrgMembership()` by adding an optional
-`minimumRole: "admin" | "member" | "viewer"` parameter. Default is `"viewer"` (any member
-can read). Update all admin-only mutations to pass `minimumRole: "admin"`.
-
-### 2F. Integration tests with real Convex
+### 2D. Integration tests with real Convex
 
 `tests/integration/api.test.ts` currently tests response shapes against static fixtures.
 Replace the stubs with real integration tests:
-- Use a Convex test deployment (`CONVEX_TEST_URL`, `TEST_API_KEY` env vars).
-- Test the full create-run → send-events → get-replay path.
-- Test the artifact upload path: `POST /api/artifacts/upload` → verify artifact record appears.
-- Test the 413 path: event with payload > 10 KB → verify HTTP 413.
-- Test idempotency: send the same event twice → verify only one record in Convex.
 
-Add `CONVEX_TEST_URL` and `TEST_API_KEY` to `.env.example` with instructions.
+- Use a Convex test deployment (`CONVEX_TEST_URL`, `TEST_API_KEY` env vars).
+- Test the full create-run → send-events → get-replay path end-to-end.
+- Test the artifact upload path: `POST /api/artifacts/upload` → verify the artifact
+  record appears in Convex with the correct checksum and storageKey.
+- Test the dedup path: upload the same artifact twice for the same run → verify only
+  one artifact record exists in Convex (second call returns the existing ID).
+- Test the 413 path: send an event with a payload > 10 KB directly (bypassing SDK
+  externalization) → verify HTTP 413 from the route.
+- Test event idempotency: send the same event twice → verify only one record in Convex.
+
+Add `CONVEX_TEST_URL` and `TEST_API_KEY` to `.env.example` with a comment indicating
+these are only required for running integration tests, not for local dev.
+
+### 2E. SDK upload-once guard
+
+On retry, the SDK re-externalizes the same oversized payload, issuing a second `PUT`
+call to blob storage. The Convex dedup (ADR-0010) prevents a duplicate Convex record,
+but the redundant blob API call wastes quota.
+
+Add a per-`sendEvents`-call cache in `HttpTransport._uploadArtifact`: before issuing
+the PUT, compute `sha256Hex(serializedPayload)` client-side and check a local `Map<string,
+UploadResult>` keyed by `(runId, checksum)`. If the result is already cached, skip the
+PUT and return the cached pointer. Cache scope is per `sendEvents` call — do not share
+state between calls (this would be a memory leak for long-running SDK instances).
 
 ---
 
-## 3. What Must NOT Be Done in Prompt 7
+## 3. What Must NOT Be Done in Prompt 8
 
 - Do not add real-time event streaming.
 - Do not add analytics dashboards or aggregate metrics.
@@ -135,40 +133,46 @@ Add `CONVEX_TEST_URL` and `TEST_API_KEY` to `.env.example` with instructions.
 - Do not add a mobile application.
 - Do not remove `ExternalizedPayload` from the `EventPayload` union or rename its fields.
   Stored events have this shape on disk — changing it requires a migration.
+- Do not remove the `by_run_checksum` index without a schema migration plan. Removing it
+  would re-expose the duplicate artifact risk on retry.
 
 ---
 
-## 4. Acceptance Criteria for Prompt 7
+## 4. Acceptance Criteria for Prompt 8
 
-1. `sdkCreateArtifact` returns the existing artifact record when `(runId, checksum)` already
-   exists — no duplicate records on retry.
-2. Convex daily cron cleans up orphaned artifact records (blob + Convex record deleted).
-3. Run list supports status and date range filtering with keyboard-accessible filter bar.
-4. Tags displayed in run list (chip, max 3) and run detail (all chips, expandable).
-5. Tags editable from run detail page (admin/member only).
-6. Admin-only mutations enforce the `admin` role via `requireOrgMembership({ minimumRole: "admin" })`.
-7. Integration tests pass against a real Convex test deployment (no stubs).
-8. `pnpm typecheck` passes with zero errors.
-9. `./scripts/validate.sh` passes all three checks.
-10. All prior tests still pass (>= 642 total, no regressions).
+1. Convex daily cron identifies orphaned artifact records (no referencing event, older
+   than 24 hours), deletes the blob from Vercel Blob, and removes the Convex record.
+   GC job is logged with a count of cleaned records.
+2. Tag editing in `RunHeader` calls `updateRunTags` via server action; admin/member only;
+   viewer role receives a 403; optimistic update reverts on error.
+3. `requireOrgMembership()` accepts `minimumRole` parameter; admin-only mutations enforce
+   the admin role and return a structured `FORBIDDEN` error for lower roles.
+4. Integration tests pass against a real Convex test deployment (no stubs); dedup path
+   and 413 path are covered.
+5. SDK upload-once guard skips redundant blob PUT calls within a single `sendEvents` call.
+6. `pnpm typecheck` passes with zero errors.
+7. `./scripts/validate.sh` passes all three checks.
+8. All prior tests still pass (>= 653 total, no regressions).
 
 ---
 
-## 5. Known Technical Debt After Prompt 6
+## 5. Known Technical Debt After Prompt 7
 
-1. **Duplicate artifact records on retry** — `sdkCreateArtifact` has no `(runId, checksum)`
-   upsert. A second flush of the same oversized event produces a second artifact record.
-   Fix in Prompt 7 (see 2A).
-2. **No artifact GC** — orphaned blobs accumulate in Vercel Blob and Convex. Fix in
-   Prompt 7 (see 2B).
-3. **No RBAC enforcement beyond basic membership** — all members can write. Fix in
-   Prompt 7 (see 2E).
+1. **Orphaned blobs accumulate** — artifact records with no referencing event are not
+   cleaned up. Fix in Prompt 8 (see 2A).
+2. **Tag editing not wired into UI** — `updateRunTags` mutation exists but `RunHeader`
+   has no inline edit affordance. Fix in Prompt 8 (see 2B).
+3. **No RBAC enforcement beyond basic membership** — all members can call all mutations.
+   Fix in Prompt 8 (see 2C).
 4. **Integration tests are fixture-based stubs** — no real Convex coverage in CI. Fix in
-   Prompt 7 (see 2F).
-5. **`payload` field comparison is order-sensitive in diff** — JSON.stringify treats
+   Prompt 8 (see 2D).
+5. **Redundant blob PUT on retry** — SDK re-uploads the same bytes on retry; the Convex
+   dedup prevents duplicate records but the blob API call is still issued. Fix in Prompt 8
+   (see 2E).
+6. **`payload` field comparison is order-sensitive in diff** — JSON.stringify treats
    `{a:1,b:2}` and `{b:2,a:1}` as different. Acceptable for v1 — documented in ADR-0005.
-6. **No request timeout on Convex event pagination** — very large runs (> 10,000 events)
+7. **No request timeout on Convex event pagination** — very large runs (> 10,000 events)
    will block the replay endpoint indefinitely.
-7. **`comments` mutations are minimal** — `resolveComment` is not wired into the UI.
-8. **`convex/organizations.ts` and `convex/projects.ts` are partially implemented** —
+8. **`comments` mutations are minimal** — `resolveComment` is not wired into the UI.
+9. **`convex/organizations.ts` and `convex/projects.ts` are partially implemented** —
    `createOrg`, `getOrgByClerkId`, `createProject` stubs need real implementations.

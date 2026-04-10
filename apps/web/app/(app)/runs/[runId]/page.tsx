@@ -95,6 +95,8 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         startedAt={run.startedAt}
         endedAt={run.endedAt}
         triggeredBy={run.triggeredBy}
+        tags={run.tags}
+        metadata={run.metadata}
       />
 
       {/* Failure summary panel — additive, shown only when there is a failure or incomplete run */}

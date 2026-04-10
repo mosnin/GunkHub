@@ -50,6 +50,7 @@ export async function listRuns(params: ListRunsRequest): Promise<ListRunsRespons
     ...(params.projectId !== undefined && { projectId: params.projectId }),
     ...(params.agentId !== undefined && { agentId: params.agentId }),
     ...(params.status !== undefined && { status: params.status }),
+    ...(params.startedAfter !== undefined && { startedAfter: params.startedAfter }),
     ...(params.limit !== undefined && { limit: params.limit }),
     ...(params.cursor !== undefined && { cursor: params.cursor }),
   })
@@ -113,4 +114,12 @@ export async function createRun(req: CreateRunRequest): Promise<CreateRunRespons
   })
 
   return { run: mapRun(doc as Record<string, unknown>) }
+}
+
+/**
+ * Update tags on a run.
+ */
+export async function updateRunTags(runId: string, tags: string[]): Promise<void> {
+  const client = await getAuthedClient()
+  await client.mutation(convex.runs.updateRunTags, { runId, tags })
 }

@@ -21,6 +21,7 @@ export const convex = {
     listRuns: makeFunctionReference<Q>('runs:listRuns'),
     getRun: makeFunctionReference<Q>('runs:getRun'),
     createRun: makeFunctionReference<M>('runs:createRun'),
+    updateRunTags: makeFunctionReference<M>('runs:updateRunTags'),
   },
   events: {
     listEvents: makeFunctionReference<Q>('events:listEvents'),

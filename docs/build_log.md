@@ -2,6 +2,99 @@
 
 ---
 
+## Prompt 7 — Artifact Deduplication, Externalized Payload Rendering, Run List Filtering, Tags
+
+**Date:** 2026-04-10
+
+### What changed
+
+- `convex/schema.ts` — added `.index("by_run_checksum", ["runId", "checksum"])` to the
+  `artifacts` table; added `.index("by_org_started", ["orgId", "startedAt"])` to the
+  `runs` table.
+- `convex/sdk_ingest.ts` — `sdkCreateArtifact` now queries `by_run_checksum` before
+  inserting. If an artifact with the same `(runId, checksum)` already exists, returns
+  the existing record instead of inserting a duplicate. Makes the mutation idempotent for
+  retry scenarios.
+- `convex/runs.ts` — `listRuns` gains an optional `startedAfter: number` filter param;
+  new `updateRunTags` mutation for admin/member tag editing.
+- `packages/contracts/src/api.ts` — `ListRunsRequest` gains `startedAfter?: number`;
+  contracts version bumped to 0.4.0.
+- `apps/web/src/lib/services/runs.ts` — service layer wires `startedAfter` through to
+  `listRuns`; new `updateRunTags` service function delegates to the Convex mutation.
+- `apps/web/app/(app)/runs/page.tsx` — filter bar with status dropdown and date range
+  buttons (Last 24h / Last 7 days / Last 30 days) with keyboard-accessible active state.
+- `apps/web/src/components/runs/RunList.tsx` — tags chips column added (max 3 visible,
+  "+N more" overflow label).
+- `apps/web/src/components/runs/EventInspector.tsx` — detects `_externalized` payload
+  type and renders `ExternalizedPayloadView` showing artifact metadata and a download
+  link instead of raw JSON.
+- `apps/web/src/components/runs/RunHeader.tsx` — `tags` and `metadata` props; renders
+  tag chips (expandable) and a collapsible metadata key-value panel.
+- `tests/unit/artifact-dedup.test.ts` — 11 new unit tests (3 groups): foundation checks
+  for threshold constant and checksum consistency, SDK retry idempotency (same payload
+  produces same upload body across two `sendEvents` calls), and boundary correctness
+  (exact threshold not externalized, threshold+1 is).
+- `docs/adrs/0010_artifact_dedup.md` — decision record for `(runId, checksum)` dedup key
+  strategy.
+
+### Why dedup fits the architecture
+
+The `(runId, checksum)` dedup key follows the same pattern established in ADR-0007 for
+event idempotency: `(runId, sequenceNumber)` is the natural key for events; `(runId,
+checksum)` is the natural key for artifacts within a run. Both use a two-field compound
+index in Convex for O(1) lookup before every insert. The dedup scope is bounded — it
+applies within a single run, avoiding unintended merging of artifacts that share content
+across different runs (e.g., a canonical system prompt appearing in multiple runs).
+
+### Hard-to-reverse decisions
+
+- **`by_run_checksum` index**: schema migration is required to add or remove compound
+  indexes in Convex. Once deployed with production data, removing this index requires
+  a coordinated schema re-deployment.
+- **`listRuns` gaining `startedAfter`**: any clients that cache or test the exact
+  `listRuns` response shape must handle the new optional parameter. The parameter is
+  additive and backward-compatible, but the new `by_org_started` index changes query
+  execution planning for `listRuns` calls that do use it.
+- **`ExternalizedPayload` rendering path in `EventInspector`**: once the UI handles
+  `_externalized` payloads as a first-class case, removing `ExternalizedPayload` from
+  the union requires both a data migration (stored events) and a UI revert.
+
+### Known residual risks
+
+- **Redundant blob upload on retry**: the `by_run_checksum` dedup prevents duplicate
+  Convex artifact records, but the SDK still issues a second `PUT` call to blob storage
+  on retry (blob write is idempotent at the same checksum-derived key, only the API call
+  is redundant). A future prompt can add a client-side upload-once cache in
+  `HttpTransport._uploadArtifact`.
+- **Orphaned blobs remain**: if a blob upload succeeds but the subsequent `POST /api/events`
+  call fails permanently and is never retried, the artifact record exists with no
+  referencing event. No GC job yet — planned for Prompt 8.
+- **Tags are read-only in list**: `RunList` displays tags but does not provide editing.
+  Tag editing requires `updateRunTags` wired into `RunHeader` via server action — planned
+  for Prompt 8.
+
+### Test count
+
+- Before Prompt 7: 382 tests in `tests/` workspace + 260 SDK tests = 642 total.
+- After Prompt 7: 393 tests in `tests/` workspace (+ 11 new artifact-dedup tests)
+  + 260 SDK tests = **653 total, all passing**.
+
+### Recommendation for Prompt 8
+
+1. **Artifact GC job** (CRITICAL): Convex scheduled job (daily) to find artifact records
+   older than 24 hours with no referencing event, delete the blob from Vercel Blob, and
+   remove the orphaned Convex record.
+2. **Tag editing UI**: wire `updateRunTags` mutation into `RunHeader` via a server action;
+   enforce admin/member role check at the UI layer.
+3. **RBAC enforcement**: add `minimumRole` parameter to `requireOrgMembership()` in
+   `convex/auth.ts`; enforce admin-only on `updateRunTags`, `createProject`, key management.
+4. **Integration tests**: replace fixture stubs in `tests/integration/api.test.ts` with
+   real tests against a Convex test deployment (`CONVEX_TEST_URL`, `TEST_API_KEY`).
+5. **SDK upload-once guard**: cache the upload result in `HttpTransport._uploadArtifact`
+   keyed by `(runId, checksum)` to skip redundant blob PUT calls on retry.
+
+---
+
 ## Prompt 6 — SDK Auto-Externalization and Test Coverage
 
 **Date:** 2026-04-10

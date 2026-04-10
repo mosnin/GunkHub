@@ -23,6 +23,7 @@ export const listRuns = query({
         v.literal("timed_out"),
       ),
     ),
+    startedAfter: v.optional(v.number()),
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
   },
@@ -71,6 +72,9 @@ export const listRuns = query({
       }
       if (args.status !== undefined) {
         condition = q.and(condition, q.eq(q.field("status"), args.status));
+      }
+      if (args.startedAfter !== undefined) {
+        condition = q.and(condition, q.gte(q.field("startedAt"), args.startedAfter));
       }
       return condition;
     });
@@ -198,5 +202,31 @@ export const updateRunStatus = mutation({
     });
 
     return await ctx.db.get(args.runId);
+  },
+});
+
+/**
+ * Update the tags on a run. Caller must be a member of the run's org.
+ * Tags are replaced wholesale — pass the full desired tag array.
+ */
+export const updateRunTags = mutation({
+  args: {
+    runId: v.id("runs"),
+    tags: v.array(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const run = await ctx.db.get(args.runId);
+    if (!run) throw new Error("Run not found");
+
+    await requireOrgMembership(ctx, run.orgId);
+
+    // Normalize: trim whitespace, deduplicate, discard empty strings
+    const normalized = [...new Set(args.tags.map((t) => t.trim()).filter(Boolean))];
+
+    await ctx.db.patch(args.runId, { tags: normalized });
+
+    const updated = await ctx.db.get(args.runId);
+    if (!updated) throw new Error("Run not found after update");
+    return updated;
   },
 });

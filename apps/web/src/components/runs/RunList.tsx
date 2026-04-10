@@ -46,6 +46,9 @@ export function RunList({ runs, loading }: RunListProps) {
             <th className="w-24 px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
               Duration
             </th>
+            <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+              Tags
+            </th>
           </tr>
         </thead>
         <tbody className="divide-y divide-neutral-800 bg-neutral-950">
@@ -90,6 +93,23 @@ export function RunList({ runs, loading }: RunListProps) {
                 >
                   {run.endedAt ? formatDuration(run.endedAt - run.startedAt) : '—'}
                 </Link>
+              </td>
+              <td className="px-4 py-3">
+                <div className="flex flex-wrap gap-1 max-w-[200px]">
+                  {(run.tags ?? []).slice(0, 3).map((tag) => (
+                    <span
+                      key={tag}
+                      className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-mono text-neutral-500 bg-neutral-900 border border-neutral-800"
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                  {(run.tags ?? []).length > 3 && (
+                    <span className="text-xs text-neutral-600 font-mono">
+                      +{(run.tags ?? []).length - 3}
+                    </span>
+                  )}
+                </div>
               </td>
             </tr>
           ))}

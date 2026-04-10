@@ -14,6 +14,8 @@ interface RunHeaderProps {
   startedAt: number
   endedAt?: number
   triggeredBy?: string
+  tags?: string[]
+  metadata?: Record<string, unknown>
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -49,33 +51,69 @@ function CopyButton({ value }: { value: string }) {
   )
 }
 
-export function RunHeader({ runId, status, agentName, startedAt, endedAt, triggeredBy }: RunHeaderProps) {
+export function RunHeader({ runId, status, agentName, startedAt, endedAt, triggeredBy, tags, metadata }: RunHeaderProps) {
   return (
-    <div className="px-6 py-4 border-b border-neutral-800 flex flex-wrap items-center gap-x-5 gap-y-2 bg-neutral-950">
-      {/* Run ID with copy button */}
-      <div className="flex items-center gap-0.5">
-        <span className="font-mono text-sm text-neutral-100 tracking-tight">
-          {truncateId(runId, 12)}
-        </span>
-        <CopyButton value={runId} />
+    <div className="px-6 py-4 border-b border-neutral-800 bg-neutral-950">
+      {/* Main row */}
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+        {/* Run ID with copy button */}
+        <div className="flex items-center gap-0.5">
+          <span className="font-mono text-sm text-neutral-100 tracking-tight">
+            {truncateId(runId, 12)}
+          </span>
+          <CopyButton value={runId} />
+        </div>
+
+        <Badge status={status} />
+
+        <span className="text-xs text-neutral-500 font-mono">{truncateId(agentName, 20)}</span>
+
+        <span className="text-xs text-neutral-500">{formatRelativeTime(startedAt)}</span>
+
+        {endedAt && (
+          <span className="text-xs font-mono text-neutral-500">
+            {formatDuration(endedAt - startedAt)}
+          </span>
+        )}
+
+        {triggeredBy && (
+          <span className="text-xs text-neutral-600">
+            via <span className="text-neutral-500 font-mono">{triggeredBy}</span>
+          </span>
+        )}
       </div>
 
-      <Badge status={status} />
-
-      <span className="text-xs text-neutral-500 font-mono">{truncateId(agentName, 20)}</span>
-
-      <span className="text-xs text-neutral-500">{formatRelativeTime(startedAt)}</span>
-
-      {endedAt && (
-        <span className="text-xs font-mono text-neutral-500">
-          {formatDuration(endedAt - startedAt)}
-        </span>
+      {/* Tags row — only rendered when tags exist */}
+      {tags && tags.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 mt-2">
+          {tags.map((tag) => (
+            <span
+              key={tag}
+              className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono text-neutral-500 bg-neutral-900 border border-neutral-800"
+            >
+              {tag}
+            </span>
+          ))}
+        </div>
       )}
 
-      {triggeredBy && (
-        <span className="text-xs text-neutral-600">
-          via <span className="text-neutral-500 font-mono">{triggeredBy}</span>
-        </span>
+      {/* Metadata — collapsible details, only when metadata has keys */}
+      {metadata && Object.keys(metadata).length > 0 && (
+        <details className="mt-2">
+          <summary className="text-xs text-neutral-600 cursor-pointer hover:text-neutral-500 select-none">
+            Metadata ({Object.keys(metadata).length} field{Object.keys(metadata).length !== 1 ? 's' : ''})
+          </summary>
+          <dl className="mt-2 flex flex-col gap-1">
+            {Object.entries(metadata).map(([key, value]) => (
+              <div key={key} className="flex gap-3 text-xs">
+                <dt className="font-mono text-neutral-600 shrink-0 min-w-[6rem]">{key}</dt>
+                <dd className="font-mono text-neutral-400 break-all">
+                  {typeof value === 'string' ? value : JSON.stringify(value)}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </details>
       )}
     </div>
   )

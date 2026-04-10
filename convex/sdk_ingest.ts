@@ -252,6 +252,20 @@ export const sdkCreateArtifact = mutation({
       throw new Error("Unauthorized");
     }
 
+    // Deduplication: if an artifact with the same (runId, checksum) already exists,
+    // return it instead of inserting a duplicate. This guards against retry scenarios
+    // where the blob upload succeeded but the subsequent /api/events call failed.
+    const existing = await ctx.db
+      .query("artifacts")
+      .withIndex("by_run_checksum", (q) =>
+        q.eq("runId", runId).eq("checksum", args.checksum)
+      )
+      .unique();
+
+    if (existing !== null) {
+      return existing;
+    }
+
     const eventId = args.eventId ? (args.eventId as Id<"events">) : undefined;
 
     // Validate that the eventId belongs to the same run when provided.
