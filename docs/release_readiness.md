@@ -1,7 +1,7 @@
 # Release Readiness — v1
 
 **Date:** 2026-04-10
-**Status:** v1 Feature Complete — Prompt 13 (onboarding path: project/agent creation, API key management, SDK snippet, dashboard guide)
+**Status:** v1 Feature Complete — Prompt 14 (agent version management: backend, UI, run attribution, SDK snippets)
 
 ---
 
@@ -65,7 +65,7 @@
 
 ### Test coverage
 
-- **482+ tests passing** across `tests/` and `packages/sdk` workspaces (16 test files, 5 skipped).
+- **501+ tests passing** across `tests/` and `packages/sdk` workspaces (17 test files, 5 skipped).
 - Unit tests cover replay, diff (including truncation), failure summary, storage, transport, artifact GC, and org bootstrap.
 - All unit tests use `MockTransport` or in-memory stubs — no network calls, instant.
 - Real-Convex integration tests (`tests/integration/api.test.ts`) run in CI when secrets are configured. Skipped gracefully otherwise. Merging to `main` requires secrets to be present.
@@ -123,6 +123,9 @@
 - SDK setup snippet — `SdkSetupSnippet` component on settings page with install command and copy-ready code block (Prompt 13)
 - Org-wide agents page — `listAgentsByOrg` query on `by_org` index, agents page with project links (Prompt 13)
 - Dashboard onboarding guide — four-step Getting Started flow replaces hardcoded SDK snippet (Prompt 13)
+- Agent version creation from UI — `createAgentVersion` mutation (admin-gated, unique per agent), version history on agent detail page, CreateVersionModal (ADR-0019)
+- Agent version attribution on runs — Version column in run list, version badge in run detail header
+- SDK snippets include `agentVersionId` across agent detail page, project detail, and settings
 
 ---
 

@@ -4,9 +4,9 @@ import { notFound } from 'next/navigation'
 import type { Agent, AgentVersion } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
+import { VersionSection } from '@/components/agents/VersionSection'
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
-import { VersionSection } from '@/components/agents/VersionSection'
 import { getProject } from '@/lib/services/projects'
 
 export const metadata: Metadata = { title: 'Agent' }

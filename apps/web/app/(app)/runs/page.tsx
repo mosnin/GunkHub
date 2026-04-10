@@ -32,7 +32,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
   let runs: Awaited<ReturnType<typeof listRuns>> | null = null
   let agents: Agent[] = []
   let error: string | null = null
-  let agentVersionLabels: Record<string, string> = {}
+  const agentVersionLabels: Record<string, string> = {}
 
   try {
     runs = await listRuns({
@@ -53,7 +53,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
     const versionIds = [...new Set(
       runs.runs
         .filter((r) => r.agentVersionId != null)
-        .map((r) => r.agentVersionId!)
+        .map((r) => r.agentVersionId as string)
     )]
     await Promise.all(
       versionIds.map(async (vId) => {

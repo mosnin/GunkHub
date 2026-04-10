@@ -2,6 +2,39 @@
 
 ---
 
+## Prompt 14 — Agent version management (2026-04-10)
+
+### What changed
+
+- Added `convex/agent_versions.ts` with `createAgentVersion` (admin-gated, unique-per-agent), `listAgentVersions`, `getAgentVersion`
+- Extended `agent_versions` schema with `configSnapshot: v.optional(v.any())`
+- Bumped `packages/contracts` to v0.6.1 with `AgentVersion.configSnapshot?: Record<string, unknown>`
+- Added `services/agent_versions.ts`, `actions/agent_versions.ts` (server action) to web service layer
+- Added version history UI on agent detail page: `VersionHistory`, `CreateVersionModal`, `VersionSection` components
+- Run list and run detail now show agent version label where available (Version column in RunList, badge in RunHeader)
+- SDK setup snippets updated across three surfaces to include `agentVersionId`
+- ADR-0019 records three hard decisions about version identity
+
+### Why these choices fit the architecture
+
+Version management is a management-plane concern that sits above the event log. Versions are created by admins, attributed to runs at creation time, and never modified after creation — consistent with the immutable event model. The `v.any()` config snapshot avoids coupling the schema to a configuration DSL that does not yet exist. Version string uniqueness enforced at the mutation level keeps the schema simple while providing the correctness guarantee that matters.
+
+### Hard-to-reverse decisions
+
+- **Version string uniqueness per agent**: a mutation-level scan (not a DB index). Reversible if volume demands an index, but the current approach is correct at v1 scale.
+- **No active-version pointer on agent**: runs self-attribute at creation time. Adding a "current version" pointer later would require a migration strategy. This is a non-breaking omission.
+
+### Residual risks
+
+- Version label enrichment in the run list page does N parallel `getAgentVersion` fetches (one per distinct version ID in the page). At v1 scale (50 runs, likely 1–3 distinct versions) this is fast. Revisit if runs pages show hundreds of distinct versions.
+- No pagination on `listAgentVersions` — `.collect()` loads all versions. Acceptable for v1 (agents typically have <100 versions).
+
+### Recommendation for Prompt 15
+
+See `docs/next_steps.md`.
+
+---
+
 ## Prompt 13 — First-success onboarding path
 
 **Date:** 2026-04-10

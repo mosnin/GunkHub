@@ -2,7 +2,7 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 13 — First-success onboarding path)
+Last updated: 2026-04-10 (Prompt 14 — Agent version management)
 
 ---
 
@@ -21,12 +21,13 @@ Prompts 1–13 complete. The following summarizes the full state after Prompt 13
 - `convex/organizations.ts` — `upsertOrganization`, `upsertMembership`, `getOrg`, `listOrgs`
 - `convex/comments.ts` — `listComments`, `createComment`, `resolveComment`
 - `convex/agents.ts` — `listDistinctAgents`, `listAgentsByOrg` (NEW Prompt 13, `by_org` index)
+- `convex/agent_versions.ts` — `createAgentVersion` (admin-gated, unique per agent), `listAgentVersions`, `getAgentVersion` (NEW Prompt 14)
 - `convex/artifact_gc.ts` — `getOrphanCandidates` (indexed range + paginate), `isArtifactReferenced`, `deleteArtifactRecord`, `cleanOrphanedArtifacts`
 - `convex/stale_runs.ts` (NEW Prompt 12) — `listStaleRuns`, `markRunTimedOut`, `expireStaleRuns`
 - Auth helpers: `getAuthContext()`, `requireOrgMembership()` with `minimumRole` in `convex/auth.ts`
 
-**packages/contracts is fully defined** (v0.6.0). All shared types:
-- `entities.ts` — Organization, Project, Agent, AgentVersion, Run, Event, Artifact, Comment
+**packages/contracts is fully defined** (v0.6.1). All shared types:
+- `entities.ts` — Organization, Project, Agent, AgentVersion (now with `configSnapshot?: Record<string, unknown>`, v0.6.1), Run, Event, Artifact, Comment
 - `events.ts` — EventType union, all payload shapes, EventPayload discriminated union (includes `ExternalizedPayload`)
 - `status.ts` — RunStatus, RunStatusValues, isTerminalStatus()
 - `api.ts` — All API request/response types
@@ -57,10 +58,11 @@ Key new exports (Prompt 10):
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
 - Run components: RunList, RunHeader, Timeline (with load-more pagination, keyboard navigation), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (with download link per row), CommentThread (resolve, show/hide resolved, compose)
-- Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`, `lib/services/projects.ts` (NEW Prompt 13)
-- Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags), `lib/actions/projects.ts` (createProjectAction, NEW Prompt 13), `lib/actions/agents.ts` (createAgentAction, NEW Prompt 13)
+- Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`, `lib/services/projects.ts` (NEW Prompt 13), `lib/services/agent_versions.ts` (NEW Prompt 14)
+- Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags), `lib/actions/projects.ts` (createProjectAction, NEW Prompt 13), `lib/actions/agents.ts` (createAgentAction, NEW Prompt 13), `lib/actions/agent_versions.ts` (createAgentVersionAction, NEW Prompt 14)
 - API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (Prompt 12), `/api/api-keys/[id]` (DELETE revoke, NEW Prompt 13), `/api/health`, `/api/webhooks/clerk`
 - UI components (Prompt 13): `CreateProjectModal`, `CreateAgentModal`, `ProjectsList`, `ProjectDetail`, `ApiKeysSection` (rewritten), `SdkSetupSnippet`
+- UI components (Prompt 14): `VersionHistory`, `CreateVersionModal`, `VersionSection`
 - Pages (Prompt 13): projects list, project detail with agents table, org-wide agents list, agent detail with SDK snippet, dashboard onboarding guide
 
 **Tests (as of Prompt 13):**
@@ -79,8 +81,9 @@ Key new exports (Prompt 10):
 - `tests/unit/run_filter.test.ts` (Prompt 11) — 14 tests for index selection and filter scenarios
 - `tests/unit/stale_runs.test.ts` (Prompt 12) — 8 tests for stale run timeout config, cutoff arithmetic, and safety invariants
 - `tests/unit/projects_agents.test.ts` (NEW Prompt 13) — 31 tests for slug generation, name validation, two-phase revoke state machine, and loadKeys fetch logic
+- `tests/unit/agent_versions.test.ts` (NEW Prompt 14) — 19 tests for version string validation, mapAgentVersion correctness, and action validation logic
 - `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
-- **Total: 482 passing, 5 skipped (16 test files, all green)**
+- **Total: 501 passing, 5 skipped (17 test files, all green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -98,6 +101,7 @@ Key new exports (Prompt 10):
 - ADR-0016: Artifact download — fetch-and-proxy route, two-layer auth (Clerk + Convex org check) (Prompt 12)
 - ADR-0017: Stale run expiry — daily cron at 03:00 UTC, internalAction pattern (Prompt 12)
 - ADR-0018: Event deep link — `?event=<sequenceNumber>` URL contract, history.replaceState (Prompt 12)
+- ADR-0019: Agent version identity — version string uniqueness per agent, `v.any()` config snapshot, no active-version pointer on agent (Prompt 14)
 
 ---
 
@@ -373,15 +377,17 @@ Events can have a `parentEventId` referencing another event in the same run. Thi
 
 ---
 
-## 8. Prompt 14 Candidates (v1.1 deferred items)
+## 8. Prompt 15 Candidates (v1.1 deferred items)
 
-The following items were explicitly deferred from v1 and are candidates for the next session:
+The following items were explicitly deferred from v1 and are candidates for the next session. See `docs/next_steps.md` for full descriptions.
 
-1. **SDK auto-externalization** — SDK does not yet detect payloads >10 KB before calling `/api/events`. API returns HTTP 413; caller must handle. Auto-externalize (upload to `/api/artifacts/upload`, replace payload with pointer) before shipping `POST /api/events`.
-2. **Artifact download error UX** — download link is a plain `<a download>` anchor. On 404/502 the browser silently downloads a JSON error body. Convert to `'use client'` with programmatic fetch and inline error display.
-3. **Run detail breadcrumb navigation** — no back-navigation from run detail to project or agent without browser Back button. Add `Organization → Project → Agent → Run <id>` breadcrumb with links.
-4. **Convex schema drift check** — contracts and Convex schema can drift silently. Add `scripts/check-schema-drift.ts` and call it from `validate.sh` as a fourth check.
-5. **Event list virtualization** — Timeline and EventInspector load events in pages of 200 but do not virtualize the DOM. Runs with 10,000+ events may have sluggish scroll. Consider react-window.
-6. **Background projection verification** — no scheduled job verifies run sequence integrity in production. Currently on-demand only via `rebuild-projection.ts`.
-7. **Live run monitoring** — no real-time event streaming. Run detail page does not auto-refresh while a run is in progress.
-8. **RBAC viewer-vs-member on read paths** — roles stored and enforced on writes; read path distinction is deferred.
+1. **SDK auto-externalization** (HIGH) — SDK does not yet detect payloads >10 KB before calling `/api/events`. API returns HTTP 413; caller must handle. Auto-externalize (upload to `/api/artifacts/upload`, replace payload with pointer) before shipping `POST /api/events`.
+2. **Artifact download error UX** (HIGH) — download link is a plain `<a download>` anchor. On 404/502 the browser silently downloads a JSON error body. Convert to `'use client'` with programmatic fetch and inline error display.
+3. **Run detail breadcrumb navigation** (MEDIUM) — no back-navigation from run detail to project or agent without browser Back button. Add `Organization → Project → Agent → Run <id>` breadcrumb with links.
+4. **Convex schema drift check** (MEDIUM) — contracts and Convex schema can drift silently. Add `scripts/check-schema-drift.ts` and call it from `validate.sh` as a fourth check.
+5. **Version list pagination** (MEDIUM) — `listAgentVersions` uses `.collect()` with no pagination. Acceptable for v1; add cursor-based pagination if version counts grow.
+6. **Event list virtualization** (LOW) — Timeline and EventInspector load events in pages of 200 but do not virtualize the DOM. Runs with 10,000+ events may have sluggish scroll. Consider react-window.
+7. **Background projection verification** (LOW) — no scheduled job verifies run sequence integrity in production. Currently on-demand only via `rebuild-projection.ts`.
+8. **Live run monitoring** (LOW) — no real-time event streaming. Run detail page does not auto-refresh while a run is in progress.
+9. **RBAC viewer-vs-member on read paths** (LOW) — roles stored and enforced on writes; read path distinction is deferred.
+10. **Version label enrichment at scale** (LOW) — run list fetches one `getAgentVersion` per distinct version ID on each page load. Consider caching or a batch query if pages regularly show many distinct versions.
