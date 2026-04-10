@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useRef, useState, useTransition } from 'react'
 
 import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts'
 
@@ -68,6 +68,8 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
   const [cursor, setCursor] = useState<string | undefined>(initialNextCursor)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
+  const [focusedIndex, setFocusedIndex] = useState<number>(-1)
+  const listRef = useRef<HTMLDivElement>(null)
 
   function handleLoadMore() {
     if (!cursor) return
@@ -100,18 +102,47 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
     )
   }
 
+  function handleKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (allEvents.length === 0) return
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      setFocusedIndex((prev) => Math.min(allEvents.length - 1, prev < 0 ? 0 : prev + 1))
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      setFocusedIndex((prev) => Math.max(0, prev < 0 ? 0 : prev - 1))
+    } else if (e.key === 'Enter') {
+      e.preventDefault()
+      const focused = allEvents[focusedIndex]
+      if (focused) {
+        setExpandedId(expandedId === focused.id ? null : focused.id)
+      }
+    }
+  }
+
   return (
     <div className="px-6 py-4">
       <div className="relative">
         {/* Vertical rail */}
         <div className="absolute left-[11px] top-3 bottom-3 w-px bg-neutral-800" aria-hidden="true" />
-        <div className="flex flex-col gap-1.5">
-          {allEvents.map((event) => {
+        <div
+          ref={listRef}
+          tabIndex={0}
+          onKeyDown={handleKeyDown}
+          onFocus={() => { if (focusedIndex === -1) setFocusedIndex(0) }}
+          className="flex flex-col gap-1.5 outline-none focus:outline-none"
+        >
+          {allEvents.map((event, idx) => {
             const isExpanded = expandedId === event.id
             const summary = payloadSummary(event)
 
             return (
-              <div key={event.id} className="flex items-start gap-3">
+              <div
+                key={event.id}
+                className={[
+                  'flex items-start gap-3 rounded',
+                  focusedIndex === idx ? 'ring-1 ring-neutral-600' : '',
+                ].join(' ')}
+              >
                 <div
                   className={[
                     'w-[23px] h-[23px] shrink-0 rounded-full border z-10 mt-0.5',

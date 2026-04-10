@@ -32,7 +32,7 @@ type TabId = (typeof TABS)[number]['id']
 
 interface RunDetailPageProps {
   params: { runId: string }
-  searchParams: { tab?: string }
+  searchParams: { tab?: string; event?: string }
 }
 
 export default async function RunDetailPage({ params, searchParams }: RunDetailPageProps) {
@@ -42,6 +42,10 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
     (searchParams.tab as TabId | undefined) && TABS.some((t) => t.id === searchParams.tab)
       ? (searchParams.tab as TabId)
       : 'timeline'
+
+  const initialEventSeq = searchParams.event !== undefined
+    ? parseInt(searchParams.event, 10) || undefined
+    : undefined
 
   // Fetch run and events server-side
   let runData: Awaited<ReturnType<typeof getRun>> | null = null
@@ -152,7 +156,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         )}
         {activeTab === 'events' && (
           <Suspense fallback={<LoadingState message="Loading events..." />}>
-            <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} />
+            <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} initialEventSeq={initialEventSeq} />
           </Suspense>
         )}
         {activeTab === 'artifacts' && (

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useEffect, useState, useTransition } from 'react'
 
 import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts'
 
@@ -13,6 +13,7 @@ interface EventInspectorProps {
   events?: Event[]
   initialNextCursor?: string
   loading?: boolean
+  initialEventSeq?: number
 }
 
 /**
@@ -81,8 +82,12 @@ function ExternalizedPayloadView({ payload }: { payload: {
   )
 }
 
-export function EventInspector({ runId, events, initialNextCursor, loading }: EventInspectorProps) {
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+export function EventInspector({ runId, events, initialNextCursor, loading, initialEventSeq }: EventInspectorProps) {
+  const initialId = (initialEventSeq !== undefined && events)
+    ? (events.find((e) => e.sequenceNumber === initialEventSeq)?.id ?? null)
+    : null
+  const [selectedId, setSelectedId] = useState<string | null>(initialId)
+  const [focusedIdx, setFocusedIdx] = useState<number>(-1)
   const [extraEvents, setExtraEvents] = useState<Event[]>([])
   const [cursor, setCursor] = useState<string | undefined>(initialNextCursor)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -121,6 +126,74 @@ export function EventInspector({ runId, events, initialNextCursor, loading }: Ev
 
   const selectedEvent = allEvents.find((e) => e.id === selectedId) ?? allEvents[0] ?? null
 
+  function handleListKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (allEvents.length === 0) return
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      const next = Math.min(allEvents.length - 1, focusedIdx < 0 ? 0 : focusedIdx + 1)
+      setFocusedIdx(next)
+      setSelectedId(allEvents[next]?.id ?? null)
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      const prev = Math.max(0, focusedIdx < 0 ? 0 : focusedIdx - 1)
+      setFocusedIdx(prev)
+      setSelectedId(allEvents[prev]?.id ?? null)
+    }
+  }
+
+  return (
+    <EventInspectorInner
+      allEvents={allEvents}
+      selectedEvent={selectedEvent}
+      selectedId={selectedId}
+      setSelectedId={setSelectedId}
+      focusedIdx={focusedIdx}
+      setFocusedIdx={setFocusedIdx}
+      handleListKeyDown={handleListKeyDown}
+      cursor={cursor}
+      loadError={loadError}
+      isPending={isPending}
+      handleLoadMore={handleLoadMore}
+    />
+  )
+}
+
+interface EventInspectorInnerProps {
+  allEvents: Event[]
+  selectedEvent: Event | null
+  selectedId: string | null
+  setSelectedId: (id: string | null) => void
+  focusedIdx: number
+  setFocusedIdx: (idx: number) => void
+  handleListKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void
+  cursor: string | undefined
+  loadError: string | null
+  isPending: boolean
+  handleLoadMore: () => void
+}
+
+function EventInspectorInner({
+  allEvents,
+  selectedEvent,
+  selectedId,
+  setSelectedId,
+  focusedIdx,
+  setFocusedIdx,
+  handleListKeyDown,
+  cursor,
+  loadError,
+  isPending,
+  handleLoadMore,
+}: EventInspectorInnerProps) {
+  // Sync ?event=<sequenceNumber> into the URL without navigation
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!selectedEvent) return
+    const url = new URL(window.location.href)
+    url.searchParams.set('event', String(selectedEvent.sequenceNumber))
+    window.history.replaceState(null, '', url.toString())
+  }, [selectedEvent?.sequenceNumber])
+
   return (
     <div className="flex h-full min-h-[400px]">
       {/* Left panel — event list */}
@@ -128,26 +201,34 @@ export function EventInspector({ runId, events, initialNextCursor, loading }: Ev
         <div className="px-3 py-2 border-b border-neutral-800">
           <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Events</p>
         </div>
-        <ul className="divide-y divide-neutral-800/60">
-          {allEvents.map((evt) => (
-            <li
-              key={evt.id}
-              onClick={() => setSelectedId(evt.id)}
-              className={[
-                'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75',
-                selectedEvent?.id === evt.id
-                  ? 'bg-neutral-900 text-neutral-200'
-                  : 'hover:bg-neutral-900/60 text-neutral-400',
-              ].join(' ')}
-            >
-              <span className="text-xs font-mono">{evt.type}</span>
-              {(evt.payload as { type: string }).type === '_externalized' && (
-                <span className="text-amber-700 text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
-              )}
-              <span className="text-xs font-mono text-neutral-600">#{evt.sequenceNumber}</span>
-            </li>
-          ))}
-        </ul>
+        <div
+          tabIndex={0}
+          className="outline-none"
+          onFocus={() => { if (focusedIdx === -1) setFocusedIdx(0) }}
+          onKeyDown={handleListKeyDown}
+        >
+          <ul className="divide-y divide-neutral-800/60">
+            {allEvents.map((evt, idx) => (
+              <li
+                key={evt.id}
+                onClick={() => { setSelectedId(evt.id); setFocusedIdx(idx) }}
+                className={[
+                  'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75',
+                  selectedEvent?.id === evt.id
+                    ? 'bg-neutral-900 text-neutral-200'
+                    : 'hover:bg-neutral-900/60 text-neutral-400',
+                  focusedIdx === idx ? 'ring-1 ring-inset ring-neutral-600' : '',
+                ].join(' ')}
+              >
+                <span className="text-xs font-mono">{evt.type}</span>
+                {(evt.payload as { type: string }).type === '_externalized' && (
+                  <span className="text-amber-700 text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
+                )}
+                <span className="text-xs font-mono text-neutral-600">#{evt.sequenceNumber}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
 
         {/* Load more */}
         {(cursor !== undefined || loadError !== null) && (
@@ -170,8 +251,19 @@ export function EventInspector({ runId, events, initialNextCursor, loading }: Ev
 
       {/* Right panel — event payload */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        <div className="px-4 py-2 border-b border-neutral-800 shrink-0">
+        <div className="px-4 py-2 border-b border-neutral-800 shrink-0 flex items-center justify-between">
           <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Payload</p>
+          {selectedEvent && (
+            <button
+              onClick={() => {
+                void navigator.clipboard.writeText(window.location.href)
+              }}
+              title="Copy link to this event"
+              className="text-xs font-mono text-neutral-600 hover:text-neutral-300 transition-colors duration-75 px-2 py-0.5 rounded hover:bg-neutral-800"
+            >
+              Copy link
+            </button>
+          )}
         </div>
         {selectedEvent ? (
           <div className="flex-1 overflow-y-auto">
