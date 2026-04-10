@@ -4,6 +4,7 @@ import type { ApiError } from '@agent-flight-recorder/contracts'
 
 import { convex } from '@/lib/convexFunctions'
 import { getPublicClient, hashApiKey } from '@/lib/convexServer'
+import { PAYLOAD_EXTERNALIZATION_THRESHOLD } from '@/lib/storage'
 
 // POST /api/events — batch append events from the SDK (x-api-key auth)
 export async function POST(req: NextRequest) {
@@ -43,11 +44,9 @@ export async function POST(req: NextRequest) {
     if (evt['payload'] == null) return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'Each event must have payload' }, { status: 422 })
   }
 
-  const MAX_PAYLOAD_BYTES = 10 * 1024 // 10 KB
-
   for (const evt of events as Record<string, unknown>[]) {
     const payloadJson = JSON.stringify(evt['payload'])
-    if (payloadJson.length > MAX_PAYLOAD_BYTES) {
+    if (payloadJson.length > PAYLOAD_EXTERNALIZATION_THRESHOLD) {
       return NextResponse.json<ApiError>(
         {
           code: 'PAYLOAD_TOO_LARGE',

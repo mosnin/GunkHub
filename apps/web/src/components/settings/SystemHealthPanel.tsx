@@ -1,37 +1,8 @@
-import { headers } from 'next/headers'
-
 import { Card } from '@/components/ui/Card'
+import { type HealthData, getHealthData } from '@/lib/health'
 
-interface HealthResponse {
-  status: 'ok' | 'degraded'
-  storage: {
-    adapter: 'vercel' | 'stub'
-    configured: boolean
-  }
-  projection: {
-    model: string
-    materializationEnabled: boolean
-  }
-  environment: 'production' | 'development' | 'test'
-  timestamp: string
-}
-
-async function fetchHealth(): Promise<HealthResponse | null> {
-  try {
-    const headersList = headers()
-    const host = headersList.get('host') ?? 'localhost:3000'
-    const protocol = host.includes('localhost') ? 'http' : 'https'
-    const url = `${protocol}://${host}/api/health`
-    const res = await fetch(url, { cache: 'no-store' })
-    if (!res.ok) return null
-    return (await res.json()) as HealthResponse
-  } catch {
-    return null
-  }
-}
-
-export async function SystemHealthPanel() {
-  const health = await fetchHealth()
+export function SystemHealthPanel() {
+  const health: HealthData = getHealthData()
 
   return (
     <Card>

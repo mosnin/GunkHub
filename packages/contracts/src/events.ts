@@ -142,6 +142,29 @@ export interface CustomPayload {
   data: unknown;
 }
 
+/**
+ * ExternalizedPayload — stored in place of an oversized inline payload.
+ *
+ * When the SDK detects that an event payload serializes to more than
+ * PAYLOAD_EXTERNALIZATION_THRESHOLD bytes, it uploads the full payload
+ * as an artifact and replaces the inline payload with this pointer shape.
+ *
+ * The event record's `type` field is unchanged (still "llm.request", etc.).
+ * The original event type is preserved in `originalType` for UI rendering.
+ */
+export interface ExternalizedPayload {
+  type: "_externalized";
+  /** The event type of the original oversized payload (e.g. "llm.request"). */
+  originalType: EventType;
+  _artifact: {
+    artifactId: string;
+    storageKey: string;
+    storageBucket: string;
+    checksum: string;
+    size: number;
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Discriminated union of all payload types
 // ---------------------------------------------------------------------------
@@ -163,4 +186,5 @@ export type EventPayload =
   | RetrievalResultPayload
   | HttpRequestPayload
   | HttpResponsePayload
-  | CustomPayload;
+  | CustomPayload
+  | ExternalizedPayload;

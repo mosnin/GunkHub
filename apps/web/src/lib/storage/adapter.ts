@@ -49,8 +49,4 @@ export async function sha256Hex(data: string): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/**
- * PAYLOAD_EXTERNALIZATION_THRESHOLD — 10 KB in bytes (JSON-serialized length).
- * Payloads whose JSON.stringify length exceeds this value must be externalized.
- */
-export const PAYLOAD_EXTERNALIZATION_THRESHOLD = 10 * 1024; // 10 KB
+export { PAYLOAD_EXTERNALIZATION_THRESHOLD } from "@agent-flight-recorder/contracts";

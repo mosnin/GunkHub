@@ -1,4 +1,9 @@
-import type { Artifact } from "./entities.js";
+/**
+ * PAYLOAD_EXTERNALIZATION_THRESHOLD — 10 KB in bytes (JSON-serialized length).
+ * Payloads whose JSON.stringify length exceeds this value must be externalized
+ * to blob storage. The event record stores an ExternalizedPayload pointer instead.
+ */
+export const PAYLOAD_EXTERNALIZATION_THRESHOLD = 10 * 1024; // 10 KB
 
 export interface ArtifactPointer {
   storageKey: string;
@@ -14,15 +19,25 @@ export interface BlobStorageConfig {
   baseUrl: string;
 }
 
-export interface UploadRequest {
+export interface ArtifactUploadRequest {
   runId: string;
   eventId?: string;
   name: string;
   mimeType: string;
+  /** Full payload to externalize (JSON-stringified server-side). */
+  payload: unknown;
+}
+
+export interface ArtifactUploadResponse {
+  artifactId: string;
+  storageKey: string;
+  storageBucket: string;
+  checksum: string;
   size: number;
 }
 
-export interface UploadResponse {
-  uploadUrl: string;
-  artifact: Artifact;
-}
+/** @deprecated Use ArtifactUploadRequest */
+export type UploadRequest = ArtifactUploadRequest;
+
+/** @deprecated Use ArtifactUploadResponse */
+export type UploadResponse = ArtifactUploadResponse;

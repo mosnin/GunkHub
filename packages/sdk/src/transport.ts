@@ -1,4 +1,6 @@
-import type { CreateEventRequest, CreateRunRequest, CreateRunResponse } from '@agent-flight-recorder/contracts'
+import { PAYLOAD_EXTERNALIZATION_THRESHOLD } from '@agent-flight-recorder/contracts'
+
+import type { CreateEventRequest, CreateRunRequest, CreateRunResponse, ExternalizedPayload } from '@agent-flight-recorder/contracts'
 import type { TransportResponse } from './types.js'
 
 export interface Transport {
@@ -57,6 +59,61 @@ export class HttpTransport implements Transport {
    */
   private _sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms))
+  }
+
+  /**
+   * Upload an oversized event payload as an artifact so the event record can
+   * store a compact pointer instead of the full inline payload.
+   *
+   * Sends POST /api/artifacts/upload with the raw payload JSON.
+   *
+   * @param runId - ID of the run this event belongs to
+   * @param eventType - The event type string (e.g. "llm.response") — used as the artifact name
+   * @param serializedPayload - The already-serialized JSON string of the event payload
+   * @param auth - Authentication credentials (API key)
+   * @returns Artifact pointer fields needed to construct an `ExternalizedPayload`
+   * @throws Error if the upload request fails (non-2xx) or the network is unreachable
+   */
+  private async _uploadArtifact(
+    runId: string,
+    eventType: string,
+    serializedPayload: string,
+    auth: TransportAuth,
+  ): Promise<{ artifactId: string; storageKey: string; storageBucket: string; checksum: string; size: number }> {
+    const url = `${this.endpoint}/api/artifacts/upload`
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'x-api-key': auth.apiKey,
+    }
+
+    const response = await this._fetchWithTimeout(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        runId,
+        name: `${eventType.replace('.', '-')}.payload.json`,
+        mimeType: 'application/json',
+        payload: JSON.parse(serializedPayload),
+      }),
+    })
+
+    if (!response.ok) {
+      let body = ''
+      try {
+        body = await response.text()
+      } catch {
+        // ignore parse failure
+      }
+      throw new Error(`HTTP ${response.status}: ${body}`)
+    }
+
+    return (await response.json()) as {
+      artifactId: string
+      storageKey: string
+      storageBucket: string
+      checksum: string
+      size: number
+    }
   }
 
   /**
@@ -164,6 +221,35 @@ export class HttpTransport implements Transport {
       'x-api-key': auth.apiKey,
     }
 
+    // Pre-externalize any events whose payload exceeds the threshold.
+    // Done before the retry loop so we don't re-upload on retry.
+    const processedEvents: CreateEventRequest[] = []
+    for (const event of events) {
+      const serialized = JSON.stringify(event.payload)
+      if (serialized.length > PAYLOAD_EXTERNALIZATION_THRESHOLD) {
+        // Upload the oversized payload as an artifact first
+        try {
+          const pointer = await this._uploadArtifact(event.runId, event.type, serialized, auth)
+          processedEvents.push({
+            ...event,
+            payload: {
+              type: '_externalized' as const,
+              originalType: event.type,
+              _artifact: pointer,
+            } satisfies ExternalizedPayload,
+          })
+        } catch (err) {
+          return {
+            success: false,
+            retryable: false,
+            error: `Failed to externalize payload for event seq=${event.sequenceNumber}: ${err instanceof Error ? err.message : String(err)}`,
+          }
+        }
+      } else {
+        processedEvents.push(event)
+      }
+    }
+
     let attempt = 0
 
     // eslint-disable-next-line no-constant-condition
@@ -173,7 +259,7 @@ export class HttpTransport implements Transport {
         response = await this._fetchWithTimeout(url, {
           method: 'POST',
           headers,
-          body: JSON.stringify({ events }),
+          body: JSON.stringify({ events: processedEvents }),
         })
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
