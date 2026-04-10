@@ -2,7 +2,7 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 5 — Release Candidate)
+Last updated: 2026-04-10 (Prompt 6 — SDK Auto-Externalization)
 
 ---
 
@@ -22,19 +22,25 @@ Prompt 5 (Release Candidate) is complete. The following summarizes the full stat
 
 **packages/contracts is fully defined.** All shared types:
 - `entities.ts` — Organization, Project, Agent, AgentVersion, Run, Event, Artifact, Comment
-- `events.ts` — EventType union, all payload shapes, EventPayload discriminated union
+- `events.ts` — EventType union, all payload shapes, EventPayload discriminated union (includes `ExternalizedPayload`)
 - `status.ts` — RunStatus, RunStatusValues, isTerminalStatus()
 - `api.ts` — All API request/response types
 - `replay.ts` — ReplayProjection, ReplayFrame, FailureSummary, FailurePoint, ReplayActor, FrameStatus
 - `diff.ts` — RunDiff, EventDiff, DiffSummary, FieldChange
+- `artifacts.ts` — `PAYLOAD_EXTERNALIZATION_THRESHOLD` (10240), `ArtifactPointer`, `ArtifactUploadRequest`, `ArtifactUploadResponse`
 
-**packages/sdk is implemented (except HTTP transport).** The `Recorder` class, `Events` builders, `buildEvent` helper, `HttpTransport` (stubbed), `Transport` interface, all types. The SDK is functional end-to-end when a `MockTransport` is injected (as in tests).
+Key new exports (Prompt 6):
+- `ExternalizedPayload` — pointer type for externalized event payloads, member of `EventPayload` union
+- `PAYLOAD_EXTERNALIZATION_THRESHOLD` — imported by SDK to determine when to externalize
+
+**packages/sdk is fully implemented.** The `Recorder` class, `Events` builders, `buildEvent` helper, `HttpTransport` (complete with auto-externalization, retry, timeout), `Transport` interface, all types. The SDK is functional end-to-end with either a real `HttpTransport` or an injected `MockTransport`.
 
 **apps/web production storage layer is implemented (Prompt 5):**
 - `apps/web/src/lib/storage/vercel.ts` — `VercelBlobAdapter` production implementation via native fetch, activated when `BLOB_STORE_TOKEN` env var is present
 - `apps/web/src/lib/storage/index.ts` — `getStorageAdapter()` updated to use `BLOB_STORE_TOKEN` presence (not `BLOB_STORAGE_PROVIDER`) to select the active adapter
 - `apps/web/src/lib/replay/verify.ts` — `verifyProjectionIntegrity(run, events): ProjectionVerifyResult` pure function for sequence integrity checks
 - `apps/web/app/api/health/route.ts` — `GET /api/health` operator endpoint
+- `apps/web/src/lib/health.ts` — shared health data function (Prompt 6: extracted from route to eliminate server-side loopback HTTP call)
 - `apps/web/src/components/runs/SystemHealthPanel.tsx` — health UI component
 - `scripts/rebuild-projection.ts` — CLI script for event integrity verification
 
@@ -67,10 +73,11 @@ Prompt 5 (Release Candidate) is complete. The following summarizes the full stat
 - `tests/unit/storage.test.ts` — BlobStorageAdapter, sha256Hex, PAYLOAD_EXTERNALIZATION_THRESHOLD (28 tests, updated in Prompt 5 for new BLOB_STORE_TOKEN-based adapter selection)
 - `tests/unit/projection-verify.test.ts` — verifyProjectionIntegrity (68 tests, Prompt 5)
 - `tests/unit/flight-recorder.test.ts` — FlightRecorder and RunRecorder HTTP transport tests (33 tests)
+- `tests/unit/transport-externalization.test.ts` — HttpTransport payload externalization tests (26 tests, Prompt 6)
 - `tests/integration/api.test.ts` — API response shape tests (16 tests)
 - `tests/fixtures/runs.ts` — Sample run/event fixture data
 - `tests/fixtures/events.ts` — 6 scenario fixtures for explainability algorithm tests
-- **Total: 356 tests in tests/ workspace, all passing; 260 SDK tests, all passing (616 total)**
+- **Total: 382 tests in tests/ workspace, all passing; 260 SDK tests, all passing (642 total)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -78,6 +85,7 @@ Prompt 5 (Release Candidate) is complete. The following summarizes the full stat
 - ADR-0006: Artifact externalization policy — 10 KB threshold, blob storage, ArtifactPointer (Prompt 4)
 - ADR-0007: Ingestion idempotency — (runId, sequenceNumber) dedup, returns existing ID (Prompt 4)
 - ADR-0008: VercelBlobAdapter design — native fetch, no @vercel/blob SDK dependency (Prompt 5)
+- ADR-0009: SDK-side payload externalization and `ExternalizedPayload` pointer representation (Prompt 6)
 
 ---
 
@@ -155,7 +163,6 @@ Prompt 5 (Release Candidate) is complete. The following summarizes the full stat
 
 | File | What is Stubbed | What It Needs |
 |------|----------------|---------------|
-| `packages/sdk/src/transport.ts` — `HttpTransport` | All three methods throw | Real `fetch` calls to `/api/runs`, `/api/events`, `/api/runs/:id/status` with auth headers, retry logic |
 | `apps/web/src/lib/services/runs.ts` | Returns empty/fake data | Real Convex calls via `ConvexHttpClient` or Convex React hooks |
 | `apps/web/src/lib/services/events.ts` | Returns empty array | Same |
 | `apps/web/src/lib/services/comments.ts` | Returns empty array | Same |
@@ -170,6 +177,11 @@ Prompt 5 (Release Candidate) is complete. The following summarizes the full stat
 - `apps/web/src/lib/replay/projection.ts` — `buildReplayProjection` complete
 - `apps/web/src/lib/replay/failure.ts` — `buildFailureSummary` complete
 - `apps/web/src/lib/replay/diff.ts` — `buildRunDiff` complete
+
+**Fully implemented in Prompt 6 (no longer stubs):**
+- `packages/sdk/src/transport.ts` — `HttpTransport` complete: auto-externalization of oversized payloads via `_uploadArtifact`, retry loop for events, per-request timeout via `AbortController`
+- `apps/web/src/lib/health.ts` — shared health data function, no more server-side loopback HTTP call
+- `tests/unit/transport-externalization.test.ts` — 26 new tests for SDK payload externalization
 
 ---
 
@@ -221,7 +233,7 @@ tests/
 | SDK public entry point | `packages/sdk/src/index.ts` |
 | SDK Recorder class | `packages/sdk/src/recorder.ts` |
 | SDK event builders | `packages/sdk/src/events.ts` |
-| SDK Transport interface + HttpTransport stub | `packages/sdk/src/transport.ts` |
+| SDK Transport interface + HttpTransport (complete) | `packages/sdk/src/transport.ts` |
 | SDK config types | `packages/sdk/src/types.ts` |
 | Web service layer (run operations) | `apps/web/src/lib/services/runs.ts` |
 | Web env validation | `apps/web/src/lib/env.ts` |
@@ -258,8 +270,8 @@ If you find yourself wanting to update an event, you are doing something wrong. 
 **`apps/web` does not have an `app/` directory yet.**
 Next.js 14 App Router requires an `app/` directory. It does not exist. Do not try to run the web app dev server until it is created in Prompt 2.
 
-**SDK `HttpTransport` throws on all methods.**
-All three `HttpTransport` methods throw `not yet implemented`. If you run the SDK's integration path, it will fail. Unit tests work because they inject `MockTransport`. Do not wire the SDK to a real endpoint until Prompt 2 implements the Next.js API routes and `HttpTransport`.
+**SDK `HttpTransport` is fully implemented.**
+`HttpTransport` now implements `createRun`, `sendEvents`, and `updateRunStatus` with real `fetch` calls, retry logic, and per-request timeout. `sendEvents` auto-externalizes payloads exceeding 10 KB by calling `POST /api/artifacts/upload` before `POST /api/events`. When using `MockTransport` in tests, none of this applies — `MockTransport` bypasses the HTTP layer entirely.
 
 **No `.env.example` exists.**
 Before any developer can run the project, `.env.example` must be created. Required vars at minimum: `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `NEXT_PUBLIC_CONVEX_URL`, `CONVEX_DEPLOYMENT`. Create this early in Prompt 2.

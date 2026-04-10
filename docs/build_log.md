@@ -2,6 +2,88 @@
 
 ---
 
+## Prompt 6 — SDK Auto-Externalization and Test Coverage
+
+**Date:** 2026-04-10
+
+### What changed
+
+- `packages/sdk/src/transport.ts` — `HttpTransport.sendEvents()` now auto-externalizes
+  oversized payloads. Before the retry loop, each event whose payload serializes to
+  > `PAYLOAD_EXTERNALIZATION_THRESHOLD` bytes is uploaded via `POST /api/artifacts/upload`.
+  The event's `payload` is replaced with an `ExternalizedPayload` pointer before being
+  sent to `POST /api/events`. Upload failures return `{ success: false, retryable: false }`
+  immediately; the events call is skipped.
+- `packages/contracts/src/events.ts` — `ExternalizedPayload` interface added to the
+  `EventPayload` discriminated union. `PAYLOAD_EXTERNALIZATION_THRESHOLD` imported by the
+  SDK from `packages/contracts/src/artifacts.ts` (was already defined there in Prompt 4).
+- `apps/web/src/lib/health.ts` — shared health data function extracted from the health
+  API route, eliminating the loopback HTTP call that `SystemHealthPanel` previously made
+  to `/api/health` from the server-side component.
+- `tests/unit/transport-externalization.test.ts` — 26 new unit tests covering SDK payload
+  externalization: small payload passthrough, large payload upload + pointer replacement,
+  mixed batches, upload failure handling, and pointer shape correctness.
+- `docs/adrs/0009_payload_externalization_sdk.md` — decision record for SDK-side
+  externalization and the `ExternalizedPayload` pointer representation.
+
+### Why the externalization path fits the architecture
+
+ADR-0006 established that payloads exceeding 10 KB must be externalized to blob storage.
+The API route has enforced this boundary since Prompt 4 (HTTP 413 for oversized events).
+The SDK-side preflight implemented here completes the loop: instead of letting the server
+reject the event, the SDK detects the oversize condition locally, uploads the blob, and
+ships a compact pointer. This is the correct place for this logic because:
+
+1. The SDK is the author of the event and has the full payload before any network call.
+2. The API route's 413 rejection is a correctness guard, not a service — it is not
+   designed to handle blobs for callers.
+3. Externalizing in Convex mutations would introduce a cross-service call from the data
+   layer into blob storage, violating the boundary established in ADR-0006.
+
+The `ExternalizedPayload` type in `packages/contracts` follows the CLAUDE.md rule that
+all shared types live in `packages/contracts` only. Any consumer (UI, Convex queries,
+future analytics) that reads event payloads will see the type in the union and handle
+it correctly.
+
+### Hard-to-reverse decisions
+
+- **`ExternalizedPayload` in the `EventPayload` union**: once events are stored in Convex
+  with `payload.type === "_externalized"`, this shape is part of the persistent data model.
+  Removing or renaming `ExternalizedPayload` would require a migration of all stored events.
+  The shape was designed to be stable: `type`, `originalType`, and `_artifact` are the
+  minimal fields needed for any consumer to render or fetch the externalized content.
+
+### Known residual risks
+
+- **Duplicate artifact records on retry**: if `_uploadArtifact` succeeds but the
+  subsequent `/api/events` call fails permanently, a repeat flush call will upload the
+  same blob again and insert a second `artifacts` record in Convex. The content is correct;
+  only the record count is inflated. Mitigation: add `(runId, checksum)` dedup to
+  `sdkCreateArtifact` (see ADR-0009, Prompt 7 recommendation).
+
+### Test count
+
+- Before Prompt 6: 356 tests in `tests/` workspace + 260 SDK tests = 616 total, all passing.
+- After Prompt 6: 382 tests in `tests/` workspace (+ 26 new transport-externalization tests)
+  + 260 SDK tests = **642 total, all passing**.
+
+### Recommendation for Prompt 7
+
+1. **ADR-0009 cleanup**: add `(runId, checksum)` dedup to `sdkCreateArtifact` in
+   `convex/sdk_ingest.ts` to fix the duplicate artifact record risk on retry.
+2. **Artifact GC job**: `convex/crons.ts` — daily job to query artifact records older than
+   24 hours with no matching event reference, delete the orphaned blob from Vercel Blob, and
+   remove the orphaned Convex record.
+3. **Run list filtering**: status + date range filter in the runs page UI (Prompt 5 spec
+   item 2C). Requires updating `convex/runs.ts → listRuns` to accept optional `status`
+   and `startedAfter` parameters.
+4. **RBAC enforcement**: `convex/auth.ts → requireOrgMembership()` needs an optional
+   `minimumRole` parameter; admin-only mutations should pass `minimumRole: "admin"`.
+5. **Integration tests**: replace fixture stubs in `tests/integration/api.test.ts` with
+   real tests against a Convex test deployment.
+
+---
+
 ## Prompt 5 — Release Candidate: Production Storage, Projection Verification, Deployment Docs
 
 **Date:** 2026-04-10
