@@ -140,14 +140,18 @@ is no recovery path for missing events in v1.
 **Cause:** The SDK crashed or the process was killed before calling `run.complete()`
 or `run.fail()`. The run has no terminal event and no status update was sent.
 
-**Fix (manual, v1):** Patch the run directly in the Convex dashboard:
+**Fix (automatic, v1):** Runs stuck in `running` for more than 24 hours are automatically
+transitioned to `timed_out` by the daily `expire-stale-runs` cron job (runs at 03:00 UTC).
+No manual intervention is required. The transition is logged in Convex function logs:
+```
+Stale run expiry: batch=N expired=E errors=X
+```
+
+**Fix (manual, if needed):** If a run must be expired immediately before the next cron run:
 1. Open the Convex dashboard → runs table.
 2. Find the stuck run by `id`.
 3. Edit the `status` field to `"timed_out"`.
 4. Edit the `endedAt` field to the current Unix timestamp in milliseconds.
-
-There is no automated timeout in v1. A background job to expire stale runs is a v1.1
-feature.
 
 ---
 

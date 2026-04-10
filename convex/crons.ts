@@ -15,4 +15,12 @@ crons.daily(
   makeFunctionReference<"action">("artifact_gc:cleanOrphanedArtifacts"),
 );
 
+// Daily stale run expiry. Runs at 03:00 UTC, one hour after artifact GC.
+// Transitions runs stuck in "running" for > 24 hours to "timed_out".
+crons.daily(
+  "expire-stale-runs",
+  { hourUTC: 3, minuteUTC: 0 },
+  makeFunctionReference<"action">("stale_runs:expireStaleRuns"),
+);
+
 export default crons;
