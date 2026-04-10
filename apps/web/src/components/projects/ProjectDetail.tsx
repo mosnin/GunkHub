@@ -27,6 +27,7 @@ const recorder = new FlightRecorder({
 
 const run = await recorder.startRun({
   agentId: '${agentId}',
+  // agentVersionId: 'YOUR_VERSION_ID',  // create a version on the agent page
 })
 try {
   // your agent logic

@@ -10,9 +10,10 @@ import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
 interface RunListProps {
   runs?: Run[]
   loading?: boolean
+  agentVersionLabels?: Record<string, string>
 }
 
-export function RunList({ runs, loading }: RunListProps) {
+export function RunList({ runs, loading, agentVersionLabels = {} }: RunListProps) {
   if (loading) {
     return <LoadingState message="Loading runs..." />
   }
@@ -39,6 +40,9 @@ export function RunList({ runs, loading }: RunListProps) {
             </th>
             <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
               Agent
+            </th>
+            <th className="w-28 px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+              Version
             </th>
             <th className="w-36 px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
               Started
@@ -74,6 +78,17 @@ export function RunList({ runs, loading }: RunListProps) {
                   tabIndex={-1}
                 >
                   {truncateId(run.agentId, 16)}
+                </Link>
+              </td>
+              <td className="px-4 py-3">
+                <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
+                  {run.agentVersionId && agentVersionLabels[run.agentVersionId] ? (
+                    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-mono text-neutral-400 bg-neutral-900 border border-neutral-800">
+                      {agentVersionLabels[run.agentVersionId]}
+                    </span>
+                  ) : (
+                    <span className="text-xs text-neutral-700">—</span>
+                  )}
                 </Link>
               </td>
               <td className="px-4 py-3">

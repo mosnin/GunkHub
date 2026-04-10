@@ -64,6 +64,18 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
     fetchError = msg
   }
 
+  // Resolve agent version label for display in RunHeader
+  let agentVersionLabel: string | undefined
+  if (runData?.run.agentVersionId) {
+    try {
+      const { getAgentVersion } = await import('@/lib/services/agent_versions')
+      const v = await getAgentVersion(runData.run.agentVersionId)
+      agentVersionLabel = v?.version
+    } catch {
+      // Non-fatal
+    }
+  }
+
   // Failure summary is additive — a failed fetch does not block the rest of the page.
   try {
     const replayData = await getReplayProjection(runId)
@@ -105,6 +117,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         runId={runId}
         status={run.status}
         agentName={run.agentId}
+        agentVersionLabel={agentVersionLabel}
         startedAt={run.startedAt}
         endedAt={run.endedAt}
         triggeredBy={run.triggeredBy}

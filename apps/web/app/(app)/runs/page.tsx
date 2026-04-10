@@ -32,6 +32,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
   let runs: Awaited<ReturnType<typeof listRuns>> | null = null
   let agents: Agent[] = []
   let error: string | null = null
+  let agentVersionLabels: Record<string, string> = {}
 
   try {
     runs = await listRuns({
@@ -44,6 +45,26 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
     })
   } catch (err) {
     error = err instanceof Error ? err.message : 'Failed to load runs'
+  }
+
+  // Build version label lookup map for runs that have agentVersionId
+  if (runs?.runs) {
+    const { getAgentVersion } = await import('@/lib/services/agent_versions')
+    const versionIds = [...new Set(
+      runs.runs
+        .filter((r) => r.agentVersionId != null)
+        .map((r) => r.agentVersionId!)
+    )]
+    await Promise.all(
+      versionIds.map(async (vId) => {
+        try {
+          const v = await getAgentVersion(vId)
+          if (v) agentVersionLabels[vId] = v.version
+        } catch {
+          // Non-fatal: omit version label for this run
+        }
+      })
+    )
   }
 
   try {
@@ -172,7 +193,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
             message={error}
           />
         ) : (
-          <RunList runs={runs?.runs} />
+          <RunList runs={runs?.runs} agentVersionLabels={agentVersionLabels} />
         )}
       </div>
     </div>

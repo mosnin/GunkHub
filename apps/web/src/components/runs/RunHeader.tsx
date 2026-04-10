@@ -12,6 +12,7 @@ interface RunHeaderProps {
   runId: string
   status: RunStatus
   agentName: string
+  agentVersionLabel?: string
   startedAt: number
   endedAt?: number
   triggeredBy?: string
@@ -52,7 +53,7 @@ function CopyButton({ value }: { value: string }) {
   )
 }
 
-export function RunHeader({ runId, status, agentName, startedAt, endedAt, triggeredBy, tags, metadata }: RunHeaderProps) {
+export function RunHeader({ runId, status, agentName, agentVersionLabel, startedAt, endedAt, triggeredBy, tags, metadata }: RunHeaderProps) {
   const [isEditing, setIsEditing] = useState(false)
   const [draftTags, setDraftTags] = useState<string[]>(tags ?? [])
   const [savedTags, setSavedTags] = useState<string[]>(tags ?? [])
@@ -117,6 +118,12 @@ export function RunHeader({ runId, status, agentName, startedAt, endedAt, trigge
         <Badge status={status} />
 
         <span className="text-xs text-neutral-500 font-mono">{truncateId(agentName, 20)}</span>
+
+        {agentVersionLabel && (
+          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-mono text-neutral-500 bg-neutral-900 border border-neutral-800">
+            v{agentVersionLabel}
+          </span>
+        )}
 
         <span className="text-xs text-neutral-500">{formatRelativeTime(startedAt)}</span>
 

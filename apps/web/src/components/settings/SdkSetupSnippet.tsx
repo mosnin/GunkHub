@@ -11,7 +11,10 @@ const recorder = new FlightRecorder({
   agentId: 'YOUR_AGENT_ID',
 })
 
-const run = await recorder.startRun()
+const run = await recorder.startRun({
+  agentId: 'YOUR_AGENT_ID',
+  agentVersionId: 'YOUR_VERSION_ID',  // optional: from the Versions tab on your agent page
+})
 await run.recordEvent({ type: 'agent.step', payload: { ... } })
 await run.complete()`
 
