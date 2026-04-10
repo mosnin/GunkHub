@@ -1,7 +1,7 @@
 import { notFound } from 'next/navigation'
 import { Suspense } from 'react'
 
-import type { FailureSummary } from '@agent-flight-recorder/contracts'
+import type { Artifact, FailureSummary } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { ArtifactList } from '@/components/runs/ArtifactList'
@@ -12,6 +12,7 @@ import { RunHeader } from '@/components/runs/RunHeader'
 import { Timeline } from '@/components/runs/Timeline'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { LoadingState } from '@/components/ui/LoadingState'
+import { listArtifacts } from '@/lib/services/artifacts'
 import { listEvents } from '@/lib/services/events'
 import { getReplayProjection } from '@/lib/services/replay'
 import { getRun } from '@/lib/services/runs'
@@ -46,6 +47,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   let eventsData: Awaited<ReturnType<typeof listEvents>> | null = null
   let fetchError: string | null = null
   let failureSummary: FailureSummary | null = null
+  let artifactsData: { artifacts: Artifact[] } = { artifacts: [] }
 
   try {
     runData = await getRun(runId)
@@ -62,6 +64,12 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
     failureSummary = replayData.failureSummary
   } catch {
     // Non-fatal: skip the failure panel if the projection cannot be built.
+  }
+
+  try {
+    artifactsData = await listArtifacts(runId)
+  } catch {
+    // Non-fatal: show empty artifact list if fetch fails
   }
 
   if (fetchError) {
@@ -138,7 +146,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         )}
         {activeTab === 'artifacts' && (
           <Suspense fallback={<LoadingState message="Loading artifacts..." />}>
-            <ArtifactList runId={runId} />
+            <ArtifactList artifacts={artifactsData.artifacts} />
           </Suspense>
         )}
         {activeTab === 'comments' && (

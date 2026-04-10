@@ -45,6 +45,20 @@ export async function listEvents(params: ListEventsRequest): Promise<ListEventsR
 }
 
 /**
+ * Get a single event by ID. Verifies org membership via Convex.
+ */
+export async function getEvent(eventId: string): Promise<Event> {
+  const client = await getAuthedClient()
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await client.query(convex.events.getEvent, { eventId })
+
+  if (!doc) throw new Error('Event not found')
+
+  return mapEvent(doc as Record<string, unknown>)
+}
+
+/**
  * Create a new event. Used by the web UI (Clerk auth).
  * For SDK-initiated events use the /api/events ingestion route with x-api-key.
  */

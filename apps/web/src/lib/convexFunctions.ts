@@ -24,6 +24,7 @@ export const convex = {
   },
   events: {
     listEvents: makeFunctionReference<Q>('events:listEvents'),
+    getEvent: makeFunctionReference<Q>('events:getEvent'),
     createEvent: makeFunctionReference<M>('events:createEvent'),
   },
   artifacts: {
