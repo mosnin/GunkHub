@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ApiKeysSection } from '@/components/settings/ApiKeysSection'
+import { SdkSetupSnippet } from '@/components/settings/SdkSetupSnippet'
 import { SystemHealthPanel } from '@/components/settings/SystemHealthPanel'
 import { Card } from '@/components/ui/Card'
 
@@ -68,6 +69,9 @@ export default function SettingsPage() {
             </p>
           </div>
         </Card>
+
+        {/* SDK Setup — install instructions and basic usage */}
+        <SdkSetupSnippet />
 
         {/* System Health — operator-facing storage and projection status */}
         <SystemHealthPanel />
