@@ -1,34 +1,39 @@
-import type { Metadata } from 'next'
+import { notFound } from 'next/navigation'
 
-import { PageHeader } from '@/components/layout/PageHeader'
-import { LoadingState } from '@/components/ui/LoadingState'
-import { Tabs } from '@/components/ui/Tabs'
+import type { Metadata } from 'next'
+import type { Agent, Project } from '@agent-flight-recorder/contracts'
+
+import { ProjectDetail } from '@/components/projects/ProjectDetail'
+import { listAgents } from '@/lib/services/agents'
+import { getProject } from '@/lib/services/projects'
 
 export const metadata: Metadata = { title: 'Project' }
 
-interface ProjectPageProps {
+interface Props {
   params: { projectId: string }
 }
 
-export default function ProjectPage({ params }: ProjectPageProps) {
-  const tabs = [
-    { id: 'overview', label: 'Overview' },
-    { id: 'agents', label: 'Agents' },
-    { id: 'runs', label: 'Runs' },
-  ]
+export default async function ProjectPage({ params }: Props) {
+  let project: Project | undefined
+  let agents: Agent[] = []
+
+  try {
+    project = await getProject(params.projectId)
+  } catch {
+    notFound()
+  }
+
+  if (!project) notFound()
+
+  try {
+    agents = await listAgents(params.projectId)
+  } catch {
+    // Non-fatal: show empty agents list if fetch fails
+  }
 
   return (
-    <div className="p-6 max-w-6xl mx-auto">
-      <PageHeader
-        title="Project"
-        subtitle={`Project ID: ${params.projectId}`}
-      />
-      <div className="mt-6">
-        <Tabs tabs={tabs} active="overview" onChange={() => {}} />
-        <div className="mt-6">
-          <LoadingState message="Loading project data..." />
-        </div>
-      </div>
+    <div className="p-6 max-w-4xl mx-auto">
+      <ProjectDetail project={project} agents={agents} />
     </div>
   )
 }
