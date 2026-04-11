@@ -10,6 +10,10 @@ export const env = {
   // See .env.example for setup instructions.
   BLOB_STORE_TOKEN: process.env.BLOB_STORE_TOKEN ?? '',
   BLOB_STORE_URL: process.env.BLOB_STORE_URL ?? '',
+  // Derivation verification — optional. Protects the internal verify-derivation route
+  // called by the Convex verifyRecentRuns action. When unset the route returns 503
+  // and the Convex action falls back to sequence-only verification.
+  INTERNAL_VERIFY_SECRET: process.env.INTERNAL_VERIFY_SECRET ?? '',
 }
 
 // Validate public vars at startup in the browser

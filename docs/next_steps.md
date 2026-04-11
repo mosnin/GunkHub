@@ -1,7 +1,7 @@
 # Next Steps — v1.1 Candidates
 
 **Document type:** State summary and v1.1 candidate list.
-**Current state:** Prompt 19 complete.
+**Current state:** Prompt 21 complete.
 
 ---
 
@@ -43,6 +43,25 @@
 - **Live status polling in RunHeader.tsx (`isLive` prop):** Polls `GET /api/runs/${runId}` every 5s when status is `'running'`. Updates `liveStatus` and `liveEndedAt` in local state; badge and duration display use the live values. Stops polling when status transitions to a terminal state. Shows animate-pulse dot and "live" label next to the status badge.
 - **page.tsx wiring:** Passes `isLive={run.status === 'running'}` to RunHeader, Timeline, and EventInspector.
 - **New tests:** `tests/unit/active_run.test.ts` (21 tests) — auto-advance window computation, event dedup for live polling, terminal status detection via contracts, and `isLive` activation rule. Total test count: **575 passing, 5 skipped, 21 test files**.
+
+---
+
+## What Prompt 21 delivered
+
+- **Full derivation verification via internal HTTP route** (`POST /api/internal/verify-derivation`): New stateless Next.js route protected by `INTERNAL_VERIFY_SECRET`. Receives raw Convex run/event documents, maps them to contracts types, calls `verifyProjectionIntegrity`, and returns `checksRan`, `replayPassed`, `failureSummaryPassed` alongside the existing sequence fields.
+- **Convex action extended** (`verifyRecentRuns`): When `INTERNAL_VERIFY_URL` and `INTERNAL_VERIFY_SECRET` are set in the Convex environment, the action fetches full event documents (`_listEventsFull`) and POSTs to the web route for full derivation check. Falls back to sequence-only on any error or if the run exceeds `DERIVATION_MAX_EVENTS = 500`.
+- **`verification_results` schema extended**: Three optional fields added — `checksRan`, `replayPassed`, `failureSummaryPassed`. Old records unaffected.
+- **`VerificationStatus` service extended**: New `checksRan`, `replayPassed`, `failureSummaryPassed` fields. Absent fields map to `[]` / `null`.
+- **`IntegrityBadge` richer states**: Now shows `seq verified` (sky blue) for valid sequence-only records, `verified` (emerald) for full derivation-verified records, `check failed` (red) for any failure, `unverified` (gray) for no record yet.
+- **New tests**: `tests/unit/derivation_verify.test.ts` (43 tests). Total test count: **680 passing, 5 skipped, 24 test files**.
+- **ADR-0021**: Documents the internal-route architecture decision, environment variable setup, size cap, and graceful degradation.
+
+---
+
+## What Prompt 20 delivered
+
+- **Follow-tail model for Timeline.tsx and EventInspector.tsx**: `followTail` boolean state (defaults to `isLive`). When following, polls auto-advance the window to the tail. When paused, `unseenCount` accumulates new event arrivals. "↓ N new — resume" badge shown when paused with unseen events. Toggle turns off on ArrowDown/ArrowUp, event row click, "earlier events" button click.
+- **New tests**: `tests/unit/follow_tail.test.ts` (31 tests). Total test count: **637 passing (before Prompt 21), 5 skipped, 23 test files**.
 
 ---
 

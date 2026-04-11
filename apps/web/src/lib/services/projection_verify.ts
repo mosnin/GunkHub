@@ -4,7 +4,7 @@ import { getAuthedClient } from '@/lib/convexServer'
 export interface VerificationStatus {
   /** True if the run has been verified at least once. */
   verified: boolean
-  /** True if the last verification found no sequence gaps or duplicates. null if never verified. */
+  /** True if the last verification found no issues. null if never verified. */
   isValid: boolean | null
   /** Epoch ms of the last verification run. null if never verified. */
   verifiedAt: number | null
@@ -14,6 +14,23 @@ export interface VerificationStatus {
   sequenceGaps: number[]
   /** Duplicate sequence numbers found in the last check. Empty array if none. */
   duplicateSeqNums: number[]
+  /**
+   * Which checks were run in the last verification.
+   * e.g. ["sequence"] for sequence-only (pre-Prompt 21 records or degraded mode),
+   * or ["sequence","replay","failureSummary"] for full derivation check.
+   * Empty array if never verified.
+   */
+  checksRan: string[]
+  /**
+   * True if buildReplayProjection succeeded in the last full check.
+   * null if the replay check was not run or the run has never been verified.
+   */
+  replayPassed: boolean | null
+  /**
+   * True if buildFailureSummary succeeded in the last full check.
+   * null if the failure-summary check was not run or the run has never been verified.
+   */
+  failureSummaryPassed: boolean | null
 }
 
 /**
@@ -35,6 +52,9 @@ export async function getRunVerificationStatus(runId: string): Promise<Verificat
       summary: null,
       sequenceGaps: [],
       duplicateSeqNums: [],
+      checksRan: [],
+      replayPassed: null,
+      failureSummaryPassed: null,
     }
   }
 
@@ -46,5 +66,8 @@ export async function getRunVerificationStatus(runId: string): Promise<Verificat
     summary: r.summary as string,
     sequenceGaps: (r.sequenceGaps as number[]) ?? [],
     duplicateSeqNums: (r.duplicateSeqNums as number[]) ?? [],
+    checksRan: (r.checksRan as string[]) ?? [],
+    replayPassed: r.replayPassed != null ? (r.replayPassed as boolean) : null,
+    failureSummaryPassed: r.failureSummaryPassed != null ? (r.failureSummaryPassed as boolean) : null,
   }
 }

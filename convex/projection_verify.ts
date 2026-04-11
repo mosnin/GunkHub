@@ -117,6 +117,25 @@ export const _listEventSeqNums = internalQuery({
   },
 });
 
+/** Fetch full event documents for a run (for derivation verification). Internal only. */
+export const _listEventsFull = internalQuery({
+  args: {
+    runId: v.id("runs"),
+    cursor: v.union(v.string(), v.null()),
+  },
+  handler: async (ctx, args) => {
+    const page = await ctx.db
+      .query("events")
+      .withIndex("by_run", (q) => q.eq("runId", args.runId))
+      .paginate({ numItems: 500, cursor: args.cursor });
+
+    return {
+      events: page.page,
+      nextCursor: page.isDone ? null : page.continueCursor,
+    };
+  },
+});
+
 /** Upsert a verification result (delete + insert). Internal only. */
 export const _upsertVerificationResult = internalMutation({
   args: {
@@ -128,6 +147,10 @@ export const _upsertVerificationResult = internalMutation({
     sequenceGaps: v.array(v.number()),
     duplicateSeqNums: v.array(v.number()),
     failureReason: v.optional(v.string()),
+    // Extended derivation check fields (absent for sequence-only verification)
+    checksRan: v.optional(v.array(v.string())),
+    replayPassed: v.optional(v.boolean()),
+    failureSummaryPassed: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
     // Remove any existing result for this run
@@ -148,6 +171,9 @@ export const _upsertVerificationResult = internalMutation({
       sequenceGaps: args.sequenceGaps,
       duplicateSeqNums: args.duplicateSeqNums,
       failureReason: args.failureReason,
+      checksRan: args.checksRan,
+      replayPassed: args.replayPassed,
+      failureSummaryPassed: args.failureSummaryPassed,
     });
   },
 });
@@ -163,21 +189,29 @@ export const _upsertVerificationResult = internalMutation({
  * Scope: runs with terminal status that ended within the last 48 hours,
  * bounded to 50 runs per invocation (newest preferred via the desc order).
  *
- * What IS verified:
+ * What IS verified (always):
  *   - Sequence numbers are contiguous starting from 1 (no gaps)
  *   - No duplicate sequence numbers exist
  *
- * What is NOT verified (requires the apps/web service layer):
- *   - buildReplayProjection frame count matches event count
- *   - buildFailureSummary determinism
- *   These are covered by unit tests in tests/unit/projection-verify.test.ts.
+ * What IS verified (when INTERNAL_VERIFY_URL + INTERNAL_VERIFY_SECRET are set
+ * and the run has ≤ DERIVATION_MAX_EVENTS events):
+ *   - buildReplayProjection produces a valid result with matching frame count
+ *   - buildFailureSummary produces a valid result without throwing
+ *
+ * Graceful degradation: if the web route is unreachable or unconfigured, the
+ * result is stored as a sequence-only record (checksRan absent).
  */
 export const verifyRecentRuns = action({
   args: {},
   handler: async (ctx): Promise<{ checked: number; passed: number; failed: number }> => {
     const WINDOW_MS = 48 * 60 * 60 * 1000;
     const BATCH_LIMIT = 50;
+    const DERIVATION_MAX_EVENTS = 500;
     const now = Date.now();
+
+    const verifyUrl = process.env.INTERNAL_VERIFY_URL as string | undefined;
+    const verifySecret = process.env.INTERNAL_VERIFY_SECRET as string | undefined;
+    const canRunDerivation = !!(verifyUrl && verifySecret);
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const runs: Array<Record<string, unknown>> = await ctx.runInternalQuery(
@@ -207,9 +241,73 @@ export const verifyRecentRuns = action({
         cursor = page.nextCursor;
       }
 
-      const result = checkSequenceIntegrity(seqNums);
+      const seqResult = checkSequenceIntegrity(seqNums);
       checked++;
-      if (result.isValid) passed++;
+
+      // Attempt full derivation check via web route when configured and run is within size cap
+      if (canRunDerivation && seqNums.length <= DERIVATION_MAX_EVENTS) {
+        try {
+          // Fetch full event documents for the web route
+          const allEvents: Array<Record<string, unknown>> = [];
+          let evtCursor: string | null = null;
+          for (;;) {
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+            const page: { events: Array<Record<string, unknown>>; nextCursor: string | null } =
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              await ctx.runInternalQuery(_listEventsFull, { runId: runId as any, cursor: evtCursor });
+            allEvents.push(...page.events);
+            if (page.nextCursor === null) break;
+            evtCursor = page.nextCursor;
+          }
+
+          const res = await fetch(`${verifyUrl}/api/internal/verify-derivation`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-internal-secret": verifySecret!,
+            },
+            body: JSON.stringify({ run, events: allEvents }),
+          });
+
+          if (!res.ok) throw new Error(`Verify route returned ${res.status}`);
+
+          const ext = await res.json() as {
+            isValid: boolean;
+            summary: string;
+            sequenceGaps: number[];
+            duplicateSeqNums: number[];
+            failureReason?: string;
+            checksRan: string[];
+            replayPassed: boolean;
+            failureSummaryPassed: boolean;
+          };
+
+          if (ext.isValid) passed++;
+          else failed++;
+
+          await ctx.runInternalMutation(_upsertVerificationResult, {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            runId: runId as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            orgId: orgId as any,
+            verifiedAt: now,
+            isValid: ext.isValid,
+            summary: ext.summary,
+            sequenceGaps: ext.sequenceGaps,
+            duplicateSeqNums: ext.duplicateSeqNums,
+            ...(ext.failureReason !== undefined && { failureReason: ext.failureReason }),
+            checksRan: ext.checksRan,
+            replayPassed: ext.replayPassed,
+            failureSummaryPassed: ext.failureSummaryPassed,
+          });
+          continue; // skip sequence-only fallback below
+        } catch {
+          // Web route unavailable or parse failure — fall through to sequence-only result
+        }
+      }
+
+      // Sequence-only path (no derivation check, or graceful degradation from above)
+      if (seqResult.isValid) passed++;
       else failed++;
 
       await ctx.runInternalMutation(_upsertVerificationResult, {
@@ -218,11 +316,11 @@ export const verifyRecentRuns = action({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         orgId: orgId as any,
         verifiedAt: now,
-        isValid: result.isValid,
-        summary: result.summary,
-        sequenceGaps: result.sequenceGaps,
-        duplicateSeqNums: result.duplicateSeqNums,
-        ...(result.failureReason !== undefined && { failureReason: result.failureReason }),
+        isValid: seqResult.isValid,
+        summary: seqResult.summary,
+        sequenceGaps: seqResult.sequenceGaps,
+        duplicateSeqNums: seqResult.duplicateSeqNums,
+        ...(seqResult.failureReason !== undefined && { failureReason: seqResult.failureReason }),
       });
     }
 

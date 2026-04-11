@@ -2,6 +2,107 @@
 
 ---
 
+## Prompt 21 — Full Derivation Verification via Internal Route (2026-04-11)
+
+### What changed
+
+**A. convex/schema.ts — verification_results extended**
+- Added three optional fields to `verification_results`: `checksRan: v.optional(v.array(v.string()))`, `replayPassed: v.optional(v.boolean())`, `failureSummaryPassed: v.optional(v.boolean())`.
+- Fields are absent on sequence-only records (pre-Prompt 21 or graceful degradation). Old records are unaffected.
+
+**B. convex/projection_verify.ts — derivation check added**
+- `_listEventsFull`: new `internalQuery` returning full event documents paginated at 500 items/page (previously only `_listEventSeqNums` existed).
+- `_upsertVerificationResult`: extended args with optional `checksRan`, `replayPassed`, `failureSummaryPassed` which are now stored to the schema fields added above.
+- `verifyRecentRuns`: new derivation check branch. When `INTERNAL_VERIFY_URL` and `INTERNAL_VERIFY_SECRET` Convex env vars are set and run has ≤ 500 events (`DERIVATION_MAX_EVENTS`), the action fetches full events and POSTs to the web internal route. Falls back gracefully to sequence-only on any error.
+
+**C. apps/web/app/api/internal/verify-derivation/route.ts — NEW**
+- `POST /api/internal/verify-derivation`: stateless internal route protected by `x-internal-secret` header matching `INTERNAL_VERIFY_SECRET`.
+- Maps raw Convex docs to `Run`/`Event[]` contract types (Convex `_id` → contracts `id`).
+- Calls `verifyProjectionIntegrity(run, events)` from `apps/web/src/lib/replay/verify.ts`.
+- Returns `{ isValid, summary, sequenceGaps, duplicateSeqNums, failureReason?, checksRan, replayPassed, failureSummaryPassed }`.
+- Always reports `checksRan: ['sequence', 'replay', 'failureSummary']` since all three are attempted.
+- Returns 503 if `INTERNAL_VERIFY_SECRET` is not configured; 401 if header mismatch.
+
+**D. apps/web/src/lib/env.ts — INTERNAL_VERIFY_SECRET added**
+- Added `INTERNAL_VERIFY_SECRET: process.env.INTERNAL_VERIFY_SECRET ?? ''` to the env object.
+- `.env.example` updated with documentation for both `INTERNAL_VERIFY_SECRET` (web) and `INTERNAL_VERIFY_URL` (Convex env var).
+
+**E. apps/web/src/lib/services/projection_verify.ts — VerificationStatus extended**
+- Added `checksRan: string[]`, `replayPassed: boolean | null`, `failureSummaryPassed: boolean | null` to `VerificationStatus`.
+- `getRunVerificationStatus` maps the new schema fields (absent → `checksRan: []`, `replayPassed: null`, `failureSummaryPassed: null`).
+
+**F. apps/web/src/components/runs/IntegrityBadge.tsx — richer badge states**
+- Added a `seq verified` (sky blue) state for valid runs where `checksRan` does not include `"replay"` (sequence-only or old records).
+- The existing `verified` (emerald) state now requires `checksRan.includes('replay')` — full derivation check confirmed.
+- `check failed` (red) and `unverified` (gray) states unchanged.
+- Old records (absent `checksRan`) display as `seq verified`, which is accurate.
+
+**G. tests/unit/derivation_verify.test.ts — NEW (Team D)**
+- 43 pure logic tests across 7 groups: unverified status defaults (6), sequence-only result (7), full derivation result (7), badge state exhaustive coverage (5), checksRan semantics (3), route-to-VerificationStatus round-trip (3), DERIVATION_MAX_EVENTS cap (4).
+- All inlined — no React, no Convex, no network.
+
+**H. docs/adrs/0021_derivation_verification_architecture.md — NEW**
+- Documents the three-option trade-off (shared package, Convex inline duplication, internal HTTP route), the chosen architecture, environment variable setup, size cap rationale, and graceful degradation behaviour.
+
+### Why these choices fit the architecture
+
+**Internal HTTP route over code duplication (ADR-0021):** The derivation logic (`buildReplayProjection`, `buildFailureSummary`) lives in `apps/web/src/lib/replay/`. Duplicating it into `convex/` would require keeping two implementations in sync by policy. The internal route lets Convex call the canonical implementation via HTTP, maintaining a single source of truth. The route is stateless and pure — no database, no auth side effects.
+
+**Graceful degradation as the default:** Both `INTERNAL_VERIFY_URL` and `INTERNAL_VERIFY_SECRET` are opt-in. Deployments without them receive the same sequence-only verification as before Prompt 21, with no regression. This matches the principle that new capabilities should not break existing configurations.
+
+**`DERIVATION_MAX_EVENTS = 500`:** Bounds the HTTP body size for the internal call. Runs with more events fall back to sequence-only. At v1 scale, 500 events covers the vast majority of runs.
+
+**`checksRan` records attempt, not success:** Including `"replay"` in `checksRan` even when `replayPassed=false` allows operators to distinguish "the check failed" from "the check was never attempted". The badge shows `check failed` in both cases when `isValid=false`, but the per-field booleans give more granular diagnostic information.
+
+### Hard-to-reverse decisions
+
+**Schema extension to `verification_results`:** The three new optional fields are backward-compatible (absent on old records). Removing them would require a schema migration. Do not remove them without confirming that no production code reads `checksRan`/`replayPassed`/`failureSummaryPassed`.
+
+### Known residual risks
+
+1. **Network dependency in cron:** The derivation check now requires the web deployment to be reachable at 04:30 UTC. If the web app is restarting or under load, the cron falls back to sequence-only. This is by design but means the full derivation check may not run consistently if the web deployment is flaky.
+2. **Secret drift:** If `INTERNAL_VERIFY_SECRET` is rotated in the web deployment but not in Convex (or vice versa), the derivation check silently degrades to sequence-only. Operators should rotate both values together and verify the cron logs after rotation.
+3. **Byte-size not bounded:** `DERIVATION_MAX_EVENTS = 500` bounds event count but not payload size. A run with 500 events each carrying 9.9KB payloads (just below externalization threshold) would generate a ~5MB HTTP body. This is within typical limits but should be monitored.
+
+### Recommendation for Prompt 22
+
+**Follow-tail model for EventInspector** is the next highest-value UX improvement after Prompt 20's Timeline follow-tail. The EventInspector left panel uses the same 5s polling but does not yet have a pause/resume mechanism or unseen count badge.
+
+---
+
+## Prompt 20 — Follow Tail Model for Active Run Inspection (2026-04-11)
+
+### What changed
+
+**A. apps/web/src/components/runs/Timeline.tsx — follow tail model**
+- Added `followTail: boolean` state (initialises to `isLive`), `unseenCount: number` state (initialises to 0), and `followTailRef` ref (stable copy for polling closures).
+- Window advance in `handleLoadMore` and `pollFromStart` is now gated on `followTailRef.current`: when following, `setWindowStart` advances to tail; when paused, `setUnseenCount` accumulates instead.
+- ArrowDown/ArrowUp handlers now call `setFollowTail(false)`.
+- "↑ N earlier events" window nav button now calls `setFollowTail(false)`.
+- `handleResume()` function: `setFollowTail(true)`, `setUnseenCount(0)`, `setWindowStart(Math.max(0, allEvents.length - WINDOW_SIZE))`.
+- Live indicator replaced with a toggle button (`live` / `paused`) and a "↓ N new — resume" badge (emerald, shown when paused + `unseenCount > 0`).
+
+**B. apps/web/src/components/runs/EventInspector.tsx — follow tail model**
+- Same `followTail` / `unseenCount` / `followTailRef` pattern added to the outer `EventInspector` component.
+- Window advance guarded identically to Timeline.
+- `setFollowTail(false)` added to ArrowDown/ArrowUp and event row `onClick`.
+- "↑ N above" window nav button calls `setFollowTail(false)`.
+- `handleResume()` function: same logic as Timeline.
+- `EventInspectorInnerProps` extended with `setFollowTail`, `followTail?`, `unseenCount?`, `onResume?`.
+- Live indicator in EventInspectorInner header replaced with toggle button + "N new — resume" badge.
+
+**C. tests/unit/follow_tail.test.ts — NEW (Team D)**
+- 31 pure logic tests across 6 groups: default state (3), window advance gate (7), resume logic (7), deactivation triggers (5), display conditions (7), round-trip (2).
+- Key helpers: `applyArrival`, `resume`, `shouldShowUnseenBadge`, `followTailLabel`.
+
+### Why these choices fit the architecture
+
+**`followTailRef` pattern for stable polling closures:** The 5s polling `setInterval` is created inside a `useEffect` and captures variables by closure. Adding `followTail` to the `useEffect` deps array would recreate the timer on every toggle, resetting the interval. The stable ref (`followTailRef.current = followTail` in a separate effect) lets the polling closure read the current value without re-registering.
+
+**`unseenCount` as a counter, not an event list:** The badge shows "N new — resume" where N is the count of events that arrived while paused. Storing the count rather than the events themselves avoids memory growth and keeps the state minimal.
+
+---
+
 ## Prompt 19 — Scheduled Verification, Auth Hardening, IntegrityBadge (2026-04-11)
 
 ### What changed

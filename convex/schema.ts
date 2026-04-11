@@ -155,6 +155,10 @@ export default defineSchema({
     sequenceGaps: v.array(v.number()),
     duplicateSeqNums: v.array(v.number()),
     failureReason: v.optional(v.string()),  // if isValid=false, the primary reason
+    // Extended derivation check fields — absent on sequence-only records (pre-Prompt 21)
+    checksRan: v.optional(v.array(v.string())),         // e.g. ["sequence"] or ["sequence","replay","failureSummary"]
+    replayPassed: v.optional(v.boolean()),              // true = buildReplayProjection succeeded; absent = not checked
+    failureSummaryPassed: v.optional(v.boolean()),      // true = buildFailureSummary succeeded; absent = not checked
   })
     .index("by_run", ["runId"])
     .index("by_org_verified", ["orgId", "verifiedAt"]),
