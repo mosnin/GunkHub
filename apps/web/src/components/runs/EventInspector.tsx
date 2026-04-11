@@ -16,6 +16,7 @@ interface EventInspectorProps {
   initialNextCursor?: string
   loading?: boolean
   initialEventSeq?: number
+  isLive?: boolean
 }
 
 /**
@@ -86,7 +87,7 @@ function ExternalizedPayloadView({ payload }: { payload: {
 
 type SeekState = 'idle' | 'seeking' | 'not-found'
 
-export function EventInspector({ runId, events, initialNextCursor, loading, initialEventSeq }: EventInspectorProps) {
+export function EventInspector({ runId, events, initialNextCursor, loading, initialEventSeq, isLive = false }: EventInspectorProps) {
   const initialId = (initialEventSeq !== undefined && events)
     ? (events.find((e) => e.sequenceNumber === initialEventSeq)?.id ?? null)
     : null
@@ -104,18 +105,44 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
   function handleLoadMore() {
     if (!cursor) return
     setLoadError(null)
+    const prevTotal = (events?.length ?? 0) + extraEvents.length
     startTransition(async () => {
       try {
         const params = new URLSearchParams({ cursor, limit: '200' })
         const res = await fetch(`/api/runs/${runId}/events?${params.toString()}`)
         if (!res.ok) throw new Error(`Failed to load events (${res.status})`)
         const data = (await res.json()) as ListEventsResponse
+        const newTotal = prevTotal + data.events.length
         setExtraEvents((prev) => [...prev, ...data.events])
         setCursor(data.nextCursor)
+        // Auto-advance: immediately show tail of newly loaded events
+        if (data.events.length > 0) {
+          setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+        }
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load more events')
       }
     })
+  }
+
+  async function pollFromStart() {
+    try {
+      const res = await fetch(`/api/runs/${runId}/events?limit=200`)
+      if (!res.ok) return
+      const data = (await res.json()) as ListEventsResponse
+      const existingIds = new Set(allEvents.map((e) => e.id))
+      const brandNew = data.events.filter((e) => !existingIds.has(e.id))
+      if (brandNew.length > 0) {
+        const newTotal = allEvents.length + brandNew.length
+        setExtraEvents((prev) => [...prev, ...brandNew])
+        setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+      }
+      if (data.nextCursor && !cursor) {
+        setCursor(data.nextCursor)
+      }
+    } catch {
+      // Non-fatal: ignore failed polls
+    }
   }
 
   // On mount: check if initialEventSeq is already in the initial page or needs seeking
@@ -157,6 +184,21 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       handleLoadMore()
     }
   }, [seekState, cursor, isPending])
+
+  // Live polling: when isLive=true, poll every 5 seconds for new events
+  useEffect(() => {
+    if (!isLive) return
+    const POLL_MS = 5000
+    const timer = setInterval(() => {
+      if (isPending) return // skip if a load is in flight
+      if (cursor) {
+        handleLoadMore()
+      } else {
+        void pollFromStart()
+      }
+    }, POLL_MS)
+    return () => clearInterval(timer)
+  }, [isLive, cursor, runId])
 
   if (loading) {
     return <LoadingState message="Loading events..." />
@@ -218,6 +260,7 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       handleLoadMore={handleLoadMore}
       seekState={seekState}
       initialEventSeq={initialEventSeq}
+      isLive={isLive}
     />
   )
 }
@@ -238,6 +281,7 @@ interface EventInspectorInnerProps {
   handleLoadMore: () => void
   seekState?: SeekState
   initialEventSeq?: number
+  isLive?: boolean
 }
 
 function EventInspectorInner({
@@ -256,6 +300,7 @@ function EventInspectorInner({
   handleLoadMore,
   seekState,
   initialEventSeq,
+  isLive,
 }: EventInspectorInnerProps) {
   // Sync ?event=<sequenceNumber> into the URL without navigation
   useEffect(() => {
@@ -274,8 +319,14 @@ function EventInspectorInner({
     <div className="flex h-full min-h-[400px]">
       {/* Left panel — event list */}
       <div className="w-1/3 border-r border-neutral-800 overflow-y-auto">
-        <div className="px-3 py-2 border-b border-neutral-800">
+        <div className="px-3 py-2 border-b border-neutral-800 flex items-center justify-between">
           <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Events</p>
+          {isLive && (
+            <span className="flex items-center gap-1 text-xs font-mono text-neutral-600">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
+              live
+            </span>
+          )}
         </div>
 
         {/* Seek status */}

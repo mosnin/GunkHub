@@ -1,8 +1,8 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useState, useTransition, useEffect } from 'react'
 
-import type { RunStatus } from '@agent-flight-recorder/contracts'
+import type { RunStatus, GetRunResponse } from '@agent-flight-recorder/contracts'
 
 import { Badge } from '@/components/ui/Badge'
 import { updateRunTagsAction } from '@/lib/actions/runs'
@@ -18,6 +18,7 @@ interface RunHeaderProps {
   triggeredBy?: string
   tags?: string[]
   metadata?: Record<string, unknown>
+  isLive?: boolean
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -53,7 +54,33 @@ function CopyButton({ value }: { value: string }) {
   )
 }
 
-export function RunHeader({ runId, status, agentName, agentVersionLabel, startedAt, endedAt, triggeredBy, tags, metadata }: RunHeaderProps) {
+export function RunHeader({ runId, status, agentName, agentVersionLabel, startedAt, endedAt, triggeredBy, tags, metadata, isLive = false }: RunHeaderProps) {
+  const [liveStatus, setLiveStatus] = useState<RunStatus>(status)
+  const [liveEndedAt, setLiveEndedAt] = useState<number | undefined>(endedAt)
+
+  useEffect(() => {
+    if (!isLive) return
+    if (liveStatus !== 'running') return  // already terminal, don't poll
+
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const res = await fetch(`/api/runs/${runId}`)
+          if (!res.ok) return
+          const data = (await res.json()) as GetRunResponse
+          setLiveStatus(data.run.status)
+          if (data.run.endedAt !== undefined) {
+            setLiveEndedAt(data.run.endedAt)
+          }
+        } catch {
+          // Non-fatal: ignore failed status polls
+        }
+      })()
+    }, 5000)
+
+    return () => clearInterval(timer)
+  }, [isLive, liveStatus, runId])
+
   const [isEditing, setIsEditing] = useState(false)
   const [draftTags, setDraftTags] = useState<string[]>(tags ?? [])
   const [savedTags, setSavedTags] = useState<string[]>(tags ?? [])
@@ -115,7 +142,13 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
           <CopyButton value={runId} />
         </div>
 
-        <Badge status={status} />
+        <Badge status={liveStatus} />
+        {isLive && liveStatus === 'running' && (
+          <span className="flex items-center gap-1 text-xs font-mono text-neutral-600">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
+            live
+          </span>
+        )}
 
         <span className="text-xs text-neutral-500 font-mono">{truncateId(agentName, 20)}</span>
 
@@ -127,9 +160,9 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
 
         <span className="text-xs text-neutral-500">{formatRelativeTime(startedAt)}</span>
 
-        {endedAt && (
+        {liveEndedAt && (
           <span className="text-xs font-mono text-neutral-500">
-            {formatDuration(endedAt - startedAt)}
+            {formatDuration(liveEndedAt - startedAt)}
           </span>
         )}
 

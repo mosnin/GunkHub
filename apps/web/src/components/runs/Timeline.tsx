@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState, useTransition } from 'react'
+import { useCallback, useEffect, useRef, useState, useTransition } from 'react'
 
 import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts'
 
@@ -14,6 +14,7 @@ interface TimelineProps {
   events?: Event[]
   initialNextCursor?: string
   loading?: boolean
+  isLive?: boolean
 }
 
 /** Colour-code event type prefixes for quick visual scanning */
@@ -64,7 +65,7 @@ function payloadSummary(event: Event): string {
   return ''
 }
 
-export function Timeline({ runId, events, initialNextCursor, loading }: TimelineProps) {
+export function Timeline({ runId, events, initialNextCursor, loading, isLive = false }: TimelineProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [extraEvents, setExtraEvents] = useState<Event[]>([])
   const [cursor, setCursor] = useState<string | undefined>(initialNextCursor)
@@ -74,7 +75,13 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
   const [windowStart, setWindowStart] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
 
-  function handleLoadMore() {
+  // Keep a stable ref to extraEvents for use inside the polling effect closure
+  const extraEventsRef = useRef<Event[]>(extraEvents)
+  useEffect(() => {
+    extraEventsRef.current = extraEvents
+  }, [extraEvents])
+
+  const handleLoadMore = useCallback(() => {
     if (!cursor) return
     setLoadError(null)
     startTransition(async () => {
@@ -83,13 +90,55 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
         const res = await fetch(`/api/runs/${runId}/events?${params.toString()}`)
         if (!res.ok) throw new Error(`Failed to load events (${res.status})`)
         const data = (await res.json()) as ListEventsResponse
+        const prevTotal = (events?.length ?? 0) + extraEventsRef.current.length
+        const newTotal = prevTotal + data.events.length
         setExtraEvents((prev) => [...prev, ...data.events])
         setCursor(data.nextCursor)
+        // Auto-advance: show the tail of newly loaded events
+        if (data.events.length > 0) {
+          setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+        }
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load more events')
       }
     })
-  }
+  }, [cursor, runId, events])
+
+  // Live polling effect — re-runs when cursor changes to pick up the right strategy
+  useEffect(() => {
+    if (!isLive) return
+
+    const POLL_MS = 5000
+
+    async function pollFromStart() {
+      const res = await fetch(`/api/runs/${runId}/events?limit=200`)
+      if (!res.ok) return
+      const data = (await res.json()) as ListEventsResponse
+      const currentExtra = extraEventsRef.current
+      const allIds = new Set([...(events ?? []).map((e) => e.id), ...currentExtra.map((e) => e.id)])
+      const brandNew = data.events.filter((e) => !allIds.has(e.id))
+      if (brandNew.length > 0) {
+        const newTotal = (events?.length ?? 0) + currentExtra.length + brandNew.length
+        setExtraEvents((prev) => [...prev, ...brandNew])
+        setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+      }
+      // If a cursor appeared (run crossed page boundary), capture it
+      if (data.nextCursor && !cursor) {
+        setCursor(data.nextCursor)
+      }
+    }
+
+    const timer = setInterval(() => {
+      if (isPending) return // skip tick if a load is already in flight
+      if (cursor) {
+        handleLoadMore() // uses existing path, auto-advances window
+      } else {
+        void pollFromStart()
+      }
+    }, POLL_MS)
+
+    return () => clearInterval(timer)
+  }, [isLive, cursor, runId]) // re-run when cursor changes so strategy updates
 
   if (loading) {
     return <LoadingState message="Loading timeline..." />
@@ -135,6 +184,14 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
 
   return (
     <div className="px-6 py-4">
+      {/* Live indicator */}
+      {isLive && (
+        <div className="flex items-center justify-end gap-1.5 px-6 pb-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
+          <span className="text-xs font-mono text-neutral-600">live</span>
+        </div>
+      )}
+
       <div className="relative">
         {/* Vertical rail */}
         <div className="absolute left-[11px] top-3 bottom-3 w-px bg-neutral-800" aria-hidden="true" />

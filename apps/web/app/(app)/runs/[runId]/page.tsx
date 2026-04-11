@@ -155,6 +155,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         triggeredBy={run.triggeredBy}
         tags={run.tags}
         metadata={run.metadata}
+        isLive={run.status === 'running'}
       />
 
       {/* Failure summary panel — additive, shown only when there is a failure or incomplete run */}
@@ -196,12 +197,12 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
       <div className="flex-1 overflow-y-auto">
         {activeTab === 'timeline' && (
           <Suspense fallback={<LoadingState message="Loading timeline..." />}>
-            <Timeline runId={runId} events={events} initialNextCursor={initialNextCursor} />
+            <Timeline runId={runId} events={events} initialNextCursor={initialNextCursor} isLive={run.status === 'running'} />
           </Suspense>
         )}
         {activeTab === 'events' && (
           <Suspense fallback={<LoadingState message="Loading events..." />}>
-            <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} initialEventSeq={initialEventSeq} />
+            <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} initialEventSeq={initialEventSeq} isLive={run.status === 'running'} />
           </Suspense>
         )}
         {activeTab === 'artifacts' && (
