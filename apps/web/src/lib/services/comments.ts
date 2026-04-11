@@ -31,10 +31,22 @@ export async function listComments(
   targetId: string,
   targetType: 'run' | 'event'
 ): Promise<Comment[]> {
+  const { orgId: clerkOrgId } = auth()
+  if (!clerkOrgId) throw new Error('Not authenticated — no org context')
+
   const client = await getAuthedClient()
 
   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-  const result = await client.query(convex.comments.listComments, { targetId, targetType })
+  const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
+  if (!org) throw new Error('Organization not found')
+  const orgDoc = org as Record<string, unknown>
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await client.query(convex.comments.listComments, {
+    orgId: orgDoc._id,
+    targetId,
+    targetType,
+  })
   return ((result as Record<string, unknown>[]) ?? []).map(mapComment)
 }
 

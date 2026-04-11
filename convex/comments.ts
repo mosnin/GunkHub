@@ -7,15 +7,19 @@ import { getAuthContext, requireOrgMembership } from "./auth.js";
  */
 export const listComments = query({
   args: {
+    orgId: v.id("organizations"),
     targetId: v.string(),
     targetType: v.union(v.literal("run"), v.literal("event")),
   },
   handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+
     const comments = await ctx.db
       .query("comments")
       .withIndex("by_target", (q) =>
         q.eq("targetId", args.targetId).eq("targetType", args.targetType),
       )
+      .filter((q) => q.eq(q.field("orgId"), args.orgId))
       .collect();
 
     return comments;

@@ -11,8 +11,8 @@ interface RouteParams {
 }
 
 export async function GET(_req: NextRequest, { params }: RouteParams) {
-  const { userId } = auth()
-  if (!userId) {
+  const { userId, orgId } = auth()
+  if (!userId || !orgId) {
     return NextResponse.json<ApiError>(
       { code: 'UNAUTHORIZED', message: 'Authentication required' },
       { status: 401 }

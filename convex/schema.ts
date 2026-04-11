@@ -145,4 +145,17 @@ export default defineSchema({
   })
     .index("by_org", ["orgId"])
     .index("by_key_hash", ["keyHash"]),
+
+  verification_results: defineTable({
+    runId: v.id("runs"),
+    orgId: v.id("organizations"),
+    verifiedAt: v.number(),          // epoch ms
+    isValid: v.boolean(),
+    summary: v.string(),             // human-readable: "OK: 42 events, no gaps" or "INVALID: ..."
+    sequenceGaps: v.array(v.number()),
+    duplicateSeqNums: v.array(v.number()),
+    failureReason: v.optional(v.string()),  // if isValid=false, the primary reason
+  })
+    .index("by_run", ["runId"])
+    .index("by_org_verified", ["orgId", "verifiedAt"]),
 });

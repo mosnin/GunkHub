@@ -2,8 +2,10 @@
 
 import { useState, useTransition, useEffect } from 'react'
 
+import type { VerificationStatus } from '@/lib/services/projection_verify'
 import type { RunStatus, GetRunResponse } from '@agent-flight-recorder/contracts'
 
+import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
 import { Badge } from '@/components/ui/Badge'
 import { updateRunTagsAction } from '@/lib/actions/runs'
 import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
@@ -19,6 +21,7 @@ interface RunHeaderProps {
   tags?: string[]
   metadata?: Record<string, unknown>
   isLive?: boolean
+  verificationStatus?: VerificationStatus | null
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -54,7 +57,7 @@ function CopyButton({ value }: { value: string }) {
   )
 }
 
-export function RunHeader({ runId, status, agentName, agentVersionLabel, startedAt, endedAt, triggeredBy, tags, metadata, isLive = false }: RunHeaderProps) {
+export function RunHeader({ runId, status, agentName, agentVersionLabel, startedAt, endedAt, triggeredBy, tags, metadata, isLive = false, verificationStatus }: RunHeaderProps) {
   const [liveStatus, setLiveStatus] = useState<RunStatus>(status)
   const [liveEndedAt, setLiveEndedAt] = useState<number | undefined>(endedAt)
 
@@ -143,6 +146,9 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
         </div>
 
         <Badge status={liveStatus} />
+        {verificationStatus && (
+          <IntegrityBadge status={verificationStatus} />
+        )}
         {isLive && liveStatus === 'running' && (
           <span className="flex items-center gap-1 text-xs font-mono text-neutral-600">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />

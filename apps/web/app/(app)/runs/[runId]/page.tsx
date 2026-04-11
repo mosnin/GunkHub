@@ -17,6 +17,7 @@ import { getAgent } from '@/lib/services/agents'
 import { listArtifacts } from '@/lib/services/artifacts'
 import { listComments } from '@/lib/services/comments'
 import { listEvents } from '@/lib/services/events'
+import { getRunVerificationStatus, type VerificationStatus } from '@/lib/services/projection_verify'
 import { getProject } from '@/lib/services/projects'
 import { getReplayProjection } from '@/lib/services/replay'
 import { getRun } from '@/lib/services/runs'
@@ -99,6 +100,17 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
     // Non-fatal: show empty comment thread if fetch fails
   }
 
+  // Only fetch verification status for terminal runs — running runs won't have results yet
+  let verificationStatus: VerificationStatus | null = null
+  const TERMINAL = ['completed', 'failed', 'cancelled', 'timed_out'] as const
+  if (runData && TERMINAL.includes(runData.run.status as typeof TERMINAL[number])) {
+    try {
+      verificationStatus = await getRunVerificationStatus(runId)
+    } catch {
+      // Non-fatal: show "unverified" if status cannot be fetched
+    }
+  }
+
   // Resolve parent context for breadcrumb — non-fatal if either fails
   let breadcrumbProjectName: string | undefined
   let breadcrumbAgentName: string | undefined
@@ -156,6 +168,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         tags={run.tags}
         metadata={run.metadata}
         isLive={run.status === 'running'}
+        verificationStatus={verificationStatus}
       />
 
       {/* Failure summary panel — additive, shown only when there is a failure or incomplete run */}

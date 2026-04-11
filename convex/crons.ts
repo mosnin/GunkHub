@@ -23,4 +23,12 @@ crons.daily(
   makeFunctionReference<"action">("stale_runs:expireStaleRuns"),
 );
 
+// Daily projection integrity verification. Runs at 04:30 UTC.
+// Checks sequence contiguity for up to 50 recent terminal runs.
+crons.daily(
+  "verify-projection-integrity",
+  { hourUTC: 4, minuteUTC: 30 },
+  makeFunctionReference<"action">("projection_verify:verifyRecentRuns"),
+);
+
 export default crons;

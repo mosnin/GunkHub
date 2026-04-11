@@ -62,4 +62,7 @@ export const convex = {
     sdkUpdateRunStatus: makeFunctionReference<M>('sdk_ingest:sdkUpdateRunStatus'),
     sdkCreateArtifact: makeFunctionReference<M>('sdk_ingest:sdkCreateArtifact'),
   },
+  projection_verify: {
+    getVerificationResult: makeFunctionReference<Q>('projection_verify:getVerificationResult'),
+  },
 } as const
