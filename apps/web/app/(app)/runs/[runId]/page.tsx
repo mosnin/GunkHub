@@ -8,13 +8,16 @@ import { ArtifactList } from '@/components/runs/ArtifactList'
 import { CommentThread } from '@/components/runs/CommentThread'
 import { EventInspector } from '@/components/runs/EventInspector'
 import { FailureSummary as FailureSummaryPanel } from '@/components/runs/FailureSummary'
+import { RunBreadcrumb } from '@/components/runs/RunBreadcrumb'
 import { RunHeader } from '@/components/runs/RunHeader'
 import { Timeline } from '@/components/runs/Timeline'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { LoadingState } from '@/components/ui/LoadingState'
+import { getAgent } from '@/lib/services/agents'
 import { listArtifacts } from '@/lib/services/artifacts'
 import { listComments } from '@/lib/services/comments'
 import { listEvents } from '@/lib/services/events'
+import { getProject } from '@/lib/services/projects'
 import { getReplayProjection } from '@/lib/services/replay'
 import { getRun } from '@/lib/services/runs'
 
@@ -96,6 +99,26 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
     // Non-fatal: show empty comment thread if fetch fails
   }
 
+  // Resolve parent context for breadcrumb — non-fatal if either fails
+  let breadcrumbProjectName: string | undefined
+  let breadcrumbAgentName: string | undefined
+
+  if (runData) {
+    try {
+      const project = await getProject(runData.run.projectId)
+      breadcrumbProjectName = project.name
+    } catch {
+      // Non-fatal: fall back to showing project ID in breadcrumb
+    }
+
+    try {
+      const agent = await getAgent(runData.run.agentId)
+      breadcrumbAgentName = agent?.name
+    } catch {
+      // Non-fatal: fall back to showing agent ID in breadcrumb
+    }
+  }
+
   if (fetchError) {
     return (
       <div className="p-6">
@@ -112,6 +135,15 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
 
   return (
     <div className="flex flex-col h-full">
+      {/* Breadcrumb — project → agent → run context */}
+      <RunBreadcrumb
+        runId={runId}
+        projectId={runData?.run.projectId}
+        projectName={breadcrumbProjectName}
+        agentId={runData?.run.agentId}
+        agentName={breadcrumbAgentName}
+      />
+
       {/* Run header */}
       <RunHeader
         runId={runId}

@@ -90,6 +90,20 @@ export async function createAgent(input: {
 }
 
 /**
+ * Get a single agent by its Convex document ID. Returns null if not found.
+ */
+export async function getAgent(agentId: string): Promise<Agent | null> {
+  const client = await getAuthedClient()
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const doc = await client.query(convex.agents.getAgent, { agentId })
+    return mapAgent(doc as Record<string, unknown>)
+  } catch {
+    return null
+  }
+}
+
+/**
  * Return agents that have at least one run in the authenticated org.
  * Used for the agent filter dropdown on the runs list page.
  */
