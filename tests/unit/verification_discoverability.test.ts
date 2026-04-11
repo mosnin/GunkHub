@@ -29,8 +29,8 @@ interface VerificationStatus {
   failureSummaryPassed: boolean | null
 }
 
-type VerifyFilter = 'all' | 'verified' | 'seq_verified' | 'failed' | 'unverified'
-const VERIFY_VALUES: VerifyFilter[] = ['all', 'verified', 'seq_verified', 'failed', 'unverified']
+type VerifyFilter = 'all' | 'verified' | 'partial' | 'failed' | 'unverified'
+const VERIFY_VALUES: VerifyFilter[] = ['all', 'verified', 'partial', 'failed', 'unverified']
 
 // ---------------------------------------------------------------------------
 // Inline: matchesVerifyFilter
@@ -46,7 +46,7 @@ function matchesVerifyFilter(
   if (verify === 'unverified') return false
   if (verify === 'failed') return !status.isValid
   if (verify === 'verified') return status.isValid === true && status.checksRan.includes('replay')
-  if (verify === 'seq_verified') return status.isValid === true && !status.checksRan.includes('replay')
+  if (verify === 'partial') return status.isValid === true && !status.checksRan.includes('replay')
   return true
 }
 
@@ -233,28 +233,28 @@ describe('matchesVerifyFilter — verified (full derivation)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 5. matchesVerifyFilter — 'seq_verified'
+// 5. matchesVerifyFilter — 'partial' (sequence-only verified)
 // ---------------------------------------------------------------------------
 
-describe('matchesVerifyFilter — seq_verified', () => {
+describe('matchesVerifyFilter — partial', () => {
   it('accepts a seq-only verified run', () => {
-    expect(matchesVerifyFilter(seqVerifiedStatus(), 'seq_verified')).toBe(true)
+    expect(matchesVerifyFilter(seqVerifiedStatus(), 'partial')).toBe(true)
   })
   it('rejects a fully verified run (has replay in checksRan)', () => {
-    expect(matchesVerifyFilter(fullyVerifiedStatus(), 'seq_verified')).toBe(false)
+    expect(matchesVerifyFilter(fullyVerifiedStatus(), 'partial')).toBe(false)
   })
   it('rejects a failed run', () => {
-    expect(matchesVerifyFilter(failedStatus(), 'seq_verified')).toBe(false)
+    expect(matchesVerifyFilter(failedStatus(), 'partial')).toBe(false)
   })
   it('rejects an unverified run', () => {
-    expect(matchesVerifyFilter(unverifiedStatus(), 'seq_verified')).toBe(false)
+    expect(matchesVerifyFilter(unverifiedStatus(), 'partial')).toBe(false)
   })
   it('accepts a run with empty checksRan (graceful degradation)', () => {
     const status: VerificationStatus = {
       ...seqVerifiedStatus(),
       checksRan: [], // Degraded — no checksRan recorded
     }
-    expect(matchesVerifyFilter(status, 'seq_verified')).toBe(true)
+    expect(matchesVerifyFilter(status, 'partial')).toBe(true)
   })
 })
 
@@ -447,7 +447,7 @@ describe('buildHref', () => {
 
 describe('verify filter value validation', () => {
   it('includes all expected filter values', () => {
-    expect(VERIFY_VALUES).toEqual(['all', 'verified', 'seq_verified', 'failed', 'unverified'])
+    expect(VERIFY_VALUES).toEqual(['all', 'verified', 'partial', 'failed', 'unverified'])
   })
 
   it('rejects invalid filter values — unknown filter treated as all', () => {
@@ -485,7 +485,7 @@ describe('edge cases', () => {
     expect(filtered).toHaveLength(0)
   })
 
-  it('verified filter with all seq_verified runs returns zero matches', () => {
+  it('verified filter with all partial runs returns zero matches', () => {
     const runIds = ['r1', 'r2']
     const statuses: Record<string, VerificationStatus> = {
       r1: seqVerifiedStatus(),
@@ -495,14 +495,14 @@ describe('edge cases', () => {
     expect(filtered).toHaveLength(0)
   })
 
-  it('seq_verified filter returns seq-only runs and excludes full-derivation runs', () => {
+  it('partial filter returns seq-only runs and excludes full-derivation runs', () => {
     const runIds = ['r1', 'r2', 'r3']
     const statuses: Record<string, VerificationStatus> = {
       r1: seqVerifiedStatus(),
       r2: fullyVerifiedStatus(),
       r3: failedStatus(),
     }
-    const filtered = runIds.filter((id) => matchesVerifyFilter(statuses[id], 'seq_verified'))
+    const filtered = runIds.filter((id) => matchesVerifyFilter(statuses[id], 'partial'))
     expect(filtered).toEqual(['r1'])
   })
 
@@ -518,7 +518,7 @@ describe('edge cases', () => {
 
     expect(runIds.filter((id) => matchesVerifyFilter(statuses[id], 'all'))).toHaveLength(5)
     expect(runIds.filter((id) => matchesVerifyFilter(statuses[id], 'unverified'))).toEqual(['r1', 'r5'])
-    expect(runIds.filter((id) => matchesVerifyFilter(statuses[id], 'seq_verified'))).toEqual(['r2'])
+    expect(runIds.filter((id) => matchesVerifyFilter(statuses[id], 'partial'))).toEqual(['r2'])
     expect(runIds.filter((id) => matchesVerifyFilter(statuses[id], 'verified'))).toEqual(['r3'])
     expect(runIds.filter((id) => matchesVerifyFilter(statuses[id], 'failed'))).toEqual(['r4'])
   })

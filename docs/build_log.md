@@ -2,6 +2,88 @@
 
 ---
 
+## Prompt 24 — Verification Actionability (2026-04-11)
+
+### What changed
+
+**A. apps/web/src/lib/actions/verification.ts — bulkReverifyAction added**
+- `BulkReverifyResult` interface exported: `{ succeeded: string[], failed: string[], errors: Record<string, string> }`.
+- `MAX_BULK_REVERIFY = 20` constant (non-exported — 'use server' files can only export async functions).
+- `bulkReverifyAction(runIds: string[])`: server action. Auth-fail path returns all IDs as failed with "Not authenticated" error. Happy path: slices input to 20, calls `reverifyRunAction` for each in parallel via `Promise.allSettled`, segregates into `succeeded`/`failed`/`errors` by checking `r.status === 'fulfilled'` explicitly (required for TypeScript strict mode narrowing on `PromiseSettledResult<T>`).
+
+**B. apps/web/src/components/runs/IntegrityBadge.tsx — vocabulary update**
+- `seq verified` → `partial` (sky blue badge).
+- `check failed` → `failed` (red badge, was already red).
+- Title attributes updated: "Sequence-only verified ... (partial — full derivation not run)" and "Integrity check failed ...".
+
+**C. apps/web/src/components/runs/VerificationPanel.tsx — vocabulary update**
+- `isSeqOnly` renamed `isPartial`.
+- Notice text: "Sequence-only — full derivation check requires..." → "Partial — sequence checked only. Full derivation requires INTERNAL_VERIFY_URL to be configured."
+
+**D. apps/web/src/components/runs/SelectableRunList.tsx — NEW 'use client' component**
+- Checkbox column for multi-select. `selectedIds: Set<string>` state. Only terminal runs (completed/failed/cancelled/timed_out — `TERMINAL_STATUSES` Set) show a checkbox.
+- Select-all header checkbox toggles all eligible runs.
+- Bulk action bar (shown when anything is selected or a result is available): count label with "N non-terminal skipped" annotation, "clear" button, "Re-verify N" button disabled when no eligible runs selected.
+- After bulk action: shows emerald "N verified" / red "N failed" counts with a "dismiss" button. Per-row ✓/✗ indicators next to run ID for runs that appeared in the bulk result.
+- `useTransition` for async server action call — `isPending` drives "Re-verifying…" loading state.
+- Selection cleared on successful reverify completion.
+
+**E. apps/web/app/(app)/runs/page.tsx — SelectableRunList + vocabulary update**
+- Import changed from `RunList` to `SelectableRunList`.
+- `VERIFY_VALUES` updated: `'seq_verified'` → `'partial'`.
+- `matchesVerifyFilter`: `'seq_verified'` branch → `'partial'`.
+- Filter pill label renders the raw value (no more `seq` abbreviation — pills now show `partial`).
+
+**F. apps/web/app/(app)/dashboard/page.tsx — dashboard link update**
+- "view all →" link text updated to "view all failed →" with `title` hint pointing operators to the bulk re-verify feature on the runs page.
+
+**G. tests/unit/verification_vocab.test.ts — NEW**
+- 57 pure-logic tests across 3 describe blocks:
+  - Badge label derivation: all 4 states, edge cases (empty checksRan), distinctness assertions (15 tests).
+  - Filter vocabulary: `partial` filter accepts/rejects each status, `partial` matches exactly what badge label "partial" covers (14 tests).
+  - Vocabulary consistency: 1:1 label↔filter mapping, each filter exclusively matches its badge label, `all` matches every status, badge label set equals non-all filter set (12 tests).
+- Inlines `getBadgeLabel` and `matchesFilter` logic — no React, no Convex, no network.
+
+**H. tests/unit/bulk_reverify.test.ts — NEW**
+- 40 pure-logic tests across 6 describe blocks:
+  - `computeBulkResult` shape and computation (6 tests).
+  - Eligibility rules — TERMINAL_STATUSES (8 tests).
+  - MAX_BULK_REVERIFY cap enforcement (5 tests).
+  - Result feedback text generation (6 tests).
+  - Selection state transitions (7 tests).
+  - Edge cases (5 tests).
+- Inlines all logic — no server actions, no React.
+
+**I. tests/unit/verification_discoverability.test.ts — vocabulary update**
+- All `seq_verified` references updated to `partial` throughout (type, filter, describe names, VERIFY_VALUES assertion).
+
+**J. docs/adrs/0022_verification_vocabulary.md — NEW**
+- Documents the `seq_verified` → `partial` URL parameter rename as hard-to-reverse (breaks existing bookmarks silently to `all`).
+- Defines the authoritative 4-term vocabulary: `unverified`, `partial`, `verified`, `failed`.
+- Records rationale for `partial` over alternatives (`seq_verified`, `sequence_ok`, `passing/failing`).
+
+### Why the design choices fit the architecture
+
+**`SelectableRunList` as a separate component from `RunList`**: `RunList` remains a plain server-renderable component used by the dashboard. `SelectableRunList` is `'use client'` only because it holds selection state and calls a server action. Both are available for the runs page to use. Keeping the dashboard on `RunList` avoids shipping JS bundle for selection to a page that doesn't need it.
+
+**Terminal-only eligibility for reverify**: Running/pending runs are excluded because the verification cron only processes terminal runs, and the `reverifyRun` Convex action inherits the same constraint. Reverifying a still-running run would produce a partial (and likely misleading) result.
+
+**`MAX_BULK_REVERIFY = 20` (non-exported)**: Cannot export non-async values from a `'use server'` file. The constant is inlined in the test file (expected value 20 tested explicitly). The server is the authority for the cap; the client only shows how many it will send.
+
+**`Promise.allSettled` with explicit status narrowing**: `for (const [i, r] of settled.entries())` avoids `settled[i]` being typed as `T | undefined` in strict mode. The `r.status === 'fulfilled'` branch fully narrows `r` to `PromiseFulfilledResult<ReverifyResult>` before accessing `r.value.error`.
+
+### Hard-to-reverse decisions
+
+- **URL parameter `?verify=partial` replaces `?verify=seq_verified`**: Any existing bookmarks or external scripts using `seq_verified` will silently fall back to `all` (safe but invisible to operators). Documented in ADR-0022. Changing back would re-break the new bookmarks.
+- **The 4-term vocabulary is now the contract**: Badge labels, filter values, and URL params all use `unverified/partial/verified/failed`. Adding a 5th state is additive; renaming any of these 4 would require another round of ADR + migration.
+
+### Known residual risks
+
+- **Page staleness after bulk reverify**: The runs page is server-rendered. After the bulk action completes, the Integrity column still shows the pre-reverify badge until the user reloads. The per-row ✓/✗ indicators in `SelectableRunList` provide immediate local feedback; full UI refresh requires a page reload or router.refresh() (not implemented).
+- **Sparse pages still possible**: Same as Prompt 23 — selective verification filters may yield sparse results because filtering is post-fetch from a 50-run page.
+
+---
+
 ## Prompt 23 — Verification Discoverability (2026-04-11)
 
 ### What changed

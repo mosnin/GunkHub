@@ -1,7 +1,7 @@
 # Next Steps — v1.1 Candidates
 
 **Document type:** State summary and v1.1 candidate list.
-**Current state:** Prompt 23 complete.
+**Current state:** Prompt 24 complete.
 
 ---
 
@@ -58,10 +58,20 @@
 
 ---
 
+## What Prompt 24 delivered
+
+- **Unified 4-term vocabulary**: `unverified`, `partial`, `verified`, `failed` — replacing `seq verified`/`seq_verified`/`check failed` across all surfaces. `IntegrityBadge` labels, filter pill values, URL params, and `VerificationPanel` notice text all use the same terms. Documented in ADR-0022 as a hard-to-reverse URL param change.
+- **`SelectableRunList` client component**: New `'use client'` component replacing `RunList` on the /runs page. Checkbox column for multi-select (terminal runs only: completed/failed/cancelled/timed_out). Select-all header checkbox. Bulk action bar with eligible count, "Re-verify N" button, and per-row ✓/✗ result indicators. `useTransition` for async action with "Re-verifying…" pending state.
+- **`bulkReverifyAction` server action**: Parallel `reverifyRunAction` calls via `Promise.allSettled`, bounded to 20 runs, returns `BulkReverifyResult` with `succeeded`/`failed`/`errors`.
+- **Dashboard link update**: "view all →" → "view all failed →" with title hint about bulk re-verify on the runs page.
+- **New tests**: `tests/unit/verification_vocab.test.ts` (57 tests) and `tests/unit/bulk_reverify.test.ts` (40 tests). Updated `verification_discoverability.test.ts` for new vocabulary. Total test count: **851 passing, 5 skipped, 29 test files**.
+
+---
+
 ## What Prompt 23 delivered
 
 - **Integrity column on RunList**: Optional `verificationStatuses` prop; when passed, shows an "Integrity" column with `IntegrityBadge` per row. Dashboard does not pass the prop (no column). Runs page passes it (column shown).
-- **Verification filter on runs page**: `VerifyFilter` type (`all/verified/seq_verified/failed/unverified`), `matchesVerifyFilter()` pure function, `buildHref()` helper preserving active params. Batch-fetches verification statuses post-fetch (non-fatal). New "Integrity" filter pill group in the filter bar.
+- **Verification filter on runs page**: `VerifyFilter` type (`all/verified/partial/failed/unverified`), `matchesVerifyFilter()` pure function, `buildHref()` helper preserving active params. Batch-fetches verification statuses post-fetch (non-fatal). New "Integrity" filter pill group in the filter bar.
 - **Dashboard verification issues section**: Compact list of up to 5 recent failed verifications (fetched via `listRecentFailedVerifications`). All-clear state, "view all →" link to `/runs?verify=failed`. Non-fatal fetch.
 - **New Convex queries**: `batchGetVerificationResults` (bounded to 100 runIds, per-record orgId safety check) and `listRecentFailedVerifications` (by_org_verified index, over-fetch 200 + filter, cap 20).
 - **New service functions**: `batchGetRunVerificationStatuses`, `getRecentFailedVerifications`, `UNVERIFIED_STATUS` constant, `FailedVerification` interface — all in `apps/web/src/lib/services/projection_verify.ts`.

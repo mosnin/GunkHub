@@ -81,7 +81,7 @@ export function VerificationPanel({ runId, initialStatus, isTerminal }: Verifica
     })
   }
 
-  const isSeqOnly = status.verified && !status.checksRan.includes('replay')
+  const isPartial = status.verified && !status.checksRan.includes('replay')
   const seqPassed = status.verified
     ? status.sequenceGaps.length === 0 && status.duplicateSeqNums.length === 0
     : null
@@ -135,9 +135,9 @@ export function VerificationPanel({ runId, initialStatus, isTerminal }: Verifica
       </div>
 
       {/* Partial verification notice */}
-      {isSeqOnly && (
+      {isPartial && (
         <p className="mt-1.5 text-xs text-neutral-700">
-          Sequence-only — full derivation check requires{' '}
+          Partial — sequence checked only. Full derivation requires{' '}
           <span className="font-mono">INTERNAL_VERIFY_URL</span> to be configured.
         </p>
       )}

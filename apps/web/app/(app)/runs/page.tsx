@@ -2,7 +2,7 @@ import type { Agent, Run } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
-import { RunList } from '@/components/runs/RunList'
+import { SelectableRunList } from '@/components/runs/SelectableRunList'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { listDistinctAgents } from '@/lib/services/agents'
 import {
@@ -14,7 +14,7 @@ import { listRuns } from '@/lib/services/runs'
 export const metadata: Metadata = { title: 'Runs' }
 
 /** Valid verification filter values. */
-const VERIFY_VALUES = ['all', 'verified', 'seq_verified', 'failed', 'unverified'] as const
+const VERIFY_VALUES = ['all', 'verified', 'partial', 'failed', 'unverified'] as const
 type VerifyFilter = (typeof VERIFY_VALUES)[number]
 
 interface RunsPageProps {
@@ -48,7 +48,7 @@ function matchesVerifyFilter(
   if (verify === 'unverified') return false
   if (verify === 'failed') return !status.isValid
   if (verify === 'verified') return status.isValid === true && status.checksRan.includes('replay')
-  if (verify === 'seq_verified') return status.isValid === true && !status.checksRan.includes('replay')
+  if (verify === 'partial') return status.isValid === true && !status.checksRan.includes('replay')
   return true
 }
 
@@ -205,7 +205,6 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
             {VERIFY_VALUES.map((v) => {
               const active = verifyFilter === v
               const href = buildHref(baseParams, { verify: v === 'all' ? undefined : v })
-              const label = v === 'seq_verified' ? 'seq' : v
               return (
                 <a
                   key={v}
@@ -217,7 +216,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
                       : 'bg-transparent text-neutral-500 border-neutral-800 hover:text-neutral-300 hover:border-neutral-700',
                   ].join(' ')}
                 >
-                  {label}
+                  {v}
                 </a>
               )
             })}
@@ -271,7 +270,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
             message={error}
           />
         ) : (
-          <RunList
+          <SelectableRunList
             runs={filteredRuns}
             agentVersionLabels={agentVersionLabels}
             verificationStatuses={verificationStatuses}

@@ -92,8 +92,9 @@ export default async function DashboardPage() {
                   <a
                     href="/runs?verify=failed"
                     className="text-xs text-neutral-600 hover:text-neutral-400 transition-colors duration-100 font-mono"
+                    title="View all failed — use the Runs page to bulk re-verify"
                   >
-                    view all →
+                    view all failed →
                   </a>
                 </div>
 

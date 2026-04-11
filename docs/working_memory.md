@@ -2,7 +2,7 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-11 (Prompt 23 — Verification discoverability: Integrity column on runs list, verification filter on runs page, dashboard verification issues section)
+Last updated: 2026-04-11 (Prompt 24 — Verification actionability: unified 4-term vocabulary, bulk reverify on runs page, SelectableRunList component, dashboard link update, ADR-0022)
 
 ---
 
@@ -58,9 +58,9 @@ Key new exports (Prompt 10):
 **apps/web components and service layer — all implemented (not stubs):**
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
-- Run components: RunList (NEW Prompt 23: optional `verificationStatuses` prop adds Integrity column; dashboard omits prop, runs page passes it), RunHeader (with `isLive` status polling every 5s, animate-pulse live badge — Prompt 18), Timeline (with load-more pagination, keyboard navigation, WINDOW_SIZE=100 bounded rendering — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with cursor/no-cursor dedup strategy, animate-pulse live indicator — Prompt 18), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button, WINDOW_SIZE=100 bounded rendering + auto-seek for deep links — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with selection stability invariant, live dot in Events header — Prompt 18), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (`'use client'`, programmatic download with per-row loading/error state, inline error display, RFC 5987 filename extraction), CommentThread (resolve, show/hide resolved, compose), IntegrityBadge (NEW Prompt 19 — green/amber badge on run detail page showing latest verification_results status)
+- Run components: RunList (NEW Prompt 23: optional `verificationStatuses` prop adds Integrity column; dashboard omits prop, runs page passed it — now uses SelectableRunList instead), SelectableRunList (NEW Prompt 24: `'use client'` component with checkbox column, multi-select, bulk re-verify action bar, per-row ✓/✗ result indicators; used exclusively on /runs page), RunHeader (with `isLive` status polling every 5s, animate-pulse live badge — Prompt 18), Timeline (with load-more pagination, keyboard navigation, WINDOW_SIZE=100 bounded rendering — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with cursor/no-cursor dedup strategy, animate-pulse live indicator — Prompt 18), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button, WINDOW_SIZE=100 bounded rendering + auto-seek for deep links — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with selection stability invariant, live dot in Events header — Prompt 18), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (`'use client'`, programmatic download with per-row loading/error state, inline error display, RFC 5987 filename extraction), CommentThread (resolve, show/hide resolved, compose), IntegrityBadge (Prompt 19 — green/amber badge; Prompt 24: vocabulary update `seq verified`→`partial`, `check failed`→`failed`), VerificationPanel (Prompt 22: CheckPill row, re-verify button; Prompt 24: vocabulary update `isSeqOnly`→`isPartial`, notice text updated)
 - Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`, `lib/services/projects.ts` (NEW Prompt 13), `lib/services/agent_versions.ts` (NEW Prompt 14, extended with `listAgentVersionsPaginated` in Prompt 17)
-- Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags), `lib/actions/projects.ts` (createProjectAction, NEW Prompt 13), `lib/actions/agents.ts` (createAgentAction, NEW Prompt 13), `lib/actions/agent_versions.ts` (createAgentVersionAction, NEW Prompt 14), `lib/actions/verification.ts` (reverifyRunAction, NEW Prompt 22)
+- Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags), `lib/actions/projects.ts` (createProjectAction, NEW Prompt 13), `lib/actions/agents.ts` (createAgentAction, NEW Prompt 13), `lib/actions/agent_versions.ts` (createAgentVersionAction, NEW Prompt 14), `lib/actions/verification.ts` (reverifyRunAction NEW Prompt 22; bulkReverifyAction + BulkReverifyResult NEW Prompt 24)
 - Services: `lib/services/projection_verify.ts` (NEW Prompt 23: `UNVERIFIED_STATUS` constant, `FailedVerification` interface, `batchGetRunVerificationStatuses`, `getRecentFailedVerifications`)
 - API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (Prompt 12), `/api/api-keys/[id]` (DELETE revoke, NEW Prompt 13), `/api/health`, `/api/webhooks/clerk`, `/api/agents/[agentId]/versions` (GET with cursor/limit params, NEW Prompt 17)
 - UI components (Prompt 13): `CreateProjectModal`, `CreateAgentModal`, `ProjectsList`, `ProjectDetail`, `ApiKeysSection` (rewritten), `SdkSetupSnippet`
@@ -92,9 +92,11 @@ Key new exports (Prompt 10):
 - `tests/unit/scheduled_verify.test.ts` (NEW Prompt 19) — 47 pure logic tests for the scheduled sequence integrity check: valid sequences (11 tests), sequence gaps (8 tests), duplicate sequence numbers (8 tests), summary string content (13 tests), bounded window constants (7 tests). Inlines `checkSequenceIntegrity` and BATCH_LIMIT/WINDOW_MS constants — no Convex, no network, no React.
 - `tests/unit/read_path_auth.test.ts` (NEW Prompt 19) — 15 pure logic tests for read-path auth fixes: comments orgId filter correctness (5 tests), artifact download route userId+orgId AND-guard (10 tests).
 - `tests/unit/reverify_panel.test.ts` (NEW Prompt 22) — 54 pure-logic tests: result mapping, state transitions (button pending/error/success), issue generation for all 4 failure types, CheckPill states (ran/skipped + passed/failed), partial verification detection (seq-only vs full), error handling.
-- `tests/unit/verification_discoverability.test.ts` (NEW Prompt 23) — 54 pure-logic tests: `matchesVerifyFilter` for all 5 filter values (26 tests), integrity column visibility (4 tests), dashboard section logic (12 tests), `buildHref` URL construction (6 tests), `VERIFY_VALUES` coverage (2 tests), edge cases (4 tests).
+- `tests/unit/verification_discoverability.test.ts` (NEW Prompt 23, updated Prompt 24) — 54 pure-logic tests: `matchesVerifyFilter` for all 5 filter values (now uses `partial` not `seq_verified`), integrity column visibility, dashboard section logic, `buildHref` URL construction, `VERIFY_VALUES` coverage, edge cases.
+- `tests/unit/verification_vocab.test.ts` (NEW Prompt 24) — 57 pure-logic tests: badge label derivation (15 tests), filter vocabulary alignment (14 tests), vocabulary consistency 1:1 mapping (12 tests).
+- `tests/unit/bulk_reverify.test.ts` (NEW Prompt 24) — 40 pure-logic tests: result shape/computation, eligibility rules, MAX_BULK_REVERIFY cap, feedback text, selection transitions, edge cases.
 - `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
-- **Total: 794 passing, 5 skipped (27 test files, all green)**
+- **Total: 851 passing, 5 skipped (29 test files, all green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -114,6 +116,8 @@ Key new exports (Prompt 10):
 - ADR-0018: Event deep link — `?event=<sequenceNumber>` URL contract, history.replaceState (Prompt 12)
 - ADR-0019: Agent version identity — version string uniqueness per agent, `v.any()` config snapshot, no active-version pointer on agent (Prompt 14)
 - ADR-0020: Scheduled verification scope — daily cron at 04:30 UTC, BATCH_LIMIT=50, WINDOW_MS=48h, sequence-only checks, inline logic duplication rationale, verification_results table (Prompt 19)
+- ADR-0021: Internal derivation verification route — POST /api/internal/verify-derivation, INTERNAL_VERIFY_SECRET guard, DERIVATION_MAX_EVENTS=500 cap, graceful degradation (Prompt 21)
+- ADR-0022: Verification state vocabulary — 4-term vocabulary (unverified/partial/verified/failed), `seq_verified`→`partial` URL param rename documented as hard-to-reverse (Prompt 24)
 
 ---
 

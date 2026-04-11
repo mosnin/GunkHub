@@ -36,7 +36,7 @@ export function IntegrityBadge({ status }: IntegrityBadgeProps) {
         title={`Integrity check failed ${when}: ${title}`}
       >
         <span className="w-1.5 h-1.5 rounded-full bg-red-600" aria-hidden="true" />
-        check failed
+        failed
       </span>
     )
   }
@@ -54,14 +54,14 @@ export function IntegrityBadge({ status }: IntegrityBadgeProps) {
     )
   }
 
-  // Sequence-only: either a pre-Prompt 21 record or graceful degradation
+  // Partial: sequence-only — either pre-Prompt 21 record or graceful degradation
   return (
     <span
       className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-sky-700 border border-sky-900"
-      title={`Sequence integrity verified ${when}: ${title}`}
+      title={`Sequence-only verified ${when} (partial — full derivation not run): ${title}`}
     >
       <span className="w-1.5 h-1.5 rounded-full bg-sky-700" aria-hidden="true" />
-      seq verified
+      partial
     </span>
   )
 }
