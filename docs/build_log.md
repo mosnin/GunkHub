@@ -2,6 +2,42 @@
 
 ---
 
+## Prompt 15 — Run detail breadcrumb + schema drift check (2026-04-11)
+
+### What changed
+
+- Added `RunBreadcrumb.tsx` component that renders `Organization → Project → Agent → Run <id>` with links to each level
+- Added `getAgent()` service function in `apps/web/src/lib/services/agents.ts` for server-side single-agent fetch
+- Wired breadcrumb into `apps/web/app/(app)/runs/[runId]/page.tsx` — the run detail page now fetches project and agent context and renders the breadcrumb above `RunHeader`
+- Added `scripts/check-schema-drift.ts` — parses `convex/schema.ts` and `packages/contracts/src/entities.ts` with regex-based field extraction, compares the two sets per entity, and exits non-zero on any mismatch
+- Updated `scripts/validate.sh` to run the drift check as a fourth step after typecheck, build, and lint
+- Updated `.github/workflows/ci.yml` to include a `schema-drift` job that runs on every push and pull request
+- Updated `docs/ops/ci_setup.md` to document the new job
+- Added `tests/unit/schema_drift.test.ts` — 12 unit tests covering `parseSchemaTableFields` (6 tests) and `parseContractsInterfaceProperties` (6 tests)
+
+### Why these choices fit the architecture
+
+**Breadcrumb:** The run detail page already fetches the run record. The breadcrumb adds two additional server-side Convex queries (`getProject`, `getAgent`) executed non-fatally — if either fails, the page still renders with a degraded breadcrumb rather than a hard error. This follows the established pattern for non-critical parent-context enrichment. No client-side state is required; the fetch happens in the server component.
+
+**Drift check:** The schema and contracts are the two authoritative definitions of each entity's field shape. They can drift silently when one is updated without the other. A static file comparison (regex-based field name extraction, no runtime import of Convex or contracts packages) is the simplest possible check that catches the common case. It runs in under 100 ms, requires no environment variables, and is safe to run in any CI context including PR previews. Storing this as a script (not a test) keeps it callable from `validate.sh` and from CI as an explicit named job.
+
+### Hard-to-reverse decisions
+
+None for this prompt. Both changes are purely additive:
+- The breadcrumb can be removed or restyled without data migration
+- The drift check script can be deleted or extended without affecting any other system component
+
+### Known residual risks
+
+- **Breadcrumb adds 2 non-fatal Convex queries per run detail page load.** At v1 scale this is negligible. If run detail becomes a high-traffic page, these two fetches are candidates for caching or request coalescing.
+- **Drift check is regex-based.** It parses field names from schema.ts and entities.ts by line-by-line pattern matching. Unusual formatting (multi-statement lines, line continuations, macro-expanded defineTable calls) could cause false negatives (missing a real field) or false positives (spurious match). The current schema formatting is conventional enough that this is not a practical risk for v1.
+
+### Recommendation for Prompt 16
+
+SDK auto-externalization is the highest-value remaining item: the SDK must detect payloads >10 KB before calling `POST /api/events` and auto-upload them to `POST /api/artifacts/upload`. This eliminates the silent HTTP 413 failure that callers currently must handle. Artifact download error UX is the next highest value: convert the plain `<a download>` anchor to a programmatic fetch with inline error display.
+
+---
+
 ## Prompt 14 — Agent version management (2026-04-10)
 
 ### What changed

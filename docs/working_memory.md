@@ -2,7 +2,7 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-10 (Prompt 14 — Agent version management)
+Last updated: 2026-04-11 (Prompt 15 — Run detail breadcrumb + schema drift check)
 
 ---
 
@@ -82,8 +82,9 @@ Key new exports (Prompt 10):
 - `tests/unit/stale_runs.test.ts` (Prompt 12) — 8 tests for stale run timeout config, cutoff arithmetic, and safety invariants
 - `tests/unit/projects_agents.test.ts` (NEW Prompt 13) — 31 tests for slug generation, name validation, two-phase revoke state machine, and loadKeys fetch logic
 - `tests/unit/agent_versions.test.ts` (NEW Prompt 14) — 19 tests for version string validation, mapAgentVersion correctness, and action validation logic
+- `tests/unit/schema_drift.test.ts` (NEW Prompt 15) — 12 tests for `parseSchemaTableFields` and `parseContractsInterfaceProperties` parsing and exclusion logic
 - `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
-- **Total: 501 passing, 5 skipped (17 test files, all green)**
+- **Total: 513 passing, 5 skipped (18 test files, all green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -237,6 +238,16 @@ Key new exports (Prompt 10):
 - `.github/workflows/ci.yml` — integration-test job needs `[test]`; explicit notice/warning on secret presence; hard fail on `main` when secrets absent
 - `docs/release_readiness.md`, `docs/operations_runbook.md`, `docs/ops/ci_setup.md` updated
 
+**Fully implemented in Prompt 15 (breadcrumb + schema drift):**
+- `apps/web/src/components/runs/RunBreadcrumb.tsx` — `Organization → Project → Agent → Run <id>` breadcrumb with links, non-fatal parent-context fetch
+- `apps/web/src/lib/services/agents.ts` — `getAgent()` service function added for server-side single-agent fetch
+- `apps/web/app/(app)/runs/[runId]/page.tsx` — breadcrumb wired above RunHeader, non-fatal project + agent fetches
+- `scripts/check-schema-drift.ts` — regex-based schema/contracts field comparison, exits 1 on drift; exports `parseSchemaTableFields` and `parseContractsInterfaceProperties` as named exports
+- `scripts/validate.sh` — fourth check added (schema drift)
+- `.github/workflows/ci.yml` — `schema-drift` job added
+- `docs/ops/ci_setup.md` — schema-drift job documented
+- `tests/unit/schema_drift.test.ts` — 12 unit tests for parsing functions (NEW)
+
 **Fully implemented in Prompt 13 (first-success onboarding path):**
 - `convex/agents.ts` — `listAgentsByOrg` query on `by_org` index for org-wide agent listing
 - `apps/web/src/lib/services/projects.ts` — `listProjects`, `getProject`, `createProject` with slug generation
@@ -377,17 +388,15 @@ Events can have a `parentEventId` referencing another event in the same run. Thi
 
 ---
 
-## 8. Prompt 15 Candidates (v1.1 deferred items)
+## 8. Prompt 16 Candidates (v1.1 deferred items)
 
 The following items were explicitly deferred from v1 and are candidates for the next session. See `docs/next_steps.md` for full descriptions.
 
 1. **SDK auto-externalization** (HIGH) — SDK does not yet detect payloads >10 KB before calling `/api/events`. API returns HTTP 413; caller must handle. Auto-externalize (upload to `/api/artifacts/upload`, replace payload with pointer) before shipping `POST /api/events`.
 2. **Artifact download error UX** (HIGH) — download link is a plain `<a download>` anchor. On 404/502 the browser silently downloads a JSON error body. Convert to `'use client'` with programmatic fetch and inline error display.
-3. **Run detail breadcrumb navigation** (MEDIUM) — no back-navigation from run detail to project or agent without browser Back button. Add `Organization → Project → Agent → Run <id>` breadcrumb with links.
-4. **Convex schema drift check** (MEDIUM) — contracts and Convex schema can drift silently. Add `scripts/check-schema-drift.ts` and call it from `validate.sh` as a fourth check.
-5. **Version list pagination** (MEDIUM) — `listAgentVersions` uses `.collect()` with no pagination. Acceptable for v1; add cursor-based pagination if version counts grow.
-6. **Event list virtualization** (LOW) — Timeline and EventInspector load events in pages of 200 but do not virtualize the DOM. Runs with 10,000+ events may have sluggish scroll. Consider react-window.
-7. **Background projection verification** (LOW) — no scheduled job verifies run sequence integrity in production. Currently on-demand only via `rebuild-projection.ts`.
-8. **Live run monitoring** (LOW) — no real-time event streaming. Run detail page does not auto-refresh while a run is in progress.
-9. **RBAC viewer-vs-member on read paths** (LOW) — roles stored and enforced on writes; read path distinction is deferred.
-10. **Version label enrichment at scale** (LOW) — run list fetches one `getAgentVersion` per distinct version ID on each page load. Consider caching or a batch query if pages regularly show many distinct versions.
+3. **Version list pagination** (MEDIUM) — `listAgentVersions` uses `.collect()` with no pagination. Acceptable for v1; add cursor-based pagination if version counts grow.
+4. **Event list virtualization** (LOW) — Timeline and EventInspector load events in pages of 200 but do not virtualize the DOM. Runs with 10,000+ events may have sluggish scroll. Consider react-window.
+5. **Background projection verification** (LOW) — no scheduled job verifies run sequence integrity in production. Currently on-demand only via `rebuild-projection.ts`.
+6. **Live run monitoring** (LOW) — no real-time event streaming. Run detail page does not auto-refresh while a run is in progress.
+7. **RBAC viewer-vs-member on read paths** (LOW) — roles stored and enforced on writes; read path distinction is deferred.
+8. **Version label enrichment at scale** (LOW) — run list fetches one `getAgentVersion` per distinct version ID on each page load. Consider caching or a batch query if pages regularly show many distinct versions.

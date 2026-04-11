@@ -1,7 +1,7 @@
 # Release Readiness — v1
 
-**Date:** 2026-04-10
-**Status:** v1 Feature Complete — Prompt 14 (agent version management: backend, UI, run attribution, SDK snippets)
+**Date:** 2026-04-11
+**Status:** v1 Feature Complete — Prompt 15 (run detail breadcrumb, schema drift check, drift CI job)
 
 ---
 
@@ -65,8 +65,8 @@
 
 ### Test coverage
 
-- **501+ tests passing** across `tests/` and `packages/sdk` workspaces (17 test files, 5 skipped).
-- Unit tests cover replay, diff (including truncation), failure summary, storage, transport, artifact GC, and org bootstrap.
+- **513+ tests passing** across `tests/` and `packages/sdk` workspaces (18 test files, 5 skipped).
+- Unit tests cover replay, diff (including truncation), failure summary, storage, transport, artifact GC, org bootstrap, and schema drift parsing.
 - All unit tests use `MockTransport` or in-memory stubs — no network calls, instant.
 - Real-Convex integration tests (`tests/integration/api.test.ts`) run in CI when secrets are configured. Skipped gracefully otherwise. Merging to `main` requires secrets to be present.
 
@@ -126,6 +126,8 @@
 - Agent version creation from UI — `createAgentVersion` mutation (admin-gated, unique per agent), version history on agent detail page, CreateVersionModal (ADR-0019)
 - Agent version attribution on runs — Version column in run list, version badge in run detail header
 - SDK snippets include `agentVersionId` across agent detail page, project detail, and settings
+- Run detail breadcrumb — `Organization → Project → Agent → Run <id>` breadcrumb with links, non-fatal parent-context fetch (Prompt 15)
+- Schema drift check — `scripts/check-schema-drift.ts` compares convex/schema.ts against contracts entities per table; called from validate.sh and CI (Prompt 15)
 
 ---
 
