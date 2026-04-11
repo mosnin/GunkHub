@@ -644,3 +644,144 @@ describe('HttpTransport.sendEvents — pointer shape correctness', () => {
     expect(body.events[0]!.runId).toBe(RUN_ID)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Group 6: Upload cache deduplication
+// ---------------------------------------------------------------------------
+
+describe('HttpTransport.sendEvents — upload cache deduplication', () => {
+  let transport: HttpTransport
+  let mockFetch: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    transport = new HttpTransport(ENDPOINT)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  /**
+   * Creates a large event whose payload content is distinct from the default
+   * makeLargePayloadEvent helper by embedding a unique marker string in the
+   * first message. Two calls with different `marker` values produce events
+   * whose JSON.stringify(payload) values are different strings, giving different
+   * cache keys and therefore separate upload calls.
+   */
+  function makeLargePayloadEventWithMarker(runId: string, seqNum: number, marker: string): CreateEventRequest {
+    return {
+      runId,
+      type: 'llm.request' as const,
+      sequenceNumber: seqNum,
+      timestamp: Date.now(),
+      payload: {
+        type: 'llm.request' as const,
+        model: 'gpt-4',
+        messages: Array.from({ length: 100 }, (_, i) => ({
+          role: 'user',
+          content: marker + 'x'.repeat(200) + String(i),
+        })),
+      },
+    }
+  }
+
+  it('calls _uploadArtifact once for two identical large payloads in the same batch', async () => {
+    // Both events have different sequenceNumbers but identical payload content.
+    // The cache key is JSON.stringify(event.payload), which is the same for both.
+    const event1 = makeLargePayloadEvent(RUN_ID, 1)
+    const event2 = makeLargePayloadEvent(RUN_ID, 2)
+    assertLargePayloadIsActuallyLarge(event1)
+    assertLargePayloadIsActuallyLarge(event2)
+
+    // Sanity check: the payloads are truly identical
+    expect(JSON.stringify(event1.payload)).toBe(JSON.stringify(event2.payload))
+
+    const uploadResponses = [
+      { artifactId: 'art-001', storageKey: 'key/abc001', storageBucket: 'default', checksum: 'abc001', size: 15000 },
+    ]
+    let uploadCallCount = 0
+
+    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+      if (url.includes('artifacts/upload')) {
+        const resp = uploadResponses[uploadCallCount]!
+        uploadCallCount++
+        return jsonResponse(resp)
+      }
+      return jsonResponse(mockEventsResponse, 201)
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    await transport.sendEvents([event1, event2], auth)
+
+    // Upload should be called exactly once (cache hit on second event)
+    const uploadCalls = mockFetch.mock.calls.filter(
+      ([url]: [string]) => (url as string).includes('artifacts/upload')
+    )
+    expect(uploadCalls).toHaveLength(1)
+
+    // Both events in the final POST /api/events body should have type '_externalized'
+    // and share the same artifactId
+    const eventsCall = mockFetch.mock.calls.find(
+      ([url]: [string]) => (url as string).endsWith('/api/events')
+    )!
+    const init = eventsCall[1] as RequestInit
+    const body = JSON.parse(init.body as string) as {
+      events: Array<{ payload: { type: string; _artifact: { artifactId: string } } }>
+    }
+    expect(body.events[0]!.payload.type).toBe('_externalized')
+    expect(body.events[1]!.payload.type).toBe('_externalized')
+    expect(body.events[0]!.payload._artifact.artifactId).toBe('art-001')
+    expect(body.events[1]!.payload._artifact.artifactId).toBe('art-001')
+  })
+
+  it('calls _uploadArtifact separately for two different large payloads in the same batch', async () => {
+    // Two events with distinct payload content produce different cache keys.
+    const event1 = makeLargePayloadEventWithMarker(RUN_ID, 1, 'ALPHA-')
+    const event2 = makeLargePayloadEventWithMarker(RUN_ID, 2, 'BETA--')
+    assertLargePayloadIsActuallyLarge(event1)
+    assertLargePayloadIsActuallyLarge(event2)
+
+    // Sanity check: the payloads are genuinely different
+    expect(JSON.stringify(event1.payload)).not.toBe(JSON.stringify(event2.payload))
+
+    const uploadResponsesForDiff = [
+      { artifactId: 'art-A01', storageKey: 'key/alphaA01', storageBucket: 'default', checksum: 'aaA01', size: 15100 },
+      { artifactId: 'art-B02', storageKey: 'key/betaB02', storageBucket: 'default', checksum: 'bbB02', size: 15200 },
+    ]
+    let uploadCallCountDiff = 0
+
+    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+      if (url.includes('artifacts/upload')) {
+        const resp = uploadResponsesForDiff[uploadCallCountDiff]!
+        uploadCallCountDiff++
+        return jsonResponse(resp)
+      }
+      return jsonResponse(mockEventsResponse, 201)
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    await transport.sendEvents([event1, event2], auth)
+
+    // Upload should be called twice (one per unique payload)
+    const uploadCalls = mockFetch.mock.calls.filter(
+      ([url]: [string]) => (url as string).includes('artifacts/upload')
+    )
+    expect(uploadCalls).toHaveLength(2)
+
+    // Both events should be externalized with different artifactIds
+    const eventsCall = mockFetch.mock.calls.find(
+      ([url]: [string]) => (url as string).endsWith('/api/events')
+    )!
+    const init = eventsCall[1] as RequestInit
+    const body = JSON.parse(init.body as string) as {
+      events: Array<{ payload: { type: string; _artifact: { artifactId: string } } }>
+    }
+    expect(body.events[0]!.payload.type).toBe('_externalized')
+    expect(body.events[1]!.payload.type).toBe('_externalized')
+    expect(body.events[0]!.payload._artifact.artifactId).toBe('art-A01')
+    expect(body.events[1]!.payload._artifact.artifactId).toBe('art-B02')
+    expect(body.events[0]!.payload._artifact.artifactId).not.toBe(
+      body.events[1]!.payload._artifact.artifactId
+    )
+  })
+})
