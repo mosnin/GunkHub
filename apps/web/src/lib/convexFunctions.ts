@@ -6,6 +6,7 @@ import { makeFunctionReference } from 'convex/server'
 
 type Q = 'query'
 type M = 'mutation'
+type A = 'action'
 
 export const convex = {
   agents: {
@@ -64,5 +65,6 @@ export const convex = {
   },
   projection_verify: {
     getVerificationResult: makeFunctionReference<Q>('projection_verify:getVerificationResult'),
+    reverifyRun: makeFunctionReference<A>('projection_verify:reverifyRun'),
   },
 } as const

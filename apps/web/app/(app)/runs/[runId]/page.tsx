@@ -11,6 +11,7 @@ import { FailureSummary as FailureSummaryPanel } from '@/components/runs/Failure
 import { RunBreadcrumb } from '@/components/runs/RunBreadcrumb'
 import { RunHeader } from '@/components/runs/RunHeader'
 import { Timeline } from '@/components/runs/Timeline'
+import { VerificationPanel } from '@/components/runs/VerificationPanel'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { LoadingState } from '@/components/ui/LoadingState'
 import { getAgent } from '@/lib/services/agents'
@@ -174,6 +175,15 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
       {/* Failure summary panel — additive, shown only when there is a failure or incomplete run */}
       {failureSummary && (
         <FailureSummaryPanel summary={failureSummary} />
+      )}
+
+      {/* Verification panel — shown only for terminal runs */}
+      {runData && TERMINAL.includes(runData.run.status as typeof TERMINAL[number]) && (
+        <VerificationPanel
+          runId={runId}
+          initialStatus={verificationStatus}
+          isTerminal={true}
+        />
       )}
 
       {/* Tab bar */}

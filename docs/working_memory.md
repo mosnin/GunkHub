@@ -2,7 +2,7 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-11 (Prompt 19 — Scheduled verification, auth hardening, IntegrityBadge)
+Last updated: 2026-04-11 (Prompt 22 — Per-run reverify action, VerificationPanel, VerificationFailureDetail)
 
 ---
 

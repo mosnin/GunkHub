@@ -2,6 +2,77 @@
 
 ---
 
+## Prompt 22 — Per-Run Reverify Action and Verification Details Panel (2026-04-11)
+
+### What changed
+
+**A. convex/projection_verify.ts — three new exports**
+- `_getRunForVerify`: `internalQuery` that fetches a single run by ID via `ctx.db.get`. Used by `reverifyRun` since actions cannot access `ctx.db` directly.
+- `_requireMembershipForReverify`: `internalQuery` accepting `clerkUserId` and `orgId`. Looks up `user_memberships` by `by_clerk_user` index, throws `Unauthorized` if not a member and `Forbidden` if rank < member. Role hierarchy: `viewer=0, member=1, admin=2`.
+- `reverifyRun`: public `action` that (1) checks Clerk identity via `ctx.auth.getUserIdentity()`, (2) fetches the run via `_getRunForVerify`, (3) enforces member+ via `_requireMembershipForReverify`, (4) runs the same seq + derivation flow as `verifyRecentRuns` (including DERIVATION_MAX_EVENTS=500 cap and graceful degradation), (5) upserts the result via `_upsertVerificationResult`, (6) returns the verification result for immediate UI update.
+
+**B. apps/web/src/lib/convexFunctions.ts — action type and reverifyRun reference**
+- Added `type A = 'action'` alongside the existing `Q` and `M` type aliases.
+- Added `reverifyRun: makeFunctionReference<A>('projection_verify:reverifyRun')` to the `projection_verify` namespace.
+
+**C. apps/web/src/lib/actions/verification.ts — NEW server action**
+- `'use server'` directive. Exports `ReverifyResult` interface (`{ status: VerificationStatus | null, error: string | null }`) and `reverifyRunAction(runId: string)`.
+- Auth: rejects immediately if no Clerk session (`userId` absent).
+- Calls `client.action(convex.projection_verify.reverifyRun, { runId })` via the authenticated `ConvexHttpClient`.
+- Maps raw action result to `VerificationStatus` (same field mapping as `getRunVerificationStatus`).
+- Returns `{ status: null, error: message }` on any thrown error.
+
+**D. apps/web/src/components/runs/VerificationFailureDetail.tsx — NEW**
+- Pure presentational component (no `'use client'` needed — no state).
+- Props: `{ status: VerificationStatus }`.
+- Internal `buildIssues()` function (exported for tests) returns an ordered `FailureIssue[]` based on which failure types are present: sequence gaps → duplicates → replay failed → failureSummary failed.
+- Each issue: `border-l-2 border-red-900` left-accent card with red title, neutral-500 detail, neutral-600 remediation hint.
+- Truncates gap/duplicate lists to 5 entries with `…` suffix.
+- Hints are system-grounded: "Check SDK ingest logs", "Check SDK retry logic", "Run scripts/rebuild-projection.ts", "Inspect the RUN_FAILED event payload".
+
+**E. apps/web/src/components/runs/VerificationPanel.tsx — NEW**
+- `'use client'` component. Props: `{ runId, initialStatus, isTerminal }`. Returns `null` if `!isTerminal`.
+- State: `status` (initialized from `initialStatus ?? UNVERIFIED_STATUS`), `reverifyError`, `isPending` (from `useTransition`).
+- Header row: `Integrity` label, `IntegrityBadge`, `formatRelativeTime(verifiedAt)` age label, per-check `CheckPill` row, `Re-verify` button (right-aligned, disabled while pending).
+- `CheckPill` subcomponent: 3 states — skipped (neutral, no dot), passed (neutral border + emerald dot), failed (red border + red dot + "failed" label).
+- Partial verification notice: shown when `status.verified && !status.checksRan.includes('replay')` — explains `INTERNAL_VERIFY_URL` must be configured.
+- Inline error display when `reverifyError` is set.
+- `VerificationFailureDetail` shown when `status.verified && !status.isValid`.
+- `handleReverify`: calls `reverifyRunAction`, updates `status` on success or sets `reverifyError` on failure.
+
+**F. apps/web/app/(app)/runs/[runId]/page.tsx — VerificationPanel wired**
+- Added `import { VerificationPanel }` from `@/components/runs/VerificationPanel`.
+- `VerificationPanel` rendered between `FailureSummaryPanel` and the tab bar, guarded by the same `TERMINAL` check used for the `verificationStatus` fetch.
+- Passes `initialStatus={verificationStatus}` and `isTerminal={true}`.
+
+**G. apps/web/app/(app)/runs/[runId]/actions.ts — re-export added**
+- Added `export { reverifyRunAction } from '@/lib/actions/verification'` so it is available as a co-located server action entry point for the route segment.
+
+**H. tests/unit/reverify_panel.test.ts — NEW (48 tests)**
+- 6 groups: reverify result mapping (5 tests), panel state transitions (5), buildIssues sequence gaps (4), buildIssues duplicates (2), buildIssues replay/failureSummary failures (4 + multi-issue), CheckPill logic via deriveCheckState (7), error handling (4), partial verification detection (4).
+- All pure logic, no React, no DOM, no Convex, no network.
+
+### Why these choices fit the architecture
+
+**Auth in Convex action context:** Convex actions have `ctx.auth` but no `ctx.db`. The workaround (two `internalQuery` helpers called via `ctx.runInternalQuery`) keeps auth enforcement inside Convex without leaking database access to the action layer. The web app never receives unauthenticated results.
+
+**No router.refresh() on reverify:** `VerificationPanel` keeps its own `status` state. After a successful reverify, `setStatus(result.status)` updates the UI instantly from the action return value. This avoids a full RSC re-render (which would re-fetch all page data) for a targeted, bounded operation.
+
+**Re-verify button always shown (not gated client-side):** Role enforcement is server-side only (in the Convex action). Viewer-only users see the button but receive a "Forbidden" error message inline. This simplifies the client component — no need to thread role state through the page.
+
+**`buildIssues` exported from VerificationFailureDetail.tsx:** Makes the function testable in isolation without React test infrastructure. All test coverage is pure-logic unit tests.
+
+### Hard-to-reverse decisions
+
+None new. The new Convex functions are pure additions. The `actions.ts` re-export is additive. The page wiring adds a new panel section but does not alter the existing layout contract.
+
+### Known residual risks
+
+1. **Action auth relies on JWT org claims:** `_requireMembershipForReverify` looks up membership by `clerkUserId`. If a user's JWT was issued before their role was downgraded, a stale-token window exists (bounded by Clerk's JWT TTL, typically 60s). Consistent with the existing auth pattern.
+2. **reverifyRun re-runs the 500-event cap:** A run that was previously verified at full derivation level (e.g., it had 300 events at last nightly check) could exceed 500 events by the time a manual reverify is triggered. It would then silently fall back to sequence-only. The UI shows the seq-only notice in this case.
+
+---
+
 ## Prompt 21 — Full Derivation Verification via Internal Route (2026-04-11)
 
 ### What changed

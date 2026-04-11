@@ -46,6 +46,18 @@
 
 ---
 
+## What Prompt 22 delivered
+
+- **`reverifyRun` Convex action**: new public action in `convex/projection_verify.ts`. Auth-gated (Clerk identity + member+ role via two `internalQuery` helpers). Runs same seq + derivation flow as the nightly cron, bounded by `DERIVATION_MAX_EVENTS=500`, graceful degradation to sequence-only. Returns result shape for immediate UI use.
+- **`reverifyRunAction` Next.js server action**: `apps/web/src/lib/actions/verification.ts`. Checks Clerk session, calls `client.action(convex.projection_verify.reverifyRun, ...)`, maps raw result to `VerificationStatus`. Re-exported from `apps/web/app/(app)/runs/[runId]/actions.ts`.
+- **`VerificationFailureDetail` component**: pure presentational component (`apps/web/src/components/runs/VerificationFailureDetail.tsx`). Renders ordered issue list for each failure type (sequence gaps, duplicates, replay failed, failureSummary failed) with system-grounded remediation hints. `buildIssues()` exported for testing.
+- **`VerificationPanel` component** (`'use client'`): `apps/web/src/components/runs/VerificationPanel.tsx`. Shows `IntegrityBadge`, age label, per-check `CheckPill` row (sequence/replay/failureSummary — ran/skipped + passed/failed), partial verification notice when seq-only, inline error display, "Re-verify" button with pending state.
+- **Run detail page wired**: `VerificationPanel` rendered between `FailureSummaryPanel` and the tab bar for terminal runs.
+- **Tests**: `tests/unit/reverify_panel.test.ts` — 48 pure-logic tests across 8 groups covering result mapping, state transitions, issue generation, CheckPill states, error handling, and partial verification detection.
+- **Build log updated** with full implementation notes for Prompt 22.
+
+---
+
 ## What Prompt 21 delivered
 
 - **Full derivation verification via internal HTTP route** (`POST /api/internal/verify-derivation`): New stateless Next.js route protected by `INTERNAL_VERIFY_SECRET`. Receives raw Convex run/event documents, maps them to contracts types, calls `verifyProjectionIntegrity`, and returns `checksRan`, `replayPassed`, `failureSummaryPassed` alongside the existing sequence fields.

@@ -329,6 +329,201 @@ export const verifyRecentRuns = action({
 });
 
 // ---------------------------------------------------------------------------
+// Internal helpers for the per-run reverify action
+// ---------------------------------------------------------------------------
+
+/** Fetch a single run by ID. Returns null if not found. Internal only. */
+export const _getRunForVerify = internalQuery({
+  args: { runId: v.id("runs") },
+  handler: async (ctx, args) => ctx.db.get(args.runId),
+});
+
+/**
+ * Check that a Clerk user is a member (or admin) of the given organization.
+ * Throws "Unauthorized" or "Forbidden" on failure. Internal only.
+ */
+export const _requireMembershipForReverify = internalQuery({
+  args: {
+    clerkUserId: v.string(),
+    orgId: v.id("organizations"),
+  },
+  handler: async (ctx, args) => {
+    const ROLE_RANK: Record<string, number> = { viewer: 0, member: 1, admin: 2 };
+
+    const membership = await ctx.db
+      .query("user_memberships")
+      .withIndex("by_clerk_user", (q) => q.eq("clerkUserId", args.clerkUserId))
+      .filter((q) => q.eq(q.field("orgId"), args.orgId))
+      .unique();
+
+    if (!membership) throw new Error("Unauthorized: not a member of this organization");
+
+    const actualRank = ROLE_RANK[membership.role] ?? 0;
+    if (actualRank < ROLE_RANK.member) {
+      throw new Error("Forbidden: member or admin role required to re-run verification");
+    }
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Per-run reverify action — called on demand by the web UI
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-run derivation verification for a single run on demand.
+ *
+ * Auth: caller must be authenticated (Clerk JWT) and a member+ of the org
+ * that owns the run. Viewer-only callers receive a "Forbidden" error.
+ *
+ * Verification scope mirrors verifyRecentRuns:
+ *   - Sequence integrity (always)
+ *   - Full derivation via web route when INTERNAL_VERIFY_URL/SECRET are set
+ *     and the run has ≤ DERIVATION_MAX_EVENTS events (graceful degradation otherwise)
+ *
+ * Returns the verification result in the same shape as _upsertVerificationResult
+ * so the caller can update UI state without a page reload.
+ */
+export const reverifyRun = action({
+  args: { runId: v.id("runs") },
+  handler: async (ctx, args) => {
+    const DERIVATION_MAX_EVENTS = 500;
+    const now = Date.now();
+
+    // Auth: require authenticated Clerk identity
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) throw new Error("Unauthorized");
+    const clerkUserId = identity.subject;
+
+    // Fetch the run — action cannot use ctx.db directly
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const run: Record<string, unknown> | null = await ctx.runInternalQuery(
+      _getRunForVerify,
+      { runId: args.runId },
+    );
+    if (!run) throw new Error("Run not found");
+
+    const orgId = run.orgId as string;
+
+    // Role check: member+ required
+    await ctx.runInternalQuery(_requireMembershipForReverify, {
+      clerkUserId,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      orgId: orgId as any,
+    });
+
+    // Collect all sequence numbers
+    const seqNums: number[] = [];
+    let cursor: string | null = null;
+    for (;;) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const page: { seqNums: number[]; nextCursor: string | null } =
+        await ctx.runInternalQuery(_listEventSeqNums, { runId: args.runId, cursor });
+      seqNums.push(...page.seqNums);
+      if (page.nextCursor === null) break;
+      cursor = page.nextCursor;
+    }
+
+    const seqResult = checkSequenceIntegrity(seqNums);
+
+    const verifyUrl = process.env.INTERNAL_VERIFY_URL as string | undefined;
+    const verifySecret = process.env.INTERNAL_VERIFY_SECRET as string | undefined;
+    const canRunDerivation = !!(verifyUrl && verifySecret);
+
+    // Attempt full derivation check via web route when configured and run is within size cap
+    if (canRunDerivation && seqNums.length <= DERIVATION_MAX_EVENTS) {
+      try {
+        const allEvents: Array<Record<string, unknown>> = [];
+        let evtCursor: string | null = null;
+        for (;;) {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          const page: { events: Array<Record<string, unknown>>; nextCursor: string | null } =
+            await ctx.runInternalQuery(_listEventsFull, { runId: args.runId, cursor: evtCursor });
+          allEvents.push(...page.events);
+          if (page.nextCursor === null) break;
+          evtCursor = page.nextCursor;
+        }
+
+        const res = await fetch(`${verifyUrl}/api/internal/verify-derivation`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-internal-secret": verifySecret!,
+          },
+          body: JSON.stringify({ run, events: allEvents }),
+        });
+
+        if (!res.ok) throw new Error(`Verify route returned ${res.status}`);
+
+        const ext = await res.json() as {
+          isValid: boolean;
+          summary: string;
+          sequenceGaps: number[];
+          duplicateSeqNums: number[];
+          failureReason?: string;
+          checksRan: string[];
+          replayPassed: boolean;
+          failureSummaryPassed: boolean;
+        };
+
+        await ctx.runInternalMutation(_upsertVerificationResult, {
+          runId: args.runId,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          orgId: orgId as any,
+          verifiedAt: now,
+          isValid: ext.isValid,
+          summary: ext.summary,
+          sequenceGaps: ext.sequenceGaps,
+          duplicateSeqNums: ext.duplicateSeqNums,
+          ...(ext.failureReason !== undefined && { failureReason: ext.failureReason }),
+          checksRan: ext.checksRan,
+          replayPassed: ext.replayPassed,
+          failureSummaryPassed: ext.failureSummaryPassed,
+        });
+
+        return {
+          isValid: ext.isValid,
+          verifiedAt: now,
+          summary: ext.summary,
+          sequenceGaps: ext.sequenceGaps,
+          duplicateSeqNums: ext.duplicateSeqNums,
+          failureReason: ext.failureReason,
+          checksRan: ext.checksRan,
+          replayPassed: ext.replayPassed,
+          failureSummaryPassed: ext.failureSummaryPassed,
+        };
+      } catch {
+        // Web route unavailable or parse failure — fall through to sequence-only result
+      }
+    }
+
+    // Sequence-only path (no derivation check, or graceful degradation)
+    await ctx.runInternalMutation(_upsertVerificationResult, {
+      runId: args.runId,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      orgId: orgId as any,
+      verifiedAt: now,
+      isValid: seqResult.isValid,
+      summary: seqResult.summary,
+      sequenceGaps: seqResult.sequenceGaps,
+      duplicateSeqNums: seqResult.duplicateSeqNums,
+      ...(seqResult.failureReason !== undefined && { failureReason: seqResult.failureReason }),
+    });
+
+    return {
+      isValid: seqResult.isValid,
+      verifiedAt: now,
+      summary: seqResult.summary,
+      sequenceGaps: seqResult.sequenceGaps,
+      duplicateSeqNums: seqResult.duplicateSeqNums,
+      failureReason: seqResult.failureReason,
+      checksRan: undefined as string[] | undefined,
+      replayPassed: undefined as boolean | undefined,
+      failureSummaryPassed: undefined as boolean | undefined,
+    };
+  },
+});
+
+// ---------------------------------------------------------------------------
 // Public query — read verification result for a specific run
 // ---------------------------------------------------------------------------
 
