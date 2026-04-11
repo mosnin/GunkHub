@@ -1,7 +1,7 @@
 # Next Steps — v1.1 Candidates
 
 **Document type:** State summary and v1.1 candidate list.
-**Current state:** Prompt 18 complete.
+**Current state:** Prompt 19 complete.
 
 ---
 
@@ -46,6 +46,16 @@
 
 ---
 
+## What Prompt 19 delivered
+
+- **Daily scheduled sequence integrity verification** (`convex/projection_verify.ts`): Convex cron at 04:30 UTC verifying up to 50 recent terminal runs (48h window). `checkSequenceIntegrity` detects gaps and duplicates in the event sequence and stores per-run outcomes in a new `verification_results` table. Logic inlined in the Convex action (documented in ADR-0020) because Convex actions cannot import from `apps/web` context.
+- **`listComments` auth fix**: `orgId` is now a required argument; `requireOrgMembership` is called before any data access. The query also applies an explicit `.filter()` by `orgId`. This closes a tenancy gap where callers could query without proving org membership. All `apps/web` callers updated.
+- **Artifact download route orgId guard**: `GET /api/artifacts/[id]/download` now checks `orgId` at the route level (in addition to `userId`) before passing control to the Convex service layer. Consistent with org-scoped route pattern used by other API routes.
+- **`IntegrityBadge` UI component**: Run detail page header shows a green "Sequence OK" or amber "Sequence warning" badge based on the most recent `verification_results` record for the run.
+- **New tests**: `tests/unit/scheduled_verify.test.ts` (47 tests) and `tests/unit/read_path_auth.test.ts` (15 tests). Total test count: **637 passing, 5 skipped, 23 test files**.
+
+---
+
 ## v1.1 Candidates
 
 Listed in rough priority order.
@@ -68,8 +78,8 @@ Implemented in Prompt 17 with Convex `.paginate()`, 20 items/page, 100 max. `pag
 **4. Event list virtualization** — addressed in Prompt 17 with bounded window (not full react-window)
 Timeline and EventInspector now render at most 100 events at a time (`WINDOW_SIZE = 100`). This eliminates the DOM growth problem for typical runs. Full `react-window` virtualization remains an option if a run needs all events visible simultaneously without page navigation, but the sliding window approach covers the common debugging use case without an additional dependency.
 
-**5. Background projection verification**
-No scheduled job verifies run sequence integrity in production. Integrity checks are on-demand only via `scripts/rebuild-projection.ts`. A Convex cron checking a sample of recent runs would provide proactive alerting.
+**5. Background projection verification** — DONE (Prompt 19)
+Daily Convex cron at 04:30 UTC verifies up to 50 recent terminal runs (48h window) for sequence gaps and duplicates. Results stored in `verification_results` table. `IntegrityBadge` component on run detail page surfaces the latest result.
 
 **6. Live run monitoring** — DONE (Prompt 18)
 Implemented via 5s polling on RunHeader, Timeline, and EventInspector. `isLive` prop wired from page.tsx. Animate-pulse indicators, cursor/no-cursor dedup strategy, selection stability.
@@ -92,21 +102,18 @@ Implemented in Prompt 18 as part of auto-advance window. After `handleLoadMore` 
 
 ---
 
-## Prompt 19 Candidates
+## Prompt 20 Candidates
 
-**1. Replay tab live refresh (highest value)**
-The replay projection is computed server-side from the event log. When a run is in progress, the replay tab shows a stale projection until the user manually reloads the page. A client-side hook or route re-fetch (similar to the RunHeader polling approach) could regenerate the projection periodically for running runs, bringing the replay view up to date without a full page reload.
-
-**2. Follow-tail toggle**
+**1. Follow-tail toggle (highest value)**
 Timeline and EventInspector auto-advance the window on each poll (newest events visible), but users who scroll backward to inspect earlier events will find the window jumping forward again on the next poll. A "follow tail" toggle — on by default for live runs — would let users anchor the window to the latest events while polling, and turn it off to inspect historical events without interruption.
 
-**3. Background projection verification**
-No scheduled job verifies run sequence integrity in production. Integrity checks are on-demand only via `scripts/rebuild-projection.ts`. A Convex cron checking a sample of recent runs would provide proactive alerting before users encounter corrupted traces.
+**2. Replay tab live refresh**
+The replay projection is computed server-side from the event log. When a run is in progress, the replay tab shows a stale projection until the user manually reloads the page. A client-side hook or route re-fetch (similar to the RunHeader polling approach) could regenerate the projection periodically for running runs, bringing the replay view up to date without a full page reload.
 
-**4. RBAC viewer-vs-member on read paths**
-Roles (`admin`, `member`, `viewer`) are stored and enforced on write mutations. The viewer-vs-member distinction on read paths is deferred.
+**3. RBAC viewer-vs-member on read paths**
+Roles (`admin`, `member`, `viewer`) are stored and enforced on write mutations. The viewer-vs-member distinction on read paths is deferred. Now that the read-path auth pattern has been tightened in Prompt 19 (listComments, artifact download), extending RBAC to viewer-level enforcement on read queries is a natural next step.
 
-**5. Version label enrichment at scale**
+**4. Version label enrichment at scale**
 The run list page fetches one `getAgentVersion` per distinct version ID per page load. At v1 scale (1–3 distinct versions per page) this is fast. Consider caching or a batch query if pages regularly show many distinct versions.
 
 ---

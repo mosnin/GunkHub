@@ -2,17 +2,17 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-11 (Prompt 18 — Live run monitoring, auto-advance window)
+Last updated: 2026-04-11 (Prompt 19 — Scheduled verification, auth hardening, IntegrityBadge)
 
 ---
 
 ## 1. Current State
 
-Prompts 1–18 complete. The following summarizes the full state after Prompt 18.
+Prompts 1–19 complete. The following summarizes the full state after Prompt 19.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
-**Convex schema is fully defined** (`convex/schema.ts`). All tables defined: `organizations`, `projects`, `agents`, `agent_versions`, `runs`, `events`, `artifacts`, `comments`, `user_memberships`, `api_keys`. Prompt 10: `artifacts` gains `by_created_at`. Prompt 11: `runs` gains `by_org_status_started = ["orgId", "status", "startedAt"]` for efficient combined status+date filtering (ADR-0015).
+**Convex schema is fully defined** (`convex/schema.ts`). All tables defined: `organizations`, `projects`, `agents`, `agent_versions`, `runs`, `events`, `artifacts`, `comments`, `user_memberships`, `api_keys`, `verification_results` (NEW Prompt 19 — stores per-run integrity check outcomes from daily cron). Prompt 10: `artifacts` gains `by_created_at`. Prompt 11: `runs` gains `by_org_status_started = ["orgId", "status", "startedAt"]` for efficient combined status+date filtering (ADR-0015).
 
 **Convex queries and mutations are implemented** (not stubbed) for:
 - `convex/runs.ts` — `listRuns`, `getRun`, `createRun`, `updateRunStatus`, `updateRunTags`
@@ -24,6 +24,7 @@ Prompts 1–18 complete. The following summarizes the full state after Prompt 18
 - `convex/agent_versions.ts` — `createAgentVersion` (admin-gated, unique per agent), `listAgentVersions`, `getAgentVersion` (NEW Prompt 14), `paginateAgentVersions` (cursor-based pagination, 20 items/page, 100 max — NEW Prompt 17)
 - `convex/artifact_gc.ts` — `getOrphanCandidates` (indexed range + paginate), `isArtifactReferenced`, `deleteArtifactRecord`, `cleanOrphanedArtifacts`
 - `convex/stale_runs.ts` (NEW Prompt 12) — `listStaleRuns`, `markRunTimedOut`, `expireStaleRuns`
+- `convex/projection_verify.ts` (NEW Prompt 19) — `checkSequenceIntegrity` (inlined pure function), `verifyRecentRuns` (scheduled action; BATCH_LIMIT=50, WINDOW_MS=48h, stores results in `verification_results`)
 - Auth helpers: `getAuthContext()`, `requireOrgMembership()` with `minimumRole` in `convex/auth.ts`
 
 **packages/contracts is fully defined** (v0.6.1). All shared types:
@@ -57,7 +58,7 @@ Key new exports (Prompt 10):
 **apps/web components and service layer — all implemented (not stubs):**
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
-- Run components: RunList, RunHeader (with `isLive` status polling every 5s, animate-pulse live badge — Prompt 18), Timeline (with load-more pagination, keyboard navigation, WINDOW_SIZE=100 bounded rendering — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with cursor/no-cursor dedup strategy, animate-pulse live indicator — Prompt 18), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button, WINDOW_SIZE=100 bounded rendering + auto-seek for deep links — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with selection stability invariant, live dot in Events header — Prompt 18), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (`'use client'`, programmatic download with per-row loading/error state, inline error display, RFC 5987 filename extraction), CommentThread (resolve, show/hide resolved, compose)
+- Run components: RunList, RunHeader (with `isLive` status polling every 5s, animate-pulse live badge — Prompt 18), Timeline (with load-more pagination, keyboard navigation, WINDOW_SIZE=100 bounded rendering — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with cursor/no-cursor dedup strategy, animate-pulse live indicator — Prompt 18), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button, WINDOW_SIZE=100 bounded rendering + auto-seek for deep links — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with selection stability invariant, live dot in Events header — Prompt 18), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (`'use client'`, programmatic download with per-row loading/error state, inline error display, RFC 5987 filename extraction), CommentThread (resolve, show/hide resolved, compose), IntegrityBadge (NEW Prompt 19 — green/amber badge on run detail page showing latest verification_results status)
 - Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`, `lib/services/projects.ts` (NEW Prompt 13), `lib/services/agent_versions.ts` (NEW Prompt 14, extended with `listAgentVersionsPaginated` in Prompt 17)
 - Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags), `lib/actions/projects.ts` (createProjectAction, NEW Prompt 13), `lib/actions/agents.ts` (createAgentAction, NEW Prompt 13), `lib/actions/agent_versions.ts` (createAgentVersionAction, NEW Prompt 14)
 - API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (Prompt 12), `/api/api-keys/[id]` (DELETE revoke, NEW Prompt 13), `/api/health`, `/api/webhooks/clerk`, `/api/agents/[agentId]/versions` (GET with cursor/limit params, NEW Prompt 17)
@@ -87,8 +88,10 @@ Key new exports (Prompt 10):
 - `tests/unit/timeline_window.test.ts` (NEW Prompt 17) — 25 pure logic tests for the sliding window algorithm shared by Timeline and EventInspector: window bounds computation, above/below counts, "earlier"/"later" navigation clamping, ArrowUp/ArrowDown edge-shift logic, absolute index mapping, and ring highlight predicate
 - `tests/unit/version_pagination.test.ts` (NEW Prompt 17) — 14 pure logic tests for version pagination: cursor accumulation across pages, `hasMore` boolean derivation, `nextCursor` passthrough from service result, and `parseVersionsParams` query-param parsing including zero-limit and URL-encoded cursor edge cases
 - `tests/unit/active_run.test.ts` (NEW Prompt 18) — 21 pure logic tests for active run monitoring: auto-advance window computation (6 tests), event deduplication for live polling (5 tests), terminal status detection via `isTerminalStatus` from contracts (6 tests), and `isLive` activation rule (4 tests)
+- `tests/unit/scheduled_verify.test.ts` (NEW Prompt 19) — 47 pure logic tests for the scheduled sequence integrity check: valid sequences (11 tests), sequence gaps (8 tests), duplicate sequence numbers (8 tests), summary string content (13 tests), bounded window constants (7 tests). Inlines `checkSequenceIntegrity` and BATCH_LIMIT/WINDOW_MS constants — no Convex, no network, no React.
+- `tests/unit/read_path_auth.test.ts` (NEW Prompt 19) — 15 pure logic tests for read-path auth fixes: comments orgId filter correctness (5 tests), artifact download route userId+orgId AND-guard (10 tests).
 - `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
-- **Total: 575 passing, 5 skipped (21 test files, all green)**
+- **Total: 637 passing, 5 skipped (23 test files, all green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -107,6 +110,7 @@ Key new exports (Prompt 10):
 - ADR-0017: Stale run expiry — daily cron at 03:00 UTC, internalAction pattern (Prompt 12)
 - ADR-0018: Event deep link — `?event=<sequenceNumber>` URL contract, history.replaceState (Prompt 12)
 - ADR-0019: Agent version identity — version string uniqueness per agent, `v.any()` config snapshot, no active-version pointer on agent (Prompt 14)
+- ADR-0020: Scheduled verification scope — daily cron at 04:30 UTC, BATCH_LIMIT=50, WINDOW_MS=48h, sequence-only checks, inline logic duplication rationale, verification_results table (Prompt 19)
 
 ---
 

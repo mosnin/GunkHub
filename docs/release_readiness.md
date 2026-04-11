@@ -15,7 +15,11 @@
   `(runId, sequenceNumber)`. Safe to retry on network failure without creating
   duplicate events. Documented in ADR-0007.
 - **Org tenancy enforcement** — every Convex query and mutation filters by `orgId`.
-  No cross-org data leakage is possible via the query layer.
+  No cross-org data leakage is possible via the query layer. **Auth fix (Prompt 19):**
+  `listComments` previously accepted callers without proving org membership; it now
+  requires `orgId` as a mandatory argument and calls `requireOrgMembership` before any
+  data access. The artifact download route (`GET /api/artifacts/[id]/download`) also
+  now checks `orgId` at the route level in addition to `userId`.
 - **Full entity hierarchy** — `organizations`, `projects`, `agents`, `agent_versions`,
   `runs`, `events`, `artifacts`, `comments`, `user_memberships` all implemented with
   correct indexes.
@@ -77,6 +81,15 @@
 ### GC and operator visibility
 
 - **Artifact GC** — daily cron processes artifacts oldest-first via `by_created_at` index, bounded at 100 per run. Blob delete failures preserve the Convex record and are retried on the next daily run. GC logs classify errors as `blobErrors`, `checkErrors`, `recordErrors` for operator diagnostics. See the Operations Runbook.
+- **Projection integrity verification (Prompt 19)** — daily Convex cron at 04:30 UTC
+  (`convex/projection_verify.ts`) checks up to 50 recent terminal runs (48-hour window)
+  for sequence gaps and duplicate sequence numbers. Results are stored in the
+  `verification_results` table and surfaced on the run detail page via the
+  `IntegrityBadge` component. This provides proactive alerting before operators
+  encounter corrupted traces. The `checkSequenceIntegrity` logic is unit-tested in
+  `tests/unit/scheduled_verify.test.ts`. Note: `buildReplayProjection` is not called
+  from the cron (cross-runtime import constraint); that code path is covered by unit
+  tests only.
 
 ### UI consistency
 
@@ -90,8 +103,9 @@
   calling `/api/events`. If a payload exceeds the limit, the API returns HTTP 413 and
   the SDK surfaces that error to the caller. Auto-externalization (upload to
   `/api/artifacts/upload` then replace payload with pointer) is v1.1 scope.
-- **Background projection verification** — no scheduled job verifies run sequence
-  integrity in production. Integrity checks are on-demand only (via the CLI script).
+- **Background projection verification** — DONE (Prompt 19). Daily Convex cron
+  verifies sequence integrity for up to 50 recent terminal runs (48h window). Results
+  stored in `verification_results` table; surfaced via `IntegrityBadge` on run detail.
 - **Live run monitoring** — no real-time event streaming. The run detail page does not
   auto-refresh while a run is in progress.
 - **RBAC beyond basic membership** — roles (`admin`, `member`, `viewer`) are stored
@@ -169,6 +183,6 @@ coordination with all deployments.
 | `BLOB_STORE_TOKEN` expiry has no fallback | High | Monitor token expiry; rotate before expiry; health endpoint will show `configured: false` if token is absent |
 | No run integrity verification in production | Low | Sequence gaps could appear if a Convex mutation fails mid-batch; use `rebuild-projection.ts` to check individual runs manually |
 | Large runs (> 10,000 events) may time out | Low | Replay endpoint fetches all events; no pagination timeout is enforced. Mitigate with per-run event count limits at the SDK level. |
-| `comments` mutations are minimal | Low | `resolveComment` is wired into the UI; `listComments` with `targetType` filter works. Full threading not in v1. |
+| `comments` mutations are minimal | Low | `resolveComment` is wired into the UI; `listComments` with `orgId` enforcement works (auth fixed Prompt 19). Full threading not in v1. |
 | Artifact download error UX | Low | 404/502 from download route causes browser to download JSON error body. Inline error display deferred to v1.1. |
 | Stale run expiry uses full-table scan | Low | No global `by_status` index; full `.filter()` scan per daily cron. Acceptable at v1 run volumes. |

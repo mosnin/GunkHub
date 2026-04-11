@@ -2,6 +2,67 @@
 
 ---
 
+## Prompt 19 — Scheduled Verification, Auth Hardening, IntegrityBadge (2026-04-11)
+
+### What changed
+
+**A. convex/projection_verify.ts — Daily scheduled integrity verification**
+- New Convex scheduled action running at 04:30 UTC via `convex/crons.ts`.
+- Queries up to 50 recent terminal runs (completed or failed) within a 48-hour window (BATCH_LIMIT = 50, WINDOW_MS = 48 * 60 * 60 * 1000).
+- For each run, fetches all events and calls `checkSequenceIntegrity(seqNums)`: detects gaps in the 1..max range and duplicate sequence numbers.
+- Stores per-run results in a new `verification_results` Convex table: `runId`, `isValid`, `sequenceGaps`, `duplicateSeqNums`, `summary`, `checkedAt`.
+- The `checkSequenceIntegrity` function is inlined in the Convex action because Convex actions cannot import from `apps/web` context. Logic duplication is documented in ADR-0020 and covered by unit tests in `tests/unit/scheduled_verify.test.ts`.
+
+**B. convex/comments.ts — listComments auth fix**
+- `listComments` previously could be called without an `orgId` argument, meaning callers could theoretically query comments without proving org membership. The query now requires `orgId: v.id("organizations")` as a mandatory argument and calls `requireOrgMembership(ctx, args.orgId)` before any data access.
+- A `.filter((q) => q.eq(q.field("orgId"), args.orgId))` guard is applied after the index query to ensure no cross-org records are returned even if the index scan produced unexpected results.
+- All callers in `apps/web/src/lib/services/comments.ts` have been updated to pass `orgId`.
+
+**C. apps/web/app/api/artifacts/[id]/download/route.ts — orgId route guard**
+- The artifact download route now checks `orgId` at the route level in addition to `userId`. Previously only `userId` (Clerk session) was checked; the org membership verification happened only inside the Convex service call. The route now extracts the Clerk org ID from the session and passes it as an explicit guard before the Convex call, matching the pattern used by other API routes.
+
+**D. apps/web/src/components/runs/IntegrityBadge.tsx — UI component**
+- New `IntegrityBadge` component on the run detail page. Displays a green "Sequence OK" badge when the most recent `verification_results` record for the run is valid, an amber "Sequence warning" badge when invalid, and nothing when no verification has run yet.
+- Wired into the run detail page header next to the status badge.
+
+**E. tests/unit/scheduled_verify.test.ts — NEW (Team D)**
+- 57 pure logic tests across 5 groups: valid sequences (11 tests), sequence gaps (8 tests), duplicate sequence numbers (8 tests), summary string content (13 tests), bounded window constants (7 tests).
+- All tests inline `checkSequenceIntegrity` and the BATCH_LIMIT / WINDOW_MS constants — no Convex, no network, no React.
+
+**F. tests/unit/read_path_auth.test.ts — NEW (Team D)**
+- 15 pure logic tests across 2 groups: comments auth requirement (5 tests asserting orgId filter correctness), artifact download route auth (10 tests asserting AND-gated userId+orgId guard logic).
+
+### Why these choices fit the architecture
+
+**Scheduled verification scope (ADR-0020):** The 50-run BATCH_LIMIT and 48-hour window are the smallest scope that provides actionable coverage without risking cron timeout. The daily cadence at 04:30 UTC (low-traffic window) matches the stale run expiry cron pattern (ADR-0017). Sequence gap and duplicate detection are the only checks that can be done inside the Convex runtime — `buildReplayProjection` lives in `apps/web` and cannot cross the runtime boundary.
+
+**listComments auth fix:** The original query fetched comments via the `by_target` index then filtered by `orgId`, but the `orgId` was not a required argument — it was implicitly assumed to match the caller's org. Making it a required argument and calling `requireOrgMembership` before data access brings the query into compliance with the tenancy rule: auth must be checked before any data access (CLAUDE.md Tenancy Rules §5). This is a breaking API change documented as hard-to-reverse below.
+
+**Artifact download orgId guard:** The existing route already called a Convex query that enforced org membership, but that check was inside the service layer, not at the HTTP boundary. Moving the check to the route level makes the boundary explicit and consistent with how other org-scoped routes are structured.
+
+### Hard-to-reverse decisions
+
+**verification_results table:** Once deployed to Convex, the table is a permanent schema fixture. Removing it requires a Convex schema migration (drop table definition + purge existing documents) coordinated with a deployment. This table should not be added without the cron action being deployed in the same change set.
+
+**listComments signature change:** `orgId` is now a required argument. Any caller that invoked `listComments` without `orgId` will receive a Convex validation error after this change. All internal callers in `apps/web` have been updated. If any external tooling or scripts called the Convex function directly, they must also be updated. This cannot be rolled back without reverting the schema change, which would re-open the auth gap.
+
+### Known residual risks
+
+1. **Inline logic duplication:** `checkSequenceIntegrity` exists in both `convex/projection_verify.ts` and `tests/unit/scheduled_verify.test.ts`. If the algorithm is updated in one place without updating the other, production behavior will diverge from the tested behavior. Mitigate by always updating both in the same PR.
+2. **buildReplayProjection not called from cron:** If a bug in the projection algorithm causes exceptions for specific event sequences, the cron will not surface it. Only unit tests cover that code path. Engineers should not interpret a green verification badge as proof that the replay tab will render correctly.
+3. **50-run cap at high volume:** At sustained volumes above 50 terminal runs per 24 hours, the cron verifies only the 50 most recent runs. Older runs in the window are skipped. Acceptable at v1 scale.
+4. **IntegrityBadge shows stale data between cron runs:** The badge reflects the last verification result, which may be up to 24 hours old. A run with fresh corruption will show no badge (or the prior green badge) until the next 04:30 UTC cron.
+
+### Recommendation for Prompt 20
+
+**Follow-tail toggle** is the highest-value remaining UX improvement: users who scroll backward in a live run's Timeline/EventInspector lose their position each time the auto-advance window fires. A sticky "follow tail" toggle (on by default) lets users pin to the latest events without disruption when they are debugging.
+
+**Replay tab live refresh** is the next highest-value item: the replay projection is stale for running runs. A periodic re-fetch of the replay endpoint (similar to RunHeader's 5s status poll) would keep the replay tab current without a full page reload.
+
+**RBAC viewer-vs-member on read paths** is deferred but increasingly important now that the read-path auth pattern has been tightened in Prompt 19.
+
+---
+
 ## Prompt 18 — Live Run Monitoring (2026-04-11)
 
 ### What changed
