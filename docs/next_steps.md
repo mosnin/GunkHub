@@ -1,7 +1,7 @@
 # Next Steps — v1.1 Candidates
 
 **Document type:** State summary and v1.1 candidate list.
-**Current state:** Prompt 15 complete.
+**Current state:** Prompt 16 complete.
 
 ---
 
@@ -14,6 +14,15 @@
 - `docs/ops/ci_setup.md` updated to document the schema-drift job.
 - `tests/unit/schema_drift.test.ts`: 12 unit tests for both parsing functions including exclusion logic.
 - Final test count: **513 passing, 5 skipped, 18 test files, all green**.
+
+---
+
+## What Prompt 16 delivered
+
+- **Audit — Scenario A confirmed:** `packages/sdk/src/transport.ts` `sendEvents()` already contained complete auto-externalization logic (upload to `/api/artifacts/upload`, replace payload with `ExternalizedPayload` pointer, per-`sendEvents` upload cache). The "SDK auto-externalization missing" note in prior working memory was stale. No SDK source changes were needed.
+- **`apps/web/src/components/runs/ArtifactList.tsx` rewrite:** Converted from a server component with a silent-failure `<a download>` anchor to a `'use client'` component. Key additions: per-row `downloadStates` record tracking `{ downloading, error }`, `handleDownload()` using programmatic `fetch`, structured `{ code, message }` JSON error parsing for 401/404/502/500 responses with inline `text-red-400` error display in the Download cell, blob download via `URL.createObjectURL` + hidden `<a>` ref with 10s object URL revocation, and `extractFilename()` helper that prefers RFC 5987 `filename*=UTF-8''...` before falling back to plain `filename=` and then `artifact.name ?? artifact.id`.
+- **`tests/unit/transport-externalization.test.ts` — Group 6 (upload cache deduplication):** Two new tests: (1) asserts `_uploadArtifact` is called exactly once when two identical large payloads appear in the same batch, and both events carry the same `artifactId` in their externalized bodies; (2) asserts `_uploadArtifact` is called twice and events carry distinct `artifactId` values when payloads differ.
+- Final test count: **515 passing, 5 skipped, 18 test files, all green**.
 
 ---
 

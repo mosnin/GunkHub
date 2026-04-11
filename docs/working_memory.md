@@ -2,13 +2,13 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-11 (Prompt 15 — Run detail breadcrumb + schema drift check)
+Last updated: 2026-04-11 (Prompt 16 — Artifact download error UX + upload cache dedup tests)
 
 ---
 
 ## 1. Current State
 
-Prompts 1–13 complete. The following summarizes the full state after Prompt 13.
+Prompts 1–16 complete. The following summarizes the full state after Prompt 16.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
@@ -57,7 +57,7 @@ Key new exports (Prompt 10):
 **apps/web components and service layer — all implemented (not stubs):**
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
-- Run components: RunList, RunHeader, Timeline (with load-more pagination, keyboard navigation), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (with download link per row), CommentThread (resolve, show/hide resolved, compose)
+- Run components: RunList, RunHeader, Timeline (with load-more pagination, keyboard navigation), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (`'use client'`, programmatic download with per-row loading/error state, inline error display, RFC 5987 filename extraction), CommentThread (resolve, show/hide resolved, compose)
 - Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`, `lib/services/projects.ts` (NEW Prompt 13), `lib/services/agent_versions.ts` (NEW Prompt 14)
 - Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags), `lib/actions/projects.ts` (createProjectAction, NEW Prompt 13), `lib/actions/agents.ts` (createAgentAction, NEW Prompt 13), `lib/actions/agent_versions.ts` (createAgentVersionAction, NEW Prompt 14)
 - API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (Prompt 12), `/api/api-keys/[id]` (DELETE revoke, NEW Prompt 13), `/api/health`, `/api/webhooks/clerk`
@@ -83,8 +83,9 @@ Key new exports (Prompt 10):
 - `tests/unit/projects_agents.test.ts` (NEW Prompt 13) — 31 tests for slug generation, name validation, two-phase revoke state machine, and loadKeys fetch logic
 - `tests/unit/agent_versions.test.ts` (NEW Prompt 14) — 19 tests for version string validation, mapAgentVersion correctness, and action validation logic
 - `tests/unit/schema_drift.test.ts` (NEW Prompt 15) — 12 tests for `parseSchemaTableFields` and `parseContractsInterfaceProperties` parsing and exclusion logic
+- `tests/unit/transport-externalization.test.ts` — Group 6 added (Prompt 16): upload cache deduplication — asserts `_uploadArtifact` called once for two identical large payloads in the same batch; asserts called twice for two different large payloads; verifies `artifactId` consistency in externalized event bodies
 - `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
-- **Total: 513 passing, 5 skipped (18 test files, all green)**
+- **Total: 515 passing, 5 skipped (18 test files, all green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
@@ -248,6 +249,12 @@ Key new exports (Prompt 10):
 - `docs/ops/ci_setup.md` — schema-drift job documented
 - `tests/unit/schema_drift.test.ts` — 12 unit tests for parsing functions (NEW)
 
+**Fully implemented in Prompt 16 (artifact download error UX + upload cache dedup tests):**
+- Audit confirmed (Scenario A): `packages/sdk/src/transport.ts` `sendEvents()` already contained complete auto-externalization logic. The "SDK auto-externalization missing" note from earlier working memory was stale. No SDK source changes were needed.
+- `apps/web/src/components/runs/ArtifactList.tsx` — rewritten as `'use client'` component: per-row `downloadStates` record (downloading/error), `handleDownload()` with programmatic `fetch('/api/artifacts/${id}/download')`, `{ code, message }` JSON error parsing from 401/404/502/500 responses with inline `text-red-400` error display in Download cell, blob download via `URL.createObjectURL` + hidden `<a>` ref pattern with 10s object URL revocation, `extractFilename()` helper (prefers RFC 5987 `filename*=UTF-8''...`, falls back to plain `filename=`, then `artifact.name ?? artifact.id`).
+- `tests/unit/transport-externalization.test.ts` — Group 6 added: two deduplication tests asserting the per-`sendEvents` upload cache prevents redundant `_uploadArtifact` calls for identical payloads within a batch, and that different payloads produce separate uploads with distinct `artifactId` values in the externalized event bodies.
+- Final test count: **515 passing, 5 skipped, 18 test files, all green**.
+
 **Fully implemented in Prompt 13 (first-success onboarding path):**
 - `convex/agents.ts` — `listAgentsByOrg` query on `by_org` index for org-wide agent listing
 - `apps/web/src/lib/services/projects.ts` — `listProjects`, `getProject`, `createProject` with slug generation
@@ -388,12 +395,12 @@ Events can have a `parentEventId` referencing another event in the same run. Thi
 
 ---
 
-## 8. Prompt 16 Candidates (v1.1 deferred items)
+## 8. Prompt 17 Candidates (v1.1 deferred items)
 
 The following items were explicitly deferred from v1 and are candidates for the next session. See `docs/next_steps.md` for full descriptions.
 
-1. **SDK auto-externalization** (HIGH) — SDK does not yet detect payloads >10 KB before calling `/api/events`. API returns HTTP 413; caller must handle. Auto-externalize (upload to `/api/artifacts/upload`, replace payload with pointer) before shipping `POST /api/events`.
-2. **Artifact download error UX** (HIGH) — download link is a plain `<a download>` anchor. On 404/502 the browser silently downloads a JSON error body. Convert to `'use client'` with programmatic fetch and inline error display.
+1. **SDK auto-externalization** (HIGH) — DONE. Audited in Prompt 16 — already fully implemented in `packages/sdk/src/transport.ts`. No action required.
+2. **Artifact download error UX** (HIGH) — DONE. Implemented in Prompt 16: `ArtifactList.tsx` rewritten as `'use client'` with programmatic fetch, per-row loading/error state, and inline error display.
 3. **Version list pagination** (MEDIUM) — `listAgentVersions` uses `.collect()` with no pagination. Acceptable for v1; add cursor-based pagination if version counts grow.
 4. **Event list virtualization** (LOW) — Timeline and EventInspector load events in pages of 200 but do not virtualize the DOM. Runs with 10,000+ events may have sluggish scroll. Consider react-window.
 5. **Background projection verification** (LOW) — no scheduled job verifies run sequence integrity in production. Currently on-demand only via `rebuild-projection.ts`.
