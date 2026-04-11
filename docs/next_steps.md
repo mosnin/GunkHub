@@ -32,11 +32,11 @@ Listed in rough priority order.
 
 ### HIGH
 
-**1. SDK auto-externalization**
-The SDK does not detect payloads >10 KB before calling `POST /api/events`. If a payload exceeds the limit, the API returns HTTP 413 and the SDK surfaces that error to the caller. Auto-externalization (upload to `POST /api/artifacts/upload` then replace payload with an `ExternalizedPayload` pointer) would eliminate the silent failure that callers currently must handle.
+**1. SDK auto-externalization** — DONE
+Audited in Prompt 16 — already fully implemented in `packages/sdk/src/transport.ts` `sendEvents()`: upload to `POST /api/artifacts/upload`, replace payload with `ExternalizedPayload` pointer, per-`sendEvents` upload cache for deduplication within a batch. No action required.
 
-**2. Artifact download error UX**
-The download link in `ArtifactList.tsx` is a plain `<a download>` anchor. If the route returns 404 or 502, the browser silently downloads a JSON error body. Convert to a `'use client'` component with programmatic `fetch`, inline error display, and a loading state.
+**2. Artifact download error UX** — DONE
+Implemented in Prompt 16. `apps/web/src/components/runs/ArtifactList.tsx` rewritten as a `'use client'` component with programmatic `fetch('/api/artifacts/${id}/download')`, per-row `downloadStates` tracking `{ downloading, error }`, inline `text-red-400` error display parsed from `{ code, message }` JSON error bodies, blob download via `URL.createObjectURL` + hidden `<a>` ref with 10s revocation, and `extractFilename()` with RFC 5987 support.
 
 ### MEDIUM
 
