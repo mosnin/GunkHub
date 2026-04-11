@@ -107,3 +107,57 @@ npx convex env set BLOB_STORE_TOKEN <your-vercel-blob-read-write-token>
 ```
 
 This must be done for every Convex deployment (dev, ci-test, production) independently.
+
+---
+
+## Schema Drift Gate
+
+The `schema-drift` CI job runs on every push and PR. It compares field names in
+`convex/schema.ts` against property names in `packages/contracts/src/entities.ts`
+for all entities that have a corresponding contract type.
+
+### Why this gate exists
+
+The Convex schema and the contracts package define the same entity shapes in two
+places. TypeScript catches type mismatches *within* a package, but a field added
+to `convex/schema.ts` without a matching property in contracts — or vice versa —
+drifts silently until runtime. This check makes drift explicit and blocks the build.
+
+### What triggers a drift failure
+
+- Adding a field to a `defineTable({...})` body in `convex/schema.ts` without adding
+  the matching property to the corresponding interface in `packages/contracts/src/entities.ts`
+- Adding a property to a contracts interface without adding the matching field to
+  `convex/schema.ts`
+
+### How to fix a drift failure
+
+Run locally to see the exact mismatch:
+
+```
+pnpm tsx scripts/check-schema-drift.ts
+```
+
+Then follow the remediation steps printed by the script:
+1. If you added a field to `convex/schema.ts`: add the matching property to
+   `packages/contracts/src/entities.ts` (and bump the contracts version).
+2. If you added a property to the contracts: add the matching field to `convex/schema.ts`.
+3. If the field is intentionally internal (not exposed by the app): add it to
+   `SCHEMA_FIELD_EXCLUSIONS` in `scripts/check-schema-drift.ts`.
+
+### Tables covered by the drift check
+
+The check covers 8 entities: `organizations`, `projects`, `agents`, `agent_versions`,
+`runs`, `events`, `artifacts`, `comments`.
+
+The `user_memberships` and `api_keys` tables are intentionally excluded — they are
+internal auth tables with no corresponding public contract types.
+
+### Running locally
+
+The drift check is the 4th step in `./scripts/validate.sh`. You can also run it
+standalone:
+
+```
+pnpm tsx scripts/check-schema-drift.ts
+```

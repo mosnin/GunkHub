@@ -63,7 +63,7 @@ print_summary() {
   log_header "Validation Summary"
   echo ""
 
-  for check in typecheck build lint; do
+  for check in typecheck build lint schema-drift; do
     if [[ -v RESULTS[$check] ]]; then
       local result="${RESULTS[$check]}"
       if [[ "$result" == "PASS" ]]; then
@@ -105,7 +105,7 @@ fi
 
 # ─── Determine which checks to run ───────────────────────────────────────────
 
-CHECKS_TO_RUN=("typecheck" "build" "lint")
+CHECKS_TO_RUN=("typecheck" "build" "lint" "schema-drift")
 
 if [[ $# -gt 0 ]]; then
   CHECKS_TO_RUN=("$@")
@@ -124,8 +124,11 @@ for check in "${CHECKS_TO_RUN[@]}"; do
     lint)
       run_check "lint" "pnpm lint"
       ;;
+    schema-drift)
+      run_check "schema-drift" "pnpm tsx scripts/check-schema-drift.ts"
+      ;;
     *)
-      echo -e "${RED}Unknown check: ${check}. Valid options: typecheck, build, lint${RESET}"
+      echo -e "${RED}Unknown check: ${check}. Valid options: typecheck, build, lint, schema-drift${RESET}"
       exit 1
       ;;
   esac
