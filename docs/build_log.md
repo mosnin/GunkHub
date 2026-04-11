@@ -2,6 +2,61 @@
 
 ---
 
+## Prompt 17 — Bounded rendering, deep link auto-seek, version pagination (2026-04-11)
+
+### What changed
+
+- **Timeline.tsx rewrite (Team A):** Added `WINDOW_SIZE = 100` constant and `windowStart` state (default 0). Renders only `allEvents.slice(windowStart, windowStart + WINDOW_SIZE)` (visibleEvents). Keyboard navigation maps each visible event with `absIdx = windowStart + relIdx` so the focus ring is correct across window shifts. "↑ N earlier events" button appears when `windowStart > 0`; "↓ N more loaded events" button appears when `windowEnd < allEvents.length`. ArrowDown/ArrowUp at a window edge shifts `windowStart` rather than clipping at the window boundary.
+- **EventInspector.tsx rewrite (Team B):** Same `WINDOW_SIZE = 100` sliding window for the left event panel. Click events call `ensureSelectedVisible` to adjust `windowStart` so the selected event stays visible. Deep link auto-seek: if `initialEventSeq` is not present in the initially loaded events and a cursor exists, EventInspector sets `seekState='seeking'` and auto-triggers `handleLoadMore()` in a loop until the target event is found or the cursor is exhausted. "Seeking event #N…" banner shown during seek; "Event #N not found in this run." shown when exhausted.
+- **Version pagination (Team C):** New Convex query `paginateAgentVersions` using `.paginate()`, 20 items/page, 100 max. New service function `listAgentVersionsPaginated`. New API route `GET /api/agents/[agentId]/versions?cursor=...&limit=N` with `parseVersionsParams` query-param parsing. `VersionSection` component now accepts `nextCursor: string | null` and renders a "Load more versions…" button when `nextCursor` is non-null.
+- **New tests (Team D):** `tests/unit/timeline_window.test.ts` (25 pure logic tests) and `tests/unit/version_pagination.test.ts` (14 pure logic tests). Both files inline the algorithms rather than importing from source, keeping tests offline and instant. Test total: **554 passing, 5 skipped, 20 test files**.
+
+### Why these choices fit the architecture
+
+**Bounded window (not react-window):** The sliding window approach requires zero new runtime dependencies and fits naturally within the existing component state model. `WINDOW_SIZE = 100` was chosen because it keeps DOM node count well within browser paint budget for a debugging tool while still showing enough context to understand event sequences. The window is bidirectional — users can navigate up and down — so no events are permanently inaccessible. Full `react-window` virtualization would require a fixed-height row contract and would complicate the existing keyboard-navigation and copy-link features; the window approach avoids both problems.
+
+**Deep link auto-seek:** Rather than requiring the caller to know which page of a run contains a specific event, the EventInspector self-heals by loading pages until the event is found. This keeps the `?event=<sequenceNumber>` URL contract simple and stable. The tradeoff is that deep links to events late in a very long run may require multiple round-trips before the event is found — see residual risks below.
+
+**Version pagination via Convex `.paginate()`:** This is the canonical Convex cursor-based pagination primitive. The 20-items-per-page default matches common UX convention; the 100-item max prevents runaway queries. The `nextCursor` passthrough from Convex through the service layer and API route to the component keeps the cursor opaque — no layer interprets or constructs it.
+
+### Hard-to-reverse decisions
+
+None. The sliding window approach is fully reversible: removing the window and rendering all events would restore the previous behavior. The version pagination cursor API is additive — the `VersionSection` component degrades gracefully when `nextCursor` is null (no button shown). The deep link auto-seek can be disabled by removing the `useEffect` that triggers it without any schema or API changes.
+
+### Known residual risks
+
+1. **Deep link auto-seek is O(pages).** If a run has 5,000 events at 200 events per server page, seeking to event #4,900 requires loading 24 pages before the event appears. Each page is a separate Convex query. For very long runs, this seek loop is noticeable. A mitigation would be a Convex query that returns the page number containing a specific `sequenceNumber`, but this would require a new query endpoint.
+2. **Timeline "load more" and window advance are two separate user actions.** After clicking "Load more" to fetch the next server page, the newly loaded events appear in `allEvents` but are not automatically brought into the visible window — the user must also click "↓ N more loaded events" to advance the window. Auto-advancing the window after a server load-more would collapse this into one click. See Prompt 18 candidates in `next_steps.md`.
+3. **Version uniqueness check in `createAgentVersion` still uses `.collect()`.** The mutation scans all existing versions for the agent to enforce uniqueness. This is O(n) per mutation but correct at v1 scale (agents typically have <50 versions). A dedicated index would eliminate the scan.
+
+### Recommendation for Prompt 18
+
+**Live run monitoring** (Convex real-time subscription on the events list so Timeline updates automatically while a run is in progress) is the highest-value next step — it is the feature that most directly improves the debugging workflow for in-flight failures. Second priority: **auto-advance window on server load-more completion** to collapse the two-click pattern into one.
+
+---
+
+## Prompt 16 — Artifact download error UX + upload cache dedup tests (2026-04-11)
+
+### What changed
+
+- Audited `packages/sdk/src/transport.ts` `sendEvents()` — auto-externalization was already fully implemented (upload to `/api/artifacts/upload`, replace payload with `ExternalizedPayload` pointer, per-`sendEvents` upload cache). The "SDK auto-externalization missing" note in prior working memory was stale; no SDK source changes were needed.
+- Rewrote `apps/web/src/components/runs/ArtifactList.tsx` as a `'use client'` component with programmatic `fetch('/api/artifacts/${id}/download')`, per-row `downloadStates` tracking `{ downloading, error }`, structured `{ code, message }` JSON error parsing for 401/404/502/500 responses with inline `text-red-400` error display, blob download via `URL.createObjectURL` + hidden `<a>` ref with 10s object URL revocation, and `extractFilename()` with RFC 5987 `filename*=UTF-8''...` support before falling back to plain `filename=` and then `artifact.name ?? artifact.id`.
+- Added Group 6 to `tests/unit/transport-externalization.test.ts`: two upload cache deduplication tests asserting `_uploadArtifact` is called once for identical large payloads in the same batch, and twice for different large payloads, with `artifactId` consistency verified in externalized event bodies.
+
+### Why these choices fit the architecture
+
+The artifact download rewrite follows the established pattern for client-side error UX: the server route returns structured `{ code, message }` JSON errors; the client component parses and displays them inline rather than relying on browser default error handling. The RFC 5987 filename extraction mirrors how modern browsers handle `Content-Disposition` headers, ensuring engineers see sensible default filenames when downloading payloads.
+
+### Hard-to-reverse decisions
+
+None. The `ArtifactList` rewrite is a component-level change with no schema or API contract implications.
+
+### Known residual risks
+
+None beyond those carried from Prompt 15.
+
+---
+
 ## Prompt 15 — Run detail breadcrumb + schema drift check (2026-04-11)
 
 ### What changed

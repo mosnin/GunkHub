@@ -2,13 +2,13 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-11 (Prompt 16 — Artifact download error UX + upload cache dedup tests)
+Last updated: 2026-04-11 (Prompt 17 — Bounded rendering windows, deep link auto-seek, version pagination)
 
 ---
 
 ## 1. Current State
 
-Prompts 1–16 complete. The following summarizes the full state after Prompt 16.
+Prompts 1–17 complete. The following summarizes the full state after Prompt 17.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
@@ -21,7 +21,7 @@ Prompts 1–16 complete. The following summarizes the full state after Prompt 16
 - `convex/organizations.ts` — `upsertOrganization`, `upsertMembership`, `getOrg`, `listOrgs`
 - `convex/comments.ts` — `listComments`, `createComment`, `resolveComment`
 - `convex/agents.ts` — `listDistinctAgents`, `listAgentsByOrg` (NEW Prompt 13, `by_org` index)
-- `convex/agent_versions.ts` — `createAgentVersion` (admin-gated, unique per agent), `listAgentVersions`, `getAgentVersion` (NEW Prompt 14)
+- `convex/agent_versions.ts` — `createAgentVersion` (admin-gated, unique per agent), `listAgentVersions`, `getAgentVersion` (NEW Prompt 14), `paginateAgentVersions` (cursor-based pagination, 20 items/page, 100 max — NEW Prompt 17)
 - `convex/artifact_gc.ts` — `getOrphanCandidates` (indexed range + paginate), `isArtifactReferenced`, `deleteArtifactRecord`, `cleanOrphanedArtifacts`
 - `convex/stale_runs.ts` (NEW Prompt 12) — `listStaleRuns`, `markRunTimedOut`, `expireStaleRuns`
 - Auth helpers: `getAuthContext()`, `requireOrgMembership()` with `minimumRole` in `convex/auth.ts`
@@ -57,15 +57,15 @@ Key new exports (Prompt 10):
 **apps/web components and service layer — all implemented (not stubs):**
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
-- Run components: RunList, RunHeader, Timeline (with load-more pagination, keyboard navigation), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (`'use client'`, programmatic download with per-row loading/error state, inline error display, RFC 5987 filename extraction), CommentThread (resolve, show/hide resolved, compose)
-- Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`, `lib/services/projects.ts` (NEW Prompt 13), `lib/services/agent_versions.ts` (NEW Prompt 14)
+- Run components: RunList, RunHeader, Timeline (with load-more pagination, keyboard navigation, WINDOW_SIZE=100 bounded rendering — Prompt 17), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button, WINDOW_SIZE=100 bounded rendering + auto-seek for deep links — Prompt 17), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (`'use client'`, programmatic download with per-row loading/error state, inline error display, RFC 5987 filename extraction), CommentThread (resolve, show/hide resolved, compose)
+- Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`, `lib/services/projects.ts` (NEW Prompt 13), `lib/services/agent_versions.ts` (NEW Prompt 14, extended with `listAgentVersionsPaginated` in Prompt 17)
 - Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags), `lib/actions/projects.ts` (createProjectAction, NEW Prompt 13), `lib/actions/agents.ts` (createAgentAction, NEW Prompt 13), `lib/actions/agent_versions.ts` (createAgentVersionAction, NEW Prompt 14)
-- API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (Prompt 12), `/api/api-keys/[id]` (DELETE revoke, NEW Prompt 13), `/api/health`, `/api/webhooks/clerk`
+- API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (Prompt 12), `/api/api-keys/[id]` (DELETE revoke, NEW Prompt 13), `/api/health`, `/api/webhooks/clerk`, `/api/agents/[agentId]/versions` (GET with cursor/limit params, NEW Prompt 17)
 - UI components (Prompt 13): `CreateProjectModal`, `CreateAgentModal`, `ProjectsList`, `ProjectDetail`, `ApiKeysSection` (rewritten), `SdkSetupSnippet`
 - UI components (Prompt 14): `VersionHistory`, `CreateVersionModal`, `VersionSection`
 - Pages (Prompt 13): projects list, project detail with agents table, org-wide agents list, agent detail with SDK snippet, dashboard onboarding guide
 
-**Tests (as of Prompt 13):**
+**Tests (as of Prompt 17):**
 - `tests/unit/sdk.test.ts` — Recorder tests with MockTransport
 - `tests/unit/contracts.test.ts` — Type shape and EventType coverage tests
 - `tests/unit/replay.test.ts` — buildReplayProjection algorithm tests
@@ -84,8 +84,10 @@ Key new exports (Prompt 10):
 - `tests/unit/agent_versions.test.ts` (NEW Prompt 14) — 19 tests for version string validation, mapAgentVersion correctness, and action validation logic
 - `tests/unit/schema_drift.test.ts` (NEW Prompt 15) — 12 tests for `parseSchemaTableFields` and `parseContractsInterfaceProperties` parsing and exclusion logic
 - `tests/unit/transport-externalization.test.ts` — Group 6 added (Prompt 16): upload cache deduplication — asserts `_uploadArtifact` called once for two identical large payloads in the same batch; asserts called twice for two different large payloads; verifies `artifactId` consistency in externalized event bodies
+- `tests/unit/timeline_window.test.ts` (NEW Prompt 17) — 25 pure logic tests for the sliding window algorithm shared by Timeline and EventInspector: window bounds computation, above/below counts, "earlier"/"later" navigation clamping, ArrowUp/ArrowDown edge-shift logic, absolute index mapping, and ring highlight predicate
+- `tests/unit/version_pagination.test.ts` (NEW Prompt 17) — 14 pure logic tests for version pagination: cursor accumulation across pages, `hasMore` boolean derivation, `nextCursor` passthrough from service result, and `parseVersionsParams` query-param parsing including zero-limit and URL-encoded cursor edge cases
 - `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
-- **Total: 515 passing, 5 skipped (18 test files, all green)**
+- **Total: 554 passing, 5 skipped (20 test files, all green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts

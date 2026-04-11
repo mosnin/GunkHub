@@ -1,7 +1,7 @@
 # Next Steps — v1.1 Candidates
 
 **Document type:** State summary and v1.1 candidate list.
-**Current state:** Prompt 16 complete.
+**Current state:** Prompt 17 complete.
 
 ---
 
@@ -26,6 +26,15 @@
 
 ---
 
+## What Prompt 17 delivered
+
+- **Bounded rendering in Timeline.tsx:** Added `WINDOW_SIZE = 100` constant and `windowStart` state. Timeline renders only `allEvents.slice(windowStart, windowStart + WINDOW_SIZE)` (visibleEvents). Keyboard navigation maps events with absolute index `absIdx = windowStart + relIdx` so the focus ring is stable across window shifts. "↑ N earlier events" and "↓ N more loaded events" navigation buttons allow moving the window without loading more data from the server.
+- **Bounded rendering in EventInspector.tsx:** Same `WINDOW_SIZE = 100` sliding window applied to the left panel. Click on an event calls `ensureSelectedVisible` to adjust `windowStart` so the selected event stays in view. Deep link auto-seek: if `initialEventSeq` is not in the initial loaded events and a server cursor exists, EventInspector sets `seekState='seeking'` and auto-triggers `handleLoadMore()` pages until the target event is found or the cursor is exhausted. Shows "Seeking event #N…" during seek, "Event #N not found in this run." when the cursor is exhausted.
+- **Version list pagination:** New Convex query `paginateAgentVersions` using `.paginate()`, 20 items/page, 100 max. New service function `listAgentVersionsPaginated`. New API route `GET /api/agents/[agentId]/versions?cursor=...&limit=N`. `VersionSection` component now accepts `nextCursor: string | null` and renders a "Load more versions…" button when `nextCursor` is non-null.
+- **New tests:** `tests/unit/timeline_window.test.ts` (25 tests) and `tests/unit/version_pagination.test.ts` (14 tests). All pure logic, no React imports. Total test count: **554 passing, 5 skipped, 20 test files**.
+
+---
+
 ## v1.1 Candidates
 
 Listed in rough priority order.
@@ -40,13 +49,13 @@ Implemented in Prompt 16. `apps/web/src/components/runs/ArtifactList.tsx` rewrit
 
 ### MEDIUM
 
-**3. Version list pagination**
-`listAgentVersions` uses `.collect()` — no pagination. Acceptable for v1 (agents typically have <100 versions). Add cursor-based pagination if version counts grow.
+**3. Version list pagination** — DONE
+Implemented in Prompt 17 with Convex `.paginate()`, 20 items/page, 100 max. `paginateAgentVersions` query, `listAgentVersionsPaginated` service, `GET /api/agents/[agentId]/versions?cursor=...&limit=N` route, and "Load more versions…" button in `VersionSection`.
 
 ### LOW
 
-**4. Event list virtualization**
-Timeline and EventInspector load events in pages of 200 but do not virtualize the DOM list. Runs with 10,000+ events loaded incrementally may have sluggish scroll performance. Consider `react-window`.
+**4. Event list virtualization** — addressed in Prompt 17 with bounded window (not full react-window)
+Timeline and EventInspector now render at most 100 events at a time (`WINDOW_SIZE = 100`). This eliminates the DOM growth problem for typical runs. Full `react-window` virtualization remains an option if a run needs all events visible simultaneously without page navigation, but the sliding window approach covers the common debugging use case without an additional dependency.
 
 **5. Background projection verification**
 No scheduled job verifies run sequence integrity in production. Integrity checks are on-demand only via `scripts/rebuild-projection.ts`. A Convex cron checking a sample of recent runs would provide proactive alerting.
@@ -59,6 +68,19 @@ Roles (`admin`, `member`, `viewer`) are stored and enforced on write mutations. 
 
 **8. Version label enrichment at scale**
 The run list page fetches one `getAgentVersion` per distinct version ID per page load. At v1 scale (1–3 distinct versions per page) this is fast. Consider caching or a batch query if pages regularly show many distinct versions.
+
+---
+
+## Prompt 18 Candidates
+
+**1. Live run monitoring (highest value)**
+The run detail page does not auto-refresh while a run is in progress. Engineers watching a live run must manually reload. A Convex real-time subscription (replacing the current one-shot server component fetch for events) would make the timeline update automatically as the agent emits events. This was LOW item 6 in the prior list; with bounded rendering now in place, live updates are the next UX gap that most affects the debugging workflow.
+
+**2. Background projection verification**
+No scheduled job verifies run sequence integrity in production. Integrity checks are on-demand only via `scripts/rebuild-projection.ts`. A Convex cron checking a sample of recent runs would provide proactive alerting before users encounter corrupted traces. This was LOW item 5 in the prior list.
+
+**3. Auto-scroll on new event load**
+Timeline and EventInspector do not auto-scroll to the newly visible window after the user clicks "Load more" and then the window advances. The user must click "Load more" (which fetches more events from the server) and then separately click "↓ N more loaded events" (which shifts the window forward). Automatically advancing the window to show new events after a server load-more completes would collapse this into a single action.
 
 ---
 
