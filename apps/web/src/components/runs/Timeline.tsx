@@ -74,12 +74,20 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
   const [focusedIndex, setFocusedIndex] = useState<number>(-1)
   const [windowStart, setWindowStart] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
+  const [followTail, setFollowTail] = useState(isLive)
+  const [unseenCount, setUnseenCount] = useState(0)
 
   // Keep a stable ref to extraEvents for use inside the polling effect closure
   const extraEventsRef = useRef<Event[]>(extraEvents)
   useEffect(() => {
     extraEventsRef.current = extraEvents
   }, [extraEvents])
+
+  // Keep a stable ref to followTail for use inside the polling effect closure
+  const followTailRef = useRef(isLive)
+  useEffect(() => {
+    followTailRef.current = followTail
+  }, [followTail])
 
   const handleLoadMore = useCallback(() => {
     if (!cursor) return
@@ -94,9 +102,13 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
         const newTotal = prevTotal + data.events.length
         setExtraEvents((prev) => [...prev, ...data.events])
         setCursor(data.nextCursor)
-        // Auto-advance: show the tail of newly loaded events
+        // Auto-advance only when following tail; otherwise accumulate unseen count
         if (data.events.length > 0) {
-          setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+          if (followTailRef.current) {
+            setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+          } else {
+            setUnseenCount((prev) => prev + data.events.length)
+          }
         }
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load more events')
@@ -120,7 +132,11 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
       if (brandNew.length > 0) {
         const newTotal = (events?.length ?? 0) + currentExtra.length + brandNew.length
         setExtraEvents((prev) => [...prev, ...brandNew])
-        setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+        if (followTailRef.current) {
+          setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+        } else {
+          setUnseenCount((prev) => prev + brandNew.length)
+        }
       }
       // If a cursor appeared (run crossed page boundary), capture it
       if (data.nextCursor && !cursor) {
@@ -161,6 +177,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
     if (allEvents.length === 0) return
     if (e.key === 'ArrowDown') {
       e.preventDefault()
+      setFollowTail(false)
       const next = Math.min(allEvents.length - 1, focusedIndex < 0 ? windowStart : focusedIndex + 1)
       setFocusedIndex(next)
       if (next >= windowStart + WINDOW_SIZE) {
@@ -168,6 +185,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
       }
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
+      setFollowTail(false)
       const prev = Math.max(0, focusedIndex < 0 ? windowStart : focusedIndex - 1)
       setFocusedIndex(prev)
       if (prev < windowStart) {
@@ -182,13 +200,38 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
     }
   }
 
+  function handleResume() {
+    setFollowTail(true)
+    setUnseenCount(0)
+    setWindowStart(Math.max(0, allEvents.length - WINDOW_SIZE))
+  }
+
   return (
     <div className="px-6 py-4">
-      {/* Live indicator */}
+      {/* Live / follow-tail indicator */}
       {isLive && (
-        <div className="flex items-center justify-end gap-1.5 px-6 pb-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
-          <span className="text-xs font-mono text-neutral-600">live</span>
+        <div className="flex items-center justify-end gap-3 px-6 pb-1">
+          {!followTail && unseenCount > 0 && (
+            <button
+              onClick={handleResume}
+              className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono bg-emerald-950 border border-emerald-800 text-emerald-400 hover:text-emerald-300 hover:border-emerald-700 transition-colors duration-100"
+            >
+              ↓ {unseenCount} new — resume
+            </button>
+          )}
+          <button
+            onClick={followTail ? () => setFollowTail(false) : handleResume}
+            className={[
+              'flex items-center gap-1.5 text-xs font-mono transition-colors duration-100',
+              followTail ? 'text-neutral-500 hover:text-neutral-400' : 'text-neutral-600 hover:text-neutral-400',
+            ].join(' ')}
+            title={followTail ? 'Following tail — click to pause' : 'Tail paused — click to resume'}
+          >
+            {followTail && (
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
+            )}
+            <span>{followTail ? 'live' : 'paused'}</span>
+          </button>
         </div>
       )}
 
@@ -206,7 +249,10 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
           {windowStart > 0 && (
             <div className="flex justify-center py-1">
               <button
-                onClick={() => setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))}
+                onClick={() => {
+                  setFollowTail(false)
+                  setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))
+                }}
                 className="px-4 py-1.5 text-xs font-mono rounded border border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600 transition-colors duration-100"
               >
                 ↑ {windowStart} earlier events

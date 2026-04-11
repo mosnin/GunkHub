@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useTransition } from 'react'
+import { useEffect, useRef, useState, useTransition } from 'react'
 
 import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts'
 
@@ -99,6 +99,14 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
   const [loadError, setLoadError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
   const [seekState, setSeekState] = useState<SeekState>('idle')
+  const [followTail, setFollowTail] = useState(isLive)
+  const [unseenCount, setUnseenCount] = useState(0)
+
+  // Keep a stable ref to followTail for use inside polling effect closures
+  const followTailRef = useRef(isLive)
+  useEffect(() => {
+    followTailRef.current = followTail
+  }, [followTail])
 
   const allEvents = [...(events ?? []), ...extraEvents]
 
@@ -115,9 +123,13 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
         const newTotal = prevTotal + data.events.length
         setExtraEvents((prev) => [...prev, ...data.events])
         setCursor(data.nextCursor)
-        // Auto-advance: immediately show tail of newly loaded events
+        // Auto-advance only when following tail; otherwise accumulate unseen count
         if (data.events.length > 0) {
-          setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+          if (followTailRef.current) {
+            setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+          } else {
+            setUnseenCount((prev) => prev + data.events.length)
+          }
         }
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load more events')
@@ -135,7 +147,11 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       if (brandNew.length > 0) {
         const newTotal = allEvents.length + brandNew.length
         setExtraEvents((prev) => [...prev, ...brandNew])
-        setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+        if (followTailRef.current) {
+          setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+        } else {
+          setUnseenCount((prev) => prev + brandNew.length)
+        }
       }
       if (data.nextCursor && !cursor) {
         setCursor(data.nextCursor)
@@ -214,6 +230,12 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
 
   const selectedEvent = allEvents.find((e) => e.id === selectedId) ?? allEvents[0] ?? null
 
+  function handleResume() {
+    setFollowTail(true)
+    setUnseenCount(0)
+    setWindowStart(Math.max(0, allEvents.length - WINDOW_SIZE))
+  }
+
   function ensureSelectedVisible(absIdx: number) {
     if (absIdx < windowStart) {
       setWindowStart(Math.max(0, absIdx))
@@ -226,6 +248,7 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
     if (allEvents.length === 0) return
     if (e.key === 'ArrowDown') {
       e.preventDefault()
+      setFollowTail(false)
       const next = Math.min(allEvents.length - 1, focusedIdx < 0 ? windowStart : focusedIdx + 1)
       setFocusedIdx(next)
       setSelectedId(allEvents[next]?.id ?? null)
@@ -234,6 +257,7 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       }
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
+      setFollowTail(false)
       const prev = Math.max(0, focusedIdx < 0 ? windowStart : focusedIdx - 1)
       setFocusedIdx(prev)
       setSelectedId(allEvents[prev]?.id ?? null)
@@ -248,6 +272,7 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       allEvents={allEvents}
       selectedEvent={selectedEvent}
       setSelectedId={setSelectedId}
+      setFollowTail={setFollowTail}
       focusedIdx={focusedIdx}
       setFocusedIdx={setFocusedIdx}
       windowStart={windowStart}
@@ -261,6 +286,9 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       seekState={seekState}
       initialEventSeq={initialEventSeq}
       isLive={isLive}
+      followTail={followTail}
+      unseenCount={unseenCount}
+      onResume={handleResume}
     />
   )
 }
@@ -269,6 +297,7 @@ interface EventInspectorInnerProps {
   allEvents: Event[]
   selectedEvent: Event | null
   setSelectedId: (id: string | null) => void
+  setFollowTail: (value: boolean) => void
   focusedIdx: number
   setFocusedIdx: (idx: number) => void
   windowStart: number
@@ -282,12 +311,16 @@ interface EventInspectorInnerProps {
   seekState?: SeekState
   initialEventSeq?: number
   isLive?: boolean
+  followTail?: boolean
+  unseenCount?: number
+  onResume?: () => void
 }
 
 function EventInspectorInner({
   allEvents,
   selectedEvent,
   setSelectedId,
+  setFollowTail,
   focusedIdx,
   setFocusedIdx,
   windowStart,
@@ -301,6 +334,9 @@ function EventInspectorInner({
   seekState,
   initialEventSeq,
   isLive,
+  followTail = false,
+  unseenCount = 0,
+  onResume,
 }: EventInspectorInnerProps) {
   // Sync ?event=<sequenceNumber> into the URL without navigation
   useEffect(() => {
@@ -322,10 +358,29 @@ function EventInspectorInner({
         <div className="px-3 py-2 border-b border-neutral-800 flex items-center justify-between">
           <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Events</p>
           {isLive && (
-            <span className="flex items-center gap-1 text-xs font-mono text-neutral-600">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
-              live
-            </span>
+            <div className="flex items-center gap-2">
+              {!followTail && unseenCount > 0 && onResume && (
+                <button
+                  onClick={onResume}
+                  className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono bg-emerald-950 border border-emerald-800 text-emerald-400 hover:text-emerald-300 hover:border-emerald-700 transition-colors duration-100"
+                >
+                  ↓ {unseenCount} new — resume
+                </button>
+              )}
+              <button
+                onClick={followTail ? () => setFollowTail(false) : onResume}
+                className={[
+                  'flex items-center gap-1 text-xs font-mono transition-colors duration-100',
+                  followTail ? 'text-neutral-600 hover:text-neutral-400' : 'text-neutral-600 hover:text-neutral-400',
+                ].join(' ')}
+                title={followTail ? 'Following tail — click to pause' : 'Tail paused — click to resume'}
+              >
+                {followTail && (
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
+                )}
+                <span>{followTail ? 'live' : 'paused'}</span>
+              </button>
+            </div>
           )}
         </div>
 
@@ -344,7 +399,10 @@ function EventInspectorInner({
         {/* Window navigation — above */}
         {aboveCount > 0 && (
           <button
-            onClick={() => setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))}
+            onClick={() => {
+              setFollowTail(false)
+              setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))
+            }}
             className="text-xs font-mono text-neutral-600 hover:text-neutral-400 px-3 py-1.5 border-b border-neutral-800 w-full text-left"
           >
             ↑ {aboveCount} above
@@ -364,6 +422,7 @@ function EventInspectorInner({
                 <li
                   key={evt.id}
                   onClick={() => {
+                    setFollowTail(false)
                     setSelectedId(evt.id)
                     setFocusedIdx(absIdx)
                     ensureSelectedVisible(absIdx)
