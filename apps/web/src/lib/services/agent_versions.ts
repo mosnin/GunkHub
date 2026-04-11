@@ -43,6 +43,31 @@ export async function getAgentVersion(versionId: string): Promise<AgentVersion |
 }
 
 /**
+ * Fetch a page of agent versions, newest first.
+ * Returns versions array and cursor for next page (null if done).
+ */
+export async function listAgentVersionsPaginated(
+  agentId: string,
+  cursor: string | null = null,
+  numItems = 20,
+): Promise<{ versions: AgentVersion[]; nextCursor: string | null }> {
+  const client = await getAuthedClient()
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await client.query(convex.agent_versions.paginateAgentVersions, {
+    agentId,
+    numItems,
+    cursor,
+  })
+
+  const raw = result as { versions: Record<string, unknown>[]; nextCursor: string | null }
+  return {
+    versions: (raw.versions ?? []).map(mapAgentVersion),
+    nextCursor: raw.nextCursor,
+  }
+}
+
+/**
  * Create a new agent version. Requires admin role in Convex.
  */
 export async function createAgentVersion(input: {

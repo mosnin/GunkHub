@@ -76,9 +76,12 @@ export default async function AgentPage({ params }: Props) {
 
   // Fetch versions — non-fatal if it fails
   let versions: AgentVersion[] = []
+  let versionsNextCursor: string | null = null
   try {
-    const { listAgentVersions } = await import('@/lib/services/agent_versions')
-    versions = await listAgentVersions(params.agentId)
+    const { listAgentVersionsPaginated } = await import('@/lib/services/agent_versions')
+    const vResult = await listAgentVersionsPaginated(params.agentId)
+    versions = vResult.versions
+    versionsNextCursor = vResult.nextCursor
   } catch {
     // Non-fatal: show empty version list
   }
@@ -132,7 +135,7 @@ export default async function AgentPage({ params }: Props) {
 
       {/* Versions section */}
       <section className="mb-8">
-        <VersionSection agentId={agent.id} versions={versions} />
+        <VersionSection agentId={agent.id} versions={versions} nextCursor={versionsNextCursor} />
       </section>
 
       {/* SDK Setup */}

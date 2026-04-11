@@ -8,6 +8,8 @@ import { CodeBlock } from '@/components/ui/CodeBlock'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { LoadingState } from '@/components/ui/LoadingState'
 
+const WINDOW_SIZE = 100
+
 interface EventInspectorProps {
   runId: string
   events?: Event[]
@@ -82,16 +84,22 @@ function ExternalizedPayloadView({ payload }: { payload: {
   )
 }
 
+type SeekState = 'idle' | 'seeking' | 'not-found'
+
 export function EventInspector({ runId, events, initialNextCursor, loading, initialEventSeq }: EventInspectorProps) {
   const initialId = (initialEventSeq !== undefined && events)
     ? (events.find((e) => e.sequenceNumber === initialEventSeq)?.id ?? null)
     : null
   const [selectedId, setSelectedId] = useState<string | null>(initialId)
   const [focusedIdx, setFocusedIdx] = useState<number>(-1)
+  const [windowStart, setWindowStart] = useState<number>(0)
   const [extraEvents, setExtraEvents] = useState<Event[]>([])
   const [cursor, setCursor] = useState<string | undefined>(initialNextCursor)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
+  const [seekState, setSeekState] = useState<SeekState>('idle')
+
+  const allEvents = [...(events ?? []), ...extraEvents]
 
   function handleLoadMore() {
     if (!cursor) return
@@ -110,11 +118,49 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
     })
   }
 
+  // On mount: check if initialEventSeq is already in the initial page or needs seeking
+  useEffect(() => {
+    if (initialEventSeq === undefined) return
+    const found = allEvents.find((e) => e.sequenceNumber === initialEventSeq)
+    if (found) {
+      const idx = allEvents.indexOf(found)
+      setSelectedId(found.id)
+      setFocusedIdx(idx)
+      setWindowStart(Math.max(0, idx - Math.floor(WINDOW_SIZE / 2)))
+    } else if (cursor) {
+      // Not in initial page but more pages exist — start seeking
+      setSeekState('seeking')
+    }
+    // If not found and no cursor: leave as-is (initialId already null)
+  }, []) // Only on mount — intentional empty dep array for mount-only effect
+
+  // Continue seeking: check newly loaded events for the target sequence number
+  useEffect(() => {
+    if (seekState !== 'seeking') return
+    const found = allEvents.find((e) => e.sequenceNumber === initialEventSeq)
+    if (found) {
+      const idx = allEvents.indexOf(found)
+      setSelectedId(found.id)
+      setFocusedIdx(idx)
+      setWindowStart(Math.max(0, idx - Math.floor(WINDOW_SIZE / 2)))
+      setSeekState('idle')
+    } else if (!cursor) {
+      // Exhausted all pages, event not found
+      setSeekState('not-found')
+    }
+    // If cursor still exists and not found: the next effect triggers load
+  }, [allEvents.length, seekState]) // intentional — cursor/initialEventSeq are stable references
+
+  // Auto-trigger load-more while seeking and more pages exist
+  useEffect(() => {
+    if (seekState === 'seeking' && cursor && !isPending) {
+      handleLoadMore()
+    }
+  }, [seekState, cursor, isPending])
+
   if (loading) {
     return <LoadingState message="Loading events..." />
   }
-
-  const allEvents = [...(events ?? []), ...extraEvents]
 
   if (allEvents.length === 0) {
     return (
@@ -126,18 +172,32 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
 
   const selectedEvent = allEvents.find((e) => e.id === selectedId) ?? allEvents[0] ?? null
 
+  function ensureSelectedVisible(absIdx: number) {
+    if (absIdx < windowStart) {
+      setWindowStart(Math.max(0, absIdx))
+    } else if (absIdx >= windowStart + WINDOW_SIZE) {
+      setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, absIdx))
+    }
+  }
+
   function handleListKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
     if (allEvents.length === 0) return
     if (e.key === 'ArrowDown') {
       e.preventDefault()
-      const next = Math.min(allEvents.length - 1, focusedIdx < 0 ? 0 : focusedIdx + 1)
+      const next = Math.min(allEvents.length - 1, focusedIdx < 0 ? windowStart : focusedIdx + 1)
       setFocusedIdx(next)
       setSelectedId(allEvents[next]?.id ?? null)
+      if (next >= windowStart + WINDOW_SIZE) {
+        setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, next))
+      }
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
-      const prev = Math.max(0, focusedIdx < 0 ? 0 : focusedIdx - 1)
+      const prev = Math.max(0, focusedIdx < 0 ? windowStart : focusedIdx - 1)
       setFocusedIdx(prev)
       setSelectedId(allEvents[prev]?.id ?? null)
+      if (prev < windowStart) {
+        setWindowStart(Math.max(0, prev))
+      }
     }
   }
 
@@ -148,11 +208,16 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       setSelectedId={setSelectedId}
       focusedIdx={focusedIdx}
       setFocusedIdx={setFocusedIdx}
+      windowStart={windowStart}
+      setWindowStart={setWindowStart}
+      ensureSelectedVisible={ensureSelectedVisible}
       handleListKeyDown={handleListKeyDown}
       cursor={cursor}
       loadError={loadError}
       isPending={isPending}
       handleLoadMore={handleLoadMore}
+      seekState={seekState}
+      initialEventSeq={initialEventSeq}
     />
   )
 }
@@ -163,11 +228,16 @@ interface EventInspectorInnerProps {
   setSelectedId: (id: string | null) => void
   focusedIdx: number
   setFocusedIdx: (idx: number) => void
+  windowStart: number
+  setWindowStart: (start: number) => void
+  ensureSelectedVisible: (absIdx: number) => void
   handleListKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void
   cursor: string | undefined
   loadError: string | null
   isPending: boolean
   handleLoadMore: () => void
+  seekState?: SeekState
+  initialEventSeq?: number
 }
 
 function EventInspectorInner({
@@ -176,11 +246,16 @@ function EventInspectorInner({
   setSelectedId,
   focusedIdx,
   setFocusedIdx,
+  windowStart,
+  setWindowStart,
+  ensureSelectedVisible,
   handleListKeyDown,
   cursor,
   loadError,
   isPending,
   handleLoadMore,
+  seekState,
+  initialEventSeq,
 }: EventInspectorInnerProps) {
   // Sync ?event=<sequenceNumber> into the URL without navigation
   useEffect(() => {
@@ -191,6 +266,10 @@ function EventInspectorInner({
     window.history.replaceState(null, '', url.toString())
   }, [selectedEvent?.sequenceNumber])
 
+  const windowedEvents = allEvents.slice(windowStart, windowStart + WINDOW_SIZE)
+  const aboveCount = windowStart
+  const belowCount = allEvents.length - windowStart - WINDOW_SIZE
+
   return (
     <div className="flex h-full min-h-[400px]">
       {/* Left panel — event list */}
@@ -198,6 +277,29 @@ function EventInspectorInner({
         <div className="px-3 py-2 border-b border-neutral-800">
           <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Events</p>
         </div>
+
+        {/* Seek status */}
+        {seekState === 'seeking' && (
+          <p className="px-3 py-1.5 text-xs font-mono text-neutral-500 border-b border-neutral-800">
+            Seeking event #{initialEventSeq}…
+          </p>
+        )}
+        {seekState === 'not-found' && (
+          <p className="px-3 py-1.5 text-xs font-mono text-amber-600 border-b border-neutral-800">
+            Event #{initialEventSeq} not found in this run.
+          </p>
+        )}
+
+        {/* Window navigation — above */}
+        {aboveCount > 0 && (
+          <button
+            onClick={() => setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))}
+            className="text-xs font-mono text-neutral-600 hover:text-neutral-400 px-3 py-1.5 border-b border-neutral-800 w-full text-left"
+          >
+            ↑ {aboveCount} above
+          </button>
+        )}
+
         <div
           tabIndex={0}
           className="outline-none"
@@ -205,27 +307,44 @@ function EventInspectorInner({
           onKeyDown={handleListKeyDown}
         >
           <ul className="divide-y divide-neutral-800/60">
-            {allEvents.map((evt, idx) => (
-              <li
-                key={evt.id}
-                onClick={() => { setSelectedId(evt.id); setFocusedIdx(idx) }}
-                className={[
-                  'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75',
-                  selectedEvent?.id === evt.id
-                    ? 'bg-neutral-900 text-neutral-200'
-                    : 'hover:bg-neutral-900/60 text-neutral-400',
-                  focusedIdx === idx ? 'ring-1 ring-inset ring-neutral-600' : '',
-                ].join(' ')}
-              >
-                <span className="text-xs font-mono">{evt.type}</span>
-                {(evt.payload as { type: string }).type === '_externalized' && (
-                  <span className="text-amber-700 text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
-                )}
-                <span className="text-xs font-mono text-neutral-600">#{evt.sequenceNumber}</span>
-              </li>
-            ))}
+            {windowedEvents.map((evt, relIdx) => {
+              const absIdx = windowStart + relIdx
+              return (
+                <li
+                  key={evt.id}
+                  onClick={() => {
+                    setSelectedId(evt.id)
+                    setFocusedIdx(absIdx)
+                    ensureSelectedVisible(absIdx)
+                  }}
+                  className={[
+                    'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75',
+                    selectedEvent?.id === evt.id
+                      ? 'bg-neutral-900 text-neutral-200'
+                      : 'hover:bg-neutral-900/60 text-neutral-400',
+                    focusedIdx === absIdx ? 'ring-1 ring-inset ring-neutral-600' : '',
+                  ].join(' ')}
+                >
+                  <span className="text-xs font-mono">{evt.type}</span>
+                  {(evt.payload as { type: string }).type === '_externalized' && (
+                    <span className="text-amber-700 text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
+                  )}
+                  <span className="text-xs font-mono text-neutral-600">#{evt.sequenceNumber}</span>
+                </li>
+              )
+            })}
           </ul>
         </div>
+
+        {/* Window navigation — below */}
+        {belowCount > 0 && (
+          <button
+            onClick={() => setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, windowStart + WINDOW_SIZE))}
+            className="text-xs font-mono text-neutral-600 hover:text-neutral-400 px-3 py-1.5 border-b border-neutral-800 w-full text-left"
+          >
+            ↓ {belowCount} below
+          </button>
+        )}
 
         {/* Load more */}
         {(cursor !== undefined || loadError !== null) && (

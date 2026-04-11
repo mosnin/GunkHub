@@ -7,6 +7,8 @@ import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts
 import { EmptyState } from '@/components/ui/EmptyState'
 import { LoadingState } from '@/components/ui/LoadingState'
 
+const WINDOW_SIZE = 100
+
 interface TimelineProps {
   runId: string
   events?: Event[]
@@ -69,6 +71,7 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
   const [loadError, setLoadError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
   const [focusedIndex, setFocusedIndex] = useState<number>(-1)
+  const [windowStart, setWindowStart] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
 
   function handleLoadMore() {
@@ -102,14 +105,25 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
     )
   }
 
+  const windowEnd = Math.min(allEvents.length, windowStart + WINDOW_SIZE)
+  const visibleEvents = allEvents.slice(windowStart, windowEnd)
+
   function handleKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
     if (allEvents.length === 0) return
     if (e.key === 'ArrowDown') {
       e.preventDefault()
-      setFocusedIndex((prev) => Math.min(allEvents.length - 1, prev < 0 ? 0 : prev + 1))
+      const next = Math.min(allEvents.length - 1, focusedIndex < 0 ? windowStart : focusedIndex + 1)
+      setFocusedIndex(next)
+      if (next >= windowStart + WINDOW_SIZE) {
+        setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, next))
+      }
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
-      setFocusedIndex((prev) => Math.max(0, prev < 0 ? 0 : prev - 1))
+      const prev = Math.max(0, focusedIndex < 0 ? windowStart : focusedIndex - 1)
+      setFocusedIndex(prev)
+      if (prev < windowStart) {
+        setWindowStart(Math.max(0, prev))
+      }
     } else if (e.key === 'Enter') {
       e.preventDefault()
       const focused = allEvents[focusedIndex]
@@ -131,7 +145,20 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
           onFocus={() => { if (focusedIndex === -1) setFocusedIndex(0) }}
           className="flex flex-col gap-1.5 outline-none focus:outline-none"
         >
-          {allEvents.map((event, idx) => {
+          {/* Earlier events navigation button */}
+          {windowStart > 0 && (
+            <div className="flex justify-center py-1">
+              <button
+                onClick={() => setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))}
+                className="px-4 py-1.5 text-xs font-mono rounded border border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600 transition-colors duration-100"
+              >
+                ↑ {windowStart} earlier events
+              </button>
+            </div>
+          )}
+
+          {visibleEvents.map((event, relIdx) => {
+            const absIdx = windowStart + relIdx
             const isExpanded = expandedId === event.id
             const summary = payloadSummary(event)
 
@@ -140,7 +167,7 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
                 key={event.id}
                 className={[
                   'flex items-start gap-3 rounded',
-                  focusedIndex === idx ? 'ring-1 ring-neutral-600' : '',
+                  focusedIndex === absIdx ? 'ring-1 ring-neutral-600' : '',
                 ].join(' ')}
               >
                 <div
@@ -193,6 +220,18 @@ export function Timeline({ runId, events, initialNextCursor, loading }: Timeline
               </div>
             )
           })}
+
+          {/* Later loaded events navigation button */}
+          {windowEnd < allEvents.length && (
+            <div className="flex justify-center py-1">
+              <button
+                onClick={() => setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, windowStart + WINDOW_SIZE))}
+                className="px-4 py-1.5 text-xs font-mono rounded border border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600 transition-colors duration-100"
+              >
+                ↓ {allEvents.length - windowEnd} more loaded events
+              </button>
+            </div>
+          )}
         </div>
       </div>
 

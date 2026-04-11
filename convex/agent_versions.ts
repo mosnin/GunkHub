@@ -75,6 +75,35 @@ export const listAgentVersions = query({
 });
 
 /**
+ * List agent versions with cursor-based pagination, newest first.
+ * Default page size is 20 — agents rarely have more.
+ */
+export const paginateAgentVersions = query({
+  args: {
+    agentId: v.id("agents"),
+    numItems: v.optional(v.number()),
+    cursor: v.union(v.string(), v.null()),
+  },
+  handler: async (ctx, args) => {
+    const agent = await ctx.db.get(args.agentId);
+    if (!agent) throw new Error("Agent not found");
+    await requireOrgMembership(ctx, agent.orgId);
+
+    const numItems = Math.min(args.numItems ?? 20, 100);
+    const page = await ctx.db
+      .query("agent_versions")
+      .withIndex("by_agent", (q) => q.eq("agentId", args.agentId))
+      .order("desc")
+      .paginate({ numItems, cursor: args.cursor });
+
+    return {
+      versions: page.page,
+      nextCursor: page.isDone ? null : page.continueCursor,
+    };
+  },
+});
+
+/**
  * Get a single agent version by ID. Verifies org membership.
  */
 export const getAgentVersion = query({
