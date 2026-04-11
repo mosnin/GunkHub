@@ -2,6 +2,51 @@
 
 ---
 
+## Prompt 18 — Live Run Monitoring (2026-04-11)
+
+### What changed
+
+**A. Timeline.tsx — Auto-advance + live polling**
+- Auto-advance: after server-side Load more, `windowStart` advances to `max(0, newTotal - WINDOW_SIZE)`. Eliminates the two-click friction from Prompt 17.
+- `isLive` prop: 5s polling — cursor path (paginated continuation) and no-cursor path (re-fetch + dedup by ID). Shows animate-pulse "live" indicator.
+
+**B. EventInspector.tsx — Auto-advance + live polling**
+- Same auto-advance and 5s polling as Timeline.
+- Selection stability: polling never modifies `selectedId` or `focusedIdx`.
+- Live dot in the Events left-panel header.
+
+**C. RunHeader.tsx — Live status polling**
+- `isLive` prop: polls `GET /api/runs/${runId}` every 5s when `liveStatus === 'running'`.
+- Updates `liveStatus` and `liveEndedAt` in local state; stops when terminal.
+- Shows animate-pulse "live" label next to the status badge.
+
+**D. page.tsx — isLive wiring**
+- Passes `isLive={run.status === 'running'}` to RunHeader, Timeline, and EventInspector.
+
+### Why these choices fit the architecture
+
+Polling was chosen over Convex real-time subscriptions because the web app's Convex integration is server-side only (`getAuthedClient()` in the service layer). Adding client-side Convex subscriptions would require `ConvexReactClient` + `ConvexProvider` — a larger architectural addition not yet in the repo and not needed for v1 live monitoring.
+
+The 5-second cadence is conservative and easy to reason about. For short runs (< 200 events), the re-fetch approach adds a small amount of redundant data transfer, but the simplicity is worth it.
+
+### Hard-to-reverse decisions
+
+None. Polling is fully reversible — the `isLive` prop and interval effects can be replaced with real-time subscriptions without changing the component API.
+
+### Known residual risks
+
+1. **Re-fetch overhead on small runs**: Polling from start fetches up to 200 events every 5s until the run crosses 200 events. For fast runs with many small events, this is ~10–50 KB/poll, acceptable for v1.
+2. **No server-push backpressure**: If the run generates events faster than the 5s poll can consume, users see batched jumps rather than a smooth tail. Acceptable for v1.
+3. **isLive not reset on status change**: Once the page renders with `isLive=true`, Timeline/EventInspector keep their intervals running until unmount, even if the run completes mid-session. The RunHeader updates its badge (correct status shown), but Timeline/EventInspector continue harmless empty polls. A future improvement could read `liveStatus` from RunHeader or context and clear the intervals.
+
+### Recommendation for Prompt 19
+
+The most impactful remaining gap: **replay tab live refresh**. The replay projection is computed server-side from the event log; running runs show a stale projection until page reload. A client-side hook or route re-fetch could regenerate the projection periodically for running runs.
+
+Second: **window auto-tail toggle** — a "follow tail" toggle that automatically keeps the window anchored to the latest events as polling delivers them, vs. the current behavior where the window advances on each poll but the user can manually navigate away.
+
+---
+
 ## Prompt 17 — Bounded rendering, deep link auto-seek, version pagination (2026-04-11)
 
 ### What changed

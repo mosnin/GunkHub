@@ -1,7 +1,7 @@
 # Next Steps — v1.1 Candidates
 
 **Document type:** State summary and v1.1 candidate list.
-**Current state:** Prompt 17 complete.
+**Current state:** Prompt 18 complete.
 
 ---
 
@@ -35,6 +35,17 @@
 
 ---
 
+## What Prompt 18 delivered
+
+- **Auto-advance window in Timeline.tsx and EventInspector.tsx:** After `handleLoadMore` completes, `windowStart` is set to `Math.max(0, newTotal - WINDOW_SIZE)` so the newly loaded events are immediately visible. Eliminates the two-click friction from Prompt 17 where users had to click "Load more" and then separately click the window-advance button.
+- **Live polling in Timeline.tsx (`isLive` prop):** A 5-second `setInterval` polls for new events when `isLive` is true. Cursor path: if `cursor` exists, calls `handleLoadMore()` to fetch the next paginated page. No-cursor path: re-fetches from start and deduplicates by event ID. Shows an animate-pulse emerald dot and "live" label above the event list.
+- **Live polling in EventInspector.tsx (`isLive` prop):** Same 5s polling strategy as Timeline. Selection stability invariant: `selectedId` and `focusedIdx` are never modified by a polling update. Live dot shown in the Events left-panel header.
+- **Live status polling in RunHeader.tsx (`isLive` prop):** Polls `GET /api/runs/${runId}` every 5s when status is `'running'`. Updates `liveStatus` and `liveEndedAt` in local state; badge and duration display use the live values. Stops polling when status transitions to a terminal state. Shows animate-pulse dot and "live" label next to the status badge.
+- **page.tsx wiring:** Passes `isLive={run.status === 'running'}` to RunHeader, Timeline, and EventInspector.
+- **New tests:** `tests/unit/active_run.test.ts` (21 tests) — auto-advance window computation, event dedup for live polling, terminal status detection via contracts, and `isLive` activation rule. Total test count: **575 passing, 5 skipped, 21 test files**.
+
+---
+
 ## v1.1 Candidates
 
 Listed in rough priority order.
@@ -60,8 +71,8 @@ Timeline and EventInspector now render at most 100 events at a time (`WINDOW_SIZ
 **5. Background projection verification**
 No scheduled job verifies run sequence integrity in production. Integrity checks are on-demand only via `scripts/rebuild-projection.ts`. A Convex cron checking a sample of recent runs would provide proactive alerting.
 
-**6. Live run monitoring**
-The run detail page does not auto-refresh while a run is in progress. Engineers watching a live run must manually reload. A polling interval or Convex real-time subscription would improve the debugging workflow.
+**6. Live run monitoring** — DONE (Prompt 18)
+Implemented via 5s polling on RunHeader, Timeline, and EventInspector. `isLive` prop wired from page.tsx. Animate-pulse indicators, cursor/no-cursor dedup strategy, selection stability.
 
 **7. RBAC viewer-vs-member on read paths**
 Roles (`admin`, `member`, `viewer`) are stored and enforced on write mutations. The viewer-vs-member distinction on read paths is deferred.
@@ -71,16 +82,32 @@ The run list page fetches one `getAgentVersion` per distinct version ID per page
 
 ---
 
-## Prompt 18 Candidates
+## Prompt 18 Candidates — DONE
 
-**1. Live run monitoring (highest value)**
-The run detail page does not auto-refresh while a run is in progress. Engineers watching a live run must manually reload. A Convex real-time subscription (replacing the current one-shot server component fetch for events) would make the timeline update automatically as the agent emits events. This was LOW item 6 in the prior list; with bounded rendering now in place, live updates are the next UX gap that most affects the debugging workflow.
+**1. Live run monitoring** — DONE
+Implemented in Prompt 18. `isLive` prop on RunHeader, Timeline, and EventInspector. 5s polling with cursor/no-cursor strategies, animate-pulse live indicators, selection stability invariant in EventInspector.
 
-**2. Background projection verification**
-No scheduled job verifies run sequence integrity in production. Integrity checks are on-demand only via `scripts/rebuild-projection.ts`. A Convex cron checking a sample of recent runs would provide proactive alerting before users encounter corrupted traces. This was LOW item 5 in the prior list.
+**2. Auto-scroll on new event load** — DONE
+Implemented in Prompt 18 as part of auto-advance window. After `handleLoadMore` completes, `windowStart` advances to `Math.max(0, newTotal - WINDOW_SIZE)` automatically.
 
-**3. Auto-scroll on new event load**
-Timeline and EventInspector do not auto-scroll to the newly visible window after the user clicks "Load more" and then the window advances. The user must click "Load more" (which fetches more events from the server) and then separately click "↓ N more loaded events" (which shifts the window forward). Automatically advancing the window to show new events after a server load-more completes would collapse this into a single action.
+---
+
+## Prompt 19 Candidates
+
+**1. Replay tab live refresh (highest value)**
+The replay projection is computed server-side from the event log. When a run is in progress, the replay tab shows a stale projection until the user manually reloads the page. A client-side hook or route re-fetch (similar to the RunHeader polling approach) could regenerate the projection periodically for running runs, bringing the replay view up to date without a full page reload.
+
+**2. Follow-tail toggle**
+Timeline and EventInspector auto-advance the window on each poll (newest events visible), but users who scroll backward to inspect earlier events will find the window jumping forward again on the next poll. A "follow tail" toggle — on by default for live runs — would let users anchor the window to the latest events while polling, and turn it off to inspect historical events without interruption.
+
+**3. Background projection verification**
+No scheduled job verifies run sequence integrity in production. Integrity checks are on-demand only via `scripts/rebuild-projection.ts`. A Convex cron checking a sample of recent runs would provide proactive alerting before users encounter corrupted traces.
+
+**4. RBAC viewer-vs-member on read paths**
+Roles (`admin`, `member`, `viewer`) are stored and enforced on write mutations. The viewer-vs-member distinction on read paths is deferred.
+
+**5. Version label enrichment at scale**
+The run list page fetches one `getAgentVersion` per distinct version ID per page load. At v1 scale (1–3 distinct versions per page) this is fast. Consider caching or a batch query if pages regularly show many distinct versions.
 
 ---
 

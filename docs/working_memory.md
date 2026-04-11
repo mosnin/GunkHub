@@ -2,13 +2,13 @@
 
 **Read this file first in every new Claude session before touching any code.**
 
-Last updated: 2026-04-11 (Prompt 17 — Bounded rendering windows, deep link auto-seek, version pagination)
+Last updated: 2026-04-11 (Prompt 18 — Live run monitoring, auto-advance window)
 
 ---
 
 ## 1. Current State
 
-Prompts 1–17 complete. The following summarizes the full state after Prompt 17.
+Prompts 1–18 complete. The following summarizes the full state after Prompt 18.
 
 **Repo skeleton is in place.** pnpm workspace with Turborepo, TypeScript strict mode, ESLint, Prettier, `tsconfig.base.json`. All packages typecheck cleanly. `./scripts/validate.sh` runs typecheck → build → lint and reports pass/fail.
 
@@ -57,7 +57,7 @@ Key new exports (Prompt 10):
 **apps/web components and service layer — all implemented (not stubs):**
 - UI primitives: Badge, Button, Card, CodeBlock, EmptyState, ErrorState, LoadingState, Tabs
 - Layout: AppShell, PageHeader, Sidebar
-- Run components: RunList, RunHeader, Timeline (with load-more pagination, keyboard navigation, WINDOW_SIZE=100 bounded rendering — Prompt 17), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button, WINDOW_SIZE=100 bounded rendering + auto-seek for deep links — Prompt 17), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (`'use client'`, programmatic download with per-row loading/error state, inline error display, RFC 5987 filename extraction), CommentThread (resolve, show/hide resolved, compose)
+- Run components: RunList, RunHeader (with `isLive` status polling every 5s, animate-pulse live badge — Prompt 18), Timeline (with load-more pagination, keyboard navigation, WINDOW_SIZE=100 bounded rendering — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with cursor/no-cursor dedup strategy, animate-pulse live indicator — Prompt 18), EventInspector (with load-more pagination, keyboard navigation, event deep link, copy-link button, WINDOW_SIZE=100 bounded rendering + auto-seek for deep links — Prompt 17; auto-advance window after load-more, `isLive` 5s polling with selection stability invariant, live dot in Events header — Prompt 18), DiffViewer (with truncation banner), ReplayViewer (with truncation banner), ArtifactList (`'use client'`, programmatic download with per-row loading/error state, inline error display, RFC 5987 filename extraction), CommentThread (resolve, show/hide resolved, compose)
 - Service layer: `lib/services/runs.ts`, `lib/services/events.ts`, `lib/services/comments.ts`, `lib/services/artifacts.ts`, `lib/services/replay.ts`, `lib/services/diff.ts`, `lib/services/agents.ts`, `lib/services/projects.ts` (NEW Prompt 13), `lib/services/agent_versions.ts` (NEW Prompt 14, extended with `listAgentVersionsPaginated` in Prompt 17)
 - Server actions: `lib/actions/comments.ts` (createComment, resolveComment), `lib/actions/runs.ts` (updateRunTags), `lib/actions/projects.ts` (createProjectAction, NEW Prompt 13), `lib/actions/agents.ts` (createAgentAction, NEW Prompt 13), `lib/actions/agent_versions.ts` (createAgentVersionAction, NEW Prompt 14)
 - API routes: `/api/runs`, `/api/runs/[id]`, `/api/runs/[id]/events`, `/api/runs/[id]/replay`, `/api/runs/[id]/status`, `/api/events`, `/api/artifacts/upload`, `/api/artifacts/[id]/download` (Prompt 12), `/api/api-keys/[id]` (DELETE revoke, NEW Prompt 13), `/api/health`, `/api/webhooks/clerk`, `/api/agents/[agentId]/versions` (GET with cursor/limit params, NEW Prompt 17)
@@ -86,8 +86,9 @@ Key new exports (Prompt 10):
 - `tests/unit/transport-externalization.test.ts` — Group 6 added (Prompt 16): upload cache deduplication — asserts `_uploadArtifact` called once for two identical large payloads in the same batch; asserts called twice for two different large payloads; verifies `artifactId` consistency in externalized event bodies
 - `tests/unit/timeline_window.test.ts` (NEW Prompt 17) — 25 pure logic tests for the sliding window algorithm shared by Timeline and EventInspector: window bounds computation, above/below counts, "earlier"/"later" navigation clamping, ArrowUp/ArrowDown edge-shift logic, absolute index mapping, and ring highlight predicate
 - `tests/unit/version_pagination.test.ts` (NEW Prompt 17) — 14 pure logic tests for version pagination: cursor accumulation across pages, `hasMore` boolean derivation, `nextCursor` passthrough from service result, and `parseVersionsParams` query-param parsing including zero-limit and URL-encoded cursor edge cases
+- `tests/unit/active_run.test.ts` (NEW Prompt 18) — 21 pure logic tests for active run monitoring: auto-advance window computation (6 tests), event deduplication for live polling (5 tests), terminal status detection via `isTerminalStatus` from contracts (6 tests), and `isLive` activation rule (4 tests)
 - `tests/integration/api.test.ts` — API response shape + org bootstrap integration tests
-- **Total: 554 passing, 5 skipped (20 test files, all green)**
+- **Total: 575 passing, 5 skipped (21 test files, all green)**
 
 **Architecture decisions recorded:**
 - ADR-0001 through ADR-0004: repo shape, event log immutability, tenancy, contracts
