@@ -1,12 +1,16 @@
+import type { FailedVerification } from '@/lib/services/projection_verify'
 import type { Run } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
+import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
 import { RunList } from '@/components/runs/RunList'
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
 import { ErrorState } from '@/components/ui/ErrorState'
+import { getRecentFailedVerifications } from '@/lib/services/projection_verify'
 import { listRuns } from '@/lib/services/runs'
+import { truncateId, formatRelativeTime } from '@/lib/utils'
 
 export const metadata: Metadata = { title: 'Dashboard' }
 
@@ -21,11 +25,27 @@ function StatCard({ label, value }: { label: string; value: string }) {
   )
 }
 
+/** Construct a minimal VerificationStatus from a FailedVerification for badge rendering. */
+function failedVerificationBadgeStatus(fv: FailedVerification) {
+  return {
+    verified: true,
+    isValid: false,
+    verifiedAt: fv.verifiedAt,
+    summary: fv.failureReason ?? 'Verification failed',
+    sequenceGaps: fv.sequenceGaps,
+    duplicateSeqNums: fv.duplicateSeqNums,
+    checksRan: fv.checksRan,
+    replayPassed: null,
+    failureSummaryPassed: null,
+  }
+}
+
 const SDK_INSTALL = `npm install @agent-flight-recorder/sdk`
 
 export default async function DashboardPage() {
   let runs: Run[] = []
   let error: string | null = null
+  let failedVerifications: FailedVerification[] = []
 
   try {
     const result = await listRuns({ limit: 20 })
@@ -38,6 +58,13 @@ export default async function DashboardPage() {
   const failedRuns = runs.filter((r) => r.status === 'failed').length
   const activeRuns = runs.filter((r) => r.status === 'running').length
   const hasRuns = totalRuns > 0
+
+  // Non-fatal: verification issues section is hidden if fetch fails
+  try {
+    failedVerifications = await getRecentFailedVerifications(5)
+  } catch {
+    // Non-fatal
+  }
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
@@ -57,10 +84,56 @@ export default async function DashboardPage() {
           </div>
 
           {hasRuns ? (
-            <div className="mt-8">
-              <h2 className="text-sm font-semibold text-neutral-300 mb-4">Recent Runs</h2>
-              <RunList runs={runs} />
-            </div>
+            <>
+              {/* Verification issues section — shown only when there are runs */}
+              <div className="mt-8">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-semibold text-neutral-300">Verification Issues</h2>
+                  <a
+                    href="/runs?verify=failed"
+                    className="text-xs text-neutral-600 hover:text-neutral-400 transition-colors duration-100 font-mono"
+                  >
+                    view all →
+                  </a>
+                </div>
+
+                {failedVerifications.length === 0 ? (
+                  <div className="flex items-center gap-2 px-3 py-2.5 rounded-md border border-neutral-800 text-xs text-neutral-600 font-mono">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-800 shrink-0" aria-hidden="true" />
+                    No recent verification issues
+                  </div>
+                ) : (
+                  <div className="rounded-md border border-neutral-800 divide-y divide-neutral-800">
+                    {failedVerifications.map((fv) => (
+                      <a
+                        key={fv.runId}
+                        href={`/runs/${fv.runId}`}
+                        className="flex items-center gap-3 px-3 py-2.5 hover:bg-neutral-900 transition-colors duration-100"
+                      >
+                        <span className="font-mono text-xs text-neutral-400 shrink-0">
+                          {truncateId(fv.runId, 12)}
+                        </span>
+                        <IntegrityBadge status={failedVerificationBadgeStatus(fv)} />
+                        {fv.failureReason && (
+                          <span className="text-xs text-neutral-600 truncate flex-1">
+                            {fv.failureReason}
+                          </span>
+                        )}
+                        <span className="text-xs text-neutral-700 shrink-0 ml-auto">
+                          {formatRelativeTime(fv.verifiedAt)}
+                        </span>
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Recent Runs list */}
+              <div className="mt-8">
+                <h2 className="text-sm font-semibold text-neutral-300 mb-4">Recent Runs</h2>
+                <RunList runs={runs} />
+              </div>
+            </>
           ) : (
             /* Getting Started guide — only show when there are no runs yet */
             <div className="mt-8">

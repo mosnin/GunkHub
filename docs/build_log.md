@@ -2,6 +2,78 @@
 
 ---
 
+## Prompt 23 — Verification Discoverability (2026-04-11)
+
+### What changed
+
+**A. convex/projection_verify.ts — two new Convex queries**
+- `batchGetVerificationResults`: `query` accepting `orgId` and `runIds` (array, bounded to 100). Calls `requireOrgMembership`, then fans out with `Promise.all` to fetch one `verification_results` record per run ID using the existing `by_run` index. Defense-in-depth: each fetched record is checked `result.orgId === args.orgId` before returning. Returns `Array<{ runId, result | null }>`.
+- `listRecentFailedVerifications`: `query` accepting `orgId` and optional `limit` (max 20, default 5). Uses `by_org_verified` index ordered descending, over-fetches 200 records, filters `isValid === false` in the handler, trims to `limit`. Returns compact shape: `{ runId, verifiedAt, isValid, checksRan, failureReason, sequenceGaps, duplicateSeqNums }[]`.
+
+**B. apps/web/src/lib/convexFunctions.ts — two new query references**
+- `batchGetVerificationResults` and `listRecentFailedVerifications` added to the `projection_verify` namespace.
+
+**C. apps/web/src/lib/services/projection_verify.ts — three additions**
+- `UNVERIFIED_STATUS` constant: exported canonical default `VerificationStatus` with `verified: false` and all null/empty fields — used as the map value for runs with no result.
+- `FailedVerification` interface: compact shape for dashboard rows (runId, verifiedAt, isValid, checksRan, failureReason, sequenceGaps, duplicateSeqNums).
+- `batchGetRunVerificationStatuses(runIds)`: resolves the org from Clerk auth, calls `batchGetVerificationResults`, maps to `Record<string, VerificationStatus>`. Non-fatal: returns `{}` on any error.
+- `getRecentFailedVerifications(limit)`: same org resolution pattern, calls `listRecentFailedVerifications`. Non-fatal: returns `[]` on any error.
+
+**D. apps/web/src/components/runs/RunList.tsx — Integrity column**
+- New optional prop `verificationStatuses?: Record<string, VerificationStatus>`.
+- When prop is present (`showIntegrity = verificationStatuses !== undefined`), renders an "Integrity" column header and per-row `<IntegrityBadge>` (or `—` dash for unverified). The dashboard run list does not pass this prop (no column); the runs page does.
+
+**E. apps/web/app/(app)/runs/page.tsx — verification filter + Integrity column**
+- `VERIFY_VALUES` constant and `VerifyFilter` type: `'all' | 'verified' | 'seq_verified' | 'failed' | 'unverified'`.
+- `matchesVerifyFilter(run, status, verify)` pure function: routes each filter value to the appropriate `VerificationStatus` field check. `unverified` = `!status.verified`; `failed` = `!status.isValid`; `verified` = `isValid === true && checksRan.includes('replay')`; `seq_verified` = `isValid === true && !checksRan.includes('replay')`.
+- `buildHref(base, override)` helper: merges base searchParams with override, drops falsy/`'all'` values to keep URLs clean.
+- Post-fetch verification filter: batch-fetches statuses for the page of 50 runs (non-fatal), then filters in the server component. Accepted trade-off: selective filters may yield sparse pages; no cursor UI exists on this page so this is safe at v1 scale.
+- New "Integrity" filter pill group in the filter bar (all / verified / seq / failed / unverified).
+- Passes `verificationStatuses` to `RunList` to show the Integrity column.
+
+**F. apps/web/app/(app)/dashboard/page.tsx — verification issues section**
+- `getRecentFailedVerifications(5)` called non-fatally; failure hides the section silently.
+- `failedVerificationBadgeStatus(fv)` helper: constructs a minimal `VerificationStatus` for badge rendering from a `FailedVerification` record.
+- "Verification Issues" section with "view all →" link to `/runs?verify=failed`. All-clear state: small emerald dot + "No recent verification issues" in a bordered row. Issue list: up to 5 compact rows with `truncateId`, `IntegrityBadge`, failure reason, and relative time.
+
+**G. tests/unit/verification_discoverability.test.ts — NEW**
+- 54 pure-logic tests across 9 describe blocks:
+  - `matchesVerifyFilter` — all 5 filter values with verified/unverified/failed/partial inputs (26 tests)
+  - Integrity column visibility — `showIntegrity` boolean derived from prop presence (4 tests)
+  - Dashboard section logic — no issues, has issues, all-clear, 5-item cap, badge status construction (12 tests)
+  - `buildHref` URL construction — filter preservation, clean URL when all defaults (6 tests)
+  - `VERIFY_VALUES` coverage — ensures all 5 values are in the constant (2 tests)
+  - Edge cases — empty run page, mixed page across all 5 filter values (4 tests)
+
+### Why the design choices fit the architecture
+
+**Post-fetch filter, not a new index query**: The `verification_results` table is indexed by `by_run` (runId) and `by_org_verified` (orgId + verifiedAt). There is no `by_run_is_valid` compound index because isValid is not part of the schema index. Filtering after the batch fetch keeps the query layer simple and avoids schema changes. At v1 scale (≤50 runs per page), the bounded fetch-then-filter is imperceptibly fast.
+
+**`UNVERIFIED_STATUS` as a zero-allocation default**: Rather than branching on `status?.verified` everywhere in the UI, all callers receive a well-typed `VerificationStatus` from the map. The map always has an entry for every run ID — either a real status or `UNVERIFIED_STATUS`. This eliminates a class of null-check bugs.
+
+**Non-fatal batch fetch**: If the Convex query or auth fails, the runs page degrades gracefully (no Integrity column shown, verification filter silently returns all runs). This matches the existing non-fatal pattern on the run detail page. The failure is not surfaced to the user as an error to avoid alarming operators for a secondary data surface.
+
+**Dashboard over-fetch + in-handler filter**: `listRecentFailedVerifications` reads up to 200 recent verification records ordered by `verifiedAt desc`, then filters `isValid === false` in the handler. This is safe at v1 scale (tens to hundreds of records per org) and avoids adding a `by_org_invalid_verified` index. The 200-record over-fetch cap prevents pathological cases.
+
+### Hard-to-reverse decisions
+
+- **No new schema or indexes.** The batch query uses the existing `by_run` index and the dashboard query uses the existing `by_org_verified` index. Reversible: no migration needed.
+- **Post-fetch filtering on verification status.** If a future operator needs cursor-based server-side filtering by verification status, a new Convex index would be needed. This is well-understood and documented.
+
+### Known residual risks
+
+- **Sparse pages under selective filters**: The runs page fetches 50 runs, then filters by verification status. If most runs on the page are verified and the user selects `failed`, the page may show 0–2 results even when more failures exist. There is no "load more" mechanism. Acceptable for v1 — operators with many failures should see them in the dashboard section.
+- **Dashboard recent failures ignores termination status**: `listRecentFailedVerifications` returns the 5 most recent failed verifications regardless of the run's current status. A run that was deleted (if that were ever possible — it isn't in v1) would still appear. Not a concern in v1 due to the append-only model.
+
+### Recommendation for Prompt 24
+
+The verification surface is now operationally discoverable. Prompt 24 candidates in priority order:
+1. **Per-run comment threading on events** — the `CommentThread` component exists but is not wired to individual events in the inspector. This is the last major missing interactive feature.
+2. **Run tagging from the runs list** — operators want to tag runs without opening each one individually.
+3. **RBAC viewer-vs-member on read paths** — roles are stored but not enforced on read queries. Low risk, high correctness value.
+
+---
+
 ## Prompt 22 — Per-Run Reverify Action and Verification Details Panel (2026-04-11)
 
 ### What changed

@@ -65,6 +65,8 @@ export const convex = {
   },
   projection_verify: {
     getVerificationResult: makeFunctionReference<Q>('projection_verify:getVerificationResult'),
+    batchGetVerificationResults: makeFunctionReference<Q>('projection_verify:batchGetVerificationResults'),
+    listRecentFailedVerifications: makeFunctionReference<Q>('projection_verify:listRecentFailedVerifications'),
     reverifyRun: makeFunctionReference<A>('projection_verify:reverifyRun'),
   },
 } as const

@@ -524,8 +524,82 @@ export const reverifyRun = action({
 });
 
 // ---------------------------------------------------------------------------
-// Public query — read verification result for a specific run
+// Public queries — verification result reads
 // ---------------------------------------------------------------------------
+
+/**
+ * Batch-fetch the most recent verification result for each of the given run IDs.
+ * Results are returned in the same order as the input array.
+ * Entries with no verification record are returned as null.
+ * Enforces org membership and filters results by orgId for tenancy safety.
+ * Bounded to 100 run IDs per call.
+ */
+export const batchGetVerificationResults = query({
+  args: {
+    orgId: v.id("organizations"),
+    runIds: v.array(v.id("runs")),
+  },
+  handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+
+    // Bound the batch size to prevent abuse
+    const runIds = args.runIds.slice(0, 100);
+
+    const results = await Promise.all(
+      runIds.map(async (runId) => {
+        const result = await ctx.db
+          .query("verification_results")
+          .withIndex("by_run", (q) => q.eq("runId", runId))
+          .order("desc")
+          .first();
+        // Tenancy safety: only return results belonging to the requesting org
+        const safeResult = result?.orgId === args.orgId ? result : null;
+        return { runId, result: safeResult ?? null };
+      }),
+    );
+
+    return results;
+  },
+});
+
+/**
+ * List the most recent failed verification results for the org.
+ * Used by the dashboard to surface verification issues compactly.
+ * Returns up to `limit` records (max 20) ordered by verifiedAt descending.
+ * Enforces org membership.
+ */
+export const listRecentFailedVerifications = query({
+  args: {
+    orgId: v.id("organizations"),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+
+    const limit = Math.min(args.limit ?? 5, 20);
+
+    // by_org_verified orders by verifiedAt — scan most recent, filter for failures
+    const recent = await ctx.db
+      .query("verification_results")
+      .withIndex("by_org_verified", (q) => q.eq("orgId", args.orgId))
+      .order("desc")
+      .take(200); // Over-fetch then filter (v1 scale: fine)
+
+    const failed = recent.filter((r) => !r.isValid).slice(0, limit);
+
+    return failed.map((r) => ({
+      runId: r.runId,
+      verifiedAt: r.verifiedAt,
+      isValid: r.isValid,
+      checksRan: r.checksRan ?? ([] as string[]),
+      failureReason: r.failureReason,
+      sequenceGaps: r.sequenceGaps,
+      duplicateSeqNums: r.duplicateSeqNums,
+    }));
+  },
+});
+
+
 
 /**
  * Get the most recent verification result for a run.

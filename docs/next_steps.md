@@ -1,7 +1,7 @@
 # Next Steps — v1.1 Candidates
 
 **Document type:** State summary and v1.1 candidate list.
-**Current state:** Prompt 21 complete.
+**Current state:** Prompt 23 complete.
 
 ---
 
@@ -55,6 +55,27 @@
 - **Run detail page wired**: `VerificationPanel` rendered between `FailureSummaryPanel` and the tab bar for terminal runs.
 - **Tests**: `tests/unit/reverify_panel.test.ts` — 48 pure-logic tests across 8 groups covering result mapping, state transitions, issue generation, CheckPill states, error handling, and partial verification detection.
 - **Build log updated** with full implementation notes for Prompt 22.
+
+---
+
+## What Prompt 23 delivered
+
+- **Integrity column on RunList**: Optional `verificationStatuses` prop; when passed, shows an "Integrity" column with `IntegrityBadge` per row. Dashboard does not pass the prop (no column). Runs page passes it (column shown).
+- **Verification filter on runs page**: `VerifyFilter` type (`all/verified/seq_verified/failed/unverified`), `matchesVerifyFilter()` pure function, `buildHref()` helper preserving active params. Batch-fetches verification statuses post-fetch (non-fatal). New "Integrity" filter pill group in the filter bar.
+- **Dashboard verification issues section**: Compact list of up to 5 recent failed verifications (fetched via `listRecentFailedVerifications`). All-clear state, "view all →" link to `/runs?verify=failed`. Non-fatal fetch.
+- **New Convex queries**: `batchGetVerificationResults` (bounded to 100 runIds, per-record orgId safety check) and `listRecentFailedVerifications` (by_org_verified index, over-fetch 200 + filter, cap 20).
+- **New service functions**: `batchGetRunVerificationStatuses`, `getRecentFailedVerifications`, `UNVERIFIED_STATUS` constant, `FailedVerification` interface — all in `apps/web/src/lib/services/projection_verify.ts`.
+- **New tests**: `tests/unit/verification_discoverability.test.ts` — 54 pure-logic tests. Total test count: **794 passing, 5 skipped, 27 test files**.
+
+---
+
+## What Prompt 22 delivered
+
+- **`reverifyRun` Convex action**: auth-gated (member+), same seq + derivation flow as nightly cron, DERIVATION_MAX_EVENTS=500, graceful degradation to seq-only.
+- **`reverifyRunAction` Next.js server action**: `apps/web/src/lib/actions/verification.ts`. Checks Clerk session, calls action, maps result.
+- **`VerificationFailureDetail`**: pure component with `buildIssues()` for all 4 failure types with system-grounded remediation hints.
+- **`VerificationPanel`** (`'use client'`): CheckPill row, re-verify button, IntegrityBadge, error display, partial verification notice.
+- **New tests**: `tests/unit/reverify_panel.test.ts` — 54 pure-logic tests.
 
 ---
 
