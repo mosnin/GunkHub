@@ -241,6 +241,43 @@ describe('Enterprise API-key lifecycle (expiration + scopes)', () => {
     const run = await t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'legacy', agentId: agent })
     expect(run.id).toBeTruthy()
   })
+
+  it('enforces the per-key ingest rate limit', async () => {
+    const t = convexTest(schema, modules)
+    // Seed a rate-limited key (3 events/min) and a run to append to.
+    const { runId } = await t.run(async (ctx) => {
+      const now = Date.now()
+      const org = await ctx.db.insert('organizations', {
+        clerkOrgId: 'clerk_r', name: 'R', slug: 'r', plan: 'free', createdAt: now, updatedAt: now,
+      })
+      const project = await ctx.db.insert('projects', { orgId: org, name: 'P', slug: 'p', createdAt: now, updatedAt: now })
+      const agent = await ctx.db.insert('agents', { orgId: org, projectId: project, name: 'A', slug: 'a', createdAt: now, updatedAt: now })
+      await ctx.db.insert('api_keys', {
+        orgId: org, keyHash: 'rl', name: 'k', createdBy: 'u', createdAt: now,
+        lastUsedAt: undefined, revokedAt: undefined, rateLimitPerMin: 3,
+      })
+      const runId = await ctx.db.insert('runs', {
+        orgId: org, projectId: project, agentId: agent, status: 'running', startedAt: now, metadata: {}, tags: [],
+      })
+      return { runId }
+    })
+    // First 3 events fit within the limit.
+    await t.mutation(api.sdk_ingest.sdkCreateEvents, {
+      apiKeyHash: 'rl',
+      events: [
+        { runId, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} },
+        { runId, type: 'tool.call', sequenceNumber: 2, timestamp: Date.now(), payload: {} },
+        { runId, type: 'tool.call', sequenceNumber: 3, timestamp: Date.now(), payload: {} },
+      ],
+    })
+    // The 4th within the same minute exceeds 3/min and is rejected.
+    await expect(
+      t.mutation(api.sdk_ingest.sdkCreateEvents, {
+        apiKeyHash: 'rl',
+        events: [{ runId, type: 'tool.call', sequenceNumber: 4, timestamp: Date.now(), payload: {} }],
+      }),
+    ).rejects.toThrow(/rate limit/i)
+  })
 })
 
 describe('Webhook-secret authorization (ADR-0023)', () => {

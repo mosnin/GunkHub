@@ -16,8 +16,10 @@ export const createApiKey = mutation({
     keyHash: v.string(),
     // Optional enterprise controls. expiresAt: epoch ms after which the key is
     // rejected. scopes: allowed operations (e.g. ["ingest:write"]); omit for full.
+    // rateLimitPerMin: max events/min accepted for this key (omit = unlimited).
     expiresAt: v.optional(v.number()),
     scopes: v.optional(v.array(v.string())),
+    rateLimitPerMin: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     const { userId } = await getAuthContext(ctx);
@@ -25,6 +27,9 @@ export const createApiKey = mutation({
 
     if (args.expiresAt !== undefined && args.expiresAt <= Date.now()) {
       throw new Error("expiresAt must be in the future");
+    }
+    if (args.rateLimitPerMin !== undefined && args.rateLimitPerMin <= 0) {
+      throw new Error("rateLimitPerMin must be a positive number");
     }
 
     const now = Date.now();
@@ -38,6 +43,9 @@ export const createApiKey = mutation({
       revokedAt: undefined,
       expiresAt: args.expiresAt,
       scopes: args.scopes,
+      rateLimitPerMin: args.rateLimitPerMin,
+      rateWindowStart: undefined,
+      rateWindowCount: undefined,
     });
 
     const key = await ctx.db.get(keyId);
@@ -79,6 +87,7 @@ export const listApiKeys = query({
         revokedAt: k.revokedAt,
         expiresAt: k.expiresAt,
         scopes: k.scopes,
+        rateLimitPerMin: k.rateLimitPerMin,
       }));
   },
 });

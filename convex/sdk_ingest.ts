@@ -161,6 +161,25 @@ export const sdkCreateEvents = mutation({
   handler: async (ctx, args) => {
     const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
 
+    // Fixed-window ingest rate limiting (runaway-agent / abuse protection). The
+    // whole mutation is transactional, so if the limit is exceeded nothing —
+    // including the events and the lastUsedAt stamp — is committed.
+    if (apiKey.rateLimitPerMin !== undefined) {
+      const window = Math.floor(Date.now() / 60_000);
+      const inSameWindow = apiKey.rateWindowStart === window;
+      const currentCount = inSameWindow ? apiKey.rateWindowCount ?? 0 : 0;
+      const newCount = currentCount + args.events.length;
+      if (newCount > apiKey.rateLimitPerMin) {
+        throw new Error(
+          `Rate limit exceeded: ${apiKey.rateLimitPerMin} events/min for this API key`,
+        );
+      }
+      await ctx.db.patch(apiKey._id, {
+        rateWindowStart: window,
+        rateWindowCount: newCount,
+      });
+    }
+
     const eventIds: string[] = [];
 
     // Per-run ingest state, established lazily and advanced as we insert. Lets us

@@ -149,6 +149,12 @@ export default defineSchema({
     // expiresAt never expires; a key with no scopes has full ingest access.
     expiresAt: v.optional(v.number()),          // epoch ms; key is rejected once past
     scopes: v.optional(v.array(v.string())),    // e.g. ["ingest:write"]
+    // Fixed-window ingest rate limit. rateLimitPerMin = max events accepted per
+    // minute (undefined = unlimited). The window state is stored inline on the key
+    // (a minute bucket + running count) so no separate table or GC is needed.
+    rateLimitPerMin: v.optional(v.number()),
+    rateWindowStart: v.optional(v.number()),    // minute bucket = floor(now/60000)
+    rateWindowCount: v.optional(v.number()),    // events counted in the current bucket
   })
     .index("by_org", ["orgId"])
     .index("by_key_hash", ["keyHash"]),

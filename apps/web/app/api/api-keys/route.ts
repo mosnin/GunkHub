@@ -98,6 +98,19 @@ export async function POST(req: Request) {
     )
   }
 
+  // Optional per-key ingest rate limit (events/min).
+  let rateLimitPerMin: number | undefined
+  const rawRate = body['rateLimitPerMin']
+  if (typeof rawRate === 'number') {
+    if (rawRate <= 0 || !Number.isFinite(rawRate)) {
+      return NextResponse.json<ApiError>(
+        { code: 'VALIDATION_ERROR', message: 'rateLimitPerMin must be a positive number' },
+        { status: 422 },
+      )
+    }
+    rateLimitPerMin = rawRate
+  }
+
   // Optional scopes: validate against the allowed set.
   let scopes: string[] | undefined
   const rawScopes = body['scopes']
@@ -124,6 +137,7 @@ export async function POST(req: Request) {
       keyHash,
       ...(expiresAt !== undefined && { expiresAt }),
       ...(scopes !== undefined && { scopes }),
+      ...(rateLimitPerMin !== undefined && { rateLimitPerMin }),
     })) as ApiKeyDoc
 
     // The raw key is returned ONCE and never stored — caller must persist it securely.
