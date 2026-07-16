@@ -16,5 +16,5 @@
     "exactOptionalPropertyTypes": false
   },
   "include": ["**/*.ts"],
-  "exclude": ["node_modules", "_generated/**/*.js"]
+  "exclude": ["node_modules", "_generated/**/*.js", "**/*.test.ts", "vitest.config.ts"]
 }
