@@ -1,14 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import type {
-  ListRunsResponse,
-  GetRunResponse,
-  ApiError,
-  ListEventsResponse,
-  CreateRunResponse,
-  CreateCommentResponse,
-  Organization,
-  AuthContext,
-} from '@agent-flight-recorder/contracts'
+
 import {
   mockRun,
   mockFailedRun,
@@ -20,6 +11,17 @@ import {
   mockRunEvents,
   mockComment,
 } from '../fixtures/runs.js'
+
+import type {
+  ListRunsResponse,
+  GetRunResponse,
+  ApiError,
+  ListEventsResponse,
+  CreateRunResponse,
+  CreateCommentResponse,
+  Organization,
+  AuthContext,
+} from '@agent-flight-recorder/contracts'
 
 describe('API response shapes', () => {
   it('ListRunsResponse has correct shape', () => {

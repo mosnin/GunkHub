@@ -1,11 +1,12 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Recorder, Events, buildEvent } from '@agent-flight-recorder/sdk'
-import type { Transport, TransportAuth } from '@agent-flight-recorder/sdk'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+
 import type {
   CreateRunRequest,
   CreateRunResponse,
   CreateEventRequest,
 } from '@agent-flight-recorder/contracts'
+import type { Transport, TransportAuth } from '@agent-flight-recorder/sdk'
 
 // ---------------------------------------------------------------------------
 // Mock transport factory

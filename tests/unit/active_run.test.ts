@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
 import { isTerminalStatus } from '@agent-flight-recorder/contracts'
+import { describe, it, expect } from 'vitest'
 
 // ---------------------------------------------------------------------------
 // Pure logic tests for the active run monitoring features introduced in

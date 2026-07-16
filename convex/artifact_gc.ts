@@ -10,11 +10,14 @@
 // Safety: the 24-hour age threshold ensures that artifacts created during an
 // in-progress run (blob uploaded, event not yet flushed) are never deleted.
 
-import { internalAction, internalMutation, internalQuery } from "./_generated/server.js";
 import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
-import type { Id } from "./_generated/dataModel.js";
+
+import { internalAction, internalMutation, internalQuery } from "./_generated/server.js";
 import { GC_CANDIDATE_PAGE_SIZE } from "./helpers/pagination.js";
+
+import type { Id } from "./_generated/dataModel.js";
+
 
 /** 24 hours in milliseconds. Artifacts younger than this are never considered orphans. */
 const ORPHAN_AGE_MS = 24 * 60 * 60 * 1000;

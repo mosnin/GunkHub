@@ -85,13 +85,42 @@ module.exports = {
       },
     },
     {
-      // Test files can use explicit any for mocking
-      files: ['**/*.test.ts', '**/*.spec.ts', '**/__tests__/**/*.ts'],
+      // Files not included in a tsconfig `project` (tests, config, examples,
+      // hand-authored generated files). Disable type-aware linting so ESLint does
+      // not error with "file not included in project", and relax rules that are
+      // idiomatic in these files. Syntactic lint (import/order, unused, etc.) stays.
+      files: [
+        '**/*.test.ts',
+        '**/*.spec.ts',
+        '**/__tests__/**/*.ts',
+        '**/*.config.{ts,js,mjs,cjs}',
+        '**/examples/**/*.ts',
+        'convex/_generated/**/*.ts',
+      ],
+      parserOptions: { project: null },
+      extends: ['plugin:@typescript-eslint/disable-type-checked'],
       rules: {
         '@typescript-eslint/no-explicit-any': 'off',
+        '@typescript-eslint/no-non-null-assertion': 'off',
+      },
+    },
+    {
+      // Convex backend source: ctx.db/ctx.runQuery returns are `any` at the type
+      // level (the generated api uses anyApi / string refs), so the unsafe-* rules
+      // fire pervasively without catching real bugs. Relax them for convex source
+      // only (NOT tests or generated, handled above).
+      files: ['convex/**/*.ts'],
+      excludedFiles: ['**/*.test.ts', 'convex/_generated/**/*.ts'],
+      rules: {
         '@typescript-eslint/no-unsafe-assignment': 'off',
-        '@typescript-eslint/no-unsafe-call': 'off',
         '@typescript-eslint/no-unsafe-member-access': 'off',
+        '@typescript-eslint/no-unsafe-call': 'off',
+        '@typescript-eslint/no-unsafe-return': 'off',
+        '@typescript-eslint/no-unsafe-argument': 'off',
+        // Idiomatic in Convex handlers: `args.agentId!` after an undefined guard,
+        // `conditions[0]!` on a proven-non-empty array. The null-checks are present;
+        // the assertions just narrow what the flow already guarantees.
+        '@typescript-eslint/no-non-null-assertion': 'off',
       },
     },
   ],

@@ -1,8 +1,7 @@
 // Convex scheduled jobs for Agent Flight Recorder.
 // All jobs run on the UTC timezone defined by hourUTC/minuteUTC.
 
-import { cronJobs } from "convex/server";
-import { makeFunctionReference } from "convex/server";
+import { cronJobs , makeFunctionReference } from "convex/server";
 
 const crons = cronJobs();
 

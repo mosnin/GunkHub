@@ -1,7 +1,7 @@
+import { HttpTransport } from '@agent-flight-recorder/sdk'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 
 import { sha256Hex, PAYLOAD_EXTERNALIZATION_THRESHOLD } from '../../apps/web/src/lib/storage/adapter.js'
-import { HttpTransport } from '@agent-flight-recorder/sdk'
 
 import type { CreateEventRequest } from '@agent-flight-recorder/contracts'
 
@@ -228,7 +228,7 @@ describe('artifact deduplication — boundary correctness', () => {
     const transport = new HttpTransport('http://test.local')
     let uploadCallCount = 0
 
-    global.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+    global.fetch = vi.fn(async (url: string, _init?: RequestInit) => {
       const urlStr = typeof url === 'string' ? url : String(url)
       if (urlStr.includes('/api/artifacts/upload')) {
         uploadCallCount++

@@ -310,7 +310,7 @@ describe('selection state transitions', () => {
   })
 
   it('clear resets selection to empty', () => {
-    const s = makeSelection(['r1', 'r2', 'r3'])
+    const _s = makeSelection(['r1', 'r2', 'r3'])
     const cleared = new Set<string>()
     expect(cleared.size).toBe(0)
   })

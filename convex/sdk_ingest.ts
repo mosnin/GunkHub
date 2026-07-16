@@ -2,10 +2,12 @@
 // Authentication here is via pre-hashed API key only. Do NOT call getAuthContext
 // or requireOrgMembership in this file — those require a Clerk JWT.
 
-import { mutation, query } from "./_generated/server.js";
-import type { MutationCtx, QueryCtx } from "./_generated/server.js";
 import { v } from "convex/values";
+
+import { mutation, query } from "./_generated/server.js";
+
 import type { Doc, Id } from "./_generated/dataModel.js";
+import type { MutationCtx, QueryCtx } from "./_generated/server.js";
 
 // Scope required to write to the ingest API (create runs/events/artifacts, update
 // status). A key with no `scopes` array has full access (back-compat).

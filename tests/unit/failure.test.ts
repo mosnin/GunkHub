@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+
 import { buildFailureSummary } from '../../apps/web/src/lib/replay/failure.js'
 import {
   successfulRun,
@@ -10,6 +11,7 @@ import {
   partialRun,
   partialRunEvents,
 } from '../fixtures/events.js'
+
 import type { Event, Run } from '@agent-flight-recorder/contracts'
 
 // ---------------------------------------------------------------------------

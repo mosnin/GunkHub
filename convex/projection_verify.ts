@@ -4,8 +4,11 @@
 // Does NOT call buildReplayProjection (not importable from Convex actions).
 // See ADR-0020 for scope and cadence.
 
-import { action, internalMutation, internalQuery, query } from "./_generated/server.js";
 import { makeFunctionReference } from "convex/server";
+import { v } from "convex/values";
+
+import { action, internalMutation, internalQuery, query } from "./_generated/server.js";
+import { requireOrgMembership } from "./auth.js";
 
 // Internal function references (typed by name, matches the stale_runs.ts pattern).
 const _getRecentTerminalRunsRef = makeFunctionReference<"query">("projection_verify:_getRecentTerminalRuns");
@@ -14,8 +17,7 @@ const _listEventsFullRef = makeFunctionReference<"query">("projection_verify:_li
 const _upsertVerificationResultRef = makeFunctionReference<"mutation">("projection_verify:_upsertVerificationResult");
 const _getRunForVerifyRef = makeFunctionReference<"query">("projection_verify:_getRunForVerify");
 const _requireMembershipForReverifyRef = makeFunctionReference<"query">("projection_verify:_requireMembershipForReverify");
-import { v } from "convex/values";
-import { requireOrgMembership } from "./auth.js";
+
 
 // ---------------------------------------------------------------------------
 // Pure sequence integrity check (inline — mirrors verify.ts logic)
@@ -218,8 +220,8 @@ export const verifyRecentRuns = action({
     const DERIVATION_MAX_EVENTS = 500;
     const now = Date.now();
 
-    const verifyUrl = process.env['INTERNAL_VERIFY_URL'] as string | undefined;
-    const verifySecret = process.env['INTERNAL_VERIFY_SECRET'] as string | undefined;
+    const verifyUrl = process.env['INTERNAL_VERIFY_URL'];
+    const verifySecret = process.env['INTERNAL_VERIFY_SECRET'];
     const canRunDerivation = !!(verifyUrl && verifySecret);
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -272,7 +274,7 @@ export const verifyRecentRuns = action({
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "x-internal-secret": verifySecret!,
+              "x-internal-secret": verifySecret,
             },
             body: JSON.stringify({ run, events: allEvents }),
           });
@@ -432,8 +434,8 @@ export const reverifyRun = action({
 
     const seqResult = checkSequenceIntegrity(seqNums);
 
-    const verifyUrl = process.env['INTERNAL_VERIFY_URL'] as string | undefined;
-    const verifySecret = process.env['INTERNAL_VERIFY_SECRET'] as string | undefined;
+    const verifyUrl = process.env['INTERNAL_VERIFY_URL'];
+    const verifySecret = process.env['INTERNAL_VERIFY_SECRET'];
     const canRunDerivation = !!(verifyUrl && verifySecret);
 
     // Attempt full derivation check via web route when configured and run is within size cap
@@ -454,7 +456,7 @@ export const reverifyRun = action({
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "x-internal-secret": verifySecret!,
+            "x-internal-secret": verifySecret,
           },
           body: JSON.stringify({ run, events: allEvents }),
         });

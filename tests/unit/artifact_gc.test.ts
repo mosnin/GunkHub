@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+
 import { GC_CANDIDATE_PAGE_SIZE, MAX_EVENTS_PER_REPLAY } from '../../convex/helpers/pagination.js'
 
 describe('Artifact GC configuration', () => {

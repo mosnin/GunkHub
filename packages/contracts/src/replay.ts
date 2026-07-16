@@ -1,5 +1,4 @@
-import type { Event } from "./entities.js";
-import type { Run } from "./entities.js";
+import type { Event , Run } from "./entities.js";
 
 // ---------------------------------------------------------------------------
 // Replay projection — derived read-only view over the event log.

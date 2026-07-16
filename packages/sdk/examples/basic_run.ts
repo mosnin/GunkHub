@@ -18,17 +18,16 @@
 import {
   Recorder,
   Events,
-  HttpTransport,
   FlightRecorder,
   type Transport,
   type TransportAuth,
-} from '@agent-flight-recorder/sdk'
+ type TransportResponse } from '@agent-flight-recorder/sdk'
+
 import type {
   CreateRunRequest,
   CreateRunResponse,
   CreateEventRequest,
 } from '@agent-flight-recorder/contracts'
-import type { TransportResponse } from '@agent-flight-recorder/sdk'
 
 // ---------------------------------------------------------------------------
 // MockTransport — logs to console instead of sending HTTP requests.
@@ -239,7 +238,7 @@ async function runFlightRecorder() {
 // Entry point — selects transport based on CLI flags
 // ---------------------------------------------------------------------------
 
-;(async () => {
+(async () => {
   const useLive = process.argv.includes('--live')
   const useFlightRecorder = process.argv.includes('--flight-recorder')
 

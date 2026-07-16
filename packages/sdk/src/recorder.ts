@@ -1,7 +1,8 @@
-import type { RunStatus, EventType, EventPayload } from '@agent-flight-recorder/contracts'
-import type { RecorderConfig, RunContext, RecordEventOptions, FlushResult } from './types.js'
-import { HttpTransport, type Transport } from './transport.js'
 import { Events, buildEvent } from './events.js'
+import { HttpTransport, type Transport } from './transport.js'
+
+import type { RecorderConfig, RunContext, RecordEventOptions, FlushResult } from './types.js'
+import type { RunStatus, EventType, EventPayload } from '@agent-flight-recorder/contracts'
 
 /** Minimal shape of the Node `process` global we depend on (avoids @types/node). */
 interface NodeProcessLike {
@@ -313,7 +314,7 @@ export class Recorder {
     // this, a caller who forgets endRun() hangs the process (and CI jobs) forever.
     // unref() is a no-op in environments where the timer lacks it (e.g. browsers).
     if (typeof this.flushTimer === 'object' && this.flushTimer !== null && 'unref' in this.flushTimer) {
-      ;(this.flushTimer as { unref: () => void }).unref()
+      (this.flushTimer as { unref: () => void }).unref()
     }
   }
 }

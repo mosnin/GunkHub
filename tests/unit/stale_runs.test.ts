@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+
 import { STALE_RUN_TIMEOUT_MS, STALE_RUN_BATCH_SIZE } from '../../convex/helpers/pagination.js'
 
 describe('Stale run timeout configuration', () => {

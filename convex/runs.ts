@@ -1,8 +1,9 @@
 // Status transitions: pending -> running -> completed|failed|cancelled|timed_out
 
-import { query, mutation } from "./_generated/server.js";
 import { v } from "convex/values";
-import { getAuthContext, requireOrgMembership } from "./auth.js";
+
+import { query, mutation } from "./_generated/server.js";
+import { requireOrgMembership } from "./auth.js";
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 /**

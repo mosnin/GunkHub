@@ -19,7 +19,8 @@
     "build": "tsup src/index.ts --format esm,cjs --dts --tsconfig tsconfig.build.json",
     "dev": "tsup src/index.ts --format esm,cjs --dts --watch --tsconfig tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --config ../../tests/vitest.config.ts"
+    "test": "vitest run --config ../../tests/vitest.config.ts",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
   },
   "dependencies": {
     "@agent-flight-recorder/contracts": "workspace:*"

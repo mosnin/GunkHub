@@ -1,7 +1,8 @@
 // Organization is created via Clerk webhook, not directly by users
 
-import { query, mutation } from "./_generated/server.js";
 import { v } from "convex/values";
+
+import { query, mutation } from "./_generated/server.js";
 
 /**
  * Shared-secret gate for webhook-only lifecycle mutations.

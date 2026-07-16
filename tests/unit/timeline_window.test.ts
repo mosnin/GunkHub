@@ -185,7 +185,7 @@ describe('Keyboard navigation window shift', () => {
   })
 
   it('ArrowUp at window edge shifts windowStart back: focusedIndex=100, windowStart=100, len=300', () => {
-    const len = 300
+    const _len = 300
     const focusedIndex = 100
     const windowStart = 100
 
@@ -200,7 +200,7 @@ describe('Keyboard navigation window shift', () => {
   })
 
   it('ArrowUp NOT at window edge does not shift windowStart: focusedIndex=101, windowStart=100, len=300', () => {
-    const len = 300
+    const _len = 300
     const focusedIndex = 101
     const windowStart = 100
 

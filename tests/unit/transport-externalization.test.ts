@@ -1,7 +1,7 @@
+import { HttpTransport } from '@agent-flight-recorder/sdk'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 import type { CreateEventRequest } from '@agent-flight-recorder/contracts'
-import { HttpTransport } from '@agent-flight-recorder/sdk'
 
 // ---------------------------------------------------------------------------
 // Fetch mock helpers (mirror pattern from flight-recorder.test.ts)

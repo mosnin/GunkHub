@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
 import { isTerminalStatus, RunStatusValues } from '@agent-flight-recorder/contracts'
+import { describe, it, expect } from 'vitest'
 
 describe('RunStatus', () => {
   it('includes all expected statuses', () => {

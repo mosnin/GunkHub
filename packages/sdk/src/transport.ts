@@ -1,7 +1,7 @@
 import { PAYLOAD_EXTERNALIZATION_THRESHOLD } from '@agent-flight-recorder/contracts'
 
-import type { CreateEventRequest, CreateRunRequest, CreateRunResponse, ExternalizedPayload } from '@agent-flight-recorder/contracts'
 import type { TransportResponse } from './types.js'
+import type { CreateEventRequest, CreateRunRequest, CreateRunResponse, ExternalizedPayload } from '@agent-flight-recorder/contracts'
 
 export interface Transport {
   createRun(req: CreateRunRequest, auth: TransportAuth): Promise<CreateRunResponse>
@@ -93,6 +93,7 @@ export class HttpTransport implements Transport {
         runId,
         name: `${eventType.replace('.', '-')}.payload.json`,
         mimeType: 'application/json',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- JSON.parse of our own serialized payload
         payload: JSON.parse(serializedPayload),
       }),
     })

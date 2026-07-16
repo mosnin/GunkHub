@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --config vitest.config.ts"
+    "test": "vitest run --config vitest.config.ts",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
   },
   "dependencies": {
     "convex": "^1.42.2"

@@ -1,8 +1,9 @@
 // API key management — Clerk-authenticated only.
 // Raw key material never enters Convex; callers hash with SHA-256 before calling.
 
-import { query, mutation } from "./_generated/server.js";
 import { v } from "convex/values";
+
+import { query, mutation } from "./_generated/server.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
 
 /**

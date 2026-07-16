@@ -14,7 +14,8 @@
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts --tsconfig tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "dev": "tsup src/index.ts --format esm,cjs --dts --watch --tsconfig tsconfig.build.json"
+    "dev": "tsup src/index.ts --format esm,cjs --dts --watch --tsconfig tsconfig.build.json",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
   },
   "devDependencies": {
     "tsup": "^8.0.0",

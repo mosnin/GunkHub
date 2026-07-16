@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+
 import { buildRunDiff, MAX_EVENTS_PER_DIFF } from '../../apps/web/src/lib/replay/diff.js'
 import {
   runARef,
@@ -6,6 +7,7 @@ import {
   runAEvents,
   runBEvents,
 } from '../fixtures/events.js'
+
 import type { Event, RunDiff } from '@agent-flight-recorder/contracts'
 
 // ---------------------------------------------------------------------------

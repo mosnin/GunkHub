@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from '../../convex/helpers/pagination.js'
 
 // These constants document the expected index names for each filter scenario.
