@@ -289,7 +289,10 @@ jobs:
           CONVEX_TEST_URL: ${{ secrets.CONVEX_TEST_URL }}
           TEST_API_KEY: ${{ secrets.TEST_API_KEY }}
           TEST_AGENT_ID: ${{ secrets.TEST_AGENT_ID }}
-        run: pnpm test --reporter=verbose tests/integration/api.test.ts
+        # Target the tests package directly and pass vitest flags after `--` so
+        # they reach vitest instead of being swallowed by turbo. The path is
+        # relative to the tests/ package (vitest root), so no `tests/` prefix.
+        run: pnpm --filter @agent-flight-recorder/tests test -- --reporter=verbose integration/api.test.ts
 
       - name: Verify integration tests were not silently skipped on main
         if: github.ref == 'refs/heads/main' && secrets.CONVEX_TEST_URL == ''

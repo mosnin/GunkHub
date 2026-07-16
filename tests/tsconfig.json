@@ -1,0 +1,23 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM"],
+    "types": ["node", "vitest/globals"],
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    // vitest executes via esbuild with bundler resolution; match that so
+    // import.meta and package-name imports resolve the same way they do at runtime.
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    // Relax two pedantic flags for test code only. Test files do a lot of
+    // positional array access (result[0]._id) and record indexing that these
+    // flags flag as noise. The valuable check — fixtures matching contracts types
+    // (exactOptionalPropertyTypes, strict) — is retained, so drift still fails CI.
+    "noUncheckedIndexedAccess": false,
+    "noPropertyAccessFromIndexSignature": false
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules"]
+}
