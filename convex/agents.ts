@@ -1,5 +1,6 @@
 import { query, mutation } from "./_generated/server.js";
 import { v } from "convex/values";
+import type { Id } from "./_generated/dataModel.js";
 import { requireOrgMembership } from "./auth.js";
 
 /**
@@ -33,11 +34,16 @@ export const listDistinctAgents = query({
 
     // Fetch the agent records for each distinct agentId.
     const agents = await Promise.all(
-      agentIds.map((id) => ctx.db.get(id as Parameters<typeof ctx.db.get>[0])),
+      agentIds.map((id) => ctx.db.get(id as Id<"agents">)),
     );
 
-    // Filter out any stale IDs where the agent record no longer exists.
-    return agents.filter(Boolean);
+    // TENANCY (Rule 3): re-verify each fetched agent belongs to this org. A run
+    // could carry a foreign agentId (see createRun/sdkCreateRun ownership checks);
+    // trusting the denormalized reference would leak another org's agent record.
+    // Filter out missing records AND any whose orgId does not match.
+    return agents.filter(
+      (a): a is NonNullable<typeof a> => a !== null && a.orgId === args.orgId,
+    );
   },
 });
 

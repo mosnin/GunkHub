@@ -213,9 +213,32 @@ export class Recorder {
       clearTimeout(this.flushTimer)
       this.flushTimer = null
     }
-    const result = await this.flush()
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-    await this.transport.updateRunStatus(this.runContext!.runId, status, Date.now(), { apiKey: this.config.apiKey })
+    const runId = this.runContext!.runId
+
+    // Drain the buffer with bounded retries. The terminal (run.completed/failed)
+    // event is in this buffer; if the final flush fails we must NOT silently give
+    // up — that strands the terminal event. Retry a few times, then, if still
+    // failing, re-arm the background flush timer and keep the run active so later
+    // flushes continue retrying instead of losing the telemetry.
+    const maxFinalizeAttempts = 3
+    let result: FlushResult = { success: true, eventsSubmitted: 0, errors: [] }
+    for (let attempt = 0; attempt < maxFinalizeAttempts; attempt++) {
+      result = await this.flush()
+      if (result.success || this.eventBuffer.length === 0) break
+    }
+
+    // Transition the run status regardless (the run IS logically finished); status
+    // and event delivery are independent concerns.
+    await this.transport.updateRunStatus(runId, status, Date.now(), { apiKey: this.config.apiKey })
+
+    if (this.eventBuffer.length > 0) {
+      // Terminal events could not be delivered yet. Keep retrying in the
+      // background rather than dropping them; the caller sees success:false.
+      this.scheduleFlush()
+      return result
+    }
+
     this.runContext = null
     return result
   }

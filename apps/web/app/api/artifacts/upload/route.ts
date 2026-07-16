@@ -90,6 +90,22 @@ export async function POST(req: NextRequest) {
   const client = getPublicClient()
   const adapter = getStorageAdapter()
 
+  // AUTHENTICATE BEFORE touching blob storage. Previously the payload was written
+  // to blob storage first and the key validated only afterward (by sdkCreateArtifact),
+  // so any caller sending a bogus x-api-key could write arbitrary blobs. This
+  // read-only check verifies the key (existence/revocation/expiration/scope) and
+  // that it owns the run, throwing before a single byte is uploaded.
+  try {
+    await client.query(convex.sdk_ingest.checkIngestAuth, { apiKeyHash, runId })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unauthorized'
+    const status = message.includes('Run not found') ? 404 : 401
+    return NextResponse.json<ApiError>(
+      { code: status === 404 ? 'NOT_FOUND' : 'UNAUTHORIZED', message },
+      { status },
+    )
+  }
+
   const checksum = await sha256Hex(serialized)
   // Key format: <apiKeyPrefix>/<runId>/<checksumPrefix>-<name>
   const storageKey = `${apiKeyHash.slice(0, 8)}/${runId}/${checksum.slice(0, 16)}-${name}`

@@ -106,7 +106,14 @@ export class FlightRecorder {
     }
 
     const data = (await response.json()) as { run: { id: string } }
-    return new RunRecorder(data.run.id, this)
+    const recorder = new RunRecorder(data.run.id, this)
+    // Event Log Rule 5: RUN_STARTED must be the first event. Emit it so a run
+    // created through this high-level path has a lifecycle log like the low-level
+    // Recorder path. Best-effort: a failed lifecycle event must not fail startRun.
+    await recorder.recordLifecycle('run.started', {
+      ...(params?.metadata !== undefined && { input: params.metadata }),
+    })
+    return recorder
   }
 }
 
@@ -202,8 +209,24 @@ export class RunRecorder {
    * @param _metadata - Reserved for future use; currently ignored.
    * @throws Error if the status update request fails.
    */
-  async complete(_metadata?: Record<string, unknown>): Promise<void> {
+  async complete(metadata?: Record<string, unknown>): Promise<void> {
+    // Event Log Rule 5: record the terminal event before transitioning status.
+    await this.recordLifecycle('run.completed', { ...(metadata !== undefined && { output: metadata }) })
     await this._updateStatus('completed')
+  }
+
+  /**
+   * Record a lifecycle event (run.started / run.completed / run.failed) on a
+   * best-effort basis. Failures are swallowed: on this un-buffered fetch path a
+   * dropped lifecycle event must never break run creation or termination. Use the
+   * buffered Recorder if you need at-least-once delivery of lifecycle events.
+   */
+  async recordLifecycle(type: 'run.started' | 'run.completed' | 'run.failed', payload: unknown): Promise<void> {
+    try {
+      await this.recordEvent(type, payload)
+    } catch {
+      // best-effort
+    }
   }
 
   /**
@@ -219,6 +242,9 @@ export class RunRecorder {
    * @throws Always re-throws `error` after attempting the status update.
    */
   async fail(error: Error | string): Promise<void> {
+    const message = error instanceof Error ? error.message : error
+    // Event Log Rule 5: record the terminal run.failed event before status.
+    await this.recordLifecycle('run.failed', { error: { message } })
     try {
       await this._updateStatus('failed')
     } catch {

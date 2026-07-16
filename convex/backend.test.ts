@@ -26,12 +26,16 @@ async function seed(t: ReturnType<typeof convexTest>) {
       orgId: orgA, keyHash: 'hash_a', name: 'A key', createdBy: 'user_a', createdAt: now,
       lastUsedAt: undefined, revokedAt: undefined,
     })
+    const keyB = await ctx.db.insert('api_keys', {
+      orgId: orgB, keyHash: 'hash_b', name: 'B key', createdBy: 'user_b', createdAt: now,
+      lastUsedAt: undefined, revokedAt: undefined,
+    })
     const projectA = await ctx.db.insert('projects', { orgId: orgA, name: 'P', slug: 'p', createdAt: now, updatedAt: now })
     const agentA = await ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'A', slug: 'a', createdAt: now, updatedAt: now })
     const runA = await ctx.db.insert('runs', {
       orgId: orgA, projectId: projectA, agentId: agentA, status: 'running', startedAt: now, metadata: {}, tags: [],
     })
-    return { orgA, orgB, keyA, runA, agentA }
+    return { orgA, orgB, keyA, keyB, runA, agentA }
   })
 }
 
@@ -71,16 +75,51 @@ describe('Tenancy isolation (CLAUDE.md Tenancy Rules)', () => {
     await expect(asB.query(api.events.listEvents, { runId: runA })).rejects.toThrow(/Unauthorized|not a member/)
   })
 
-  it("an org-A API key cannot write events into org A's run from org B's key", async () => {
-    // Cross-org ingest: org B has no key here; forge with a nonexistent hash.
+  it("org B's VALID key cannot write events into org A's run (cross-org branch)", async () => {
+    // This exercises the real tenancy branch (run.orgId !== apiKey.orgId), not the
+    // unknown-key guard: hash_b is a legitimate, non-revoked key belonging to org B.
     const t = convexTest(schema, modules)
     const { runA } = await seed(t)
     await expect(
       t.mutation(api.sdk_ingest.sdkCreateEvents, {
-        apiKeyHash: 'hash_does_not_exist',
+        apiKeyHash: 'hash_b',
         events: [{ runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} }],
       }),
     ).rejects.toThrow(/Unauthorized/)
+    // ...and org A's own key CAN, proving the rejection is org-scoped, not blanket.
+    const ok = await t.mutation(api.sdk_ingest.sdkCreateEvents, {
+      apiKeyHash: 'hash_a',
+      events: [{ runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} }],
+    })
+    expect(ok.eventIds.length).toBe(1)
+  })
+
+  it("org B's valid key also cannot create a run against org A's agent", async () => {
+    const t = convexTest(schema, modules)
+    const { agentA } = await seed(t)
+    await expect(
+      t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'hash_b', agentId: agentA }),
+    ).rejects.toThrow(/Unauthorized/)
+  })
+
+  it('createRun rejects a project/agent from another org (cross-org reference)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seed(t)
+    // Create a project + agent that belong to org B.
+    const { projectB, agentB } = await t.run(async (ctx) => {
+      const now = Date.now()
+      const orgB = await ctx.db
+        .query('organizations')
+        .withIndex('by_clerk_org_id', (q) => q.eq('clerkOrgId', 'clerk_org_b'))
+        .unique()
+      const projectB = await ctx.db.insert('projects', { orgId: orgB!._id, name: 'PB', slug: 'pb', createdAt: now, updatedAt: now })
+      const agentB = await ctx.db.insert('agents', { orgId: orgB!._id, projectId: projectB, name: 'AB', slug: 'ab', createdAt: now, updatedAt: now })
+      return { projectB, agentB }
+    })
+    const asA = t.withIdentity({ subject: 'user_a', org_id: 'clerk_org_a' })
+    await expect(
+      asA.mutation(api.runs.createRun, { orgId: orgA, projectId: projectB, agentId: agentB }),
+    ).rejects.toThrow(/not found in this organization/i)
   })
 
   it('getOrganization rejects resolving another org (enumeration guard)', async () => {
@@ -181,6 +220,30 @@ describe('Event log invariants (Rule 4/5)', () => {
         events: [{ runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: huge }],
       }),
     ).rejects.toThrow(/10|externaliz/i)
+  })
+
+  it('rejects an oversized payload even when it SPOOFS type "_externalized"', async () => {
+    // The size guard must not be bypassable by claiming the payload is a pointer.
+    const t = convexTest(schema, modules)
+    const { runA } = await seed(t)
+    const spoof = { type: '_externalized', blob: 'x'.repeat(11 * 1024) }
+    await expect(
+      t.mutation(api.sdk_ingest.sdkCreateEvents, {
+        apiKeyHash: 'hash_a',
+        events: [{ runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: spoof }],
+      }),
+    ).rejects.toThrow(/10|externaliz/i)
+  })
+
+  it('rejects a first event that is not run.started (Rule 5)', async () => {
+    const t = convexTest(schema, modules)
+    const { runA } = await seed(t)
+    await expect(
+      t.mutation(api.sdk_ingest.sdkCreateEvents, {
+        apiKeyHash: 'hash_a',
+        events: [{ runId: runA, type: 'tool.call', sequenceNumber: 1, timestamp: Date.now(), payload: {} }],
+      }),
+    ).rejects.toThrow(/first event.*run\.started/i)
   })
 })
 

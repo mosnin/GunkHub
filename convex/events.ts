@@ -12,16 +12,10 @@ const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
 // storage. Enforced server-side so a direct Convex call cannot bloat the store.
 const MAX_INLINE_PAYLOAD_BYTES = 10 * 1024;
 
-function isExternalizedPayload(payload: unknown): boolean {
-  return (
-    typeof payload === "object" &&
-    payload !== null &&
-    (payload as { type?: unknown }).type === "_externalized"
-  );
-}
-
+// Applied to EVERY payload with no type-based exemption: a genuine externalized
+// pointer is tiny and passes, while a client-spoofed `type: "_externalized"` field
+// must not be a way to smuggle a large payload past the guard.
 function assertPayloadWithinInlineLimit(payload: unknown): void {
-  if (isExternalizedPayload(payload)) return;
   const bytes = new TextEncoder().encode(JSON.stringify(payload ?? null)).length;
   if (bytes > MAX_INLINE_PAYLOAD_BYTES) {
     throw new Error(
@@ -168,6 +162,13 @@ export const createEvent = mutation({
     if (args.sequenceNumber !== expected) {
       throw new Error(
         `Non-contiguous sequenceNumber: expected ${expected}, got ${args.sequenceNumber}`,
+      );
+    }
+
+    // Event Log Rule 5: RUN_STARTED must be the first event of a run.
+    if (!latest && args.type !== "run.started") {
+      throw new Error(
+        `First event of a run must be "run.started", got "${args.type}"`,
       );
     }
 

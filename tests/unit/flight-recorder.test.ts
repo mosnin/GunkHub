@@ -203,14 +203,14 @@ describe('FlightRecorder', () => {
     vi.stubGlobal('fetch', mockFetch)
 
     const fr = new FlightRecorder({ apiKey: 'k', baseUrl: 'http://localhost:3000', agentId: 'a' })
-    const runA = await fr.startRun()
-    await runA.recordEvent('custom', {})
-    await runA.recordEvent('custom', {})
-    const runB = await fr.startRun()
-    await runB.recordEvent('custom', {})
+    const runA = await fr.startRun() // emits run.started (seq 1)
+    await runA.recordEvent('custom', {}) // seq 2
+    await runA.recordEvent('custom', {}) // seq 3
+    const runB = await fr.startRun() // emits run.started (seq 1 again — per-run counter)
+    await runB.recordEvent('custom', {}) // seq 2
 
-    // Run A: 1, 2 ; Run B restarts at 1 (not 3).
-    expect(seqs).toEqual([1, 2, 1])
+    // Run A: run.started(1), custom(2), custom(3) ; Run B restarts at 1, not 4.
+    expect(seqs).toEqual([1, 2, 3, 1, 2])
     vi.unstubAllGlobals()
   })
 })
@@ -264,10 +264,13 @@ describe('RunRecorder', () => {
     const run = await fr.startRun()
     await run.recordEvent('custom', { x: 1 })
 
-    const evtCall = mockFetch.mock.calls.find(
+    const eventCalls = mockFetch.mock.calls.filter(
       ([url, init]: [string, RequestInit]) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
-    )!
+    )
+    // The last /api/events POST is the user's recordEvent; the first is the
+    // run.started lifecycle event now emitted automatically by startRun().
+    const evtCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
     const body = JSON.parse((evtCall[1] as RequestInit).body as string) as Record<string, unknown>
     expect(body['runId']).toBe('run_rr_001')
   })
@@ -276,10 +279,13 @@ describe('RunRecorder', () => {
     const run = await fr.startRun()
     await run.recordEvent('LLM_REQUEST', { model: 'gpt-4o' })
 
-    const evtCall = mockFetch.mock.calls.find(
+    const eventCalls = mockFetch.mock.calls.filter(
       ([url, init]: [string, RequestInit]) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
-    )!
+    )
+    // The last /api/events POST is the user's recordEvent; the first is the
+    // run.started lifecycle event now emitted automatically by startRun().
+    const evtCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
     const body = JSON.parse((evtCall[1] as RequestInit).body as string) as Record<string, unknown>
     expect(body['type']).toBe('LLM_REQUEST')
   })
@@ -288,10 +294,13 @@ describe('RunRecorder', () => {
     const run = await fr.startRun()
     await run.recordEvent('custom', { key: 'value', count: 42 })
 
-    const evtCall = mockFetch.mock.calls.find(
+    const eventCalls = mockFetch.mock.calls.filter(
       ([url, init]: [string, RequestInit]) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
-    )!
+    )
+    // The last /api/events POST is the user's recordEvent; the first is the
+    // run.started lifecycle event now emitted automatically by startRun().
+    const evtCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
     const body = JSON.parse((evtCall[1] as RequestInit).body as string) as Record<string, unknown>
     expect(body['payload']).toEqual({ key: 'value', count: 42 })
   })
@@ -300,10 +309,13 @@ describe('RunRecorder', () => {
     const run = await fr.startRun()
     await run.recordEvent('custom', {})
 
-    const evtCall = mockFetch.mock.calls.find(
+    const eventCalls = mockFetch.mock.calls.filter(
       ([url, init]: [string, RequestInit]) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
-    )!
+    )
+    // The last /api/events POST is the user's recordEvent; the first is the
+    // run.started lifecycle event now emitted automatically by startRun().
+    const evtCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
     const headers = (evtCall[1] as RequestInit).headers as Record<string, string>
     expect(headers['x-api-key']).toBe('test-key')
   })
@@ -318,10 +330,13 @@ describe('RunRecorder', () => {
     const run = await fr.startRun()
     await run.recordEvent('tool.result', { output: 'ok' }, 'evt_parent_123')
 
-    const evtCall = mockFetch.mock.calls.find(
+    const eventCalls = mockFetch.mock.calls.filter(
       ([url, init]: [string, RequestInit]) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
-    )!
+    )
+    // The last /api/events POST is the user's recordEvent; the first is the
+    // run.started lifecycle event now emitted automatically by startRun().
+    const evtCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
     const body = JSON.parse((evtCall[1] as RequestInit).body as string) as Record<string, unknown>
     expect(body['parentEventId']).toBe('evt_parent_123')
   })
@@ -330,10 +345,13 @@ describe('RunRecorder', () => {
     const run = await fr.startRun()
     await run.recordEvent('custom', {})
 
-    const evtCall = mockFetch.mock.calls.find(
+    const eventCalls = mockFetch.mock.calls.filter(
       ([url, init]: [string, RequestInit]) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
-    )!
+    )
+    // The last /api/events POST is the user's recordEvent; the first is the
+    // run.started lifecycle event now emitted automatically by startRun().
+    const evtCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
     const body = JSON.parse((evtCall[1] as RequestInit).body as string) as Record<string, unknown>
     expect(body['parentEventId']).toBeUndefined()
   })
@@ -360,8 +378,9 @@ describe('RunRecorder', () => {
 
   it('recordEvent throws on non-2xx response with API error message', async () => {
     vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce(jsonResponse({ run: { id: 'run_err' } })) // startRun
-      .mockResolvedValueOnce(errorResponse(400, 'Invalid event type')) // recordEvent
+      .mockResolvedValueOnce(jsonResponse({ run: { id: 'run_err' } })) // startRun POST /api/runs
+      .mockResolvedValueOnce(jsonResponse({ eventId: 'e' }))           // auto run.started event
+      .mockResolvedValueOnce(errorResponse(400, 'Invalid event type')) // user recordEvent
     )
     const run = await fr.startRun()
     await expect(run.recordEvent('bad-type', {})).rejects.toThrow('Invalid event type')
@@ -370,6 +389,7 @@ describe('RunRecorder', () => {
   it('recordEvent throws on 500 response', async () => {
     vi.stubGlobal('fetch', vi.fn()
       .mockResolvedValueOnce(jsonResponse({ run: { id: 'run_500' } }))
+      .mockResolvedValueOnce(jsonResponse({ eventId: 'e' })) // auto run.started event
       .mockResolvedValueOnce(errorResponse(500, 'Server error'))
     )
     const run = await fr.startRun()
@@ -429,20 +449,24 @@ describe('RunRecorder', () => {
   })
 
   it('fail swallows status-update failure and still re-throws original error', async () => {
-    vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce(jsonResponse({ run: { id: 'run_sw' } })) // startRun
-      .mockResolvedValueOnce(errorResponse(503, 'Service Unavailable')) // PATCH status
-    )
+    // Route by URL so auto-emitted lifecycle events (run.started/run.failed) don't
+    // shift a positional mock chain: runs+events succeed, the PATCH status fails.
+    vi.stubGlobal('fetch', makeMockFetch(async (url: string, init?: RequestInit) => {
+      if (url.includes('/status') && init?.method === 'PATCH') return errorResponse(503, 'Service Unavailable')
+      if (url.endsWith('/api/runs')) return jsonResponse({ run: { id: 'run_sw' } })
+      return jsonResponse({ eventId: 'e' })
+    }))
     const run = await fr.startRun()
     // Should throw the original error, not a status-update error
     await expect(run.fail(new Error('agent failure'))).rejects.toThrow('agent failure')
   })
 
   it('complete throws when status update returns non-2xx', async () => {
-    vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce(jsonResponse({ run: { id: 'run_ct' } }))
-      .mockResolvedValueOnce(errorResponse(503, 'Service Unavailable'))
-    )
+    vi.stubGlobal('fetch', makeMockFetch(async (url: string, init?: RequestInit) => {
+      if (url.includes('/status') && init?.method === 'PATCH') return errorResponse(503, 'Service Unavailable')
+      if (url.endsWith('/api/runs')) return jsonResponse({ run: { id: 'run_ct' } })
+      return jsonResponse({ eventId: 'e' })
+    }))
     const run = await fr.startRun()
     await expect(run.complete()).rejects.toThrow('Service Unavailable')
   })

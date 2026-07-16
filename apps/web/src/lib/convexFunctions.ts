@@ -58,6 +58,7 @@ export const convex = {
     resolveComment: makeFunctionReference<M>('comments:resolveComment'),
   },
   sdk_ingest: {
+    checkIngestAuth: makeFunctionReference<Q>('sdk_ingest:checkIngestAuth'),
     sdkCreateRun: makeFunctionReference<M>('sdk_ingest:sdkCreateRun'),
     sdkCreateEvents: makeFunctionReference<M>('sdk_ingest:sdkCreateEvents'),
     sdkUpdateRunStatus: makeFunctionReference<M>('sdk_ingest:sdkUpdateRunStatus'),

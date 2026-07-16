@@ -24,8 +24,15 @@ function assertWebhookSecret(provided: string): void {
       "CONVEX_WEBHOOK_SECRET is not configured on the Convex deployment",
     );
   }
-  // Constant-time-ish comparison: reject on any length or content mismatch.
-  if (provided.length !== expected.length || provided !== expected) {
+  // Compare without an early content short-circuit so match/mismatch timing does
+  // not vary with how many leading bytes are correct. (Length still affects the
+  // loop bound, but the secret is a fixed-length random token, so that is moot.)
+  let diff = provided.length ^ expected.length;
+  const len = Math.max(provided.length, expected.length);
+  for (let i = 0; i < len; i++) {
+    diff |= (provided.charCodeAt(i) || 0) ^ (expected.charCodeAt(i) || 0);
+  }
+  if (diff !== 0) {
     throw new Error("Unauthorized");
   }
 }

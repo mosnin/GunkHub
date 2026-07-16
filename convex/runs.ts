@@ -126,6 +126,27 @@ export const createRun = mutation({
   handler: async (ctx, args) => {
     await requireOrgMembership(ctx, args.orgId, { minimumRole: "member" });
 
+    // TENANCY: the run's foreign references must belong to the caller's org.
+    // Without this, a member of org A could stamp a run with org B's
+    // project/agent id (a cross-org reference that later leaks via agent listings).
+    const project = await ctx.db.get(args.projectId);
+    if (!project || project.orgId !== args.orgId) {
+      throw new Error("Project not found in this organization");
+    }
+    const agent = await ctx.db.get(args.agentId);
+    if (!agent || agent.orgId !== args.orgId) {
+      throw new Error("Agent not found in this organization");
+    }
+    if (agent.projectId !== args.projectId) {
+      throw new Error("Agent does not belong to the given project");
+    }
+    if (args.agentVersionId !== undefined) {
+      const version = await ctx.db.get(args.agentVersionId);
+      if (!version || version.orgId !== args.orgId || version.agentId !== args.agentId) {
+        throw new Error("Agent version not found for this agent/organization");
+      }
+    }
+
     const now = Date.now();
     const runId = await ctx.db.insert("runs", {
       orgId: args.orgId,

@@ -2,8 +2,8 @@
 // Authentication here is via pre-hashed API key only. Do NOT call getAuthContext
 // or requireOrgMembership in this file — those require a Clerk JWT.
 
-import { mutation } from "./_generated/server.js";
-import type { MutationCtx } from "./_generated/server.js";
+import { mutation, query } from "./_generated/server.js";
+import type { MutationCtx, QueryCtx } from "./_generated/server.js";
 import { v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel.js";
 
@@ -56,23 +56,22 @@ const TERMINAL_STATUSES = new Set([
 // run. Once one is stored, no further events may be appended.
 const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
 
+// Event Log Rule 5: the first event of every run must be RUN_STARTED.
+const RUN_STARTED_TYPE = "run.started";
+
 // CLAUDE.md Event Log Rule 3: payloads over 10 KB must be externalized to blob
 // storage; the event stores only a pointer. Enforced server-side (defense in
 // depth) so a direct Convex call or an SDK bug cannot bloat the document store.
 const MAX_INLINE_PAYLOAD_BYTES = 10 * 1024;
 
-/** True if the payload is an externalized pointer (holds a blob ref, not the data). */
-function isExternalizedPayload(payload: unknown): boolean {
-  return (
-    typeof payload === "object" &&
-    payload !== null &&
-    (payload as { type?: unknown }).type === "_externalized"
-  );
-}
-
-/** Throws if a non-externalized payload exceeds the 10 KB inline limit (UTF-8 bytes). */
+/**
+ * Throws if a payload exceeds the 10 KB inline limit (UTF-8 bytes). Applied to
+ * EVERY payload with no type-based exemption: a genuine externalized pointer is a
+ * few hundred bytes and passes naturally, while exempting by a client-supplied
+ * `type: "_externalized"` field would let an attacker spoof the type to smuggle a
+ * multi-MB payload past the guard.
+ */
 function assertPayloadWithinInlineLimit(payload: unknown): void {
-  if (isExternalizedPayload(payload)) return;
   const bytes = new TextEncoder().encode(JSON.stringify(payload ?? null)).length;
   if (bytes > MAX_INLINE_PAYLOAD_BYTES) {
     throw new Error(
@@ -81,6 +80,44 @@ function assertPayloadWithinInlineLimit(payload: unknown): void {
     );
   }
 }
+
+/**
+ * Read-only ingest authorization check. Verifies the API key (existence,
+ * revocation, expiration, ingest:write scope) AND that it owns the given run,
+ * WITHOUT mutating anything. The artifact-upload route calls this BEFORE writing
+ * the caller's payload to blob storage, so an unauthenticated/cross-org caller
+ * cannot write arbitrary blobs. Throws Unauthorized/Forbidden on any failure.
+ */
+export const checkIngestAuth = query({
+  args: { apiKeyHash: v.string(), runId: v.string() },
+  handler: async (ctx: QueryCtx, args) => {
+    const apiKey = await ctx.db
+      .query("api_keys")
+      .withIndex("by_key_hash", (q) => q.eq("keyHash", args.apiKeyHash))
+      .unique();
+    if (!apiKey || apiKey.revokedAt !== undefined) {
+      throw new Error("Unauthorized");
+    }
+    if (apiKey.expiresAt !== undefined && apiKey.expiresAt <= Date.now()) {
+      throw new Error("Unauthorized: API key has expired");
+    }
+    if (
+      apiKey.scopes !== undefined &&
+      apiKey.scopes.length > 0 &&
+      !apiKey.scopes.includes(INGEST_WRITE)
+    ) {
+      throw new Error(`Forbidden: API key lacks required scope "${INGEST_WRITE}"`);
+    }
+    const run = await ctx.db.get(args.runId as Id<"runs">);
+    if (!run) {
+      throw new Error("Run not found");
+    }
+    if (run.orgId !== apiKey.orgId) {
+      throw new Error("Unauthorized");
+    }
+    return { ok: true as const };
+  },
+});
 
 /**
  * Create a new run from an SDK call.  Authenticates via API key hash.
@@ -114,6 +151,15 @@ export const sdkCreateRun = mutation({
     const agentVersionId = args.agentVersionId
       ? (args.agentVersionId as Id<"agent_versions">)
       : undefined;
+
+    // Cross-org protection: a supplied agent version must belong to the same org
+    // and agent, so a valid key cannot stamp a run with a foreign version id.
+    if (agentVersionId !== undefined) {
+      const version = await ctx.db.get(agentVersionId);
+      if (!version || version.orgId !== apiKey.orgId || version.agentId !== agent._id) {
+        throw new Error("Agent version not found for this agent");
+      }
+    }
 
     const now = Date.now();
     const runId = await ctx.db.insert("runs", {
@@ -264,6 +310,13 @@ export const sdkCreateEvents = mutation({
       if (evt.sequenceNumber !== expected) {
         throw new Error(
           `Non-contiguous sequenceNumber for run ${evt.runId}: expected ${expected}, got ${evt.sequenceNumber}`,
+        );
+      }
+
+      // --- Event Log Rule 5: RUN_STARTED must be the FIRST event ---
+      if (state.maxSeq === 0 && evt.type !== RUN_STARTED_TYPE) {
+        throw new Error(
+          `First event of a run must be "${RUN_STARTED_TYPE}", got "${evt.type}"`,
         );
       }
 
