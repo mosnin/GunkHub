@@ -4,6 +4,33 @@ import { query, mutation } from "convex/server";
 import { v } from "convex/values";
 
 /**
+ * Shared-secret gate for webhook-only lifecycle mutations.
+ *
+ * upsertOrganization / createOrganization / upsertMembership are reachable on
+ * the public Convex function surface, so possession of the deployment URL is not
+ * a sufficient authorization signal. The Clerk webhook route (which has already
+ * verified the Svix signature) proves it is the trusted caller by presenting the
+ * shared secret configured in CONVEX_WEBHOOK_SECRET. Without this gate any client
+ * could forge an org record or an admin membership row and defeat tenancy.
+ *
+ * NOTE: The long-term fix (tracked in ADR-0023) is to convert these to
+ * internalMutation invoked from a Convex httpAction that performs Svix
+ * verification in-backend. The shared secret closes the hole until that lands.
+ */
+function assertWebhookSecret(provided: string): void {
+  const expected = process.env.CONVEX_WEBHOOK_SECRET;
+  if (!expected) {
+    throw new Error(
+      "CONVEX_WEBHOOK_SECRET is not configured on the Convex deployment",
+    );
+  }
+  // Constant-time-ish comparison: reject on any length or content mismatch.
+  if (provided.length !== expected.length || provided !== expected) {
+    throw new Error("Unauthorized");
+  }
+}
+
+/**
  * Look up an organization by its Clerk org ID.
  * Called during auth resolution and webhook handlers.
  */
@@ -30,11 +57,13 @@ export const getOrganization = query({
  */
 export const upsertOrganization = mutation({
   args: {
+    webhookSecret: v.string(),
     clerkOrgId: v.string(),
     name: v.string(),
     slug: v.string(),
   },
   handler: async (ctx, args) => {
+    assertWebhookSecret(args.webhookSecret);
     const now = Date.now();
 
     const existing = await ctx.db
@@ -76,6 +105,7 @@ export const upsertOrganization = mutation({
  */
 export const createOrganization = mutation({
   args: {
+    webhookSecret: v.string(),
     clerkOrgId: v.string(),
     name: v.string(),
     slug: v.string(),
@@ -88,6 +118,7 @@ export const createOrganization = mutation({
     ),
   },
   handler: async (ctx, args) => {
+    assertWebhookSecret(args.webhookSecret);
     // Idempotency guard: if the org already exists return it as-is
     const existing = await ctx.db
       .query("organizations")
@@ -129,6 +160,7 @@ export const createOrganization = mutation({
  */
 export const upsertMembership = mutation({
   args: {
+    webhookSecret: v.string(),
     clerkUserId: v.string(),
     clerkOrgId: v.string(),
     role: v.union(
@@ -138,6 +170,7 @@ export const upsertMembership = mutation({
     ),
   },
   handler: async (ctx, args) => {
+    assertWebhookSecret(args.webhookSecret);
     // Resolve the org record
     const org = await ctx.db
       .query("organizations")

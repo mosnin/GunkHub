@@ -137,6 +137,7 @@ export async function POST(req: Request) {
 async function handleOrganizationUpsert(data: ClerkOrganizationData) {
   const client = getPublicClient()
   await client.mutation(convex.organizations.upsertOrganization, {
+    webhookSecret: env.CONVEX_WEBHOOK_SECRET,
     clerkOrgId: data.id,
     name: data.name,
     slug: data.slug,
@@ -153,6 +154,7 @@ async function handleOrganizationMembershipCreated(
   // In normal Clerk flow, organization.created fires first, but we handle
   // reordered delivery defensively.
   await client.mutation(convex.organizations.upsertOrganization, {
+    webhookSecret: env.CONVEX_WEBHOOK_SECRET,
     clerkOrgId: org.id,
     name: org.name,
     slug: org.slug,
@@ -161,6 +163,7 @@ async function handleOrganizationMembershipCreated(
   // Create or update the user membership record in Convex.
   // Without this row, requireOrgMembership rejects the user on every query/mutation.
   await client.mutation(convex.organizations.upsertMembership, {
+    webhookSecret: env.CONVEX_WEBHOOK_SECRET,
     clerkUserId: data.public_user_data.user_id,
     clerkOrgId: org.id,
     role: clerkRoleToInternal(data.role),

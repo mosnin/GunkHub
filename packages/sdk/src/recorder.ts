@@ -133,6 +133,13 @@ export class Recorder {
       return { success: true, eventsSubmitted: batch.length, errors: [] }
     }
 
+    // DURABILITY: the send failed, so the batch is NOT persisted. Return it to the
+    // FRONT of the buffer (ahead of any events appended during the await) so a
+    // later flush — or finalizeRun's flush — retries it instead of dropping it.
+    // Losing terminal (run.completed/run.failed) events is the worst failure mode
+    // for a flight recorder; never discard on failure.
+    this.eventBuffer.unshift(...batch)
+
     return {
       success: false,
       eventsSubmitted: 0,
@@ -162,5 +169,11 @@ export class Recorder {
       void this.flush()
       this.scheduleFlush()
     }, interval)
+    // Do not keep the Node event loop alive on the recurring flush timer. Without
+    // this, a caller who forgets endRun() hangs the process (and CI jobs) forever.
+    // unref() is a no-op in environments where the timer lacks it (e.g. browsers).
+    if (typeof this.flushTimer === 'object' && this.flushTimer !== null && 'unref' in this.flushTimer) {
+      ;(this.flushTimer as { unref: () => void }).unref()
+    }
   }
 }

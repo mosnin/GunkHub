@@ -76,7 +76,10 @@ export default defineSchema({
     .index("by_agent_started", ["agentId", "startedAt"])
     .index("by_project_started", ["projectId", "startedAt"])
     .index("by_org_started", ["orgId", "startedAt"])
-    .index("by_org_status_started", ["orgId", "status", "startedAt"]),
+    .index("by_org_status_started", ["orgId", "status", "startedAt"])
+    // Cross-org index for the stale-run sweep: find "running" runs older than a
+    // cutoff without scanning the whole (unbounded) runs table.
+    .index("by_status_started", ["status", "startedAt"]),
 
   // IMMUTABILITY: Events must never be updated or deleted. This table is append-only.
   events: defineTable({

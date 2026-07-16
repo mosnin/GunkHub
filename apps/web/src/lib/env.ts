@@ -5,6 +5,11 @@ export const env = {
   // Server-only — never sent to the browser
   CLERK_SECRET_KEY: process.env.CLERK_SECRET_KEY ?? '',
   CLERK_WEBHOOK_SECRET: process.env.CLERK_WEBHOOK_SECRET ?? '',
+  // Shared secret presented to the webhook-only Convex lifecycle mutations
+  // (upsertOrganization / createOrganization / upsertMembership). Must match
+  // CONVEX_WEBHOOK_SECRET configured on the Convex deployment. Without it, those
+  // mutations reject the webhook route's calls. See ADR-0023.
+  CONVEX_WEBHOOK_SECRET: process.env.CONVEX_WEBHOOK_SECRET ?? '',
   // Blob storage — optional for local dev; required in production for large payload externalization.
   // When unset, the StubBlobStorageAdapter is used (in-memory, data lost on restart).
   // See .env.example for setup instructions.

@@ -47,7 +47,6 @@ export class FlightRecorder {
   readonly agentId: string
   private readonly agentVersionId: string | undefined
   private readonly sdkVersion: string
-  private sequenceCounter = 0
 
   /**
    * Create a new FlightRecorder.
@@ -60,19 +59,6 @@ export class FlightRecorder {
     this.agentId = config.agentId
     this.agentVersionId = config.agentVersionId
     this.sdkVersion = config.sdkVersion ?? '0.1.0'
-  }
-
-  /**
-   * Increment and return the next sequence number.
-   *
-   * Sequence numbers are globally monotone within a `FlightRecorder` instance
-   * so that events from multiple concurrent `RunRecorder` instances remain
-   * orderable.
-   *
-   * @internal Used by RunRecorder — not intended for direct external use.
-   */
-  nextSequence(): number {
-    return ++this.sequenceCounter
   }
 
   /**
@@ -134,6 +120,15 @@ export class RunRecorder {
   readonly runId: string
 
   private readonly fr: FlightRecorder
+  /**
+   * Per-run sequence counter. CLAUDE.md Event Log Rule 4 requires sequence
+   * numbers to be monotonically increasing integers starting at 1 *within a run*
+   * and contiguous — so the counter must live on the RunRecorder, not shared
+   * across runs on the parent FlightRecorder. The server now rejects
+   * non-contiguous sequences, so a shared counter would fail verification for
+   * every run after the first.
+   */
+  private sequenceCounter = 0
 
   /**
    * @param runId - Run ID returned by the server.
@@ -143,6 +138,11 @@ export class RunRecorder {
   constructor(runId: string, fr: FlightRecorder) {
     this.runId = runId
     this.fr = fr
+  }
+
+  /** Increment and return the next per-run sequence number (starts at 1). */
+  private nextSequence(): number {
+    return ++this.sequenceCounter
   }
 
   /**
@@ -159,7 +159,7 @@ export class RunRecorder {
    * @throws Error if the request fails (network failure or non-2xx response).
    */
   async recordEvent(type: string, payload: unknown, parentEventId?: string): Promise<string> {
-    const seq = this.fr.nextSequence()
+    const seq = this.nextSequence()
 
     const body: Record<string, unknown> = {
       runId: this.runId,

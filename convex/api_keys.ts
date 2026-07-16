@@ -51,8 +51,23 @@ export const listApiKeys = query({
       .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
       .collect();
 
-    // Filter out revoked keys — revokedAt is set when a key is revoked
-    return keys.filter((k) => k.revokedAt === undefined);
+    // Filter out revoked keys — revokedAt is set when a key is revoked.
+    // SECURITY: never return keyHash. sdk_ingest authenticates on possession of
+    // keyHash, so exposing it here would let any org member (including a viewer)
+    // impersonate the SDK and write to the immutable event log. Return only the
+    // non-secret metadata the settings UI needs.
+    return keys
+      .filter((k) => k.revokedAt === undefined)
+      .map((k) => ({
+        _id: k._id,
+        _creationTime: k._creationTime,
+        orgId: k.orgId,
+        name: k.name,
+        createdBy: k.createdBy,
+        createdAt: k.createdAt,
+        lastUsedAt: k.lastUsedAt,
+        revokedAt: k.revokedAt,
+      }));
   },
 });
 

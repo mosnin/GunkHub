@@ -5,6 +5,9 @@ import { v } from "convex/values";
 import { requireOrgMembership } from "./auth.js";
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
+// Event types that must be the last event in a run (CLAUDE.md Event Log Rule 5).
+const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
+
 /**
  * List events for a run, ordered by sequenceNumber, with optional type filter.
  */
@@ -96,6 +99,40 @@ export const createEvent = mutation({
     }
 
     await requireOrgMembership(ctx, run.orgId);
+
+    // Idempotency + Event Log Rule 4/5 enforcement (mirrors sdkCreateEvents).
+    const duplicate = await ctx.db
+      .query("events")
+      .withIndex("by_run", (q) =>
+        q.eq("runId", args.runId).eq("sequenceNumber", args.sequenceNumber),
+      )
+      .unique();
+    if (duplicate !== null) {
+      return duplicate;
+    }
+
+    if (!Number.isInteger(args.sequenceNumber) || args.sequenceNumber < 1) {
+      throw new Error(
+        `Invalid sequenceNumber ${args.sequenceNumber}: must be a positive integer`,
+      );
+    }
+
+    const latest = await ctx.db
+      .query("events")
+      .withIndex("by_run", (q) => q.eq("runId", args.runId))
+      .order("desc")
+      .first();
+    if (latest && TERMINAL_EVENT_TYPES.has(latest.type)) {
+      throw new Error(
+        "Cannot append event: a terminal event has already been recorded for this run",
+      );
+    }
+    const expected = (latest ? latest.sequenceNumber : 0) + 1;
+    if (args.sequenceNumber !== expected) {
+      throw new Error(
+        `Non-contiguous sequenceNumber: expected ${expected}, got ${args.sequenceNumber}`,
+      );
+    }
 
     const eventId = await ctx.db.insert("events", {
       runId: args.runId,

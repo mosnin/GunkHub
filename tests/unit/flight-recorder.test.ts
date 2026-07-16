@@ -185,11 +185,33 @@ describe('FlightRecorder', () => {
     expect(body['agentVersionId']).toBeUndefined()
   })
 
-  it('nextSequence increments monotonically', () => {
+  it('assigns sequence numbers per-run starting at 1, independent across runs', async () => {
+    // Event Log Rule 4: each run's sequence numbers must start at 1 and be
+    // contiguous. Two runs from the same FlightRecorder must NOT share a counter.
+    const seqs: number[] = []
+    const mockFetch = makeMockFetch(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/runs') && init?.method === 'POST') {
+        return jsonResponse({ run: { id: `run_${seqs.length}` } })
+      }
+      if (url.endsWith('/api/events') && init?.method === 'POST') {
+        const body = JSON.parse(init.body as string) as { sequenceNumber: number }
+        seqs.push(body.sequenceNumber)
+        return jsonResponse({ eventId: 'e' })
+      }
+      return jsonResponse({})
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
     const fr = new FlightRecorder({ apiKey: 'k', baseUrl: 'http://localhost:3000', agentId: 'a' })
-    expect(fr.nextSequence()).toBe(1)
-    expect(fr.nextSequence()).toBe(2)
-    expect(fr.nextSequence()).toBe(3)
+    const runA = await fr.startRun()
+    await runA.recordEvent('custom', {})
+    await runA.recordEvent('custom', {})
+    const runB = await fr.startRun()
+    await runB.recordEvent('custom', {})
+
+    // Run A: 1, 2 ; Run B restarts at 1 (not 3).
+    expect(seqs).toEqual([1, 2, 1])
+    vi.unstubAllGlobals()
   })
 })
 

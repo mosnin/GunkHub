@@ -17,13 +17,13 @@ export const listStaleRuns = internalQuery({
   args: {},
   handler: async (ctx) => {
     const cutoff = Date.now() - STALE_RUN_TIMEOUT_MS;
+    // Index-driven: walk only "running" runs with startedAt < cutoff. The
+    // by_status_started index is ordered [status, startedAt], so the range scan
+    // touches at most STALE_RUN_BATCH_SIZE rows instead of the entire runs table.
     const staleRuns = await ctx.db
       .query("runs")
-      .filter((q) =>
-        q.and(
-          q.eq(q.field("status"), "running"),
-          q.lt(q.field("startedAt"), cutoff),
-        ),
+      .withIndex("by_status_started", (q) =>
+        q.eq("status", "running").lt("startedAt", cutoff),
       )
       .take(STALE_RUN_BATCH_SIZE);
     return { runs: staleRuns };

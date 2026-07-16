@@ -13,6 +13,10 @@ const TERMINAL_STATUSES = new Set([
   "timed_out",
 ]);
 
+// Event types that, per CLAUDE.md Event Log Rule 5, must be the LAST event in a
+// run. Once one is stored, no further events may be appended.
+const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
+
 /**
  * Create a new run from an SDK call.  Authenticates via API key hash.
  * The run is created immediately in the "running" state because SDK callers
@@ -111,6 +115,33 @@ export const sdkCreateEvents = mutation({
 
     const eventIds: string[] = [];
 
+    // Per-run ingest state, established lazily and advanced as we insert. Lets us
+    // validate CLAUDE.md Event Log Rule 4 (contiguous, non-repeating sequence
+    // numbers) and Rule 5 (terminal event is last) without re-querying per event.
+    const runState = new Map<
+      string,
+      { maxSeq: number; hasTerminal: boolean }
+    >();
+
+    const loadRunState = async (
+      runId: Id<"runs">,
+    ): Promise<{ maxSeq: number; hasTerminal: boolean }> => {
+      const cached = runState.get(runId);
+      if (cached) return cached;
+      // Highest stored sequence number for this run (by_run is [runId, seq]).
+      const latest = await ctx.db
+        .query("events")
+        .withIndex("by_run", (q) => q.eq("runId", runId))
+        .order("desc")
+        .first();
+      const state = {
+        maxSeq: latest ? latest.sequenceNumber : 0,
+        hasTerminal: latest ? TERMINAL_EVENT_TYPES.has(latest.type) : false,
+      };
+      runState.set(runId, state);
+      return state;
+    };
+
     for (const evt of args.events) {
       const runId = evt.runId as Id<"runs">;
       const run = await ctx.db.get(runId);
@@ -138,9 +169,33 @@ export const sdkCreateEvents = mutation({
         .unique();
 
       if (existing !== null) {
-        // Idempotent: already stored — return existing ID
+        // Idempotent: already stored (SDK retry) — return existing ID and do not
+        // re-validate ordering for a record we already accepted.
         eventIds.push(existing._id);
         continue;
+      }
+
+      // --- Event Log Rule 4: sequence numbers are positive, integral, contiguous ---
+      if (!Number.isInteger(evt.sequenceNumber) || evt.sequenceNumber < 1) {
+        throw new Error(
+          `Invalid sequenceNumber ${evt.sequenceNumber}: must be a positive integer`,
+        );
+      }
+
+      const state = await loadRunState(runId);
+
+      // --- Event Log Rule 5: nothing may follow a terminal event ---
+      if (state.hasTerminal) {
+        throw new Error(
+          `Cannot append event to run ${evt.runId}: a terminal event has already been recorded`,
+        );
+      }
+
+      const expected = state.maxSeq + 1;
+      if (evt.sequenceNumber !== expected) {
+        throw new Error(
+          `Non-contiguous sequenceNumber for run ${evt.runId}: expected ${expected}, got ${evt.sequenceNumber}`,
+        );
       }
 
       const parentEventId = evt.parentEventId
@@ -156,6 +211,10 @@ export const sdkCreateEvents = mutation({
         payload: evt.payload,
         parentEventId,
       });
+
+      // Advance in-memory state so the next event in the batch validates against it.
+      state.maxSeq = evt.sequenceNumber;
+      state.hasTerminal = TERMINAL_EVENT_TYPES.has(evt.type);
 
       eventIds.push(eventId);
     }
