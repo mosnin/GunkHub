@@ -277,6 +277,39 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
           />
         )}
       </div>
+
+      {/* Pagination — cursor-based. Preserves all active filters (incl. projectId).
+          Without this, runs beyond the first page of 50 were unreachable. */}
+      {!error && (searchParams.cursor ?? runs?.nextCursor) && (
+        <div className="mt-4 flex items-center justify-between border-t border-neutral-800 pt-3">
+          <div>
+            {searchParams.cursor && (
+              <a
+                href={buildHref(
+                  { ...baseParams, projectId: searchParams.projectId },
+                  { cursor: undefined },
+                )}
+                className="px-2 py-1 rounded text-xs font-mono font-medium border bg-transparent text-neutral-400 border-neutral-800 hover:text-neutral-200 hover:border-neutral-700 transition-colors duration-100"
+              >
+                ← First page
+              </a>
+            )}
+          </div>
+          <div>
+            {runs?.nextCursor && (
+              <a
+                href={buildHref(
+                  { ...baseParams, projectId: searchParams.projectId },
+                  { cursor: runs.nextCursor },
+                )}
+                className="px-2 py-1 rounded text-xs font-mono font-medium border bg-transparent text-neutral-400 border-neutral-800 hover:text-neutral-200 hover:border-neutral-700 transition-colors duration-100"
+              >
+                Older runs →
+              </a>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

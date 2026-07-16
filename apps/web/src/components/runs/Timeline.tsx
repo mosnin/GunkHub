@@ -83,6 +83,10 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
     extraEventsRef.current = extraEvents
   }, [extraEvents])
 
+  // Guards overlapping fetches without depending on the stale `isPending` value
+  // captured by the interval closure.
+  const inFlightRef = useRef(false)
+
   // Keep a stable ref to followTail for use inside the polling effect closure
   const followTailRef = useRef(isLive)
   useEffect(() => {
@@ -98,16 +102,23 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
         const res = await fetch(`/api/runs/${runId}/events?${params.toString()}`)
         if (!res.ok) throw new Error(`Failed to load events (${res.status})`)
         const data = (await res.json()) as ListEventsResponse
+        // Dedup against already-loaded events so a re-fetched page cannot append
+        // duplicates (defence-in-depth alongside the cursor-reset fix below).
+        const known = new Set([
+          ...(events ?? []).map((e) => e.id),
+          ...extraEventsRef.current.map((e) => e.id),
+        ])
+        const fresh = data.events.filter((e) => !known.has(e.id))
         const prevTotal = (events?.length ?? 0) + extraEventsRef.current.length
-        const newTotal = prevTotal + data.events.length
-        setExtraEvents((prev) => [...prev, ...data.events])
+        const newTotal = prevTotal + fresh.length
+        if (fresh.length > 0) setExtraEvents((prev) => [...prev, ...fresh])
         setCursor(data.nextCursor)
         // Auto-advance only when following tail; otherwise accumulate unseen count
-        if (data.events.length > 0) {
+        if (fresh.length > 0) {
           if (followTailRef.current) {
             setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
           } else {
-            setUnseenCount((prev) => prev + data.events.length)
+            setUnseenCount((prev) => prev + fresh.length)
           }
         }
       } catch (err) {
@@ -138,19 +149,26 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
           setUnseenCount((prev) => prev + brandNew.length)
         }
       }
-      // If a cursor appeared (run crossed page boundary), capture it
-      if (data.nextCursor && !cursor) {
-        setCursor(data.nextCursor)
-      }
+      // NOTE: intentionally do NOT re-seed `cursor` from page 1 here. Doing so
+      // restarts pagination, and handleLoadMore then re-fetches and re-appends
+      // pages every tick — the run-duplication loop. Once cursor is undefined we
+      // stay in tail-poll mode.
     }
 
     const timer = setInterval(() => {
-      if (isPending) return // skip tick if a load is already in flight
-      if (cursor) {
-        handleLoadMore() // uses existing path, auto-advances window
-      } else {
-        void pollFromStart()
-      }
+      if (inFlightRef.current) return // skip tick if a fetch is already in flight
+      inFlightRef.current = true
+      void (async () => {
+        try {
+          if (cursor) {
+            handleLoadMore() // uses existing path, auto-advances window
+          } else {
+            await pollFromStart()
+          }
+        } finally {
+          inFlightRef.current = false
+        }
+      })()
     }, POLL_MS)
 
     return () => clearInterval(timer)

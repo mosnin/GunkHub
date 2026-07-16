@@ -110,6 +110,21 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
 
   const allEvents = [...(events ?? []), ...extraEvents]
 
+  // Always-current set of known event IDs, for dedup inside polling closures.
+  // The interval closure captures state at effect-setup time, so deduping against
+  // the `allEvents` array (stale) re-classifies already-appended events as new and
+  // appends them again every tick. A ref is read live, so dedup stays correct.
+  const knownIdsRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const ids = new Set<string>()
+    for (const e of allEvents) ids.add(e.id)
+    knownIdsRef.current = ids
+  }, [events, extraEvents])
+
+  // Guards against overlapping fetches without depending on the stale `isPending`
+  // captured by the interval closure.
+  const inFlightRef = useRef(false)
+
   function handleLoadMore() {
     if (!cursor) return
     setLoadError(null)
@@ -142,20 +157,27 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       const res = await fetch(`/api/runs/${runId}/events?limit=200`)
       if (!res.ok) return
       const data = (await res.json()) as ListEventsResponse
-      const existingIds = new Set(allEvents.map((e) => e.id))
-      const brandNew = data.events.filter((e) => !existingIds.has(e.id))
+      // Dedup against the LIVE id set (ref), not the stale closure array.
+      const known = knownIdsRef.current
+      const brandNew = data.events.filter((e) => !known.has(e.id))
       if (brandNew.length > 0) {
-        const newTotal = allEvents.length + brandNew.length
-        setExtraEvents((prev) => [...prev, ...brandNew])
-        if (followTailRef.current) {
-          setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
-        } else {
-          setUnseenCount((prev) => prev + brandNew.length)
-        }
+        // Add immediately so a rapid follow-up poll (before re-render) won't
+        // re-append the same events.
+        for (const e of brandNew) known.add(e.id)
+        setExtraEvents((prev) => {
+          const next = [...prev, ...brandNew]
+          const newTotal = (events?.length ?? 0) + next.length
+          if (followTailRef.current) {
+            setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+          } else {
+            setUnseenCount((u) => u + brandNew.length)
+          }
+          return next
+        })
       }
-      if (data.nextCursor && !cursor) {
-        setCursor(data.nextCursor)
-      }
+      // NOTE: intentionally do NOT reset `cursor` here. When cursor is undefined
+      // all pages are loaded and we are tailing; re-seeding it from page 1's cursor
+      // restarts pagination and re-appends already-loaded pages every tick.
     } catch {
       // Non-fatal: ignore failed polls
     }
@@ -206,12 +228,19 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
     if (!isLive) return
     const POLL_MS = 5000
     const timer = setInterval(() => {
-      if (isPending) return // skip if a load is in flight
-      if (cursor) {
-        handleLoadMore()
-      } else {
-        void pollFromStart()
-      }
+      if (inFlightRef.current) return // skip if a fetch is already in flight
+      inFlightRef.current = true
+      void (async () => {
+        try {
+          if (cursor) {
+            handleLoadMore()
+          } else {
+            await pollFromStart()
+          }
+        } finally {
+          inFlightRef.current = false
+        }
+      })()
     }, POLL_MS)
     return () => clearInterval(timer)
   }, [isLive, cursor, runId])
