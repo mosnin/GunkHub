@@ -7,7 +7,7 @@
 import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
-import { action, internalMutation, internalQuery, query } from "./_generated/server.js";
+import { action, internalAction, internalMutation, internalQuery, query } from "./_generated/server.js";
 import { requireOrgMembership } from "./auth.js";
 
 // Internal function references (typed by name, matches the stale_runs.ts pattern).
@@ -212,7 +212,13 @@ export const _upsertVerificationResult = internalMutation({
  * Graceful degradation: if the web route is unreachable or unconfigured, the
  * result is stored as a sequence-only record (checksRan absent).
  */
-export const verifyRecentRuns = action({
+// internalAction, not action: this is a cross-org batch job invoked only by the
+// daily cron (by name). Exposing it publicly let anyone with the deployment URL
+// trigger an unauthenticated cross-org sweep (cost abuse + aggregate leak +
+// forced outbound transmission of other orgs' run/event payloads). The on-demand
+// reverifyRun below stays a public `action` because it is Clerk-auth + membership
+// gated per run.
+export const verifyRecentRuns = internalAction({
   args: {},
   handler: async (ctx): Promise<{ checked: number; passed: number; failed: number }> => {
     const WINDOW_MS = 48 * 60 * 60 * 1000;

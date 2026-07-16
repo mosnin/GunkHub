@@ -3,6 +3,8 @@ import { v } from "convex/values";
 import { query, mutation } from "./_generated/server.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
 
+import type { Id } from "./_generated/dataModel.js";
+
 /**
  * List all comments on a given target (run or event).
  */
@@ -41,6 +43,22 @@ export const createComment = mutation({
   handler: async (ctx, args) => {
     const { userId } = await getAuthContext(ctx);
     await requireOrgMembership(ctx, args.orgId);
+
+    // TENANCY: confirm the comment target (run/event) actually belongs to the
+    // caller's org. Without this, a member could stamp a comment with their own
+    // orgId that references another org's run/event id, weakening referential
+    // tenancy integrity (mirrors the ownership checks in createRun/sdkCreateArtifact).
+    if (args.targetType === "run") {
+      const run = await ctx.db.get(args.targetId as Id<"runs">);
+      if (!run || run.orgId !== args.orgId) {
+        throw new Error("Comment target run not found in this organization");
+      }
+    } else {
+      const event = await ctx.db.get(args.targetId as Id<"events">);
+      if (!event || event.orgId !== args.orgId) {
+        throw new Error("Comment target event not found in this organization");
+      }
+    }
 
     const now = Date.now();
     const commentId = await ctx.db.insert("comments", {

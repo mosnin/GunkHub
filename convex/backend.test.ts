@@ -122,6 +122,21 @@ describe('Tenancy isolation (CLAUDE.md Tenancy Rules)', () => {
     ).rejects.toThrow(/not found in this organization/i)
   })
 
+  it('createComment rejects a target run from another org', async () => {
+    const t = convexTest(schema, modules)
+    const { orgB, runA } = await seed(t) // runA belongs to org A
+    // user_b (org B) tries to comment on org A's run.
+    const asB = t.withIdentity({ subject: 'user_b', org_id: 'clerk_org_b' })
+    await expect(
+      asB.mutation(api.comments.createComment, {
+        orgId: orgB,
+        targetId: runA,
+        targetType: 'run',
+        content: 'cross-org note',
+      }),
+    ).rejects.toThrow(/not found in this organization/i)
+  })
+
   it('getOrganization rejects resolving another org (enumeration guard)', async () => {
     const t = convexTest(schema, modules)
     await seed(t)
