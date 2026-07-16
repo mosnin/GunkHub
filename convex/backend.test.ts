@@ -191,11 +191,37 @@ describe('Event log invariants (Rule 4/5)', () => {
         { runId: runA, type: 'run.completed', sequenceNumber: 2, timestamp: Date.now(), payload: {} },
       ],
     })
+    // After the terminal event, the run is reconciled to "completed", so a later
+    // append is rejected by the status guard (still correct — nothing follows a
+    // terminal event either way).
     await expect(
       t.mutation(api.sdk_ingest.sdkCreateEvents, {
         apiKeyHash: 'hash_a',
         events: [{ runId: runA, type: 'tool.call', sequenceNumber: 3, timestamp: Date.now(), payload: {} }],
       }),
+    ).rejects.toThrow(/terminal|status "completed"/i)
+  })
+
+  it('a terminal event reconciles run.status, and updateRunStatus is then idempotent', async () => {
+    const t = convexTest(schema, modules)
+    const { runA } = await seed(t)
+    await t.mutation(api.sdk_ingest.sdkCreateEvents, {
+      apiKeyHash: 'hash_a',
+      events: [
+        { runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} },
+        { runId: runA, type: 'run.completed', sequenceNumber: 2, timestamp: Date.now(), payload: {} },
+      ],
+    })
+    // The run.completed event transitioned status to "completed".
+    const run = await t.run((ctx) => ctx.db.get(runA))
+    expect(run?.status).toBe('completed')
+    // The SDK's separate status update is then an idempotent no-op (does not throw).
+    await expect(
+      t.mutation(api.sdk_ingest.sdkUpdateRunStatus, { apiKeyHash: 'hash_a', runId: runA, status: 'completed' }),
+    ).resolves.toBeNull()
+    // ...but a CONFLICTING terminal transition is still rejected.
+    await expect(
+      t.mutation(api.sdk_ingest.sdkUpdateRunStatus, { apiKeyHash: 'hash_a', runId: runA, status: 'failed' }),
     ).rejects.toThrow(/terminal/)
   })
 

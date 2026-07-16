@@ -349,6 +349,17 @@ export const sdkCreateEvents = mutation({
         parentEventId,
       });
 
+      // Reconcile run.status with the terminal event so the event log (source of
+      // truth) and the run's status never disagree. A run.completed/run.failed
+      // event immediately transitions the run to the matching terminal status;
+      // the SDK's separate updateRunStatus call is then an idempotent no-op.
+      if (TERMINAL_EVENT_TYPES.has(evt.type)) {
+        await ctx.db.patch(runId, {
+          status: evt.type === "run.failed" ? "failed" : "completed",
+          endedAt: evt.timestamp,
+        });
+      }
+
       // Advance in-memory state so the next event in the batch validates against it.
       state.maxSeq = evt.sequenceNumber;
       state.hasTerminal = TERMINAL_EVENT_TYPES.has(evt.type);
@@ -391,6 +402,13 @@ export const sdkUpdateRunStatus = mutation({
     }
 
     if (TERMINAL_STATUSES.has(run.status)) {
+      // Idempotent: transitioning to the SAME terminal status is a no-op (this
+      // happens when sdkCreateEvents already reconciled status from the terminal
+      // event, then the SDK's separate updateRunStatus call arrives). Only a
+      // conflicting terminal transition is an error.
+      if (run.status === args.status) {
+        return;
+      }
       throw new Error(
         `Cannot transition run from terminal status "${run.status}"`,
       );
