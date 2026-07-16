@@ -188,6 +188,63 @@ describe('Recorder', () => {
     // Should not throw
     await expect(recorder.startRun('second input')).resolves.toBeDefined()
   })
+
+  // --- Durability regression tests (audit Phase 0 / gate finding) ------------
+
+  it('does not drop events when a flush fails — batch is retried on next flush', async () => {
+    // First sendEvents fails, second succeeds. The failed batch must survive.
+    const sent: number[] = []
+    let call = 0
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        call += 1
+        if (call === 1) {
+          return { success: false as const, error: 'network down', retryable: true }
+        }
+        sent.push(...events.map((e) => e.sequenceNumber))
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+
+    await recorder.startRun('input') // records run.started (seq 1)
+    recorder.recordEvent('custom', { type: 'custom', data: 'a' }) // seq 2
+    const first = await recorder.flush()
+    expect(first.success).toBe(false) // failed — but not lost
+
+    recorder.recordEvent('custom', { type: 'custom', data: 'b' }) // seq 3
+    const second = await recorder.flush()
+    expect(second.success).toBe(true)
+    // All three events reach the server, in ascending sequence order.
+    expect(sent).toEqual([1, 2, 3])
+  })
+
+  it('serializes concurrent failing flushes so the buffer stays in sequence order', async () => {
+    // Both flushes fail; without serialization the LIFO unshift would reorder the
+    // buffer to [later..., earlier...]. Serialized, order is preserved.
+    let call = 0
+    const captured: number[][] = []
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        call += 1
+        captured.push(events.map((e) => e.sequenceNumber))
+        if (call <= 2) return { success: false as const, error: 'down', retryable: true }
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+
+    await recorder.startRun('input') // seq 1
+    recorder.recordEvent('custom', { type: 'custom', data: 'a' }) // seq 2
+    const p1 = recorder.flush()
+    recorder.recordEvent('custom', { type: 'custom', data: 'b' }) // seq 3
+    const p2 = recorder.flush()
+    await Promise.all([p1, p2])
+
+    // A final flush drains whatever remains; it must be globally ascending.
+    await recorder.flush()
+    const finalBatch = captured[captured.length - 1]!
+    const ascending = [...finalBatch].sort((a, b) => a - b)
+    expect(finalBatch).toEqual(ascending)
+  })
 })
 
 // ---------------------------------------------------------------------------

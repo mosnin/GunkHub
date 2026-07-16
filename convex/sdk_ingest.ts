@@ -155,12 +155,9 @@ export const sdkCreateEvents = mutation({
         throw new Error("Unauthorized");
       }
 
-      if (run.status !== "running") {
-        throw new Error(
-          `Cannot append event to run with status "${run.status}". Run must be in "running" state.`,
-        );
-      }
-
+      // Idempotency FIRST: a retry of an already-stored event must return its ID
+      // regardless of the run's current status (a late retry after the run has
+      // terminated is still idempotent, not an error).
       const existing = await ctx.db
         .query("events")
         .withIndex("by_run", (q) =>
@@ -169,10 +166,15 @@ export const sdkCreateEvents = mutation({
         .unique();
 
       if (existing !== null) {
-        // Idempotent: already stored (SDK retry) — return existing ID and do not
-        // re-validate ordering for a record we already accepted.
         eventIds.push(existing._id);
         continue;
+      }
+
+      // A genuinely new event may only be appended while the run is running.
+      if (run.status !== "running") {
+        throw new Error(
+          `Cannot append event to run with status "${run.status}". Run must be in "running" state.`,
+        );
       }
 
       // --- Event Log Rule 4: sequence numbers are positive, integral, contiguous ---

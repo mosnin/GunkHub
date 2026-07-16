@@ -92,15 +92,11 @@ export const createEvent = mutation({
     if (!run) {
       throw new Error("Run not found");
     }
-    if (run.status !== "running") {
-      throw new Error(
-        `Cannot append event to run with status "${run.status}". Run must be in "running" state.`,
-      );
-    }
 
     await requireOrgMembership(ctx, run.orgId);
 
-    // Idempotency + Event Log Rule 4/5 enforcement (mirrors sdkCreateEvents).
+    // Idempotency FIRST (mirrors sdkCreateEvents): a retry of an already-stored
+    // event returns idempotently regardless of run status.
     const duplicate = await ctx.db
       .query("events")
       .withIndex("by_run", (q) =>
@@ -111,6 +107,14 @@ export const createEvent = mutation({
       return duplicate;
     }
 
+    // A genuinely new event may only be appended while the run is running.
+    if (run.status !== "running") {
+      throw new Error(
+        `Cannot append event to run with status "${run.status}". Run must be in "running" state.`,
+      );
+    }
+
+    // Event Log Rule 4/5 enforcement.
     if (!Number.isInteger(args.sequenceNumber) || args.sequenceNumber < 1) {
       throw new Error(
         `Invalid sequenceNumber ${args.sequenceNumber}: must be a positive integer`,

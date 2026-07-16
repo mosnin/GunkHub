@@ -10,6 +10,13 @@ export class Recorder {
   private eventBuffer: ReturnType<typeof buildEvent>[] = []
   private sequenceCounter = 0
   private flushTimer: ReturnType<typeof setTimeout> | null = null
+  // Serializes flushes. flush() is launched fire-and-forget from both the flush
+  // timer and the maxBatch path, so without serialization two overlapping FAILED
+  // flushes would unshift LIFO and reorder the buffer out of sequence order —
+  // which the server's non-repeating/contiguity check then rejects, wedging the
+  // buffer so terminal events never persist. Chaining guarantees at most one
+  // in-flight flush and preserves buffer order.
+  private flushChain: Promise<unknown> = Promise.resolve()
 
   constructor(config: RecorderConfig, transport?: Transport) {
     this.config = config
@@ -123,7 +130,19 @@ export class Recorder {
   /**
    * Flush all buffered events to the server.
    */
-  async flush(): Promise<FlushResult> {
+  /**
+   * Flush buffered events to the server. Flushes are serialized: a call waits for
+   * any in-flight flush to finish before it splices the buffer, so overlapping
+   * flushes can never reorder events or double-send a batch.
+   */
+  flush(): Promise<FlushResult> {
+    const run = this.flushChain.then(() => this.flushOnce())
+    // Keep the chain alive and unrejected regardless of this flush's outcome.
+    this.flushChain = run.catch(() => {})
+    return run
+  }
+
+  private async flushOnce(): Promise<FlushResult> {
     if (this.eventBuffer.length === 0) return { success: true, eventsSubmitted: 0, errors: [] }
 
     const batch = this.eventBuffer.splice(0)
@@ -136,8 +155,10 @@ export class Recorder {
     // DURABILITY: the send failed, so the batch is NOT persisted. Return it to the
     // FRONT of the buffer (ahead of any events appended during the await) so a
     // later flush — or finalizeRun's flush — retries it instead of dropping it.
-    // Losing terminal (run.completed/run.failed) events is the worst failure mode
-    // for a flight recorder; never discard on failure.
+    // Because flushes are serialized, no other flush spliced concurrently, so the
+    // buffer stays in ascending sequence order. Losing terminal
+    // (run.completed/run.failed) events is the worst failure mode for a flight
+    // recorder; never discard on failure.
     this.eventBuffer.unshift(...batch)
 
     return {
