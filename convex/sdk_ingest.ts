@@ -11,6 +11,10 @@ import type { Doc, Id } from "./_generated/dataModel.js";
 // status). A key with no `scopes` array has full access (back-compat).
 const INGEST_WRITE = "ingest:write";
 
+// Only refresh api_keys.lastUsedAt when the stamp is older than this, to keep the
+// key document off the ingest write hot path (see resolveApiKey).
+const LAST_USED_THROTTLE_MS = 60_000;
+
 /**
  * Resolve and authorize an API key for ingest. Centralizes the credential checks
  * that every ingest mutation must perform: existence, revocation, expiration, and
@@ -40,8 +44,14 @@ async function resolveApiKey(
     throw new Error(`Forbidden: API key lacks required scope "${requiredScope}"`);
   }
 
-  // Fire-and-forget usage tracking.
-  await ctx.db.patch(apiKey._id, { lastUsedAt: Date.now() });
+  // Usage tracking, THROTTLED. Patching lastUsedAt on every ingest call serializes
+  // all ingest for a single high-throughput key on one document (Convex serializes
+  // writes to the same doc) — a scale bottleneck for busy autonomous agents. Only
+  // write when the stamp is stale, so the hot path stays read-only on the key.
+  const now = Date.now();
+  if (apiKey.lastUsedAt === undefined || now - apiKey.lastUsedAt > LAST_USED_THROTTLE_MS) {
+    await ctx.db.patch(apiKey._id, { lastUsedAt: now });
+  }
   return apiKey;
 }
 
