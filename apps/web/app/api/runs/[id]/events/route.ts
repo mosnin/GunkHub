@@ -22,11 +22,15 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
     : undefined
 
   try {
+    const afterSeqParam = searchParams.get('afterSeq')
     const result = await listEvents({
       runId: params.id,
       limit: searchParams.get('limit') ? Number(searchParams.get('limit')) : undefined,
       cursor: searchParams.get('cursor') ?? undefined,
       types,
+      ...(afterSeqParam !== null && Number.isFinite(Number(afterSeqParam))
+        ? { afterSeq: Number(afterSeqParam) }
+        : {}),
     })
 
     return NextResponse.json<ListEventsResponse>(result)

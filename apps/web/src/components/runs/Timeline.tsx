@@ -134,10 +134,15 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
     const POLL_MS = 5000
 
     async function pollFromStart() {
-      const res = await fetch(`/api/runs/${runId}/events?limit=200`)
+      // Tail from the highest known sequence number so newly-appended events are
+      // found on runs larger than one page (re-fetching page 1 never returns them).
+      const currentExtra = extraEventsRef.current
+      let maxSeq = 0
+      for (const e of events ?? []) if (e.sequenceNumber > maxSeq) maxSeq = e.sequenceNumber
+      for (const e of currentExtra) if (e.sequenceNumber > maxSeq) maxSeq = e.sequenceNumber
+      const res = await fetch(`/api/runs/${runId}/events?limit=200&afterSeq=${maxSeq}`)
       if (!res.ok) return
       const data = (await res.json()) as ListEventsResponse
-      const currentExtra = extraEventsRef.current
       const allIds = new Set([...(events ?? []).map((e) => e.id), ...currentExtra.map((e) => e.id)])
       const brandNew = data.events.filter((e) => !allIds.has(e.id))
       if (brandNew.length > 0) {

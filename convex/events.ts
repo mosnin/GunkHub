@@ -40,6 +40,11 @@ export const listEvents = query({
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
     types: v.optional(v.array(v.string())),
+    // Tail mode: return only events with sequenceNumber > afterSeq. Live polling
+    // uses this to fetch NEW events from the end of the log, instead of re-reading
+    // the first page (which never contains newly appended tail events on runs
+    // larger than one page).
+    afterSeq: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     const run = await ctx.db.get(args.runId);
@@ -52,7 +57,12 @@ export const listEvents = query({
 
     const baseQuery = ctx.db
       .query("events")
-      .withIndex("by_run", (q) => q.eq("runId", args.runId));
+      .withIndex("by_run", (q) => {
+        const scoped = q.eq("runId", args.runId);
+        return args.afterSeq !== undefined
+          ? scoped.gt("sequenceNumber", args.afterSeq)
+          : scoped;
+      });
 
     const typeSet = args.types && args.types.length > 0 ? new Set(args.types) : null;
     const filtered = typeSet

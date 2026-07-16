@@ -111,6 +111,23 @@ describe('Event log invariants (Rule 4/5)', () => {
     ).rejects.toThrow(/terminal/)
   })
 
+  it('afterSeq returns only events past the given sequence number (live tail)', async () => {
+    const t = convexTest(schema, modules)
+    const { runA } = await seed(t)
+    await t.mutation(api.sdk_ingest.sdkCreateEvents, {
+      apiKeyHash: 'hash_a',
+      events: [
+        { runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} },
+        { runId: runA, type: 'tool.call', sequenceNumber: 2, timestamp: Date.now(), payload: {} },
+        { runId: runA, type: 'tool.call', sequenceNumber: 3, timestamp: Date.now(), payload: {} },
+      ],
+    })
+    const asA = t.withIdentity({ subject: 'user_a', org_id: 'clerk_org_a' })
+    const tail = await asA.query(api.events.listEvents, { runId: runA, afterSeq: 2 })
+    // Only seq 3 is past afterSeq=2.
+    expect(tail.events.map((e: { sequenceNumber: number }) => e.sequenceNumber)).toEqual([3])
+  })
+
   it('is idempotent for an already-stored event', async () => {
     const t = convexTest(schema, modules)
     const { runA } = await seed(t)

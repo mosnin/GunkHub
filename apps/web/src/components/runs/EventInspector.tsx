@@ -115,10 +115,17 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
   // the `allEvents` array (stale) re-classifies already-appended events as new and
   // appends them again every tick. A ref is read live, so dedup stays correct.
   const knownIdsRef = useRef<Set<string>>(new Set())
+  // Highest known sequence number, for tail polling (fetch events after it).
+  const maxSeqRef = useRef<number>(0)
   useEffect(() => {
     const ids = new Set<string>()
-    for (const e of allEvents) ids.add(e.id)
+    let maxSeq = 0
+    for (const e of allEvents) {
+      ids.add(e.id)
+      if (e.sequenceNumber > maxSeq) maxSeq = e.sequenceNumber
+    }
     knownIdsRef.current = ids
+    maxSeqRef.current = maxSeq
   }, [events, extraEvents])
 
   // Guards against overlapping fetches without depending on the stale `isPending`
@@ -154,7 +161,11 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
 
   async function pollFromStart() {
     try {
-      const res = await fetch(`/api/runs/${runId}/events?limit=200`)
+      // Tail from the highest known sequence number so new events are found
+      // regardless of run size. Re-fetching page 1 would only ever return the
+      // earliest events and never the newly-appended tail on runs > one page.
+      const maxSeq = maxSeqRef.current
+      const res = await fetch(`/api/runs/${runId}/events?limit=200&afterSeq=${maxSeq}`)
       if (!res.ok) return
       const data = (await res.json()) as ListEventsResponse
       // Dedup against the LIVE id set (ref), not the stale closure array.
@@ -162,8 +173,11 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       const brandNew = data.events.filter((e) => !known.has(e.id))
       if (brandNew.length > 0) {
         // Add immediately so a rapid follow-up poll (before re-render) won't
-        // re-append the same events.
-        for (const e of brandNew) known.add(e.id)
+        // re-append the same events, and advance the tail cursor.
+        for (const e of brandNew) {
+          known.add(e.id)
+          if (e.sequenceNumber > maxSeqRef.current) maxSeqRef.current = e.sequenceNumber
+        }
         setExtraEvents((prev) => {
           const next = [...prev, ...brandNew]
           const newTotal = (events?.length ?? 0) + next.length
