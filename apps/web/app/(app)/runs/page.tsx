@@ -77,11 +77,14 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
       ? (searchParams.verify as VerifyFilter)
       : 'all'
 
-  // Base searchParams dict for href builders (excludes cursor to reset on filter change)
+  // Base searchParams dict for href builders. Excludes cursor (reset on filter
+  // change) but preserves projectId so clicking a status/range/verify/agent pill
+  // while scoped to a project does not silently drop the project filter.
   const baseParams = {
     status: searchParams.status,
     range: searchParams.range,
     agentId: searchParams.agentId,
+    projectId: searchParams.projectId,
     verify: verifyFilter === 'all' ? undefined : verifyFilter,
   }
 
