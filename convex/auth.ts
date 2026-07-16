@@ -1,7 +1,7 @@
 // All queries and mutations must call getAuthContext and scope to org
 
-import { QueryCtx, MutationCtx } from "convex/server";
-import { Id } from "convex/_generated/dataModel";
+import type { QueryCtx, MutationCtx } from "./_generated/server.js";
+import type { Id } from "./_generated/dataModel.js";
 
 export interface AuthContextResult {
   userId: string;

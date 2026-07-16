@@ -4,7 +4,16 @@
 // Does NOT call buildReplayProjection (not importable from Convex actions).
 // See ADR-0020 for scope and cadence.
 
-import { action, internalMutation, internalQuery, query } from "convex/server";
+import { action, internalMutation, internalQuery, query } from "./_generated/server.js";
+import { makeFunctionReference } from "convex/server";
+
+// Internal function references (typed by name, matches the stale_runs.ts pattern).
+const _getRecentTerminalRunsRef = makeFunctionReference<"query">("projection_verify:_getRecentTerminalRuns");
+const _listEventSeqNumsRef = makeFunctionReference<"query">("projection_verify:_listEventSeqNums");
+const _listEventsFullRef = makeFunctionReference<"query">("projection_verify:_listEventsFull");
+const _upsertVerificationResultRef = makeFunctionReference<"mutation">("projection_verify:_upsertVerificationResult");
+const _getRunForVerifyRef = makeFunctionReference<"query">("projection_verify:_getRunForVerify");
+const _requireMembershipForReverifyRef = makeFunctionReference<"query">("projection_verify:_requireMembershipForReverify");
 import { v } from "convex/values";
 import { requireOrgMembership } from "./auth.js";
 
@@ -209,13 +218,12 @@ export const verifyRecentRuns = action({
     const DERIVATION_MAX_EVENTS = 500;
     const now = Date.now();
 
-    const verifyUrl = process.env.INTERNAL_VERIFY_URL as string | undefined;
-    const verifySecret = process.env.INTERNAL_VERIFY_SECRET as string | undefined;
+    const verifyUrl = process.env['INTERNAL_VERIFY_URL'] as string | undefined;
+    const verifySecret = process.env['INTERNAL_VERIFY_SECRET'] as string | undefined;
     const canRunDerivation = !!(verifyUrl && verifySecret);
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const runs: Array<Record<string, unknown>> = await ctx.runInternalQuery(
-      _getRecentTerminalRuns,
+    const runs: Array<Record<string, unknown>> = await ctx.runQuery(_getRecentTerminalRunsRef,
       { windowStart: now - WINDOW_MS, limit: BATCH_LIMIT }
     );
 
@@ -224,8 +232,8 @@ export const verifyRecentRuns = action({
     let failed = 0;
 
     for (const run of runs) {
-      const runId = run._id as string;
-      const orgId = run.orgId as string;
+      const runId = run['_id'] as string;
+      const orgId = run['orgId'] as string;
 
       // Collect all sequence numbers by paginating through events
       const seqNums: number[] = [];
@@ -235,7 +243,7 @@ export const verifyRecentRuns = action({
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         const page: { seqNums: number[]; nextCursor: string | null } =
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          await ctx.runInternalQuery(_listEventSeqNums, { runId: runId as any, cursor });
+          await ctx.runQuery(_listEventSeqNumsRef, { runId: runId as any, cursor });
         seqNums.push(...page.seqNums);
         if (page.nextCursor === null) break;
         cursor = page.nextCursor;
@@ -254,7 +262,7 @@ export const verifyRecentRuns = action({
             // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
             const page: { events: Array<Record<string, unknown>>; nextCursor: string | null } =
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              await ctx.runInternalQuery(_listEventsFull, { runId: runId as any, cursor: evtCursor });
+              await ctx.runQuery(_listEventsFullRef, { runId: runId as any, cursor: evtCursor });
             allEvents.push(...page.events);
             if (page.nextCursor === null) break;
             evtCursor = page.nextCursor;
@@ -285,7 +293,7 @@ export const verifyRecentRuns = action({
           if (ext.isValid) passed++;
           else failed++;
 
-          await ctx.runInternalMutation(_upsertVerificationResult, {
+          await ctx.runMutation(_upsertVerificationResultRef, {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             runId: runId as any,
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -310,7 +318,7 @@ export const verifyRecentRuns = action({
       if (seqResult.isValid) passed++;
       else failed++;
 
-      await ctx.runInternalMutation(_upsertVerificationResult, {
+      await ctx.runMutation(_upsertVerificationResultRef, {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         runId: runId as any,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -359,7 +367,7 @@ export const _requireMembershipForReverify = internalQuery({
     if (!membership) throw new Error("Unauthorized: not a member of this organization");
 
     const actualRank = ROLE_RANK[membership.role] ?? 0;
-    if (actualRank < ROLE_RANK.member) {
+    if (actualRank < (ROLE_RANK['member'] ?? 0)) {
       throw new Error("Forbidden: member or admin role required to re-run verification");
     }
   },
@@ -396,16 +404,15 @@ export const reverifyRun = action({
 
     // Fetch the run — action cannot use ctx.db directly
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const run: Record<string, unknown> | null = await ctx.runInternalQuery(
-      _getRunForVerify,
+    const run: Record<string, unknown> | null = await ctx.runQuery(_getRunForVerifyRef,
       { runId: args.runId },
     );
     if (!run) throw new Error("Run not found");
 
-    const orgId = run.orgId as string;
+    const orgId = run['orgId'] as string;
 
     // Role check: member+ required
-    await ctx.runInternalQuery(_requireMembershipForReverify, {
+    await ctx.runQuery(_requireMembershipForReverifyRef, {
       clerkUserId,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       orgId: orgId as any,
@@ -417,7 +424,7 @@ export const reverifyRun = action({
     for (;;) {
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       const page: { seqNums: number[]; nextCursor: string | null } =
-        await ctx.runInternalQuery(_listEventSeqNums, { runId: args.runId, cursor });
+        await ctx.runQuery(_listEventSeqNumsRef, { runId: args.runId, cursor });
       seqNums.push(...page.seqNums);
       if (page.nextCursor === null) break;
       cursor = page.nextCursor;
@@ -425,8 +432,8 @@ export const reverifyRun = action({
 
     const seqResult = checkSequenceIntegrity(seqNums);
 
-    const verifyUrl = process.env.INTERNAL_VERIFY_URL as string | undefined;
-    const verifySecret = process.env.INTERNAL_VERIFY_SECRET as string | undefined;
+    const verifyUrl = process.env['INTERNAL_VERIFY_URL'] as string | undefined;
+    const verifySecret = process.env['INTERNAL_VERIFY_SECRET'] as string | undefined;
     const canRunDerivation = !!(verifyUrl && verifySecret);
 
     // Attempt full derivation check via web route when configured and run is within size cap
@@ -437,7 +444,7 @@ export const reverifyRun = action({
         for (;;) {
           // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
           const page: { events: Array<Record<string, unknown>>; nextCursor: string | null } =
-            await ctx.runInternalQuery(_listEventsFull, { runId: args.runId, cursor: evtCursor });
+            await ctx.runQuery(_listEventsFullRef, { runId: args.runId, cursor: evtCursor });
           allEvents.push(...page.events);
           if (page.nextCursor === null) break;
           evtCursor = page.nextCursor;
@@ -465,7 +472,7 @@ export const reverifyRun = action({
           failureSummaryPassed: boolean;
         };
 
-        await ctx.runInternalMutation(_upsertVerificationResult, {
+        await ctx.runMutation(_upsertVerificationResultRef, {
           runId: args.runId,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           orgId: orgId as any,
@@ -497,7 +504,7 @@ export const reverifyRun = action({
     }
 
     // Sequence-only path (no derivation check, or graceful degradation)
-    await ctx.runInternalMutation(_upsertVerificationResult, {
+    await ctx.runMutation(_upsertVerificationResultRef, {
       runId: args.runId,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       orgId: orgId as any,

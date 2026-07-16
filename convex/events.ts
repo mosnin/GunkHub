@@ -1,6 +1,6 @@
 // IMMUTABILITY: No updateEvent or deleteEvent. These operations must never exist.
 
-import { query, mutation } from "convex/server";
+import { query, mutation } from "./_generated/server.js";
 import { v } from "convex/values";
 import { requireOrgMembership } from "./auth.js";
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";

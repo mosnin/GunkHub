@@ -2,9 +2,9 @@
 // Authentication here is via pre-hashed API key only. Do NOT call getAuthContext
 // or requireOrgMembership in this file — those require a Clerk JWT.
 
-import { mutation } from "convex/server";
+import { mutation } from "./_generated/server.js";
 import { v } from "convex/values";
-import { Id } from "convex/_generated/dataModel";
+import type { Id } from "./_generated/dataModel.js";
 
 const TERMINAL_STATUSES = new Set([
   "completed",

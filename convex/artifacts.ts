@@ -1,6 +1,6 @@
 // Artifacts are immutable once created — payloads live in blob storage
 
-import { query, mutation } from "convex/server";
+import { query, mutation } from "./_generated/server.js";
 import { v } from "convex/values";
 import { requireOrgMembership } from "./auth.js";
 

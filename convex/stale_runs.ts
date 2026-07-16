@@ -4,10 +4,10 @@
 // Runs that crash before calling run.complete() or run.fail() never transition
 // to a terminal status. This daily job detects them and closes them out.
 
-import { internalAction, internalMutation, internalQuery } from "convex/server";
+import { internalAction, internalMutation, internalQuery } from "./_generated/server.js";
 import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
-import type { Id } from "convex/_generated/dataModel";
+import type { Id } from "./_generated/dataModel.js";
 import { STALE_RUN_TIMEOUT_MS, STALE_RUN_BATCH_SIZE } from "./helpers/pagination.js";
 
 const _listStaleRuns = makeFunctionReference<"query">("stale_runs:listStaleRuns");

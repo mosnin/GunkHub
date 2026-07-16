@@ -1,6 +1,6 @@
 // Organization is created via Clerk webhook, not directly by users
 
-import { query, mutation } from "convex/server";
+import { query, mutation } from "./_generated/server.js";
 import { v } from "convex/values";
 
 /**
@@ -18,7 +18,7 @@ import { v } from "convex/values";
  * verification in-backend. The shared secret closes the hole until that lands.
  */
 function assertWebhookSecret(provided: string): void {
-  const expected = process.env.CONVEX_WEBHOOK_SECRET;
+  const expected = process.env['CONVEX_WEBHOOK_SECRET'];
   if (!expected) {
     throw new Error(
       "CONVEX_WEBHOOK_SECRET is not configured on the Convex deployment",

@@ -1,4 +1,4 @@
-import { query, mutation } from "convex/server";
+import { query, mutation } from "./_generated/server.js";
 import { v } from "convex/values";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
 
