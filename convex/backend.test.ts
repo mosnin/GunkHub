@@ -59,6 +59,40 @@ describe('Tenancy isolation (CLAUDE.md Tenancy Rules)', () => {
     expect(keys.length).toBeGreaterThan(0)
     for (const k of keys) expect('keyHash' in k).toBe(false)
   })
+
+  it("org B's admin cannot read org A's events", async () => {
+    const t = convexTest(schema, modules)
+    const { runA } = await seed(t)
+    await t.mutation(api.sdk_ingest.sdkCreateEvents, {
+      apiKeyHash: 'hash_a',
+      events: [{ runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} }],
+    })
+    const asB = t.withIdentity({ subject: 'user_b', org_id: 'clerk_org_b' })
+    await expect(asB.query(api.events.listEvents, { runId: runA })).rejects.toThrow(/Unauthorized|not a member/)
+  })
+
+  it("an org-A API key cannot write events into org A's run from org B's key", async () => {
+    // Cross-org ingest: org B has no key here; forge with a nonexistent hash.
+    const t = convexTest(schema, modules)
+    const { runA } = await seed(t)
+    await expect(
+      t.mutation(api.sdk_ingest.sdkCreateEvents, {
+        apiKeyHash: 'hash_does_not_exist',
+        events: [{ runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} }],
+      }),
+    ).rejects.toThrow(/Unauthorized/)
+  })
+
+  it('getOrganization rejects resolving another org (enumeration guard)', async () => {
+    const t = convexTest(schema, modules)
+    await seed(t)
+    // user_b (org B) tries to resolve org A's record.
+    const asB = t.withIdentity({ subject: 'user_b', org_id: 'clerk_org_b' })
+    await expect(asB.query(api.organizations.getOrganization, { clerkOrgId: 'clerk_org_a' })).rejects.toThrow(/Unauthorized/)
+    // ...but can resolve its own.
+    const own = await asB.query(api.organizations.getOrganization, { clerkOrgId: 'clerk_org_b' })
+    expect(own).toBeTruthy()
+  })
 })
 
 describe('Event log invariants (Rule 4/5)', () => {

@@ -39,6 +39,21 @@ export const getOrganization = query({
     clerkOrgId: v.string(),
   },
   handler: async (ctx, args) => {
+    // Authorization: a caller may only resolve their OWN organization. Previously
+    // this was a public query with no auth, letting anyone enumerate org metadata
+    // (name/slug/plan) by guessing Clerk org IDs. Require an authenticated identity
+    // whose org_id claim matches the requested org.
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Unauthorized");
+    }
+    const callerOrgId = (identity as Record<string, unknown>)["org_id"] as
+      | string
+      | undefined;
+    if (callerOrgId !== args.clerkOrgId) {
+      throw new Error("Unauthorized: cannot resolve another organization");
+    }
+
     const org = await ctx.db
       .query("organizations")
       .withIndex("by_clerk_org_id", (q) =>
