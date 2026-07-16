@@ -65,14 +65,29 @@ export const isArtifactReferenced = internalQuery({
     runId: v.id("runs"),
   },
   handler: async (ctx, args) => {
+    const artifact = await ctx.db.get(args.artifactId);
+    // Artifact already gone (deleted by a concurrent run) — nothing to reclaim.
+    if (!artifact) return true;
+
+    // (1) Run-level artifact (no eventId): it "hangs off the Run" per CLAUDE.md.
+    // Runs are immutable and never deleted, so this artifact is always reachable.
+    // We cannot distinguish a legitimate run-level artifact from a dedup-race
+    // leftover, and destroying recorded data is unacceptable — so keep it.
+    if (artifact.eventId === undefined) return true;
+
+    // (2) Event-attached artifact: reachable as long as its event exists.
+    const event = await ctx.db.get(artifact.eventId);
+    if (event) return true;
+
+    // (3) Fallback: some event's _externalized payload references it by id.
     const events = await ctx.db
       .query("events")
       .withIndex("by_run", (q) => q.eq("runId", args.runId))
       .collect();
 
     const idStr = args.artifactId as string;
-    for (const event of events) {
-      const payload = event.payload as {
+    for (const e of events) {
+      const payload = e.payload as {
         type?: string;
         _artifact?: { artifactId?: string };
       };
@@ -83,6 +98,9 @@ export const isArtifactReferenced = internalQuery({
         return true;
       }
     }
+
+    // eventId is set but points to a missing event and nothing else references it:
+    // a genuine dangling pointer. Safe to reclaim.
     return false;
   },
 });
@@ -122,17 +140,6 @@ export const deleteArtifactRecord = internalMutation({
 export const cleanOrphanedArtifacts = internalAction({
   args: {},
   handler: async (ctx) => {
-    // Fetch one page of orphan candidates (oldest first via by_created_at index).
-    // Processing is intentionally bounded per GC run; remaining candidates are
-    // processed in subsequent daily invocations.
-    const { candidates, nextCursor } = await ctx.runQuery(_getOrphanCandidates, {});
-
-    if (nextCursor !== undefined) {
-      console.log(
-        `Artifact GC: ${candidates.length} candidates in this batch; additional candidates will be processed in future GC runs.`
-      );
-    }
-
     const blobToken = process.env["BLOB_STORE_TOKEN"];
     if (!blobToken) {
       console.warn(
@@ -141,76 +148,105 @@ export const cleanOrphanedArtifacts = internalAction({
       );
     }
 
+    // Bound total pages per run so a pathological backlog cannot exceed the action
+    // time budget, but page THROUGH candidates rather than only ever touching the
+    // first page. Referenced artifacts are permanent residents of the candidate
+    // set (oldest-first), so a single-page GC starves: it re-examines the same
+    // immortal head every day and never reaches real orphans behind them.
+    const MAX_PAGES = 50;
+
+    let batch = 0;
     let cleaned = 0;
     let skipped = 0;
     let blobErrors = 0;
     let checkErrors = 0;
     let recordErrors = 0;
 
-    for (const artifact of candidates) {
-      let referenced: boolean;
-      try {
-        referenced = await ctx.runQuery(_isArtifactReferenced, {
-          artifactId: artifact._id as Id<"artifacts">,
-          runId: artifact.runId,
-        });
-      } catch (err) {
-        console.error(
-          `Artifact GC: could not check references for artifact ${String(artifact._id)}: ${String(err)}`,
-        );
-        checkErrors++;
-        continue;
-      }
+    let cursor: string | undefined = undefined;
+    let pages = 0;
 
-      if (referenced) {
-        skipped++;
-        continue;
-      }
+    for (;;) {
+      const { candidates, nextCursor }: {
+        candidates: Array<{ _id: Id<"artifacts">; runId: Id<"runs">; storageKey: string }>;
+        nextCursor: string | undefined;
+      } = await ctx.runQuery(_getOrphanCandidates, cursor ? { cursor } : {});
+      batch += candidates.length;
 
-      // Attempt blob deletion first. If it fails, leave the Convex record intact
-      // so the next GC run can retry the blob delete.
-      if (blobToken) {
+      for (const artifact of candidates) {
+        let referenced: boolean;
         try {
-          const res = await fetch(
-            `https://blob.vercel-storage.com/${artifact.storageKey}`,
-            {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${blobToken}` },
-            },
-          );
-          if (!res.ok && res.status !== 404) {
-            throw new Error(
-              `Vercel Blob DELETE returned ${res.status} ${res.statusText}`,
-            );
-          }
+          referenced = await ctx.runQuery(_isArtifactReferenced, {
+            artifactId: artifact._id,
+            runId: artifact.runId,
+          });
         } catch (err) {
           console.error(
-            `Artifact GC: blob DELETE failed for artifact ${String(artifact._id)} (key=${artifact.storageKey}): ${String(err)}`,
+            `Artifact GC: could not check references for artifact ${String(artifact._id)}: ${String(err)}`,
           );
-          console.warn(`Artifact GC: artifact ${String(artifact._id)} will be retried in the next scheduled GC run`);
-          blobErrors++;
-          continue; // Leave the Convex record so the next run can retry
+          checkErrors++;
+          continue;
+        }
+
+        if (referenced) {
+          skipped++;
+          continue;
+        }
+
+        // Attempt blob deletion first. If it fails, leave the Convex record intact
+        // so the next GC run can retry the blob delete.
+        if (blobToken) {
+          try {
+            const res = await fetch(
+              `https://blob.vercel-storage.com/${artifact.storageKey}`,
+              {
+                method: "DELETE",
+                headers: { Authorization: `Bearer ${blobToken}` },
+              },
+            );
+            if (!res.ok && res.status !== 404) {
+              throw new Error(
+                `Vercel Blob DELETE returned ${res.status} ${res.statusText}`,
+              );
+            }
+          } catch (err) {
+            console.error(
+              `Artifact GC: blob DELETE failed for artifact ${String(artifact._id)} (key=${artifact.storageKey}): ${String(err)}`,
+            );
+            console.warn(`Artifact GC: artifact ${String(artifact._id)} will be retried in the next scheduled GC run`);
+            blobErrors++;
+            continue; // Leave the Convex record so the next run can retry
+          }
+        }
+
+        // Blob deleted (or skipped) — now remove the Convex record
+        try {
+          await ctx.runMutation(_deleteArtifactRecord, {
+            artifactId: artifact._id,
+          });
+          cleaned++;
+        } catch (err) {
+          console.error(
+            `Artifact GC: Convex record delete failed for artifact ${String(artifact._id)}: ${String(err)}`,
+          );
+          recordErrors++;
         }
       }
 
-      // Blob deleted (or skipped) — now remove the Convex record
-      try {
-        await ctx.runMutation(_deleteArtifactRecord, {
-          artifactId: artifact._id as Id<"artifacts">,
-        });
-        cleaned++;
-      } catch (err) {
-        console.error(
-          `Artifact GC: Convex record delete failed for artifact ${String(artifact._id)}: ${String(err)}`,
+      pages++;
+      if (nextCursor === undefined) break;
+      if (pages >= MAX_PAGES) {
+        console.log(
+          `Artifact GC: reached MAX_PAGES=${MAX_PAGES}; remaining candidates will be processed in the next scheduled run.`,
         );
-        recordErrors++;
+        break;
       }
+      cursor = nextCursor;
     }
 
     console.log(
-      `Artifact GC: batch=${candidates.length} cleaned=${cleaned} skipped=${skipped} ` +
+      `Artifact GC: batch=${batch} pages=${pages} cleaned=${cleaned} skipped=${skipped} ` +
         `blobErrors=${blobErrors} checkErrors=${checkErrors} recordErrors=${recordErrors}`,
     );
-    return { batch: candidates.length, cleaned, skipped, blobErrors, checkErrors, recordErrors };
+    return { batch, cleaned, skipped, blobErrors, checkErrors, recordErrors };
   },
 });

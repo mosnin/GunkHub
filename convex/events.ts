@@ -8,6 +8,29 @@ import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 // Event types that must be the last event in a run (CLAUDE.md Event Log Rule 5).
 const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
 
+// CLAUDE.md Event Log Rule 3: payloads over 10 KB must be externalized to blob
+// storage. Enforced server-side so a direct Convex call cannot bloat the store.
+const MAX_INLINE_PAYLOAD_BYTES = 10 * 1024;
+
+function isExternalizedPayload(payload: unknown): boolean {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    (payload as { type?: unknown }).type === "_externalized"
+  );
+}
+
+function assertPayloadWithinInlineLimit(payload: unknown): void {
+  if (isExternalizedPayload(payload)) return;
+  const bytes = new TextEncoder().encode(JSON.stringify(payload ?? null)).length;
+  if (bytes > MAX_INLINE_PAYLOAD_BYTES) {
+    throw new Error(
+      `Event payload is ${bytes} bytes, exceeding the ${MAX_INLINE_PAYLOAD_BYTES}-byte inline limit. ` +
+        `Payloads over 10 KB must be externalized to blob storage (store a pointer, not the data).`,
+    );
+  }
+}
+
 /**
  * List events for a run, ordered by sequenceNumber, with optional type filter.
  */
@@ -137,6 +160,9 @@ export const createEvent = mutation({
         `Non-contiguous sequenceNumber: expected ${expected}, got ${args.sequenceNumber}`,
       );
     }
+
+    // Event Log Rule 3: enforce payload externalization threshold.
+    assertPayloadWithinInlineLimit(args.payload);
 
     const eventId = await ctx.db.insert("events", {
       runId: args.runId,

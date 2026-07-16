@@ -3,6 +3,22 @@ import type { RecorderConfig, RunContext, RecordEventOptions, FlushResult } from
 import { HttpTransport, type Transport } from './transport.js'
 import { Events, buildEvent } from './events.js'
 
+/** Minimal shape of the Node `process` global we depend on (avoids @types/node). */
+interface NodeProcessLike {
+  on(event: string, listener: (...args: unknown[]) => void): unknown
+  off(event: string, listener: (...args: unknown[]) => void): unknown
+  exit(code?: number): never
+}
+
+/** Return the Node process if we're running under Node, otherwise undefined. */
+function getNodeProcess(): NodeProcessLike | undefined {
+  const p = (globalThis as { process?: unknown }).process
+  if (p && typeof (p as NodeProcessLike).on === 'function' && typeof (p as NodeProcessLike).off === 'function') {
+    return p as NodeProcessLike
+  }
+  return undefined
+}
+
 export class Recorder {
   private readonly config: RecorderConfig
   private readonly transport: Transport
@@ -18,9 +34,29 @@ export class Recorder {
   // in-flight flush and preserves buffer order.
   private flushChain: Promise<unknown> = Promise.resolve()
 
+  private processHandlersInstalled = false
+  private readonly onBeforeExit = (): void => {
+    void this.shutdown()
+  }
+  private readonly onSignal = (): void => {
+    void this.shutdown().finally(() => {
+      // Re-raise default behavior: exit non-zero after best-effort flush.
+      getNodeProcess()?.exit(1)
+    })
+  }
+  private readonly onFatal = (err: unknown): void => {
+    // Mark the run failed and flush, then let the process terminate.
+    void this.crashRun(err).finally(() => {
+      getNodeProcess()?.exit(1)
+    })
+  }
+
   constructor(config: RecorderConfig, transport?: Transport) {
     this.config = config
     this.transport = transport ?? new HttpTransport(config.endpoint)
+    if (config.options?.captureProcessExit) {
+      this.installProcessHandlers()
+    }
   }
 
   /**
@@ -182,6 +218,66 @@ export class Recorder {
     await this.transport.updateRunStatus(this.runContext!.runId, status, Date.now(), { apiKey: this.config.apiKey })
     this.runContext = null
     return result
+  }
+
+  /**
+   * Gracefully stop the recorder: cancel the flush timer, flush anything buffered,
+   * and remove any installed process handlers. Safe to call multiple times and
+   * safe to call with no active run. Call this before your process exits to
+   * guarantee buffered events are delivered.
+   */
+  async shutdown(): Promise<FlushResult> {
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
+    const result = await this.flush()
+    this.removeProcessHandlers()
+    return result
+  }
+
+  /**
+   * Mark the active run failed (if any) and flush. Used by the fatal-error handler
+   * so a crash still records a terminal run.failed event instead of leaving the
+   * run dangling as "running" forever.
+   */
+  private async crashRun(err: unknown): Promise<void> {
+    try {
+      if (this.runContext) {
+        const message = err instanceof Error ? err.message : String(err)
+        this.recordEvent(
+          'run.failed',
+          Events.runFailed(this.runContext.runId, { message }, Date.now() - this.runContext.startedAt).payload
+        )
+        await this.finalizeRun('failed')
+      } else {
+        await this.shutdown()
+      }
+    } catch {
+      // Best effort — the process is already dying.
+    }
+  }
+
+  private installProcessHandlers(): void {
+    const proc = getNodeProcess()
+    if (this.processHandlersInstalled || !proc) return
+    proc.on('beforeExit', this.onBeforeExit)
+    proc.on('SIGTERM', this.onSignal)
+    proc.on('SIGINT', this.onSignal)
+    proc.on('uncaughtException', this.onFatal)
+    proc.on('unhandledRejection', this.onFatal)
+    this.processHandlersInstalled = true
+  }
+
+  private removeProcessHandlers(): void {
+    const proc = getNodeProcess()
+    if (!this.processHandlersInstalled || !proc) return
+    proc.off('beforeExit', this.onBeforeExit)
+    proc.off('SIGTERM', this.onSignal)
+    proc.off('SIGINT', this.onSignal)
+    proc.off('uncaughtException', this.onFatal)
+    proc.off('unhandledRejection', this.onFatal)
+    this.processHandlersInstalled = false
   }
 
   private scheduleFlush(): void {

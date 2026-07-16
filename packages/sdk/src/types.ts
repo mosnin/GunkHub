@@ -24,6 +24,14 @@ export interface RecorderOptions {
   retryBackoffMs?: number
   /** Whether to log debug info. Default: false */
   debug?: boolean
+  /**
+   * Install process handlers (beforeExit, SIGTERM, SIGINT, uncaughtException,
+   * unhandledRejection) that best-effort flush buffered events and mark the active
+   * run failed if the process is dying. For a flight recorder, losing the crash
+   * telemetry is the worst failure mode. Node-only; a no-op where `process` is
+   * unavailable. Default: false (opt-in, since it registers global handlers).
+   */
+  captureProcessExit?: boolean
 }
 
 export interface RunContext {

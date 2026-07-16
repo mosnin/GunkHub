@@ -239,7 +239,12 @@ export class HttpTransport implements Transport {
     const processedEvents: CreateEventRequest[] = []
     for (const event of events) {
       const serialized = JSON.stringify(event.payload)
-      if (serialized.length > PAYLOAD_EXTERNALIZATION_THRESHOLD) {
+      // Measure UTF-8 BYTES, not UTF-16 code units. `string.length` undercounts
+      // multi-byte characters, so a payload that is >10 KB on the wire (and in the
+      // Convex document store, which the server now rejects) could slip under the
+      // threshold and never externalize. TextEncoder gives the true byte length.
+      const byteLength = new TextEncoder().encode(serialized).length
+      if (byteLength > PAYLOAD_EXTERNALIZATION_THRESHOLD) {
         // Check the per-call cache before issuing a PUT to blob storage
         const cached = uploadCache.get(serialized)
         if (cached) {

@@ -17,6 +17,32 @@ const TERMINAL_STATUSES = new Set([
 // run. Once one is stored, no further events may be appended.
 const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
 
+// CLAUDE.md Event Log Rule 3: payloads over 10 KB must be externalized to blob
+// storage; the event stores only a pointer. Enforced server-side (defense in
+// depth) so a direct Convex call or an SDK bug cannot bloat the document store.
+const MAX_INLINE_PAYLOAD_BYTES = 10 * 1024;
+
+/** True if the payload is an externalized pointer (holds a blob ref, not the data). */
+function isExternalizedPayload(payload: unknown): boolean {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    (payload as { type?: unknown }).type === "_externalized"
+  );
+}
+
+/** Throws if a non-externalized payload exceeds the 10 KB inline limit (UTF-8 bytes). */
+function assertPayloadWithinInlineLimit(payload: unknown): void {
+  if (isExternalizedPayload(payload)) return;
+  const bytes = new TextEncoder().encode(JSON.stringify(payload ?? null)).length;
+  if (bytes > MAX_INLINE_PAYLOAD_BYTES) {
+    throw new Error(
+      `Event payload is ${bytes} bytes, exceeding the ${MAX_INLINE_PAYLOAD_BYTES}-byte inline limit. ` +
+        `Payloads over 10 KB must be externalized to blob storage (store a pointer, not the data).`,
+    );
+  }
+}
+
 /**
  * Create a new run from an SDK call.  Authenticates via API key hash.
  * The run is created immediately in the "running" state because SDK callers
@@ -199,6 +225,9 @@ export const sdkCreateEvents = mutation({
           `Non-contiguous sequenceNumber for run ${evt.runId}: expected ${expected}, got ${evt.sequenceNumber}`,
         );
       }
+
+      // --- Event Log Rule 3: enforce payload externalization threshold ---
+      assertPayloadWithinInlineLimit(evt.payload);
 
       const parentEventId = evt.parentEventId
         ? (evt.parentEventId as Id<"events">)

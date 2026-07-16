@@ -218,6 +218,22 @@ describe('Recorder', () => {
     expect(sent).toEqual([1, 2, 3])
   })
 
+  it('shutdown() flushes buffered events and stops the flush timer', async () => {
+    const sent: number[] = []
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        sent.push(...events.map((e) => e.sequenceNumber))
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+    await recorder.startRun('input') // seq 1 (run.started)
+    recorder.recordEvent('custom', { type: 'custom', data: 'a' }) // seq 2
+    const result = await recorder.shutdown()
+    expect(result.success).toBe(true)
+    expect(sent).toContain(1)
+    expect(sent).toContain(2)
+  })
+
   it('serializes concurrent failing flushes so the buffer stays in sequence order', async () => {
     // Both flushes fail; without serialization the LIFO unshift would reorder the
     // buffer to [later..., earlier...]. Serialized, order is preserved.
