@@ -14,10 +14,18 @@ export const createApiKey = mutation({
     orgId: v.id("organizations"),
     name: v.string(),
     keyHash: v.string(),
+    // Optional enterprise controls. expiresAt: epoch ms after which the key is
+    // rejected. scopes: allowed operations (e.g. ["ingest:write"]); omit for full.
+    expiresAt: v.optional(v.number()),
+    scopes: v.optional(v.array(v.string())),
   },
   handler: async (ctx, args) => {
     const { userId } = await getAuthContext(ctx);
     await requireOrgMembership(ctx, args.orgId, { minimumRole: "admin" });
+
+    if (args.expiresAt !== undefined && args.expiresAt <= Date.now()) {
+      throw new Error("expiresAt must be in the future");
+    }
 
     const now = Date.now();
     const keyId = await ctx.db.insert("api_keys", {
@@ -28,6 +36,8 @@ export const createApiKey = mutation({
       createdAt: now,
       lastUsedAt: undefined,
       revokedAt: undefined,
+      expiresAt: args.expiresAt,
+      scopes: args.scopes,
     });
 
     const key = await ctx.db.get(keyId);
@@ -67,6 +77,8 @@ export const listApiKeys = query({
         createdAt: k.createdAt,
         lastUsedAt: k.lastUsedAt,
         revokedAt: k.revokedAt,
+        expiresAt: k.expiresAt,
+        scopes: k.scopes,
       }));
   },
 });

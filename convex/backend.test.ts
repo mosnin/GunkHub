@@ -184,6 +184,65 @@ describe('Event log invariants (Rule 4/5)', () => {
   })
 })
 
+describe('Enterprise API-key lifecycle (expiration + scopes)', () => {
+  async function seedKey(
+    t: ReturnType<typeof convexTest>,
+    keyProps: { keyHash: string; expiresAt?: number; scopes?: string[] },
+  ) {
+    return await t.run(async (ctx) => {
+      const now = Date.now()
+      const org = await ctx.db.insert('organizations', {
+        clerkOrgId: 'clerk_k', name: 'K', slug: 'k', plan: 'free', createdAt: now, updatedAt: now,
+      })
+      const project = await ctx.db.insert('projects', { orgId: org, name: 'P', slug: 'p', createdAt: now, updatedAt: now })
+      const agent = await ctx.db.insert('agents', { orgId: org, projectId: project, name: 'A', slug: 'a', createdAt: now, updatedAt: now })
+      await ctx.db.insert('api_keys', {
+        orgId: org, keyHash: keyProps.keyHash, name: 'k', createdBy: 'u', createdAt: now,
+        lastUsedAt: undefined, revokedAt: undefined,
+        expiresAt: keyProps.expiresAt, scopes: keyProps.scopes,
+      })
+      return { org, agent }
+    })
+  }
+
+  it('rejects an expired API key on ingest', async () => {
+    const t = convexTest(schema, modules)
+    const { agent } = await seedKey(t, { keyHash: 'expired', expiresAt: Date.now() - 1000 })
+    await expect(
+      t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'expired', agentId: agent }),
+    ).rejects.toThrow(/expired/i)
+  })
+
+  it('accepts a key whose expiresAt is in the future', async () => {
+    const t = convexTest(schema, modules)
+    const { agent } = await seedKey(t, { keyHash: 'future', expiresAt: Date.now() + 60_000 })
+    const run = await t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'future', agentId: agent })
+    expect(run.id).toBeTruthy()
+  })
+
+  it('rejects a key that lacks the ingest:write scope', async () => {
+    const t = convexTest(schema, modules)
+    const { agent } = await seedKey(t, { keyHash: 'scoped', scopes: ['ingest:read'] })
+    await expect(
+      t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'scoped', agentId: agent }),
+    ).rejects.toThrow(/scope/i)
+  })
+
+  it('accepts a key that has the ingest:write scope', async () => {
+    const t = convexTest(schema, modules)
+    const { agent } = await seedKey(t, { keyHash: 'writer', scopes: ['ingest:write'] })
+    const run = await t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'writer', agentId: agent })
+    expect(run.id).toBeTruthy()
+  })
+
+  it('a key with no scopes has full ingest access (back-compat)', async () => {
+    const t = convexTest(schema, modules)
+    const { agent } = await seedKey(t, { keyHash: 'legacy' })
+    const run = await t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'legacy', agentId: agent })
+    expect(run.id).toBeTruthy()
+  })
+})
+
 describe('Webhook-secret authorization (ADR-0023)', () => {
   beforeEach(() => {
     ;(globalThis as { process?: { env?: Record<string, string> } }).process ??= { env: {} }

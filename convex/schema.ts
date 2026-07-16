@@ -145,6 +145,10 @@ export default defineSchema({
     createdAt: v.number(),
     lastUsedAt: v.optional(v.number()),
     revokedAt: v.optional(v.number()),
+    // Enterprise key lifecycle. Both optional for back-compat: a key with no
+    // expiresAt never expires; a key with no scopes has full ingest access.
+    expiresAt: v.optional(v.number()),          // epoch ms; key is rejected once past
+    scopes: v.optional(v.array(v.string())),    // e.g. ["ingest:write"]
   })
     .index("by_org", ["orgId"])
     .index("by_key_hash", ["keyHash"]),

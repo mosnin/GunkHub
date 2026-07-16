@@ -19,7 +19,12 @@ interface ApiKeyDoc {
   name: string
   createdAt: number
   lastUsedAt?: number
+  expiresAt?: number
+  scopes?: string[]
 }
+
+// Scopes an API key may be granted. Ingest routes require "ingest:write".
+const ALLOWED_SCOPES = ['ingest:write', 'ingest:read'] as const
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ConvexArgs = Record<string, any>
@@ -76,6 +81,37 @@ export async function POST(req: Request) {
     )
   }
 
+  // Optional expiration: accept either an absolute epoch-ms `expiresAt` or a
+  // convenience `expiresInDays`.
+  let expiresAt: number | undefined
+  const rawExpiresAt = body['expiresAt']
+  const rawExpiresInDays = body['expiresInDays']
+  if (typeof rawExpiresAt === 'number') {
+    expiresAt = rawExpiresAt
+  } else if (typeof rawExpiresInDays === 'number' && rawExpiresInDays > 0) {
+    expiresAt = Date.now() + rawExpiresInDays * 24 * 60 * 60 * 1000
+  }
+  if (expiresAt !== undefined && expiresAt <= Date.now()) {
+    return NextResponse.json<ApiError>(
+      { code: 'VALIDATION_ERROR', message: 'expiration must be in the future' },
+      { status: 422 },
+    )
+  }
+
+  // Optional scopes: validate against the allowed set.
+  let scopes: string[] | undefined
+  const rawScopes = body['scopes']
+  if (Array.isArray(rawScopes)) {
+    const invalid = rawScopes.filter((s) => !ALLOWED_SCOPES.includes(s as (typeof ALLOWED_SCOPES)[number]))
+    if (invalid.length > 0) {
+      return NextResponse.json<ApiError>(
+        { code: 'VALIDATION_ERROR', message: `invalid scope(s): ${invalid.join(', ')}` },
+        { status: 422 },
+      )
+    }
+    scopes = rawScopes as string[]
+  }
+
   try {
     const convexOrgId = await resolveConvexOrgId(clerkOrgId)
     const rawKey = randomBytes(32).toString('hex')
@@ -86,6 +122,8 @@ export async function POST(req: Request) {
       orgId: convexOrgId,
       name: name.trim(),
       keyHash,
+      ...(expiresAt !== undefined && { expiresAt }),
+      ...(scopes !== undefined && { scopes }),
     })) as ApiKeyDoc
 
     // The raw key is returned ONCE and never stored — caller must persist it securely.
@@ -94,6 +132,8 @@ export async function POST(req: Request) {
         id: keyDoc._id,
         name: keyDoc.name,
         createdAt: keyDoc.createdAt,
+        expiresAt: keyDoc.expiresAt,
+        scopes: keyDoc.scopes,
         key: rawKey,
       },
       { status: 201 },
@@ -125,11 +165,15 @@ export async function GET() {
     })) as ApiKeyDoc[]
 
     // Return only safe fields — never the raw key or hash
+    const now = Date.now()
     const safeKeys = keys.map((k) => ({
       id: k._id,
       name: k.name,
       createdAt: k.createdAt,
       lastUsedAt: k.lastUsedAt,
+      expiresAt: k.expiresAt,
+      scopes: k.scopes,
+      expired: k.expiresAt !== undefined && k.expiresAt <= now,
     }))
 
     return NextResponse.json({ keys: safeKeys })

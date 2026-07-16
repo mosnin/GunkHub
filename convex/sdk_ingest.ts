@@ -3,8 +3,47 @@
 // or requireOrgMembership in this file — those require a Clerk JWT.
 
 import { mutation } from "./_generated/server.js";
+import type { MutationCtx } from "./_generated/server.js";
 import { v } from "convex/values";
-import type { Id } from "./_generated/dataModel.js";
+import type { Doc, Id } from "./_generated/dataModel.js";
+
+// Scope required to write to the ingest API (create runs/events/artifacts, update
+// status). A key with no `scopes` array has full access (back-compat).
+const INGEST_WRITE = "ingest:write";
+
+/**
+ * Resolve and authorize an API key for ingest. Centralizes the credential checks
+ * that every ingest mutation must perform: existence, revocation, expiration, and
+ * scope. Throws "Unauthorized"/"Forbidden" on any failure. Also stamps lastUsedAt.
+ */
+async function resolveApiKey(
+  ctx: MutationCtx,
+  apiKeyHash: string,
+  requiredScope: string,
+): Promise<Doc<"api_keys">> {
+  const apiKey = await ctx.db
+    .query("api_keys")
+    .withIndex("by_key_hash", (q) => q.eq("keyHash", apiKeyHash))
+    .unique();
+
+  if (!apiKey || apiKey.revokedAt !== undefined) {
+    throw new Error("Unauthorized");
+  }
+  if (apiKey.expiresAt !== undefined && apiKey.expiresAt <= Date.now()) {
+    throw new Error("Unauthorized: API key has expired");
+  }
+  if (
+    apiKey.scopes !== undefined &&
+    apiKey.scopes.length > 0 &&
+    !apiKey.scopes.includes(requiredScope)
+  ) {
+    throw new Error(`Forbidden: API key lacks required scope "${requiredScope}"`);
+  }
+
+  // Fire-and-forget usage tracking.
+  await ctx.db.patch(apiKey._id, { lastUsedAt: Date.now() });
+  return apiKey;
+}
 
 const TERMINAL_STATUSES = new Set([
   "completed",
@@ -59,17 +98,7 @@ export const sdkCreateRun = mutation({
     sdkVersion: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const apiKey = await ctx.db
-      .query("api_keys")
-      .withIndex("by_key_hash", (q) => q.eq("keyHash", args.apiKeyHash))
-      .unique();
-
-    if (!apiKey || apiKey.revokedAt !== undefined) {
-      throw new Error("Unauthorized");
-    }
-
-    // Update lastUsedAt on the key record (fire-and-forget tracking)
-    await ctx.db.patch(apiKey._id, { lastUsedAt: Date.now() });
+    const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
 
     const agentId = args.agentId as Id<"agents">;
     const agent = await ctx.db.get(agentId);
@@ -130,14 +159,7 @@ export const sdkCreateEvents = mutation({
     ),
   },
   handler: async (ctx, args) => {
-    const apiKey = await ctx.db
-      .query("api_keys")
-      .withIndex("by_key_hash", (q) => q.eq("keyHash", args.apiKeyHash))
-      .unique();
-
-    if (!apiKey || apiKey.revokedAt !== undefined) {
-      throw new Error("Unauthorized");
-    }
+    const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
 
     const eventIds: string[] = [];
 
@@ -270,14 +292,7 @@ export const sdkUpdateRunStatus = mutation({
     endedAt: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const apiKey = await ctx.db
-      .query("api_keys")
-      .withIndex("by_key_hash", (q) => q.eq("keyHash", args.apiKeyHash))
-      .unique();
-
-    if (!apiKey || apiKey.revokedAt !== undefined) {
-      throw new Error("Unauthorized");
-    }
+    const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
 
     const runId = args.runId as Id<"runs">;
     const run = await ctx.db.get(runId);
@@ -321,14 +336,7 @@ export const sdkCreateArtifact = mutation({
     checksum: v.string(),
   },
   handler: async (ctx, args) => {
-    const apiKey = await ctx.db
-      .query("api_keys")
-      .withIndex("by_key_hash", (q) => q.eq("keyHash", args.apiKeyHash))
-      .unique();
-
-    if (!apiKey || apiKey.revokedAt !== undefined) {
-      throw new Error("Unauthorized");
-    }
+    const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
 
     const runId = args.runId as Id<"runs">;
     const run = await ctx.db.get(runId);
