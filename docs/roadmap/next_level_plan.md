@@ -174,14 +174,24 @@ terminal check (G7).
 
 ---
 
-## 4. Current state after Phase 0
+## 4. Current state after Phases 0–4
 
 | Goal | Status |
 |------|--------|
-| G1 compiles & gated | ⏳ Phase 1 (backend still outside workspace) |
-| G2 zero cross-tenant | 🟡 critical + high closed; `getOrganization` query + `convex-test` proof remain |
-| G3 invariants enforced | 🟡 sequence/terminal enforced; server-side 10 KB + schema union remain |
-| G4 durable ingestion | 🟡 data-loss + per-run seq + unref fixed; crash handlers + UTF-8 remain |
-| G5 no full scans | 🟡 stale-run scan fixed; artifact GC + UI pagination remain |
-| G6 explainable | ⏳ Phase 2/4 (verify-action API + poll dedupe) |
-| G7 audit ≥ 8 | ⏳ terminal gate |
+| G1 compiles & gated | 🟢 backend now in workspace + typechecks (6/6); CI integration cmd fixed. 🟡 remaining: `tests/` typecheck (107 vitest-Mock/tautology errors, Phase 3 cleanup) and lint coverage beyond web |
+| G2 zero cross-tenant | 🟢 critical+high closed AND proven by convex-test (org A/B isolation, keyHash never returned). 🟡 `getOrganization` public query → internalQuery (low) |
+| G3 invariants enforced | 🟢 positivity/contiguity/terminal-last + server-side 10 KB enforced and tested. 🟡 close `Event.type`/`payload` schema union (needs custom-event decision) |
+| G4 durable ingestion | 🟢 buffer restore + serialized flushes + per-run seq + crash handlers + UTF-8, with regression tests |
+| G5 no full scans | 🟢 stale-run indexed, artifact GC paged + safe, `/runs` paginated |
+| G6 explainable | 🟢 verify cron/reverify fixed (runInternalQuery bug), live-poll duplication fixed |
+| G7 audit ≥ 8 | ⏳ terminal gate — run the full ten-dimension re-audit |
+
+### Remaining before the goal is fully met
+- **Phase 3 cleanup:** flip on `tests/` typecheck (rewrite the ~90 vitest-Mock
+  annotations + the audit's tautological assertions); extend lint to all packages.
+- **Small hardening:** `getOrganization` → internalQuery; decide + close the
+  `Event.type` schema union (or keep open for custom events, with an ADR).
+- **Phase 5 (needs a scope decision + a live Convex deployment):** the actual
+  at-scale features — high-throughput/streaming ingestion, live subscriptions,
+  fleet analytics, retention tiering — each behind an ADR lifting "Not in v1".
+- **G7:** re-run the full adversarial audit; require every dimension ≥ 8.
