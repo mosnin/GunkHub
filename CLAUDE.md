@@ -118,6 +118,17 @@ Multi-tenancy is enforced at the organization boundary. These rules prevent data
 Agent Flight Recorder is a premium engineering tool, not a startup template.
 Every UI decision must reflect this.
 
+> **⚠️ AUTHORITATIVE VISUAL STYLE — `design.md`.**
+> The repo-root **`design.md`** ("Neon — Server Room After Dark") is the single
+> source of truth for the product's visual identity: palette, typography, spacing,
+> shapes, motion, components, and imagery. **You MUST read and follow `design.md`
+> every time you make ANY UI change** — new components, restyles, layout, pages,
+> animations, or graphics. All colors come from its tokens (Blackout `#000000`
+> ground, Whiteout `#ffffff` text, Neon Glow `#34d59a` accent only), buttons are
+> pills (`9999px`), all other containers are `4px`, and depth is layered near-black
+> surfaces, never box-shadows. Do not introduce colors, radii, or type outside the
+> `design.md` system without updating `design.md` first.
+
 - **Calm, technical, high signal.** Remove anything that does not carry information.
 - **Strong visual hierarchy.** Engineers scan vertically. Make the most important
   data (event type, status, timestamp, error message) immediately legible at a glance.
@@ -197,6 +208,12 @@ When starting a new Claude session on this repository:
 
 8. **Check `.env.example`** if you add a new environment variable. Document it there
    before the code that consumes it is merged.
+
+9. **Read `design.md` before any UI change.** Any change to `apps/web` components,
+   pages, styles, layout, motion, or graphics MUST conform to the `design.md`
+   ("Neon") system — its palette tokens, pill/4px shapes, Inter + GeistMono type,
+   and motion/imagery rules. If a change needs something outside that system,
+   update `design.md` first.
 
 ---
 

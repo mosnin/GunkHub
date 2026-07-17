@@ -2,6 +2,26 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Neon design system — see /design.md. Tokens exposed as CSS custom properties. */
+:root {
+  --color-neon-glow: #34d59a;
+  --color-neon-muted: #285d49;
+  --color-scanline-fade: #39a57d;
+  --gradient-scanline-fade: linear-gradient(90deg, rgba(57, 165, 125, 0.6) 50%, rgba(0, 0, 0, 0) 50%);
+  --color-system-warning: #ff3621;
+  --color-whiteout: #ffffff;
+  --color-ash: #797d86;
+  --color-pewter: #94979e;
+  --color-cloud: #c9cbcf;
+  --color-graphite-light: #303236;
+  --color-graphite: #242628;
+  --color-graphite-deep: #151617;
+  --color-depth: #0a0a0b;
+  --color-blackout: #000000;
+  --font-inter: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-geistmono: 'Geist Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 @layer base {
   * {
     box-sizing: border-box;
@@ -10,15 +30,104 @@
   html {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    background-color: #000000;
   }
 
+  body {
+    background-color: #000000;
+    color: #ffffff;
+    font-family: var(--font-inter);
+  }
+
+  /* Neon accent focus ring + selection. */
   :focus-visible {
-    outline: 2px solid theme('colors.primary.600');
+    outline: 2px solid var(--color-neon-glow);
     outline-offset: 2px;
   }
 
   ::selection {
-    background-color: theme('colors.primary.600');
-    color: #fff;
+    background-color: var(--color-neon-glow);
+    color: #000000;
+  }
+
+  /* Thin, dark scrollbars to match the server-room aesthetic. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #303236 #000000;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-track {
+    background: #000000;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: #242628;
+    border-radius: 9999px;
+    border: 2px solid #000000;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: #303236;
+  }
+}
+
+@layer components {
+  /* Generative "data stream" backdrop — thin vertical neon lines drifting upward,
+     purely atmospheric (design.md Imagery). Sits behind content, non-interactive. */
+  .data-stream-bg {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    pointer-events: none;
+    opacity: 0.4;
+    background-image: repeating-linear-gradient(
+      90deg,
+      transparent 0,
+      transparent 38px,
+      rgba(52, 213, 154, 0.11) 39px,
+      rgba(52, 213, 154, 0.11) 40px
+    );
+    -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 78%);
+    mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 78%);
+  }
+
+  /* A single vertical scanline that streams down a container. */
+  .scanline {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 40%;
+    background: linear-gradient(180deg, transparent, rgba(52, 213, 154, 0.14), transparent);
+    animation: data-stream 6s linear infinite;
+  }
+
+  /* Card surface: layered near-black with a 4px radius and hairline border. */
+  .neon-surface {
+    background-color: #151617;
+    border: 1px solid #242628;
+    border-radius: 4px;
+  }
+
+  /* Neon status dot used before feature/list items. */
+  .neon-dot::before {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background-color: var(--color-neon-glow);
+    box-shadow: 0 0 8px rgba(52, 213, 154, 0.7);
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scanline,
+  .animate-data-stream,
+  .animate-neon-pulse,
+  .animate-fade-up {
+    animation: none !important;
   }
 }

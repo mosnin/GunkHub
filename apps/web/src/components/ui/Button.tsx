@@ -11,21 +11,23 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   children: ReactNode
 }
 
+// Buttons are pills (design.md: 9999px radius). Primary = Whiteout bg / Graphite
+// Deep text; Ghost = transparent with a Graphite-light hairline border.
 const variantClasses: Record<ButtonVariant, string> = {
   primary:
-    'bg-primary-600 hover:bg-primary-700 text-white border-transparent focus-visible:ring-primary-500',
+    'bg-whiteout hover:bg-cloud text-graphite-deep border-transparent focus-visible:ring-neon-glow',
   secondary:
-    'bg-neutral-800 hover:bg-neutral-700 text-neutral-100 border-neutral-700 focus-visible:ring-neutral-500',
+    'bg-graphite hover:bg-graphite-light text-whiteout border-graphite-light focus-visible:ring-neon-glow',
   ghost:
-    'bg-transparent hover:bg-neutral-800 text-neutral-300 hover:text-neutral-100 border-transparent focus-visible:ring-neutral-500',
+    'bg-transparent hover:bg-graphite text-whiteout border-graphite-light hover:border-neutral-600 focus-visible:ring-neon-glow',
   destructive:
-    'bg-destructive-600 hover:bg-destructive-700 text-white border-transparent focus-visible:ring-destructive-500',
+    'bg-transparent hover:bg-destructive-900 text-destructive-500 border-destructive-700 focus-visible:ring-destructive-500',
 }
 
 const sizeClasses: Record<ButtonSize, string> = {
-  sm: 'px-2.5 py-1.5 text-xs',
-  md: 'px-3.5 py-2 text-sm',
-  lg: 'px-5 py-2.5 text-sm',
+  sm: 'px-4 py-1.5 text-xs',
+  md: 'px-[18px] py-2 text-sm',
+  lg: 'px-7 py-3 text-sm',
 }
 
 export function Button({
@@ -38,9 +40,9 @@ export function Button({
   return (
     <button
       className={cn(
-        'inline-flex items-center justify-center font-medium rounded-md border',
-        'transition-colors duration-100',
-        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-neutral-950',
+        'inline-flex items-center justify-center font-medium rounded-full border',
+        'transition-colors duration-150',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-blackout',
         'disabled:opacity-40 disabled:pointer-events-none',
         variantClasses[variant],
         sizeClasses[size],

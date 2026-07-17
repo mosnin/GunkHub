@@ -1,74 +1,133 @@
 import type { Config } from 'tailwindcss'
 
+// Palette, type, and shapes are governed by /design.md ("Neon — Server Room After
+// Dark"). The existing `neutral`/`primary`/etc. scales are REMAPPED onto the Neon
+// tokens so every component inherits the identity, and the radius scale is
+// overridden to enforce the design's shape dichotomy: 4px for all containers,
+// 9999px (pill) for buttons via `rounded-full`.
 const config: Config = {
-  content: [
-    './app/**/*.{ts,tsx}',
-    './src/**/*.{ts,tsx}',
-  ],
+  content: ['./app/**/*.{ts,tsx}', './src/**/*.{ts,tsx}'],
   theme: {
     extend: {
       colors: {
+        // Direct Neon token names (design.md) — preferred for new work.
+        neon: {
+          glow: '#34d59a',
+          muted: '#285d49',
+          scanline: '#39a57d',
+        },
+        blackout: '#000000',
+        depth: '#0a0a0b',
+        graphite: {
+          deep: '#151617',
+          DEFAULT: '#242628',
+          light: '#303236',
+        },
+        ash: '#797d86',
+        pewter: '#94979e',
+        cloud: '#c9cbcf',
+        whiteout: '#ffffff',
+        // Remapped legacy scales → Neon greys (dark-first). Existing classes like
+        // bg-neutral-900 / text-neutral-400 now render the Neon environment.
         neutral: {
-          50:  '#fafafa',
-          100: '#f5f5f5',
-          200: '#e5e5e5',
-          300: '#d4d4d4',
-          400: '#a3a3a3',
-          500: '#737373',
-          600: '#525252',
-          700: '#404040',
-          800: '#262626',
-          850: '#1a1a1a',
-          900: '#171717',
-          950: '#0a0a0a',
+          50: '#ffffff',
+          100: '#f4f5f6',
+          200: '#c9cbcf', // cloud
+          300: '#a6a9af',
+          400: '#94979e', // pewter
+          500: '#797d86', // ash
+          600: '#4a4d53',
+          700: '#303236', // graphite-light (borders)
+          800: '#242628', // graphite
+          850: '#151617', // graphite-deep (cards)
+          900: '#0a0a0b', // depth
+          950: '#000000', // blackout
         },
+        // Accent scale → Neon Glow. primary-* usages become electric green.
         primary: {
-          DEFAULT: '#2563eb',
-          50:  '#eff6ff',
-          100: '#dbeafe',
-          200: '#bfdbfe',
-          300: '#93c5fd',
-          400: '#60a5fa',
-          500: '#3b82f6',
-          600: '#2563eb',
-          700: '#1d4ed8',
-          800: '#1e40af',
-          900: '#1e3a8a',
-        },
-        destructive: {
-          DEFAULT: '#dc2626',
-          50:  '#fef2f2',
-          100: '#fee2e2',
-          400: '#f87171',
-          500: '#ef4444',
-          600: '#dc2626',
-          700: '#b91c1c',
-          900: '#7f1d1d',
+          DEFAULT: '#34d59a',
+          50: '#e7fbf3',
+          100: '#c2f4e0',
+          200: '#8fe9c6',
+          300: '#5fdeae',
+          400: '#34d59a', // neon glow
+          500: '#34d59a',
+          600: '#22b884',
+          700: '#1a8f68',
+          800: '#285d49', // neon muted
+          900: '#123b2f',
         },
         success: {
-          DEFAULT: '#16a34a',
-          50:  '#f0fdf4',
-          100: '#dcfce7',
-          400: '#4ade80',
-          500: '#22c55e',
-          600: '#16a34a',
-          700: '#15803d',
-          900: '#14532d',
+          DEFAULT: '#34d59a',
+          50: '#e7fbf3',
+          100: '#c2f4e0',
+          400: '#5fdeae',
+          500: '#34d59a',
+          600: '#22b884',
+          700: '#1a8f68',
+          900: '#123b2f',
+        },
+        destructive: {
+          DEFAULT: '#ff3621',
+          50: '#3a0e0a',
+          100: '#4d120c',
+          400: '#ff6a5a',
+          500: '#ff3621',
+          600: '#e02a17',
+          700: '#b71f10',
+          900: '#4d120c',
         },
         warning: {
-          DEFAULT: '#d97706',
-          50:  '#fffbeb',
-          100: '#fef3c7',
-          400: '#fbbf24',
-          500: '#f59e0b',
-          600: '#d97706',
-          700: '#b45309',
-          900: '#78350f',
+          DEFAULT: '#ff3621',
+          50: '#3a0e0a',
+          100: '#4d120c',
+          400: '#ff6a5a',
+          500: '#ff3621',
+          600: '#e02a17',
+          700: '#b71f10',
+          900: '#4d120c',
         },
       },
       fontFamily: {
         sans: ['Inter', 'ui-sans-serif', 'system-ui', '-apple-system', 'sans-serif'],
-        mono: ['JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        mono: ['Geist Mono', 'Fira Code', 'Source Code Pro', 'JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+      },
+      // Shape dichotomy: every container radius collapses to 4px; only `rounded-full`
+      // (buttons) stays a pill. See design.md "Do's": 9999px buttons / 4px else.
+      borderRadius: {
+        none: '0px',
+        sm: '4px',
+        DEFAULT: '4px',
+        md: '4px',
+        lg: '4px',
+        xl: '4px',
+        '2xl': '4px',
+        '3xl': '4px',
+        full: '9999px',
+      },
+      boxShadow: {
+        // design.md: depth is layered near-black surfaces, not shadows. The one
+        // sanctioned shadow token for genuine overlays (modals) only.
+        lg: 'rgba(0, 0, 0, 0.4) 0px 8px 20px 0px',
+      },
+      keyframes: {
+        'neon-pulse': {
+          '0%, 100%': { opacity: '1' },
+          '50%': { opacity: '0.55' },
+        },
+        'data-stream': {
+          '0%': { transform: 'translateY(-100%)' },
+          '100%': { transform: 'translateY(100%)' },
+        },
+        'fade-up': {
+          '0%': { opacity: '0', transform: 'translateY(8px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+      },
+      animation: {
+        'neon-pulse': 'neon-pulse 2s ease-in-out infinite',
+        'data-stream': 'data-stream 6s linear infinite',
+        'fade-up': 'fade-up 0.4s ease-out both',
       },
     },
   },
