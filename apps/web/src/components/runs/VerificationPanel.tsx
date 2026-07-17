@@ -36,7 +36,7 @@ interface CheckPillProps {
 function CheckPill({ label, ran, passed }: CheckPillProps) {
   if (!ran) {
     return (
-      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-neutral-700 border border-neutral-800">
+      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-pewter border border-neutral-800">
         <span className="w-1.5 h-1.5 rounded-full bg-neutral-800" aria-hidden="true" />
         {label}
         <span className="text-neutral-800">skipped</span>
@@ -52,10 +52,10 @@ function CheckPill({ label, ran, passed }: CheckPillProps) {
     )
   }
   return (
-    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-red-500 border border-red-900">
-      <span className="w-1.5 h-1.5 rounded-full bg-red-700" aria-hidden="true" />
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-destructive-500 border border-destructive-700">
+      <span className="w-1.5 h-1.5 rounded-full bg-destructive-500" aria-hidden="true" />
       {label}
-      <span className="text-red-700">failed</span>
+      <span className="text-destructive-500">failed</span>
     </span>
   )
 }
@@ -90,14 +90,14 @@ export function VerificationPanel({ runId, initialStatus, isTerminal }: Verifica
     <div className="px-6 py-3 border-b border-neutral-800 bg-neutral-950">
       {/* Header row */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
-        <span className="text-xs text-neutral-600 font-mono uppercase tracking-wider">
+        <span className="text-xs text-pewter font-mono uppercase tracking-wider">
           Integrity
         </span>
 
         <IntegrityBadge status={status} />
 
         {status.verifiedAt && (
-          <span className="text-xs text-neutral-600">
+          <span className="text-xs text-pewter">
             verified {formatRelativeTime(status.verifiedAt)}
           </span>
         )}
@@ -128,7 +128,7 @@ export function VerificationPanel({ runId, initialStatus, isTerminal }: Verifica
           type="button"
           onClick={handleReverify}
           disabled={isPending}
-          className="ml-auto text-xs font-mono text-neutral-600 hover:text-neutral-400 disabled:text-neutral-700 transition-colors border border-neutral-800 hover:border-neutral-700 disabled:border-neutral-800 px-2 py-0.5 rounded"
+          className="ml-auto text-xs font-mono text-pewter hover:text-cloud disabled:text-pewter transition-colors border border-neutral-800 hover:border-neutral-700 disabled:border-neutral-800 px-2 py-0.5 rounded"
         >
           {isPending ? 'Verifying…' : 'Re-verify'}
         </button>
@@ -136,7 +136,7 @@ export function VerificationPanel({ runId, initialStatus, isTerminal }: Verifica
 
       {/* Partial verification notice */}
       {isPartial && (
-        <p className="mt-1.5 text-xs text-neutral-700">
+        <p className="mt-1.5 text-xs text-pewter">
           Partial — sequence checked only. Full derivation requires{' '}
           <span className="font-mono">INTERNAL_VERIFY_URL</span> to be configured.
         </p>
@@ -144,7 +144,7 @@ export function VerificationPanel({ runId, initialStatus, isTerminal }: Verifica
 
       {/* Error feedback */}
       {reverifyError && (
-        <p className="mt-1.5 text-xs text-red-500 font-mono">{reverifyError}</p>
+        <p className="mt-1.5 text-xs text-destructive-500 font-mono">{reverifyError}</p>
       )}
 
       {/* Failure detail — shown when verification found issues */}

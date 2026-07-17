@@ -22,7 +22,7 @@ export function RunBreadcrumb({ runId, projectId, projectName, agentId, agentNam
 
       {projectId && (
         <>
-          <span className="text-neutral-700" aria-hidden>/</span>
+          <span className="text-pewter" aria-hidden>/</span>
           <Link
             href={`/projects/${projectId}`}
             className="hover:text-neutral-300 transition-colors duration-75 max-w-[180px] truncate"
@@ -35,7 +35,7 @@ export function RunBreadcrumb({ runId, projectId, projectName, agentId, agentNam
 
       {agentId && (
         <>
-          <span className="text-neutral-700" aria-hidden>/</span>
+          <span className="text-pewter" aria-hidden>/</span>
           <Link
             href={`/agents/${agentId}`}
             className="hover:text-neutral-300 transition-colors duration-75 max-w-[180px] truncate"
@@ -46,7 +46,7 @@ export function RunBreadcrumb({ runId, projectId, projectName, agentId, agentNam
         </>
       )}
 
-      <span className="text-neutral-700" aria-hidden>/</span>
+      <span className="text-pewter" aria-hidden>/</span>
       <span className="font-mono text-neutral-400" aria-current="page">
         {truncateId(runId, 12)}
       </span>

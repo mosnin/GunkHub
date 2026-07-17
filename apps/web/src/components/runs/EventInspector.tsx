@@ -45,7 +45,7 @@ function ExternalizedPayloadView({ payload }: { payload: {
     <div className="p-4 flex flex-col gap-3">
       {/* Header */}
       <div className="flex items-center gap-2">
-        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium border bg-amber-900/40 text-amber-400 border-amber-700/60">
+        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium border bg-neutral-800 text-neutral-300 border-neutral-600">
           externalized
         </span>
         <span className="text-xs text-neutral-500">
@@ -57,19 +57,19 @@ function ExternalizedPayloadView({ payload }: { payload: {
       {/* Artifact metadata */}
       <dl className="flex flex-col gap-2 text-xs">
         <div className="flex items-start justify-between gap-4">
-          <dt className="text-neutral-600 shrink-0 w-24">Artifact ID</dt>
+          <dt className="text-pewter shrink-0 w-24">Artifact ID</dt>
           <dd className="font-mono text-neutral-400 truncate text-right">{_artifact.artifactId}</dd>
         </div>
         <div className="flex items-start justify-between gap-4">
-          <dt className="text-neutral-600 shrink-0 w-24">Storage key</dt>
+          <dt className="text-pewter shrink-0 w-24">Storage key</dt>
           <dd className="font-mono text-neutral-500 text-right">{keyPreview}</dd>
         </div>
         <div className="flex items-start justify-between gap-4">
-          <dt className="text-neutral-600 shrink-0 w-24">Size</dt>
+          <dt className="text-pewter shrink-0 w-24">Size</dt>
           <dd className="font-mono text-neutral-400">{sizeKb} KB</dd>
         </div>
         <div className="flex items-start justify-between gap-4">
-          <dt className="text-neutral-600 shrink-0 w-24">Checksum</dt>
+          <dt className="text-pewter shrink-0 w-24">Checksum</dt>
           <dd className="font-mono text-neutral-500 text-right" title={_artifact.checksum}>
             {_artifact.checksum.slice(0, 16)}…
           </dd>
@@ -77,7 +77,7 @@ function ExternalizedPayloadView({ payload }: { payload: {
       </dl>
 
       {/* Note */}
-      <p className="text-xs text-neutral-600 border-t border-neutral-800 pt-3 mt-1">
+      <p className="text-xs text-pewter border-t border-neutral-800 pt-3 mt-1">
         Full payload stored as artifact. View it in the{' '}
         <span className="text-neutral-500">Artifacts</span> tab.
       </p>
@@ -414,7 +414,7 @@ function EventInspectorInner({
                 onClick={followTail ? () => setFollowTail(false) : onResume}
                 className={[
                   'flex items-center gap-1 text-xs font-mono transition-colors duration-100',
-                  followTail ? 'text-neutral-600 hover:text-neutral-400' : 'text-neutral-600 hover:text-neutral-400',
+                  followTail ? 'text-pewter hover:text-cloud' : 'text-pewter hover:text-cloud',
                 ].join(' ')}
                 title={followTail ? 'Following tail — click to pause' : 'Tail paused — click to resume'}
               >
@@ -434,7 +434,7 @@ function EventInspectorInner({
           </p>
         )}
         {seekState === 'not-found' && (
-          <p className="px-3 py-1.5 text-xs font-mono text-amber-600 border-b border-neutral-800">
+          <p className="px-3 py-1.5 text-xs font-mono text-destructive-400 border-b border-neutral-800">
             Event #{initialEventSeq} not found in this run.
           </p>
         )}
@@ -446,7 +446,7 @@ function EventInspectorInner({
               setFollowTail(false)
               setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))
             }}
-            className="text-xs font-mono text-neutral-600 hover:text-neutral-400 px-3 py-1.5 border-b border-neutral-800 w-full text-left"
+            className="text-xs font-mono text-pewter hover:text-cloud px-3 py-1.5 border-b border-neutral-800 w-full text-left"
           >
             ↑ {aboveCount} above
           </button>
@@ -464,14 +464,26 @@ function EventInspectorInner({
               return (
                 <li
                   key={evt.id}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={selectedEvent?.id === evt.id}
                   onClick={() => {
                     setFollowTail(false)
                     setSelectedId(evt.id)
                     setFocusedIdx(absIdx)
                     ensureSelectedVisible(absIdx)
                   }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      setFollowTail(false)
+                      setSelectedId(evt.id)
+                      setFocusedIdx(absIdx)
+                      ensureSelectedVisible(absIdx)
+                    }
+                  }}
                   className={[
-                    'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75',
+                    'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75 outline-none focus:ring-1 focus:ring-inset focus:ring-neutral-600',
                     selectedEvent?.id === evt.id
                       ? 'bg-neutral-900 text-neutral-200'
                       : 'hover:bg-neutral-900/60 text-neutral-400',
@@ -480,9 +492,9 @@ function EventInspectorInner({
                 >
                   <span className="text-xs font-mono">{evt.type}</span>
                   {(evt.payload as { type: string }).type === '_externalized' && (
-                    <span className="text-amber-700 text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
+                    <span className="text-pewter text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
                   )}
-                  <span className="text-xs font-mono text-neutral-600">#{evt.sequenceNumber}</span>
+                  <span className="text-xs font-mono text-pewter">#{evt.sequenceNumber}</span>
                 </li>
               )
             })}
@@ -493,7 +505,7 @@ function EventInspectorInner({
         {belowCount > 0 && (
           <button
             onClick={() => setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, windowStart + WINDOW_SIZE))}
-            className="text-xs font-mono text-neutral-600 hover:text-neutral-400 px-3 py-1.5 border-b border-neutral-800 w-full text-left"
+            className="text-xs font-mono text-pewter hover:text-cloud px-3 py-1.5 border-b border-neutral-800 w-full text-left"
           >
             ↓ {belowCount} below
           </button>
@@ -503,7 +515,7 @@ function EventInspectorInner({
         {(cursor !== undefined || loadError !== null) && (
           <div className="px-3 py-2 border-t border-neutral-800 flex flex-col gap-1">
             {loadError && (
-              <p className="text-xs text-red-400">{loadError}</p>
+              <p className="text-xs text-destructive-400">{loadError}</p>
             )}
             {cursor && (
               <button
@@ -528,7 +540,7 @@ function EventInspectorInner({
                 void navigator.clipboard.writeText(window.location.href)
               }}
               title="Copy link to this event"
-              className="text-xs font-mono text-neutral-600 hover:text-neutral-300 transition-colors duration-75 px-2 py-0.5 rounded hover:bg-neutral-800"
+              className="text-xs font-mono text-pewter hover:text-neutral-300 transition-colors duration-75 px-2 py-0.5 rounded hover:bg-neutral-800"
             >
               Copy link
             </button>

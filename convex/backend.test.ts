@@ -424,3 +424,146 @@ describe('Webhook-secret authorization (ADR-0023)', () => {
     expect(membership.role).toBe('admin')
   })
 })
+
+// Seed one org with a viewer, member, and admin membership plus a running run.
+// Exercises the AUTHENTICATED (Clerk-JWT) write path — api.events.createEvent —
+// which is role-gated, unlike the API-key sdk_ingest path.
+async function seedRoles(t: ReturnType<typeof convexTest>) {
+  return await t.run(async (ctx) => {
+    const now = Date.now()
+    const org = await ctx.db.insert('organizations', {
+      clerkOrgId: 'clerk_role', name: 'Role Org', slug: 'role-org', plan: 'free', createdAt: now, updatedAt: now,
+    })
+    await ctx.db.insert('user_memberships', { clerkUserId: 'viewer_u', orgId: org, role: 'viewer', joinedAt: now })
+    await ctx.db.insert('user_memberships', { clerkUserId: 'member_u', orgId: org, role: 'member', joinedAt: now })
+    await ctx.db.insert('user_memberships', { clerkUserId: 'admin_u', orgId: org, role: 'admin', joinedAt: now })
+    const project = await ctx.db.insert('projects', { orgId: org, name: 'P', slug: 'p', createdAt: now, updatedAt: now })
+    const agent = await ctx.db.insert('agents', { orgId: org, projectId: project, name: 'A', slug: 'a', createdAt: now, updatedAt: now })
+    const run = await ctx.db.insert('runs', {
+      orgId: org, projectId: project, agentId: agent, status: 'running', startedAt: now, metadata: {}, tags: [],
+    })
+    return { org, project, agent, run }
+  })
+}
+
+describe('Role-based write authorization on createEvent (P0 gate)', () => {
+  it('REJECTS a viewer appending an event via createEvent', async () => {
+    const t = convexTest(schema, modules)
+    const { run } = await seedRoles(t)
+    const asViewer = t.withIdentity({ subject: 'viewer_u', org_id: 'clerk_role' })
+    await expect(
+      asViewer.mutation(api.events.createEvent, {
+        runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
+      }),
+    ).rejects.toThrow(/Forbidden|member/i)
+    // ...and nothing was written (immutable log stays empty).
+    const count = await t.run((ctx) => ctx.db.query('events').collect())
+    expect(count.length).toBe(0)
+  })
+
+  it('ALLOWS a member to append an event via createEvent', async () => {
+    const t = convexTest(schema, modules)
+    const { run } = await seedRoles(t)
+    const asMember = t.withIdentity({ subject: 'member_u', org_id: 'clerk_role' })
+    const evt = await asMember.mutation(api.events.createEvent, {
+      runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
+    })
+    expect(evt.sequenceNumber).toBe(1)
+  })
+
+  it("REJECTS a member of another org appending to this org's run (cross-org write)", async () => {
+    const t = convexTest(schema, modules)
+    const { run } = await seedRoles(t)
+    // user_b is an admin of a DIFFERENT org (org B), seeded here inline.
+    await t.run(async (ctx) => {
+      const now = Date.now()
+      const orgB = await ctx.db.insert('organizations', {
+        clerkOrgId: 'clerk_other', name: 'Other', slug: 'other', plan: 'free', createdAt: now, updatedAt: now,
+      })
+      await ctx.db.insert('user_memberships', { clerkUserId: 'other_u', orgId: orgB, role: 'admin', joinedAt: now })
+    })
+    const asOther = t.withIdentity({ subject: 'other_u', org_id: 'clerk_other' })
+    await expect(
+      asOther.mutation(api.events.createEvent, {
+        runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
+      }),
+    ).rejects.toThrow(/Unauthorized|not a member/i)
+  })
+})
+
+describe('createEvent event-log invariants (authenticated path)', () => {
+  const asMember = { subject: 'member_u', org_id: 'clerk_role' } as const
+
+  it('rejects a non-contiguous sequenceNumber', async () => {
+    const t = convexTest(schema, modules)
+    const { run } = await seedRoles(t)
+    const m = t.withIdentity(asMember)
+    await m.mutation(api.events.createEvent, {
+      runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
+    })
+    // Skip seq 2, jump to 3 -> rejected.
+    await expect(
+      m.mutation(api.events.createEvent, {
+        runId: run, type: 'tool.call', sequenceNumber: 3, timestamp: Date.now(), payload: {},
+      }),
+    ).rejects.toThrow(/contiguous|expected 2/)
+  })
+
+  it('rejects appending after a terminal event (terminal must be last)', async () => {
+    const t = convexTest(schema, modules)
+    const { run } = await seedRoles(t)
+    const m = t.withIdentity(asMember)
+    await m.mutation(api.events.createEvent, {
+      runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
+    })
+    await m.mutation(api.events.createEvent, {
+      runId: run, type: 'run.completed', sequenceNumber: 2, timestamp: Date.now(), payload: {},
+    })
+    await expect(
+      m.mutation(api.events.createEvent, {
+        runId: run, type: 'tool.call', sequenceNumber: 3, timestamp: Date.now(), payload: {},
+      }),
+    ).rejects.toThrow(/terminal/i)
+  })
+
+  it('rejects an oversized inline payload (>10 KB)', async () => {
+    const t = convexTest(schema, modules)
+    const { run } = await seedRoles(t)
+    const m = t.withIdentity(asMember)
+    const huge = { blob: 'x'.repeat(11 * 1024) }
+    await expect(
+      m.mutation(api.events.createEvent, {
+        runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: huge,
+      }),
+    ).rejects.toThrow(/10|externaliz/i)
+  })
+
+  it('rejects an unknown / typo\'d event type (closed EventType set)', async () => {
+    const t = convexTest(schema, modules)
+    const { run } = await seedRoles(t)
+    const m = t.withIdentity(asMember)
+    await m.mutation(api.events.createEvent, {
+      runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
+    })
+    // "run.complete" (missing the trailing 'd') is NOT a terminal type, so without
+    // the guard it would persist and the run would never close.
+    await expect(
+      m.mutation(api.events.createEvent, {
+        runId: run, type: 'run.complete', sequenceNumber: 2, timestamp: Date.now(), payload: {},
+      }),
+    ).rejects.toThrow(/unknown event type/i)
+  })
+})
+
+describe('Event type validation on the SDK ingest path (P0 #6)', () => {
+  it('sdkCreateEvents rejects a typo\'d terminal event type', async () => {
+    const t = convexTest(schema, modules)
+    const { runA } = await seed(t)
+    await expect(
+      t.mutation(api.sdk_ingest.sdkCreateEvents, {
+        apiKeyHash: 'hash_a',
+        events: [{ runId: runA, type: 'run.complete', sequenceNumber: 1, timestamp: Date.now(), payload: {} }],
+      }),
+    ).rejects.toThrow(/unknown event type/i)
+  })
+})

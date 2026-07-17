@@ -180,7 +180,7 @@ export function ArtifactList({ artifacts, loading }: ArtifactListProps) {
                   <td className="px-4 py-3 text-neutral-400 tabular-nums">{formatBytes(artifact.size)}</td>
                   <td className="px-4 py-3 text-neutral-500 tabular-nums">{formatDate(artifact.createdAt)}</td>
                   <td
-                    className="px-4 py-3 font-mono text-xs text-neutral-600 truncate max-w-xs"
+                    className="px-4 py-3 font-mono text-xs text-pewter truncate max-w-xs"
                     title={artifact.storageKey}
                   >
                     {artifact.storageKey}
@@ -218,7 +218,7 @@ export function ArtifactList({ artifacts, loading }: ArtifactListProps) {
                         </button>
                       )}
                       {error !== null && (
-                        <p className="text-xs text-red-400 leading-tight max-w-[12rem]">
+                        <p className="text-xs text-destructive-400 leading-tight max-w-[12rem]">
                           {error}
                         </p>
                       )}

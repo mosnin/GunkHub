@@ -4,13 +4,19 @@ import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
 import { requireOrgMembership } from "./auth.js";
+import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 /**
- * List all artifacts associated with a run.
+ * List artifacts associated with a run, bounded by `limit` (default
+ * DEFAULT_PAGE_SIZE, capped at MAX_PAGE_SIZE). Return shape is unchanged — a plain
+ * array of artifact docs — so existing consumers do not need to adapt; the only
+ * behavioral change is that at most MAX_PAGE_SIZE rows are returned instead of an
+ * unbounded `.collect()`.
  */
 export const listArtifacts = query({
   args: {
     runId: v.id("runs"),
+    limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     const run = await ctx.db.get(args.runId);
@@ -19,10 +25,12 @@ export const listArtifacts = query({
     }
     await requireOrgMembership(ctx, run.orgId);
 
+    const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+
     const artifacts = await ctx.db
       .query("artifacts")
       .withIndex("by_run", (q) => q.eq("runId", args.runId))
-      .collect();
+      .take(limit);
 
     return artifacts;
   },
@@ -64,7 +72,9 @@ export const createArtifact = mutation({
     if (!run) {
       throw new Error("Run not found");
     }
-    await requireOrgMembership(ctx, run.orgId);
+    // Recording an artifact is a write; a read-only viewer must not be able to do
+    // it (P0 authorization gate — mirrors createEvent).
+    await requireOrgMembership(ctx, run.orgId, { minimumRole: "member" });
 
     // If an eventId is provided verify it belongs to the same run
     if (args.eventId !== undefined) {

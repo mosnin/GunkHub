@@ -71,6 +71,32 @@ const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
 // Event Log Rule 5: the first event of every run must be RUN_STARTED.
 const RUN_STARTED_TYPE = "run.started";
 
+// Closed set of accepted event types. MUST stay in sync with the `EventType` union
+// in packages/contracts/src/events.ts (the source of truth). Convex cannot import
+// the contracts package (no path resolution / not a dependency), so the union is
+// mirrored here — same rationale as events.ts. Rejecting unknown types prevents a
+// typo'd terminal event (e.g. "run.complete") from persisting as a non-terminal
+// event, which would leave the run permanently open.
+const VALID_EVENT_TYPES = new Set<string>([
+  "run.started",
+  "run.completed",
+  "run.failed",
+  "run.cancelled",
+  "llm.request",
+  "llm.response",
+  "llm.error",
+  "tool.call",
+  "tool.result",
+  "tool.error",
+  "memory.read",
+  "memory.write",
+  "retrieval.query",
+  "retrieval.result",
+  "http.request",
+  "http.response",
+  "custom",
+]);
+
 // CLAUDE.md Event Log Rule 3: payloads over 10 KB must be externalized to blob
 // storage; the event stores only a pointer. Enforced server-side (defense in
 // depth) so a direct Convex call or an SDK bug cannot bloat the document store.
@@ -299,6 +325,16 @@ export const sdkCreateEvents = mutation({
       if (run.status !== "running") {
         throw new Error(
           `Cannot append event to run with status "${run.status}". Run must be in "running" state.`,
+        );
+      }
+
+      // --- Reject unknown event types (closed set from contracts EventType) ---
+      // Without this, a typo'd terminal event persists as a non-terminal event and
+      // the run never closes.
+      if (!VALID_EVENT_TYPES.has(evt.type)) {
+        throw new Error(
+          `Unknown event type "${evt.type}" for run ${evt.runId}. ` +
+            `Must be one of the contracts EventType union.`,
         );
       }
 

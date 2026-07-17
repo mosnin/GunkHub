@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useTransition } from 'react'
 
 import { Button } from '@/components/ui/Button'
 import { createAgentVersionAction } from '@/lib/actions/agent_versions'
+import { useFocusTrap } from '@/lib/hooks/useFocusTrap'
 
 interface CreateVersionModalProps {
   isOpen: boolean
@@ -24,6 +25,7 @@ export function CreateVersionModal({
   const [error, setError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
   const versionRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useFocusTrap<HTMLDivElement>(isOpen)
 
   // Reset state when modal opens
   useEffect(() => {
@@ -32,7 +34,6 @@ export function CreateVersionModal({
       setChangelog('')
       setConfigSnapshotRaw('')
       setError(null)
-      setTimeout(() => versionRef.current?.focus(), 50)
     }
   }, [isOpen])
 
@@ -85,10 +86,17 @@ export function CreateVersionModal({
         if (e.target === e.currentTarget) onClose()
       }}
     >
-      <div className="w-full max-w-lg mx-4 rounded-xl border border-neutral-800 bg-neutral-900 shadow-2xl">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-version-title"
+        tabIndex={-1}
+        className="w-full max-w-lg mx-4 rounded-[4px] border border-graphite-light bg-graphite-deep shadow-lg outline-none"
+      >
         {/* Header */}
         <div className="px-5 py-4 border-b border-neutral-800">
-          <h2 className="text-sm font-semibold text-neutral-100">New Version</h2>
+          <h2 id="create-version-title" className="text-sm font-semibold text-neutral-100">New Version</h2>
         </div>
 
         {/* Form */}
@@ -100,7 +108,7 @@ export function CreateVersionModal({
                 htmlFor="version-version"
                 className="block text-xs font-medium text-neutral-400 mb-1.5"
               >
-                Version <span className="text-red-500">*</span>
+                Version <span className="text-destructive-400">*</span>
               </label>
               <input
                 ref={versionRef}
@@ -121,7 +129,7 @@ export function CreateVersionModal({
                 htmlFor="version-changelog"
                 className="block text-xs font-medium text-neutral-400 mb-1.5"
               >
-                Changelog <span className="text-neutral-600">(optional)</span>
+                Changelog <span className="text-pewter">(optional)</span>
               </label>
               <textarea
                 id="version-changelog"
@@ -140,7 +148,7 @@ export function CreateVersionModal({
                 htmlFor="version-config"
                 className="block text-xs font-medium text-neutral-400 mb-1.5"
               >
-                Config snapshot (JSON) <span className="text-neutral-600">(optional)</span>
+                Config snapshot (JSON) <span className="text-pewter">(optional)</span>
               </label>
               <textarea
                 id="version-config"
@@ -154,7 +162,7 @@ export function CreateVersionModal({
             </div>
 
             {/* Error */}
-            {error && <p className="text-sm text-red-400 mt-2">{error}</p>}
+            {error && <p className="text-sm text-destructive-400 mt-2">{error}</p>}
           </div>
 
           {/* Actions */}

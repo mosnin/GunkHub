@@ -6,6 +6,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 // ---------------------------------------------------------------------------
 
 type FetchMockImpl = (url: string, init?: RequestInit) => Promise<Response>
+type FetchArgs = Parameters<FetchMockImpl>
 
 function makeMockFetch(impl: FetchMockImpl) {
   return vi.fn(impl)
@@ -30,7 +31,7 @@ function errorResponse(status: number, message: string): Response {
 // ---------------------------------------------------------------------------
 
 describe('FlightRecorder', () => {
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockFetch: ReturnType<typeof makeMockFetch>
 
   beforeEach(() => {
     mockFetch = makeMockFetch(async (url: string, init?: RequestInit) => {
@@ -220,7 +221,7 @@ describe('FlightRecorder', () => {
 // ---------------------------------------------------------------------------
 
 describe('RunRecorder', () => {
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockFetch: ReturnType<typeof makeMockFetch>
   let fr: FlightRecorder
 
   beforeEach(() => {
@@ -254,7 +255,7 @@ describe('RunRecorder', () => {
     await run.recordEvent('custom', { hello: 'world' })
 
     const evtCall = mockFetch.mock.calls.find(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
     )
     expect(evtCall).toBeDefined()
@@ -265,7 +266,7 @@ describe('RunRecorder', () => {
     await run.recordEvent('custom', { x: 1 })
 
     const eventCalls = mockFetch.mock.calls.filter(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
     )
     // The last /api/events POST is the user's recordEvent; the first is the
@@ -280,7 +281,7 @@ describe('RunRecorder', () => {
     await run.recordEvent('LLM_REQUEST', { model: 'gpt-4o' })
 
     const eventCalls = mockFetch.mock.calls.filter(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
     )
     // The last /api/events POST is the user's recordEvent; the first is the
@@ -295,7 +296,7 @@ describe('RunRecorder', () => {
     await run.recordEvent('custom', { key: 'value', count: 42 })
 
     const eventCalls = mockFetch.mock.calls.filter(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
     )
     // The last /api/events POST is the user's recordEvent; the first is the
@@ -310,7 +311,7 @@ describe('RunRecorder', () => {
     await run.recordEvent('custom', {})
 
     const eventCalls = mockFetch.mock.calls.filter(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
     )
     // The last /api/events POST is the user's recordEvent; the first is the
@@ -331,7 +332,7 @@ describe('RunRecorder', () => {
     await run.recordEvent('tool.result', { output: 'ok' }, 'evt_parent_123')
 
     const eventCalls = mockFetch.mock.calls.filter(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
     )
     // The last /api/events POST is the user's recordEvent; the first is the
@@ -346,7 +347,7 @@ describe('RunRecorder', () => {
     await run.recordEvent('custom', {})
 
     const eventCalls = mockFetch.mock.calls.filter(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
     )
     // The last /api/events POST is the user's recordEvent; the first is the
@@ -363,10 +364,10 @@ describe('RunRecorder', () => {
     await run.recordEvent('ev3', {})
 
     const evtCalls = mockFetch.mock.calls.filter(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).endsWith('/api/events') && init?.method === 'POST'
     )
-    const seqNumbers = evtCalls.map(([, init]: [string, RequestInit]) => {
+    const seqNumbers = evtCalls.map(([, init]: FetchArgs) => {
       const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>
       return body['sequenceNumber'] as number
     })
@@ -401,7 +402,7 @@ describe('RunRecorder', () => {
     await run.complete()
 
     const patchCall = mockFetch.mock.calls.find(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).includes('/api/runs/run_rr_001/status') && init?.method === 'PATCH'
     )
     expect(patchCall).toBeDefined()
@@ -415,7 +416,7 @@ describe('RunRecorder', () => {
     await run.complete()
 
     const patchCall = mockFetch.mock.calls.find(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).includes('/api/runs/run_rr_001/status') && init?.method === 'PATCH'
     )!
     const headers = (patchCall[1] as RequestInit).headers as Record<string, string>
@@ -428,7 +429,7 @@ describe('RunRecorder', () => {
     await expect(run.fail(new Error('something went wrong'))).rejects.toThrow('something went wrong')
 
     const patchCall = mockFetch.mock.calls.find(
-      ([url, init]: [string, RequestInit]) =>
+      ([url, init]: FetchArgs) =>
         (url as string).includes('/api/runs/run_rr_001/status') && init?.method === 'PATCH'
     )
     expect(patchCall).toBeDefined()
@@ -469,5 +470,86 @@ describe('RunRecorder', () => {
     }))
     const run = await fr.startRun()
     await expect(run.complete()).rejects.toThrow('Service Unavailable')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// RunRecorder — oversized payload externalization (regression for C1)
+// ---------------------------------------------------------------------------
+
+describe('RunRecorder — payload externalization', () => {
+  let mockFetch: ReturnType<typeof makeMockFetch>
+  let fr: FlightRecorder
+
+  beforeEach(() => {
+    fr = new FlightRecorder({ apiKey: 'k', baseUrl: 'http://localhost:3000', agentId: 'a' })
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  /** A payload that serializes to well over 10 KB. */
+  function largePayload(): Record<string, unknown> {
+    return { blob: 'x'.repeat(12_000) }
+  }
+
+  it('a >10KB payload is uploaded as an artifact and shipped as a pointer, not inline', async () => {
+    const urls: string[] = []
+    mockFetch = makeMockFetch(async (url: string, init?: RequestInit) => {
+      urls.push(url)
+      if (url.endsWith('/api/runs') && init?.method === 'POST') {
+        return jsonResponse({ run: { id: 'run_big' } })
+      }
+      if (url.includes('/api/artifacts/upload')) {
+        return jsonResponse({
+          artifactId: 'art-1',
+          storageKey: 'key/big',
+          storageBucket: 'default',
+          checksum: 'deadbeef',
+          size: 12010,
+        })
+      }
+      return jsonResponse({ eventId: 'evt_big' })
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    const run = await fr.startRun()
+    await run.recordEvent('custom', largePayload())
+
+    // The upload endpoint was hit.
+    expect(urls.some((u) => u.includes('/api/artifacts/upload'))).toBe(true)
+
+    // The events POST for the large custom event carries a pointer, not the blob.
+    const eventCalls = mockFetch.mock.calls.filter(
+      ([url, init]: FetchArgs) =>
+        (url as string).endsWith('/api/events') && init?.method === 'POST',
+    )
+    const bigCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
+    const body = JSON.parse((bigCall[1] as RequestInit).body as string) as {
+      payload: { type: string; _artifact?: { storageKey: string } }
+    }
+    expect(body.payload.type).toBe('_externalized')
+    expect(body.payload._artifact?.storageKey).toBe('key/big')
+    // The oversized blob must not be present inline in the events request.
+    expect((bigCall[1] as RequestInit).body as string).not.toContain('x'.repeat(12_000))
+  })
+
+  it('a small payload is NOT externalized (no upload call)', async () => {
+    mockFetch = makeMockFetch(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/runs') && init?.method === 'POST') {
+        return jsonResponse({ run: { id: 'run_small' } })
+      }
+      return jsonResponse({ eventId: 'evt_small' })
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    const run = await fr.startRun()
+    await run.recordEvent('custom', { hello: 'world' })
+
+    const uploadCalls = mockFetch.mock.calls.filter(
+      ([url]: FetchArgs) => (url as string).includes('/api/artifacts/upload'),
+    )
+    expect(uploadCalls).toHaveLength(0)
   })
 })

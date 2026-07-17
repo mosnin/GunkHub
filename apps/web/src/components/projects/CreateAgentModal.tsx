@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useTransition } from 'react'
 
 import { Button } from '@/components/ui/Button'
 import { createAgentAction } from '@/lib/actions/agents'
+import { useFocusTrap } from '@/lib/hooks/useFocusTrap'
 
 interface CreateAgentModalProps {
   isOpen: boolean
@@ -18,6 +19,7 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
   const [error, setError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
   const nameRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useFocusTrap<HTMLDivElement>(isOpen)
 
   // Reset state when modal opens
   useEffect(() => {
@@ -25,7 +27,6 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
       setName('')
       setDescription('')
       setError(null)
-      setTimeout(() => nameRef.current?.focus(), 50)
     }
   }, [isOpen])
 
@@ -61,10 +62,17 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
       onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
     >
-      <div className="w-full max-w-md mx-4 rounded-[4px] border border-graphite-light bg-graphite-deep">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-agent-title"
+        tabIndex={-1}
+        className="w-full max-w-md mx-4 rounded-[4px] border border-graphite-light bg-graphite-deep outline-none"
+      >
         {/* Header */}
         <div className="px-5 py-4 border-b border-neutral-800">
-          <h2 className="text-sm font-semibold text-neutral-100">New Agent</h2>
+          <h2 id="create-agent-title" className="text-sm font-semibold text-neutral-100">New Agent</h2>
         </div>
 
         {/* Form */}
@@ -91,7 +99,7 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
             {/* Description */}
             <div>
               <label htmlFor="agent-description" className="block text-xs font-medium text-neutral-400 mb-1.5">
-                Description <span className="text-neutral-600">(optional)</span>
+                Description <span className="text-pewter">(optional)</span>
               </label>
               <textarea
                 id="agent-description"

@@ -1,5 +1,5 @@
 import { Events, buildEvent } from './events.js'
-import { HttpTransport, type Transport } from './transport.js'
+import { HttpTransport, createRetryStrategy, type Transport } from './transport.js'
 
 import type { RecorderConfig, RunContext, RecordEventOptions, FlushResult } from './types.js'
 import type { RunStatus, EventType, EventPayload } from '@agent-flight-recorder/contracts'
@@ -8,8 +8,16 @@ import type { RunStatus, EventType, EventPayload } from '@agent-flight-recorder/
 interface NodeProcessLike {
   on(event: string, listener: (...args: unknown[]) => void): unknown
   off(event: string, listener: (...args: unknown[]) => void): unknown
-  exit(code?: number): never
+  exitCode?: number
 }
+
+/** Event types that must never be dropped from the buffer on overflow. */
+const PROTECTED_EVENT_TYPES: ReadonlySet<EventType> = new Set<EventType>([
+  'run.started',
+  'run.completed',
+  'run.failed',
+  'run.cancelled',
+])
 
 /** Return the Node process if we're running under Node, otherwise undefined. */
 function getNodeProcess(): NodeProcessLike | undefined {
@@ -35,26 +43,36 @@ export class Recorder {
   // in-flight flush and preserves buffer order.
   private flushChain: Promise<unknown> = Promise.resolve()
 
+  /** Cumulative count of events dropped from the buffer due to overflow. */
+  private droppedEventCount = 0
+
   private processHandlersInstalled = false
   private readonly onBeforeExit = (): void => {
-    void this.shutdown()
+    // Best-effort flush as the event loop drains. Never rejects into the host.
+    void this.shutdown().catch(() => {})
   }
-  private readonly onSignal = (): void => {
-    void this.shutdown().finally(() => {
-      // Re-raise default behavior: exit non-zero after best-effort flush.
-      getNodeProcess()?.exit(1)
-    })
-  }
-  private readonly onFatal = (err: unknown): void => {
-    // Mark the run failed and flush, then let the process terminate.
-    void this.crashRun(err).finally(() => {
-      getNodeProcess()?.exit(1)
-    })
+  private readonly onUncaught = (err: unknown): void => {
+    // An uncaught exception genuinely crashed the run — mark it failed and flush
+    // best-effort. We do NOT call process.exit: as an observability library the
+    // SDK must not seize the host's shutdown. Setting exitCode preserves the
+    // failure signal for whenever the process naturally exits.
+    void this.crashRun(err).catch(() => {})
+    const proc = getNodeProcess()
+    if (proc) proc.exitCode = 1
   }
 
   constructor(config: RecorderConfig, transport?: Transport) {
     this.config = config
-    this.transport = transport ?? new HttpTransport(config.endpoint)
+    // When we own the transport, thread the retry-tuning options through so
+    // maxRetries/retryBackoffMs actually take effect instead of being dead config.
+    this.transport =
+      transport ??
+      new HttpTransport(config.endpoint, {
+        retryStrategy: createRetryStrategy({
+          ...(config.options?.maxRetries !== undefined && { maxRetries: config.options.maxRetries }),
+          ...(config.options?.retryBackoffMs !== undefined && { backoffMs: config.options.retryBackoffMs }),
+        }),
+      })
     if (config.options?.captureProcessExit) {
       this.installProcessHandlers()
     }
@@ -126,10 +144,38 @@ export class Recorder {
       )
     )
 
+    this.enforceBufferLimit()
+
     const maxBatch = this.config.options?.maxBatchSize ?? 100
     if (this.eventBuffer.length >= maxBatch) {
-      void this.flush()
+      // Fire-and-forget: a throwing custom Transport must not surface as an
+      // unhandled rejection in the host.
+      void this.flush().catch(() => {})
     }
+  }
+
+  /**
+   * Enforce the configured `maxBufferSize`. When the buffer exceeds the cap,
+   * drop the OLDEST non-protected events (protected = run.started and the
+   * terminal events) until the buffer is back within bounds. Terminal telemetry
+   * is the worst thing to lose, so it is never dropped. Dropped events are
+   * counted and surfaced via `FlushResult.droppedEvents`.
+   */
+  private enforceBufferLimit(): void {
+    const max = this.config.options?.maxBufferSize ?? 10_000
+    if (max <= 0 || this.eventBuffer.length <= max) return
+
+    let toDrop = this.eventBuffer.length - max
+    const kept: ReturnType<typeof buildEvent>[] = []
+    for (const ev of this.eventBuffer) {
+      if (toDrop > 0 && !PROTECTED_EVENT_TYPES.has(ev.type)) {
+        toDrop--
+        this.droppedEventCount++
+        continue
+      }
+      kept.push(ev)
+    }
+    this.eventBuffer = kept
   }
 
   /**
@@ -180,13 +226,15 @@ export class Recorder {
   }
 
   private async flushOnce(): Promise<FlushResult> {
-    if (this.eventBuffer.length === 0) return { success: true, eventsSubmitted: 0, errors: [] }
+    if (this.eventBuffer.length === 0) {
+      return { success: true, eventsSubmitted: 0, errors: [], droppedEvents: this.droppedEventCount }
+    }
 
     const batch = this.eventBuffer.splice(0)
     const result = await this.transport.sendEvents(batch, { apiKey: this.config.apiKey })
 
     if (result.success) {
-      return { success: true, eventsSubmitted: batch.length, errors: [] }
+      return { success: true, eventsSubmitted: batch.length, errors: [], droppedEvents: this.droppedEventCount }
     }
 
     // DURABILITY: the send failed, so the batch is NOT persisted. Return it to the
@@ -202,6 +250,7 @@ export class Recorder {
       success: false,
       eventsSubmitted: 0,
       errors: [{ eventIndex: -1, error: result.error, retryable: result.retryable }],
+      droppedEvents: this.droppedEventCount,
     }
   }
 
@@ -223,15 +272,33 @@ export class Recorder {
     // failing, re-arm the background flush timer and keep the run active so later
     // flushes continue retrying instead of losing the telemetry.
     const maxFinalizeAttempts = 3
-    let result: FlushResult = { success: true, eventsSubmitted: 0, errors: [] }
+    let result: FlushResult = { success: true, eventsSubmitted: 0, errors: [], droppedEvents: this.droppedEventCount }
     for (let attempt = 0; attempt < maxFinalizeAttempts; attempt++) {
       result = await this.flush()
       if (result.success || this.eventBuffer.length === 0) break
     }
 
     // Transition the run status regardless (the run IS logically finished); status
-    // and event delivery are independent concerns.
-    await this.transport.updateRunStatus(runId, status, Date.now(), { apiKey: this.config.apiKey })
+    // and event delivery are independent concerns. A failed transition must NOT be
+    // swallowed — otherwise the run is stuck "running" forever, invisibly. Surface
+    // it into the returned FlushResult.
+    const statusResult = await this.transport.updateRunStatus(runId, status, Date.now(), {
+      apiKey: this.config.apiKey,
+    })
+    if (!statusResult.success) {
+      result = {
+        ...result,
+        success: false,
+        errors: [
+          ...result.errors,
+          {
+            eventIndex: -1,
+            error: `Run status transition to "${status}" failed: ${statusResult.error}`,
+            retryable: statusResult.retryable,
+          },
+        ],
+      }
+    }
 
     if (this.eventBuffer.length > 0) {
       // Terminal events could not be delivered yet. Keep retrying in the
@@ -285,11 +352,11 @@ export class Recorder {
   private installProcessHandlers(): void {
     const proc = getNodeProcess()
     if (this.processHandlersInstalled || !proc) return
+    // Deliberately NOT registering SIGINT/SIGTERM: adding listeners there would
+    // suppress Node's default termination and hijack the host's signal handling.
+    // We only observe the two events that let us flush without seizing control.
     proc.on('beforeExit', this.onBeforeExit)
-    proc.on('SIGTERM', this.onSignal)
-    proc.on('SIGINT', this.onSignal)
-    proc.on('uncaughtException', this.onFatal)
-    proc.on('unhandledRejection', this.onFatal)
+    proc.on('uncaughtException', this.onUncaught)
     this.processHandlersInstalled = true
   }
 
@@ -297,17 +364,16 @@ export class Recorder {
     const proc = getNodeProcess()
     if (!this.processHandlersInstalled || !proc) return
     proc.off('beforeExit', this.onBeforeExit)
-    proc.off('SIGTERM', this.onSignal)
-    proc.off('SIGINT', this.onSignal)
-    proc.off('uncaughtException', this.onFatal)
-    proc.off('unhandledRejection', this.onFatal)
+    proc.off('uncaughtException', this.onUncaught)
     this.processHandlersInstalled = false
   }
 
   private scheduleFlush(): void {
     const interval = this.config.options?.flushIntervalMs ?? 1000
     this.flushTimer = setTimeout(() => {
-      void this.flush()
+      // Guard the fire-and-forget flush: a throwing custom Transport must not
+      // surface as an unhandled rejection in the host process.
+      void this.flush().catch(() => {})
       this.scheduleFlush()
     }, interval)
     // Do not keep the Node event loop alive on the recurring flush timer. Without

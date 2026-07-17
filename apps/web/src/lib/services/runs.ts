@@ -55,10 +55,18 @@ export async function listRuns(params: ListRunsRequest): Promise<ListRunsRespons
     ...(params.cursor !== undefined && { cursor: params.cursor }),
   })
 
-  const res = result as { runs: Record<string, unknown>[]; total: number; nextCursor?: string }
+  // Backend renamed `total` → `pageSize` (it was only ever the current page's
+  // length, never a grand total). ListRunsResponse keeps the `total` field name
+  // for now (contracts are owned by the data team); it is not surfaced as a
+  // grand-total count anywhere in the UI, so no display change is needed.
+  const res = result as {
+    runs: Record<string, unknown>[]
+    pageSize: number
+    nextCursor?: string
+  }
   return {
     runs: (res.runs ?? []).map(mapRun),
-    total: res.total ?? 0,
+    total: res.pageSize ?? 0,
     nextCursor: res.nextCursor,
   }
 }

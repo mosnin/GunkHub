@@ -17,6 +17,7 @@ export {
   HttpTransport,
   defaultBatchingStrategy,
   defaultRetryStrategy,
+  createRetryStrategy,
 } from './transport.js'
 export { FlightRecorder, RunRecorder } from './flight-recorder.js'
 
@@ -30,7 +31,14 @@ export type {
   TransportResponse,
 } from './types.js'
 
-export type { Transport, TransportAuth, BatchingStrategy, RetryStrategy } from './transport.js'
+export type {
+  Transport,
+  TransportAuth,
+  BatchingStrategy,
+  RetryStrategy,
+  HttpTransportOptions,
+  RetryStrategyOptions,
+} from './transport.js'
 export type { FlightRecorderConfig } from './flight-recorder.js'
 
 // Re-export key contract types so SDK consumers don't need a separate import

@@ -11,32 +11,21 @@ interface ReplayViewerProps {
   failureSummary: FailureSummary
 }
 
-// Actor → left border color class
+// Actor → left border treatment. design.md limits colour to Neon Glow, the red
+// alert, and greys. The actor name is shown in the frame metadata, so hue only
+// encodes lifecycle: red for an errored frame, the single Neon accent for the
+// system/run lifecycle, neutral for every other actor.
 function actorBorderClass(frame: ReplayFrame): string {
-  if (frame.status === 'error') return 'border-l-red-600'
-  switch (frame.actor) {
-    case 'llm':       return 'border-l-violet-600'
-    case 'tool':      return 'border-l-amber-600'
-    case 'system':    return 'border-l-primary-700'
-    case 'http':      return 'border-l-sky-600'
-    case 'memory':    return 'border-l-pink-600'
-    case 'retrieval': return 'border-l-cyan-600'
-    default:          return 'border-l-neutral-600'
-  }
+  if (frame.status === 'error') return 'border-l-destructive-600'
+  if (frame.actor === 'system') return 'border-l-neon-muted'
+  return 'border-l-neutral-700'
 }
 
-// Actor → dot color for the frame list
+// Actor → dot treatment, same rationale as actorBorderClass.
 function actorDotClass(frame: ReplayFrame): string {
-  if (frame.status === 'error') return 'bg-red-600'
-  switch (frame.actor) {
-    case 'llm':       return 'bg-violet-600'
-    case 'tool':      return 'bg-amber-600'
-    case 'system':    return 'bg-neon-glow'
-    case 'http':      return 'bg-sky-600'
-    case 'memory':    return 'bg-pink-600'
-    case 'retrieval': return 'bg-cyan-600'
-    default:          return 'bg-neutral-600'
-  }
+  if (frame.status === 'error') return 'bg-destructive-500'
+  if (frame.actor === 'system') return 'bg-neon-glow'
+  return 'bg-neutral-600'
 }
 
 function formatElapsed(ms: number): string {
@@ -76,18 +65,18 @@ function FrameRow({ frame, isActive, onClick }: FrameRowProps) {
         <span
           className={[
             'block text-xs font-mono truncate',
-            frame.status === 'error' ? 'text-red-400' : 'text-neutral-300',
+            frame.status === 'error' ? 'text-destructive-400' : 'text-neutral-300',
           ].join(' ')}
         >
           {frame.event.type}
         </span>
         {frame.payloadPreview && (
-          <span className="block text-xs text-neutral-600 truncate mt-0.5">
+          <span className="block text-xs text-pewter truncate mt-0.5">
             {frame.payloadPreview}
           </span>
         )}
       </span>
-      <span className="shrink-0 text-xs font-mono text-neutral-700 mt-0.5">
+      <span className="shrink-0 text-xs font-mono text-pewter mt-0.5">
         #{frame.event.sequenceNumber}
       </span>
       {frame.status === 'terminal' && (
@@ -131,7 +120,7 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
   if (total === 0) {
     return (
       <div className="flex flex-col h-full">
-        <div className="px-4 py-2 bg-amber-950/40 border border-amber-900/50 rounded-md mx-6 mt-4 text-xs text-amber-500/80 font-medium">
+        <div className="px-4 py-2 bg-graphite border border-graphite-light rounded-[4px] mx-6 mt-4 text-xs text-pewter font-medium">
           Replay is a derived projection. The event log is not modified.
         </div>
         <div className="flex-1 flex items-center justify-center">
@@ -147,13 +136,13 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
   return (
     <div className="flex flex-col h-full">
       {/* Read-only banner */}
-      <div className="px-4 py-2 bg-amber-950/40 border border-amber-900/50 rounded-md mx-6 mt-4 text-xs text-amber-500/80 font-medium shrink-0">
+      <div className="px-4 py-2 bg-graphite border border-graphite-light rounded-[4px] mx-6 mt-4 text-xs text-pewter font-medium shrink-0">
         Replay is a derived projection. The event log is not modified.
       </div>
 
       {/* Truncation warning — shown when the run exceeds MAX_EVENTS_PER_REPLAY */}
       {projection.truncated && (
-        <div className="px-4 py-2 bg-orange-950/40 border border-orange-900/50 rounded-md mx-6 mt-2 text-xs text-orange-400 font-medium shrink-0">
+        <div className="px-4 py-2 bg-graphite border border-graphite-light rounded-[4px] mx-6 mt-2 text-xs text-pewter font-medium shrink-0">
           This run contains more than 10,000 events. Only the first 10,000 are shown in this replay.
         </div>
       )}
@@ -186,12 +175,12 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
         </span>
 
         {activeFrame && (
-          <span className="text-xs font-mono text-neutral-600">
+          <span className="text-xs font-mono text-pewter">
             {formatElapsed(activeFrame.elapsed_ms)}
           </span>
         )}
 
-        <span className="ml-auto text-xs text-neutral-700">
+        <span className="ml-auto text-xs text-pewter">
           ArrowLeft / ArrowRight to step
         </span>
       </div>
@@ -241,13 +230,13 @@ function FrameDetail({ frame }: FrameDetailProps) {
           <span
             className={[
               'text-sm font-mono font-semibold',
-              frame.status === 'error' ? 'text-red-400' : 'text-neutral-100',
+              frame.status === 'error' ? 'text-destructive-400' : 'text-neutral-100',
             ].join(' ')}
           >
             {event.type}
           </span>
           {frame.status === 'error' && (
-            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-red-950 text-red-400 border border-red-900">
+            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-destructive-900 text-destructive-400 border border-destructive-700">
               error
             </span>
           )}

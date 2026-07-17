@@ -17,15 +17,17 @@ interface TimelineProps {
   isLive?: boolean
 }
 
-/** Colour-code event type prefixes for quick visual scanning */
+/**
+ * Timeline dot treatment. design.md sanctions only Neon Glow, the red alert, and
+ * greys — event *types* are differentiated by the mono type label (already shown
+ * next to each dot), not by hue. The dot therefore carries only lifecycle
+ * meaning: the single Neon accent for run lifecycle, the red alert for failure,
+ * neutral for every data event.
+ */
 function dotClass(type: string): string {
-  if (type.startsWith('llm.')) return 'border-violet-700 bg-violet-950'
-  if (type.startsWith('tool.')) return 'border-amber-700 bg-amber-950'
-  if (type.startsWith('http.')) return 'border-sky-700 bg-sky-950'
-  if (type.startsWith('run.')) return 'border-primary-800 bg-primary-900'
-  if (type.startsWith('memory.')) return 'border-pink-700 bg-pink-950'
-  if (type.startsWith('retrieval.')) return 'border-cyan-700 bg-cyan-950'
-  return 'border-neutral-700 bg-neutral-900'
+  if (type === 'run.failed') return 'border-destructive-700 bg-destructive-900'
+  if (type.startsWith('run.')) return 'border-neon-muted bg-primary-900'
+  return 'border-neutral-700 bg-neutral-800'
 }
 
 function payloadSummary(event: Event): string {
@@ -246,7 +248,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
             onClick={followTail ? () => setFollowTail(false) : handleResume}
             className={[
               'flex items-center gap-1.5 text-xs font-mono transition-colors duration-100',
-              followTail ? 'text-neutral-500 hover:text-neutral-400' : 'text-neutral-600 hover:text-neutral-400',
+              followTail ? 'text-neutral-500 hover:text-neutral-400' : 'text-pewter hover:text-cloud',
             ].join(' ')}
             title={followTail ? 'Following tail — click to pause' : 'Tail paused — click to resume'}
           >
@@ -310,13 +312,13 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
                     aria-expanded={isExpanded}
                   >
                     <span className="text-xs font-mono text-neutral-300 min-w-[140px]">{event.type}</span>
-                    <span className="text-xs font-mono text-neutral-600 w-10 shrink-0">
+                    <span className="text-xs font-mono text-pewter w-10 shrink-0">
                       #{event.sequenceNumber}
                     </span>
                     {summary && (
                       <span className="text-xs text-neutral-500 truncate flex-1">{summary}</span>
                     )}
-                    <span className="ml-auto text-xs font-mono text-neutral-600 shrink-0">
+                    <span className="ml-auto text-xs font-mono text-pewter shrink-0">
                       {new Date(event.timestamp).toISOString().slice(11, 23)}
                     </span>
                     <svg
@@ -327,7 +329,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
                       xmlns="http://www.w3.org/2000/svg"
                       aria-hidden="true"
                       className={[
-                        'shrink-0 text-neutral-600 transition-transform duration-100',
+                        'shrink-0 text-pewter transition-transform duration-100',
                         isExpanded ? 'rotate-180' : '',
                       ].join(' ')}
                     >
@@ -365,7 +367,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
       {(cursor !== undefined || loadError !== null) && (
         <div className="mt-4 flex flex-col items-center gap-2">
           {loadError && (
-            <p className="text-xs text-red-400">{loadError}</p>
+            <p className="text-xs text-destructive-400">{loadError}</p>
           )}
           {cursor && (
             <button

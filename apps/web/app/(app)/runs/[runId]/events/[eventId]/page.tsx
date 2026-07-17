@@ -19,12 +19,18 @@ export default async function EventDetailPage({ params }: EventDetailPageProps) 
 
   try {
     event = await getEvent(eventId)
-    if (!event || event.runId !== runId) notFound()
   } catch (err) {
+    // notFound() throws a NEXT_NOT_FOUND digest — if that were caught here it
+    // would leak into the ErrorState below. Keep it out of the try entirely and
+    // only translate genuine "not found" fetch errors into a 404.
     const msg = err instanceof Error ? err.message : 'Unknown error'
     if (msg.toLowerCase().includes('not found')) notFound()
     fetchError = msg
   }
+
+  // Outside the try: a valid event under the wrong run URL (or a missing event)
+  // must 404, and notFound()'s thrown digest must propagate, not be swallowed.
+  if (!fetchError && (!event || event.runId !== runId)) notFound()
 
   if (fetchError) {
     return (
@@ -62,7 +68,7 @@ export default async function EventDetailPage({ params }: EventDetailPageProps) 
           <span className="text-xs text-neutral-500">
             seq #{event.sequenceNumber}
           </span>
-          <span className="text-xs text-neutral-600 tabular-nums">
+          <span className="text-xs text-pewter tabular-nums">
             {new Date(event.timestamp).toISOString()}
           </span>
         </div>

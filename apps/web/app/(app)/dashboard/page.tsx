@@ -112,7 +112,7 @@ export default async function DashboardPage() {
                   <h2 className="text-sm font-semibold text-neutral-300">Verification Issues</h2>
                   <a
                     href="/runs?verify=failed"
-                    className="text-xs text-neutral-600 hover:text-neutral-400 transition-colors duration-100 font-mono"
+                    className="text-xs text-pewter hover:text-cloud transition-colors duration-100 font-mono"
                     title="View all failed — use the Runs page to bulk re-verify"
                   >
                     view all failed →
@@ -137,11 +137,11 @@ export default async function DashboardPage() {
                         </span>
                         <IntegrityBadge status={failedVerificationBadgeStatus(fv)} />
                         {fv.failureReason && (
-                          <span className="text-xs text-neutral-600 truncate flex-1">
+                          <span className="text-xs text-pewter truncate flex-1">
                             {fv.failureReason}
                           </span>
                         )}
-                        <span className="text-xs text-neutral-700 shrink-0 ml-auto">
+                        <span className="text-xs text-pewter shrink-0 ml-auto">
                           {formatRelativeTime(fv.verifiedAt)}
                         </span>
                       </a>

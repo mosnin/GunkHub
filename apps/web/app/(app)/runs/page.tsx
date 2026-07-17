@@ -4,7 +4,7 @@ import type { Metadata } from 'next'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { SelectableRunList } from '@/components/runs/SelectableRunList'
 import { ErrorState } from '@/components/ui/ErrorState'
-import { listDistinctAgents } from '@/lib/services/agents'
+import { listAgentsByOrg } from '@/lib/services/agents'
 import {
   batchGetRunVerificationStatuses,
   type VerificationStatus,
@@ -122,7 +122,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
   }
 
   try {
-    agents = await listDistinctAgents()
+    agents = await listAgentsByOrg()
   } catch {
     // Non-fatal: agent dropdown is hidden if fetch fails
   }
@@ -153,7 +153,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
       <div className="mt-4 flex flex-wrap items-center gap-3">
         {/* Status filter */}
         <div className="flex items-center gap-1.5">
-          <span className="text-xs text-neutral-600 font-medium uppercase tracking-wider">Status</span>
+          <span className="text-xs text-pewter font-medium uppercase tracking-wider">Status</span>
           <div className="flex gap-1">
             {(['all', 'running', 'completed', 'failed', 'cancelled', 'timed_out'] as const).map((s) => {
               const active = s === 'all' ? !searchParams.status : searchParams.status === s
@@ -178,7 +178,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
 
         {/* Date range filter */}
         <div className="flex items-center gap-1.5">
-          <span className="text-xs text-neutral-600 font-medium uppercase tracking-wider">Range</span>
+          <span className="text-xs text-pewter font-medium uppercase tracking-wider">Range</span>
           <div className="flex gap-1">
             {(['all', '24h', '7d', '30d'] as const).map((r) => {
               const active = r === 'all' ? !searchParams.range : searchParams.range === r
@@ -203,7 +203,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
 
         {/* Verification filter */}
         <div className="flex items-center gap-1.5">
-          <span className="text-xs text-neutral-600 font-medium uppercase tracking-wider">Integrity</span>
+          <span className="text-xs text-pewter font-medium uppercase tracking-wider">Integrity</span>
           <div className="flex gap-1">
             {VERIFY_VALUES.map((v) => {
               const active = verifyFilter === v
@@ -229,7 +229,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
         {/* Agent filter — shown only when there are agents with runs */}
         {agents.length > 0 && (
           <div className="flex items-center gap-1.5">
-            <span className="text-xs text-neutral-600 font-medium uppercase tracking-wider">Agent</span>
+            <span className="text-xs text-pewter font-medium uppercase tracking-wider">Agent</span>
             <div className="flex gap-1 flex-wrap">
               {/* "All agents" option */}
               <a

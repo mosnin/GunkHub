@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useTransition } from 'react'
 
 import { Button } from '@/components/ui/Button'
 import { createProjectAction } from '@/lib/actions/projects'
+import { useFocusTrap } from '@/lib/hooks/useFocusTrap'
 
 interface CreateProjectModalProps {
   isOpen: boolean
@@ -27,6 +28,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
   const [error, setError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
   const nameRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useFocusTrap<HTMLDivElement>(isOpen)
 
   // Reset state when modal opens
   useEffect(() => {
@@ -34,7 +36,6 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       setName('')
       setDescription('')
       setError(null)
-      setTimeout(() => nameRef.current?.focus(), 50)
     }
   }, [isOpen])
 
@@ -72,10 +73,17 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
       onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
     >
-      <div className="w-full max-w-md mx-4 rounded-[4px] border border-graphite-light bg-graphite-deep">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-project-title"
+        tabIndex={-1}
+        className="w-full max-w-md mx-4 rounded-[4px] border border-graphite-light bg-graphite-deep outline-none"
+      >
         {/* Header */}
         <div className="px-5 py-4 border-b border-neutral-800">
-          <h2 className="text-sm font-semibold text-neutral-100">New Project</h2>
+          <h2 id="create-project-title" className="text-sm font-semibold text-neutral-100">New Project</h2>
         </div>
 
         {/* Form */}
@@ -98,7 +106,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
               />
               {slug && (
-                <p className="mt-1.5 text-xs text-neutral-600 font-mono">
+                <p className="mt-1.5 text-xs text-pewter font-mono">
                   slug: <span className="text-neutral-500">{slug}</span>
                 </p>
               )}
@@ -107,7 +115,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
             {/* Description */}
             <div>
               <label htmlFor="project-description" className="block text-xs font-medium text-neutral-400 mb-1.5">
-                Description <span className="text-neutral-600">(optional)</span>
+                Description <span className="text-pewter">(optional)</span>
               </label>
               <textarea
                 id="project-description"

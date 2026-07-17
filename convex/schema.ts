@@ -13,9 +13,7 @@ export default defineSchema({
     ),
     createdAt: v.number(),
     updatedAt: v.number(),
-  })
-    .index("by_clerk_org_id", ["clerkOrgId"])
-    .index("by_slug", ["slug"]),
+  }).index("by_clerk_org_id", ["clerkOrgId"]),
 
   projects: defineTable({
     orgId: v.id("organizations"),
@@ -70,8 +68,6 @@ export default defineSchema({
     sdkVersion: v.optional(v.string()),
   })
     .index("by_org", ["orgId"])
-    .index("by_project", ["projectId"])
-    .index("by_agent", ["agentId"])
     .index("by_org_status", ["orgId", "status"])
     .index("by_agent_started", ["agentId", "startedAt"])
     .index("by_project_started", ["projectId", "startedAt"])
@@ -90,9 +86,7 @@ export default defineSchema({
     timestamp: v.number(),
     payload: v.any(),
     parentEventId: v.optional(v.id("events")),
-  })
-    .index("by_run", ["runId", "sequenceNumber"])
-    .index("by_run_type", ["runId", "type"]),
+  }).index("by_run", ["runId", "sequenceNumber"]),
 
   artifacts: defineTable({
     runId: v.id("runs"),

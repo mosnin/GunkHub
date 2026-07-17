@@ -60,76 +60,67 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   let artifactsData: { artifacts: Artifact[] } = { artifacts: [] }
   let commentsData: Comment[] = []
 
-  try {
-    runData = await getRun(runId)
-    eventsData = await listEvents({ runId, limit: 200 })
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error'
+  // Phase 1 — fetch everything that only depends on runId in parallel instead of
+  // serially. run + events are the fatal group (drive notFound / ErrorState);
+  // replay, artifacts and comments are additive (non-fatal). allSettled lets one
+  // failure not reject the others.
+  const [runSettled, eventsSettled, replaySettled, artifactsSettled, commentsSettled] =
+    await Promise.allSettled([
+      getRun(runId),
+      listEvents({ runId, limit: 200 }),
+      getReplayProjection(runId),
+      listArtifacts(runId),
+      listComments(runId, 'run'),
+    ])
+
+  if (runSettled.status === 'fulfilled') runData = runSettled.value
+  if (eventsSettled.status === 'fulfilled') eventsData = eventsSettled.value
+
+  // Fatal group error handling — preserve notFound() on "not found", else surface.
+  const fatalRejection: unknown =
+    runSettled.status === 'rejected'
+      ? runSettled.reason
+      : eventsSettled.status === 'rejected'
+        ? eventsSettled.reason
+        : null
+  if (fatalRejection) {
+    const msg = fatalRejection instanceof Error ? fatalRejection.message : 'Unknown error'
     if (msg.toLowerCase().includes('not found')) notFound()
     fetchError = msg
   }
 
-  // Resolve agent version label for display in RunHeader
-  let agentVersionLabel: string | undefined
-  if (runData?.run.agentVersionId) {
-    try {
-      const { getAgentVersion } = await import('@/lib/services/agent_versions')
-      const v = await getAgentVersion(runData.run.agentVersionId)
-      agentVersionLabel = v?.version
-    } catch {
-      // Non-fatal
-    }
-  }
+  // Additive results — non-fatal, defaults retained on rejection.
+  if (replaySettled.status === 'fulfilled') failureSummary = replaySettled.value.failureSummary
+  if (artifactsSettled.status === 'fulfilled') artifactsData = artifactsSettled.value
+  if (commentsSettled.status === 'fulfilled') commentsData = commentsSettled.value
 
-  // Failure summary is additive — a failed fetch does not block the rest of the page.
-  try {
-    const replayData = await getReplayProjection(runId)
-    failureSummary = replayData.failureSummary
-  } catch {
-    // Non-fatal: skip the failure panel if the projection cannot be built.
-  }
-
-  try {
-    artifactsData = await listArtifacts(runId)
-  } catch {
-    // Non-fatal: show empty artifact list if fetch fails
-  }
-
-  try {
-    commentsData = await listComments(runId, 'run')
-  } catch {
-    // Non-fatal: show empty comment thread if fetch fails
-  }
-
-  // Only fetch verification status for terminal runs — running runs won't have results yet
-  let verificationStatus: VerificationStatus | null = null
   const TERMINAL = ['completed', 'failed', 'cancelled', 'timed_out'] as const
-  if (runData && TERMINAL.includes(runData.run.status as typeof TERMINAL[number])) {
-    try {
-      verificationStatus = await getRunVerificationStatus(runId)
-    } catch {
-      // Non-fatal: show "unverified" if status cannot be fetched
-    }
-  }
 
-  // Resolve parent context for breadcrumb — non-fatal if either fails
+  // Phase 2 — fetches that depend on runData, run in parallel with one another.
+  let agentVersionLabel: string | undefined
+  let verificationStatus: VerificationStatus | null = null
   let breadcrumbProjectName: string | undefined
   let breadcrumbAgentName: string | undefined
 
   if (runData) {
-    try {
-      const project = await getProject(runData.run.projectId)
-      breadcrumbProjectName = project.name
-    } catch {
-      // Non-fatal: fall back to showing project ID in breadcrumb
-    }
+    const run = runData.run
+    const isTerminal = TERMINAL.includes(run.status as typeof TERMINAL[number])
+    const { getAgentVersion } = await import('@/lib/services/agent_versions')
 
-    try {
-      const agent = await getAgent(runData.run.agentId)
-      breadcrumbAgentName = agent?.name
-    } catch {
-      // Non-fatal: fall back to showing agent ID in breadcrumb
-    }
+    const [versionRes, verifyRes, projectRes, agentRes] = await Promise.all([
+      run.agentVersionId
+        ? getAgentVersion(run.agentVersionId).catch(() => null)
+        : Promise.resolve(null),
+      // Only terminal runs have verification results yet.
+      isTerminal ? getRunVerificationStatus(runId).catch(() => null) : Promise.resolve(null),
+      getProject(run.projectId).catch(() => null),
+      getAgent(run.agentId).catch(() => null),
+    ])
+
+    agentVersionLabel = versionRes?.version
+    verificationStatus = verifyRes
+    breadcrumbProjectName = projectRes?.name
+    breadcrumbAgentName = agentRes?.name
   }
 
   if (fetchError) {

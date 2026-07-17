@@ -88,7 +88,9 @@ export const listRuns = query({
     return {
       runs: page.page,
       nextCursor: page.isDone ? undefined : page.continueCursor,
-      total: page.page.length,
+      // Number of runs in THIS page — NOT a grand total across all pages. Renamed
+      // from the misleading `total` (which UI read as a full count).
+      pageSize: page.page.length,
     };
   },
 });
@@ -190,7 +192,8 @@ export const updateRunStatus = mutation({
     const run = await ctx.db.get(args.runId);
     if (!run) throw new Error("Run not found");
 
-    await requireOrgMembership(ctx, run.orgId);
+    // Changing a run's lifecycle status requires "admin" (matches updateRunTags).
+    await requireOrgMembership(ctx, run.orgId, { minimumRole: "admin" });
 
     const TERMINAL_STATUSES = new Set([
       "completed",

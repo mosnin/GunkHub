@@ -1,3 +1,11 @@
+import { externalizePayloadIfLarge, uploadArtifact } from './externalize.js'
+
+import type {
+  RunStartedPayload,
+  RunCompletedPayload,
+  RunFailedPayload,
+} from '@agent-flight-recorder/contracts'
+
 /**
  * Configuration for FlightRecorder.
  */
@@ -27,6 +35,11 @@ export interface FlightRecorderConfig {
  * It manages the `agentId`/`apiKey` configuration so callers only need to
  * supply run-specific parameters when starting a run. All HTTP calls use
  * native `fetch` (Node 18+).
+ *
+ * Unlike the buffered {@link Recorder}, this is an un-buffered path: each event
+ * is POSTed immediately. It shares the SAME payload-externalization logic as the
+ * buffered path, so an oversized (>10 KB) payload is uploaded as an artifact and
+ * replaced with a pointer rather than being shipped inline and rejected.
  *
  * @example
  * ```typescript
@@ -109,10 +122,18 @@ export class FlightRecorder {
     const recorder = new RunRecorder(data.run.id, this)
     // Event Log Rule 5: RUN_STARTED must be the first event. Emit it so a run
     // created through this high-level path has a lifecycle log like the low-level
-    // Recorder path. Best-effort: a failed lifecycle event must not fail startRun.
-    await recorder.recordLifecycle('run.started', {
-      ...(params?.metadata !== undefined && { input: params.metadata }),
-    })
+    // Recorder path. The run.started event is non-terminal, so it stays
+    // best-effort here: a failed run.started must not break run creation.
+    const startedPayload: RunStartedPayload = {
+      type: 'run.started',
+      input: params?.metadata ?? null,
+      config: params?.metadata ?? {},
+    }
+    try {
+      await recorder.recordEvent('run.started', startedPayload)
+    } catch {
+      // best-effort: run creation already succeeded
+    }
     return recorder
   }
 }
@@ -127,6 +148,8 @@ export class RunRecorder {
   readonly runId: string
 
   private readonly fr: FlightRecorder
+  /** Wall-clock time (ms) this run recorder was created, for duration_ms. */
+  private readonly startedAt: number
   /**
    * Per-run sequence counter. CLAUDE.md Event Log Rule 4 requires sequence
    * numbers to be monotonically increasing integers starting at 1 *within a run*
@@ -145,6 +168,7 @@ export class RunRecorder {
   constructor(runId: string, fr: FlightRecorder) {
     this.runId = runId
     this.fr = fr
+    this.startedAt = Date.now()
   }
 
   /** Increment and return the next per-run sequence number (starts at 1). */
@@ -156,24 +180,37 @@ export class RunRecorder {
    * Record an event in this run.
    *
    * Calls POST /api/events. Sequence numbers are assigned automatically and
-   * monotonically. The caller is responsible for ensuring the run has not
-   * already reached a terminal state.
+   * monotonically. Oversized payloads (>10 KB serialized) are first uploaded as
+   * an artifact via POST /api/artifacts/upload and replaced with a compact
+   * pointer, matching the buffered `Recorder`/`HttpTransport` path — so a large
+   * payload is never shipped inline and 413'd. The caller is responsible for
+   * ensuring the run has not already reached a terminal state.
    *
-   * @param type - Event type string (e.g. 'RUN_STARTED', 'LLM_REQUEST', 'custom').
+   * @param type - Event type string (e.g. 'run.started', 'llm.request', 'custom').
    * @param payload - Arbitrary event payload. Must be JSON-serialisable.
    * @param parentEventId - Optional ID of the parent event for tree-shaped traces.
    * @returns The event ID assigned by the server.
-   * @throws Error if the request fails (network failure or non-2xx response).
+   * @throws Error if the request fails (network failure, upload failure, or non-2xx response).
    */
   async recordEvent(type: string, payload: unknown, parentEventId?: string): Promise<string> {
     const seq = this.nextSequence()
+
+    // Externalize oversized payloads through the shared helper so this path
+    // enforces the same >10 KB rule as HttpTransport. Failures propagate.
+    const outgoingPayload = await externalizePayloadIfLarge(
+      this.runId,
+      type,
+      payload,
+      (runId, eventType, serialized) =>
+        uploadArtifact((u, i) => fetch(u, i), this.fr.baseUrl, this.fr.apiKey, runId, eventType, serialized),
+    )
 
     const body: Record<string, unknown> = {
       runId: this.runId,
       type,
       sequenceNumber: seq,
       timestamp: Date.now(),
-      payload,
+      payload: outgoingPayload,
     }
     if (parentEventId !== undefined) body['parentEventId'] = parentEventId
 
@@ -204,54 +241,73 @@ export class RunRecorder {
   /**
    * Mark the run as completed.
    *
-   * Calls PATCH /api/runs/:id/status with `status: 'completed'`.
+   * Records the terminal `run.completed` event (Event Log Rule 5) and then calls
+   * PATCH /api/runs/:id/status with `status: 'completed'`. Unlike the previous
+   * implementation, a failure to record the terminal event is NOT swallowed —
+   * losing terminal telemetry is the worst failure mode for a flight recorder,
+   * so it propagates to the caller.
    *
-   * @param _metadata - Reserved for future use; currently ignored.
-   * @throws Error if the status update request fails.
+   * @param metadata - Optional output metadata recorded as the run.completed output.
+   * @throws Error if the terminal event cannot be recorded or the status update fails.
    */
   async complete(metadata?: Record<string, unknown>): Promise<void> {
-    // Event Log Rule 5: record the terminal event before transitioning status.
-    await this.recordLifecycle('run.completed', { ...(metadata !== undefined && { output: metadata }) })
-    await this._updateStatus('completed')
-  }
-
-  /**
-   * Record a lifecycle event (run.started / run.completed / run.failed) on a
-   * best-effort basis. Failures are swallowed: on this un-buffered fetch path a
-   * dropped lifecycle event must never break run creation or termination. Use the
-   * buffered Recorder if you need at-least-once delivery of lifecycle events.
-   */
-  async recordLifecycle(type: 'run.started' | 'run.completed' | 'run.failed', payload: unknown): Promise<void> {
-    try {
-      await this.recordEvent(type, payload)
-    } catch {
-      // best-effort
+    const payload: RunCompletedPayload = {
+      type: 'run.completed',
+      output: metadata ?? null,
+      duration_ms: Date.now() - this.startedAt,
     }
+    // Surface terminal-event failures rather than swallowing them.
+    await this.recordEvent('run.completed', payload)
+    await this._updateStatus('completed')
   }
 
   /**
    * Mark the run as failed.
    *
-   * Calls PATCH /api/runs/:id/status with `status: 'failed'`, then re-throws
-   * the original error so the caller's promise chain remains in a rejected
-   * state. If a status update error occurs it is swallowed so the original
-   * error is always the one surfaced.
+   * Records the terminal `run.failed` event (Event Log Rule 5), then calls
+   * PATCH /api/runs/:id/status with `status: 'failed'`, then re-throws the
+   * original error so the caller's promise chain remains rejected.
+   *
+   * Terminal-event failures are surfaced, not swallowed: if run.failed cannot be
+   * recorded, a combined error is thrown that still includes the original error's
+   * message (and carries the original as its `cause`). A subsequent status-update
+   * failure is swallowed so the original error stays the primary signal.
    *
    * @param error - The error that caused the failure. Can be an Error instance
    *   or a plain string message.
-   * @throws Always re-throws `error` after attempting the status update.
+   * @throws Always throws after attempting the status update — the original error
+   *   on the happy path, or a combined error if terminal telemetry could not be recorded.
    */
   async fail(error: Error | string): Promise<void> {
-    const message = error instanceof Error ? error.message : error
-    // Event Log Rule 5: record the terminal run.failed event before status.
-    await this.recordLifecycle('run.failed', { error: { message } })
+    const originalError = error instanceof Error ? error : new Error(error)
+    const payload: RunFailedPayload = {
+      type: 'run.failed',
+      error: {
+        message: originalError.message,
+        ...(originalError.stack !== undefined && { stack: originalError.stack }),
+      },
+      duration_ms: Date.now() - this.startedAt,
+    }
+
+    try {
+      await this.recordEvent('run.failed', payload)
+    } catch (recErr) {
+      // Do NOT hide a dropped terminal event. Surface it, but keep the original
+      // agent error as the primary cause and in the message for callers matching on it.
+      const detail = recErr instanceof Error ? recErr.message : String(recErr)
+      const combined = new Error(
+        `${originalError.message} (additionally, run.failed telemetry could not be recorded: ${detail})`
+      )
+      ;(combined as { cause?: unknown }).cause = originalError
+      throw combined
+    }
+
     try {
       await this._updateStatus('failed')
     } catch {
       // Swallow status-update failures — the caller's error takes priority.
     }
-    if (error instanceof Error) throw error
-    throw new Error(error)
+    throw originalError
   }
 
   private async _updateStatus(status: 'completed' | 'failed' | 'cancelled'): Promise<void> {

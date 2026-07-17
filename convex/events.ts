@@ -9,6 +9,32 @@ import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 // Event types that must be the last event in a run (CLAUDE.md Event Log Rule 5).
 const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
 
+// Closed set of accepted event types. MUST stay in sync with the `EventType` union
+// in packages/contracts/src/events.ts (the source of truth). Convex cannot import
+// the contracts package (no path resolution / not a dependency; CLAUDE.md keeps the
+// convex boundary free of cross-package deps and requires the shapes to align), so
+// the union is mirrored here. An unknown/typo'd type (e.g. "run.complete") would
+// otherwise persist as a non-terminal event and the run would never close.
+const VALID_EVENT_TYPES = new Set<string>([
+  "run.started",
+  "run.completed",
+  "run.failed",
+  "run.cancelled",
+  "llm.request",
+  "llm.response",
+  "llm.error",
+  "tool.call",
+  "tool.result",
+  "tool.error",
+  "memory.read",
+  "memory.write",
+  "retrieval.query",
+  "retrieval.result",
+  "http.request",
+  "http.response",
+  "custom",
+]);
+
 // CLAUDE.md Event Log Rule 3: payloads over 10 KB must be externalized to blob
 // storage. Enforced server-side so a direct Convex call cannot bloat the store.
 const MAX_INLINE_PAYLOAD_BYTES = 10 * 1024;
@@ -121,7 +147,9 @@ export const createEvent = mutation({
       throw new Error("Run not found");
     }
 
-    await requireOrgMembership(ctx, run.orgId);
+    // Writing to the append-only event log requires at least "member". A read-only
+    // viewer must never be able to mutate the log (P0 authorization gate).
+    await requireOrgMembership(ctx, run.orgId, { minimumRole: "member" });
 
     // Idempotency FIRST (mirrors sdkCreateEvents): a retry of an already-stored
     // event returns idempotently regardless of run status.
@@ -139,6 +167,15 @@ export const createEvent = mutation({
     if (run.status !== "running") {
       throw new Error(
         `Cannot append event to run with status "${run.status}". Run must be in "running" state.`,
+      );
+    }
+
+    // Reject unknown event types: `type` is stored as an unvalidated string, so a
+    // typo'd terminal event ("run.complete") would silently persist as a
+    // non-terminal event and the run would never close. Enforce the closed set.
+    if (!VALID_EVENT_TYPES.has(args.type)) {
+      throw new Error(
+        `Unknown event type "${args.type}". Must be one of the contracts EventType union.`,
       );
     }
 

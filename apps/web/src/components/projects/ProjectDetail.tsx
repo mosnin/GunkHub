@@ -124,7 +124,7 @@ export function ProjectDetail({ project, agents }: ProjectDetailProps) {
                     <td className="px-4 py-3 text-sm text-neutral-200 font-medium">
                       {a.name}
                       {a.description && (
-                        <span className="ml-2 text-xs text-neutral-600 font-normal">
+                        <span className="ml-2 text-xs text-pewter font-normal">
                           {a.description}
                         </span>
                       )}
@@ -159,7 +159,7 @@ export function ProjectDetail({ project, agents }: ProjectDetailProps) {
           </div>
           <div className="px-5 py-4">
             <CodeBlock content={sdkSnippet} language="typescript" maxHeight="300px" />
-            <p className="mt-3 text-xs text-neutral-600">
+            <p className="mt-3 text-xs text-pewter">
               Need an API key?{' '}
               <Link
                 href="/settings"

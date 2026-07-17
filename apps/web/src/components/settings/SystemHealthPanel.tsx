@@ -52,7 +52,7 @@ export function SystemHealthPanel() {
               </dt>
               <dd className="flex items-center gap-2">
                 <span className="font-mono text-xs text-neutral-300">{health.projection.model}</span>
-                <span className="text-xs text-neutral-600">always fresh from canonical events</span>
+                <span className="text-xs text-pewter">always fresh from canonical events</span>
               </dd>
             </div>
 
@@ -68,9 +68,9 @@ export function SystemHealthPanel() {
 
             {/* Timestamp row */}
             <div className="flex items-center justify-between border-t border-neutral-800 pt-3 mt-1">
-              <dt className="text-xs font-medium text-neutral-600">Last checked</dt>
+              <dt className="text-xs font-medium text-pewter">Last checked</dt>
               <dd>
-                <time className="font-mono text-xs text-neutral-600" dateTime={health.timestamp}>
+                <time className="font-mono text-xs text-pewter" dateTime={health.timestamp}>
                   {new Date(health.timestamp).toLocaleTimeString('en-US', {
                     hour: '2-digit',
                     minute: '2-digit',

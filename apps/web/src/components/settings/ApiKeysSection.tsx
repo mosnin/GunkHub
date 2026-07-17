@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/Button'
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
+import { useFocusTrap } from '@/lib/hooks/useFocusTrap'
 
 interface ApiKey {
   id: string
@@ -31,6 +32,7 @@ function formatDate(ts: number): string {
 
 function NewKeyModal({ result, onClose }: { result: GenerateResult; onClose: () => void }) {
   const [copied, setCopied] = useState(false)
+  const dialogRef = useFocusTrap<HTMLDivElement>(true)
 
   function handleCopy() {
     void navigator.clipboard.writeText(result.key).then(() => {
@@ -50,13 +52,20 @@ function NewKeyModal({ result, onClose }: { result: GenerateResult; onClose: () 
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-      <div className="bg-graphite-deep border border-graphite-light rounded-[4px] w-full max-w-md mx-4">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="new-key-title"
+        tabIndex={-1}
+        className="bg-graphite-deep border border-graphite-light rounded-[4px] shadow-lg w-full max-w-md mx-4 outline-none"
+      >
         <div className="px-5 py-4 border-b border-neutral-800 flex items-center justify-between">
-          <h3 className="text-sm font-semibold text-neutral-100">API Key Created</h3>
+          <h3 id="new-key-title" className="text-sm font-semibold text-neutral-100">API Key Created</h3>
           <button
             onClick={onClose}
             aria-label="Close"
-            className="text-neutral-600 hover:text-neutral-400 transition-colors duration-100"
+            className="text-pewter hover:text-cloud transition-colors duration-100"
           >
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
               <path d="M3 3l10 10M13 3L3 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
@@ -65,12 +74,12 @@ function NewKeyModal({ result, onClose }: { result: GenerateResult; onClose: () 
         </div>
 
         <div className="px-5 py-4 flex flex-col gap-4">
-          <div className="flex items-start gap-2 bg-amber-950/50 border border-amber-800 rounded-md px-3 py-2.5">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" className="text-amber-400 shrink-0 mt-0.5">
+          <div className="flex items-start gap-2 bg-destructive-900/40 border border-destructive-700/60 rounded-[4px] px-3 py-2.5">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" className="text-destructive-400 shrink-0 mt-0.5">
               <path d="M8 5v3.5M8 10.5v.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
               <path d="M6.68 2.5L1.5 11a1.5 1.5 0 001.32 2.25h10.36A1.5 1.5 0 0014.5 11L9.32 2.5a1.5 1.5 0 00-2.64 0z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
             </svg>
-            <p className="text-xs text-amber-300 leading-relaxed">
+            <p className="text-xs text-destructive-400 leading-relaxed">
               This key is shown <strong>only once</strong>. Copy it now and store it securely. You cannot retrieve it again.
             </p>
           </div>
@@ -155,7 +164,7 @@ function RevokeButton({ keyId, onRevoked }: RevokeButtonProps) {
         <button
           onClick={() => { void handleRevoke() }}
           disabled={revoking}
-          className="text-xs text-red-400 hover:text-red-300 disabled:opacity-40 disabled:pointer-events-none transition-colors duration-100"
+          className="text-xs text-destructive-400 hover:text-destructive-500 disabled:opacity-40 disabled:pointer-events-none transition-colors duration-100"
         >
           {revoking ? 'Revoking…' : 'Confirm?'}
         </button>
@@ -167,44 +176,25 @@ function RevokeButton({ keyId, onRevoked }: RevokeButtonProps) {
           Revoke
         </button>
       )}
-      {error && <span className="text-red-400 text-xs">{error}</span>}
+      {error && <span className="text-destructive-400 text-xs">{error}</span>}
     </div>
   )
 }
 
-export function ApiKeysSection() {
-  const [keys, setKeys] = useState<ApiKey[]>([])
-  const [loading, setLoading] = useState(true)
-  const [fetchError, setFetchError] = useState<string | null>(null)
+interface ApiKeysSectionProps {
+  initialKeys: ApiKey[]
+  loadError: string | null
+}
+
+export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) {
+  // Initial list is server-rendered and passed in as a prop — no client-side
+  // useEffect fetch (forbidden pattern). Mutations still update this state locally.
+  const [keys, setKeys] = useState<ApiKey[]>(initialKeys)
   const [keyName, setKeyName] = useState('')
   const [generating, setGenerating] = useState(false)
   const [generateError, setGenerateError] = useState<string | null>(null)
   const [newKey, setNewKey] = useState<GenerateResult | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-
-    async function load() {
-      setLoading(true)
-      setFetchError(null)
-      try {
-        const res = await fetch('/api/api-keys')
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({})) as { message?: string }
-          throw new Error(body.message ?? `Server error ${res.status}`)
-        }
-        const data = await res.json() as { keys: ApiKey[] }
-        if (!cancelled) setKeys(data.keys)
-      } catch (err) {
-        if (!cancelled) setFetchError(err instanceof Error ? err.message : 'Failed to load keys')
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    }
-
-    void load()
-    return () => { cancelled = true }
-  }, [])
+  const fetchError = loadError
 
   async function handleGenerate() {
     setGenerating(true)
@@ -277,14 +267,12 @@ export function ApiKeysSection() {
           </div>
 
           {generateError && (
-            <p className="text-red-400 text-sm">{generateError}</p>
+            <p className="text-destructive-400 text-sm">{generateError}</p>
           )}
 
           {/* Key list */}
-          {loading ? (
-            <p className="text-sm text-neutral-500">Loading keys…</p>
-          ) : fetchError ? (
-            <p className="text-red-400 text-sm">{fetchError}</p>
+          {fetchError ? (
+            <p className="text-destructive-400 text-sm">{fetchError}</p>
           ) : keys.length === 0 ? (
             <p className="text-sm text-neutral-500">
               No API keys yet. Enter a name above and generate one to start recording runs.

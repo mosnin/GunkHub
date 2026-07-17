@@ -91,7 +91,7 @@ export function RunList({ runs, loading, agentVersionLabels = {}, verificationSt
                         <IntegrityBadge status={verificationStatus} />
                       </Link>
                     ) : (
-                      <span className="text-xs text-neutral-700">—</span>
+                      <span className="text-xs text-pewter">—</span>
                     )}
                   </td>
                 )}
@@ -111,7 +111,7 @@ export function RunList({ runs, loading, agentVersionLabels = {}, verificationSt
                         {agentVersionLabels[run.agentVersionId]}
                       </span>
                     ) : (
-                      <span className="text-xs text-neutral-700">—</span>
+                      <span className="text-xs text-pewter">—</span>
                     )}
                   </Link>
                 </td>
@@ -144,7 +144,7 @@ export function RunList({ runs, loading, agentVersionLabels = {}, verificationSt
                       </span>
                     ))}
                     {(run.tags ?? []).length > 3 && (
-                      <span className="text-xs text-neutral-600 font-mono">
+                      <span className="text-xs text-pewter font-mono">
                         +{(run.tags ?? []).length - 3}
                       </span>
                     )}

@@ -97,7 +97,8 @@ export const updateProject = mutation({
     if (!project) {
       throw new Error("Project not found");
     }
-    await requireOrgMembership(ctx, project.orgId);
+    // Mutating a project requires "admin" (matches createProject).
+    await requireOrgMembership(ctx, project.orgId, { minimumRole: "admin" });
 
     const patch: { name?: string; description?: string; updatedAt: number } = {
       updatedAt: Date.now(),

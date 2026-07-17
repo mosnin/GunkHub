@@ -2,20 +2,28 @@ import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 import type { Id } from "./_generated/dataModel.js";
 
 /**
- * List all comments on a given target (run or event).
+ * List comments on a given target (run or event), bounded by `limit` (default
+ * DEFAULT_PAGE_SIZE, capped at MAX_PAGE_SIZE). Return shape is unchanged — a plain
+ * array of comment docs — so existing consumers do not need to adapt; the only
+ * behavioral change is that at most MAX_PAGE_SIZE rows are returned instead of an
+ * unbounded `.collect()`.
  */
 export const listComments = query({
   args: {
     orgId: v.id("organizations"),
     targetId: v.string(),
     targetType: v.union(v.literal("run"), v.literal("event")),
+    limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     await requireOrgMembership(ctx, args.orgId);
+
+    const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
 
     const comments = await ctx.db
       .query("comments")
@@ -23,7 +31,7 @@ export const listComments = query({
         q.eq("targetId", args.targetId).eq("targetType", args.targetType),
       )
       .filter((q) => q.eq(q.field("orgId"), args.orgId))
-      .collect();
+      .take(limit);
 
     return comments;
   },
@@ -42,7 +50,8 @@ export const createComment = mutation({
   },
   handler: async (ctx, args) => {
     const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, args.orgId);
+    // Authoring a comment is a write; a read-only viewer must not be able to do it.
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "member" });
 
     // TENANCY: confirm the comment target (run/event) actually belongs to the
     // caller's org. Without this, a member could stamp a comment with their own
@@ -94,7 +103,8 @@ export const resolveComment = mutation({
     }
 
     const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, comment.orgId);
+    // Resolving a comment mutates it; a read-only viewer must not be able to do it.
+    await requireOrgMembership(ctx, comment.orgId, { minimumRole: "member" });
 
     if (comment.resolvedAt !== undefined) {
       throw new Error("Comment is already resolved");

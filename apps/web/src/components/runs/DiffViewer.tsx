@@ -14,26 +14,26 @@ interface DiffViewerProps {
   loading?: boolean
 }
 
-// Event type → color class consistent with Timeline
+// Event type text treatment. design.md restricts colour to Neon Glow, the red
+// alert, and greys — event types are read from the mono label itself, so only
+// run lifecycle gets the single Neon accent; every other type is neutral.
 function typeColorClass(type: string | undefined): string {
   if (!type) return 'text-neutral-500'
-  if (type.startsWith('llm.') || type.startsWith('LLM_')) return 'text-violet-400'
-  if (type.startsWith('tool.') || type.startsWith('TOOL_')) return 'text-amber-400'
-  if (type.startsWith('http.') || type.startsWith('HTTP_')) return 'text-sky-400'
   if (type.startsWith('run.') || type.startsWith('RUN_')) return 'text-neon-glow'
-  if (type.startsWith('memory.') || type.startsWith('MEMORY_')) return 'text-pink-400'
-  if (type.startsWith('retrieval.') || type.startsWith('RETRIEVAL_')) return 'text-cyan-400'
-  return 'text-neutral-400'
+  return 'text-neutral-300'
 }
 
+// Diff kinds map to the git-style +/-/~/= glyphs. added/removed keep the two
+// sanctioned accents (Neon Glow green add, red-alert remove); `changed` and
+// `same` are differentiated by the glyph + weight/opacity, not an off-palette hue.
 const kindConfig: Record<
   DiffKind,
   { prefix: string; border: string; bg: string; text: string }
 > = {
-  same:    { prefix: ' ', border: 'border-l-neutral-700', bg: '',                  text: 'text-neutral-500' },
-  added:   { prefix: '+', border: 'border-l-primary-700', bg: 'bg-primary-900/20', text: 'text-neon-glow' },
-  removed: { prefix: '-', border: 'border-l-red-600',     bg: 'bg-red-950/20',     text: 'text-red-400'    },
-  changed: { prefix: '~', border: 'border-l-amber-600',   bg: 'bg-amber-950/20',   text: 'text-amber-400'  },
+  same:    { prefix: ' ', border: 'border-l-neutral-700',    bg: '',                      text: 'text-neutral-500' },
+  added:   { prefix: '+', border: 'border-l-primary-700',    bg: 'bg-primary-900/20',     text: 'text-neon-glow'   },
+  removed: { prefix: '-', border: 'border-l-destructive-600', bg: 'bg-destructive-900/20', text: 'text-destructive-400' },
+  changed: { prefix: '~', border: 'border-l-neutral-500',    bg: 'bg-neutral-800/40',     text: 'text-neutral-200 font-semibold' },
 }
 
 interface FieldChangesTableProps {
@@ -44,9 +44,9 @@ function FieldChangesTable({ changes }: FieldChangesTableProps) {
   return (
     <table className="w-full text-xs font-mono mt-2 border-collapse">
       <thead>
-        <tr className="text-neutral-600">
+        <tr className="text-pewter">
           <th className="text-left px-2 py-1 w-1/3 font-medium">field</th>
-          <th className="text-left px-2 py-1 w-1/3 font-medium text-red-600">left</th>
+          <th className="text-left px-2 py-1 w-1/3 font-medium text-destructive-500">left</th>
           <th className="text-left px-2 py-1 w-1/3 font-medium text-neon-glow">right</th>
         </tr>
       </thead>
@@ -54,7 +54,7 @@ function FieldChangesTable({ changes }: FieldChangesTableProps) {
         {changes.map((change, i) => (
           <tr key={i} className="border-t border-neutral-800">
             <td className="px-2 py-1 text-neutral-400 truncate max-w-0 w-1/3">{change.path}</td>
-            <td className="px-2 py-1 text-red-400/80 truncate max-w-0 w-1/3">
+            <td className="px-2 py-1 text-destructive-400/90 truncate max-w-0 w-1/3">
               {JSON.stringify(change.left)}
             </td>
             <td className="px-2 py-1 text-neon-glow/80 truncate max-w-0 w-1/3">
@@ -82,7 +82,7 @@ function EventDiffRow({ entry, isFirstDivergence }: EventDiffRowProps) {
   return (
     <div>
       {isFirstDivergence && (
-        <div className="flex items-center gap-2 px-3 py-1 text-xs text-amber-400 font-mono border-t border-amber-900/40 bg-amber-950/10">
+        <div className="flex items-center gap-2 px-3 py-1 text-xs text-neon-glow font-mono border-t border-neon-muted/40 bg-primary-900/10">
           <span aria-hidden="true">↑</span>
           First divergence
         </div>
@@ -99,7 +99,7 @@ function EventDiffRow({ entry, isFirstDivergence }: EventDiffRowProps) {
           <span className={['font-mono text-xs w-4 shrink-0 select-none', cfg.text].join(' ')}>
             {cfg.prefix}
           </span>
-          <span className="font-mono text-xs text-neutral-600 w-8 shrink-0">
+          <span className="font-mono text-xs text-pewter w-8 shrink-0">
             #{entry.sequenceNumber}
           </span>
           <span className={['font-mono text-xs flex-1 truncate', typeColorClass(type)].join(' ')}>
@@ -226,17 +226,17 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-primary-900/40 border border-primary-800/50 text-xs font-mono font-medium text-neon-glow">
             +{summary.added} added
           </span>
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-red-950/40 border border-red-900/50 text-xs font-mono font-medium text-red-400">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-destructive-900/40 border border-destructive-700/50 text-xs font-mono font-medium text-destructive-400">
             -{summary.removed} removed
           </span>
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-950/40 border border-amber-900/50 text-xs font-mono font-medium text-amber-400">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-neutral-800 border border-neutral-600 text-xs font-mono font-semibold text-neutral-200">
             ~{summary.changed} changed
           </span>
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-neutral-800 border border-neutral-700 text-xs font-mono font-medium text-neutral-500">
             ={summary.same} same
           </span>
           {summary.statusChanged && (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-950/40 border border-amber-900/50 text-xs font-mono font-medium text-amber-400">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-destructive-900/40 border border-destructive-700/50 text-xs font-mono font-medium text-destructive-400">
               status changed
             </span>
           )}
@@ -245,14 +245,14 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
 
       {/* Truncation warning */}
       {diff.truncated && (
-        <div className="px-4 py-2 bg-orange-950/40 border border-orange-900/50 rounded-md text-xs text-orange-400 font-medium">
+        <div className="px-4 py-2 bg-graphite border border-graphite-light rounded-[4px] text-xs text-pewter font-medium">
           This comparison is partial. Each run was capped at 10,000 events — the displayed diff may not represent the full difference.
         </div>
       )}
 
       {/* Incomparable notice */}
       {incomparable && (
-        <div className="rounded-md bg-amber-950/30 border border-amber-900/60 px-4 py-3 text-sm text-amber-300">
+        <div className="rounded-[4px] bg-destructive-900/30 border border-destructive-700/60 px-4 py-3 text-sm text-destructive-400">
           <span className="font-semibold">Cannot compare: </span>
           {incomparableReason ?? 'These runs cannot be fairly compared.'}
         </div>

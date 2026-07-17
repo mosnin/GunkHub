@@ -3,55 +3,11 @@ import { v } from "convex/values";
 import { query, mutation } from "./_generated/server.js";
 import { requireOrgMembership } from "./auth.js";
 
-import type { Id } from "./_generated/dataModel.js";
-
-
-/**
- * Return the distinct agents that have at least one run in the given org.
- * Used to populate the agent filter dropdown on the runs list page.
- */
-export const listDistinctAgents = query({
-  args: {
-    orgId: v.id("organizations"),
-  },
-  handler: async (ctx, args) => {
-    await requireOrgMembership(ctx, args.orgId);
-
-    // Collect all runs for the org, then derive the distinct agent IDs.
-    // This approach avoids a separate cross-table join and is acceptable
-    // at v1 scale (orgId-scoped index keeps the scan bounded).
-    const runs = await ctx.db
-      .query("runs")
-      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
-      .collect();
-
-    const seenAgentIds = new Set<string>();
-    const agentIds: string[] = [];
-    for (const run of runs) {
-      const id = run.agentId as string;
-      if (!seenAgentIds.has(id)) {
-        seenAgentIds.add(id);
-        agentIds.push(id);
-      }
-    }
-
-    // Fetch the agent records for each distinct agentId.
-    const agents = await Promise.all(
-      agentIds.map((id) => ctx.db.get(id as Id<"agents">)),
-    );
-
-    // TENANCY (Rule 3): re-verify each fetched agent belongs to this org. A run
-    // could carry a foreign agentId (see createRun/sdkCreateRun ownership checks);
-    // trusting the denormalized reference would leak another org's agent record.
-    // Filter out missing records AND any whose orgId does not match.
-    return agents.filter(
-      (a): a is NonNullable<typeof a> => a !== null && a.orgId === args.orgId,
-    );
-  },
-});
-
 /**
  * List all agents belonging to an organization (not filtered by project).
+ * Returns full agent docs (id + name + slug + ...), which is a superset of what
+ * the runs-page agent filter dropdown needs. Replaces the deleted
+ * listDistinctAgents, which did a full runs-table scan + N+1 agent fetch.
  */
 export const listAgentsByOrg = query({
   args: {

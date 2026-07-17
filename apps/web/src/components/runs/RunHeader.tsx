@@ -39,7 +39,7 @@ function CopyButton({ value }: { value: string }) {
       onClick={handleCopy}
       title="Copy run ID"
       aria-label="Copy run ID to clipboard"
-      className="ml-1 inline-flex items-center justify-center w-5 h-5 rounded text-neutral-600 hover:text-neutral-400 hover:bg-neutral-800 transition-colors duration-100 shrink-0"
+      className="ml-1 inline-flex items-center justify-center w-5 h-5 rounded text-pewter hover:text-cloud hover:bg-neutral-800 transition-colors duration-100 shrink-0"
     >
       {copied ? (
         /* Checkmark icon */
@@ -150,7 +150,7 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
           <IntegrityBadge status={verificationStatus} />
         )}
         {isLive && liveStatus === 'running' && (
-          <span className="flex items-center gap-1 text-xs font-mono text-neutral-600">
+          <span className="flex items-center gap-1 text-xs font-mono text-pewter">
             <span className="w-1.5 h-1.5 rounded-full bg-neon-glow animate-neon-pulse" aria-hidden="true" />
             live
           </span>
@@ -173,7 +173,7 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
         )}
 
         {triggeredBy && (
-          <span className="text-xs text-neutral-600">
+          <span className="text-xs text-pewter">
             via <span className="text-neutral-500 font-mono">{triggeredBy}</span>
           </span>
         )}
@@ -193,7 +193,7 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
                 <button
                   type="button"
                   onClick={() => removeTag(tag)}
-                  className="text-neutral-600 hover:text-neutral-300 transition-colors"
+                  className="text-pewter hover:text-neutral-300 transition-colors"
                   aria-label={`Remove tag ${tag}`}
                 >
                   ×
@@ -219,7 +219,7 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
               type="button"
               onClick={handleSave}
               disabled={isPending}
-              className="text-xs font-mono text-primary-400 hover:text-primary-300 disabled:text-neutral-600 transition-colors"
+              className="text-xs font-mono text-primary-400 hover:text-primary-300 disabled:text-pewter transition-colors"
             >
               {isPending ? 'Saving…' : 'Save'}
             </button>
@@ -232,14 +232,14 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
                 setErrorMsg(null)
               }}
               disabled={isPending}
-              className="text-xs font-mono text-neutral-600 hover:text-neutral-400 disabled:text-neutral-700 transition-colors"
+              className="text-xs font-mono text-pewter hover:text-cloud disabled:text-pewter transition-colors"
             >
               Cancel
             </button>
 
             {/* Error feedback */}
             {errorMsg && (
-              <span className="text-xs text-red-500 font-mono">{errorMsg}</span>
+              <span className="text-xs text-destructive-500 font-mono">{errorMsg}</span>
             )}
           </>
         ) : (
@@ -261,7 +261,7 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
                 setDraftTags(savedTags)
                 setIsEditing(true)
               }}
-              className="inline-flex items-center gap-0.5 text-xs text-neutral-700 hover:text-neutral-500 transition-colors font-mono"
+              className="inline-flex items-center gap-0.5 text-xs text-pewter hover:text-neutral-500 transition-colors font-mono"
               aria-label="Edit tags"
               title="Edit tags"
             >
@@ -290,13 +290,13 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
       {/* Metadata — collapsible details, only when metadata has keys */}
       {metadata && Object.keys(metadata).length > 0 && (
         <details className="mt-2">
-          <summary className="text-xs text-neutral-600 cursor-pointer hover:text-neutral-500 select-none">
+          <summary className="text-xs text-pewter cursor-pointer hover:text-neutral-500 select-none">
             Metadata ({Object.keys(metadata).length} field{Object.keys(metadata).length !== 1 ? 's' : ''})
           </summary>
           <dl className="mt-2 flex flex-col gap-1">
             {Object.entries(metadata).map(([key, value]) => (
               <div key={key} className="flex gap-3 text-xs">
-                <dt className="font-mono text-neutral-600 shrink-0 min-w-[6rem]">{key}</dt>
+                <dt className="font-mono text-pewter shrink-0 min-w-[6rem]">{key}</dt>
                 <dd className="font-mono text-neutral-400 break-all">
                   {typeof value === 'string' ? value : JSON.stringify(value)}
                 </dd>

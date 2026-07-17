@@ -245,8 +245,8 @@ describe('Absolute index mapping', () => {
   })
 
   it('ring highlight is false when focusedIndex !== absIdx', () => {
-    const focusedIndex = 52
-    const absIdx = 53
+    const focusedIndex: number = 52
+    const absIdx: number = 53
     expect(focusedIndex === absIdx).toBe(false)
   })
 

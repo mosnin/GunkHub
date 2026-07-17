@@ -62,7 +62,7 @@ function CommentItem({
               {resolving ? 'Resolving…' : 'Resolve'}
             </button>
           )}
-          <span className="text-xs text-neutral-700">
+          <span className="text-xs text-pewter">
             {formatTime(comment.createdAt)}
           </span>
         </div>
@@ -72,7 +72,7 @@ function CommentItem({
       <p
         className={[
           'text-sm leading-relaxed whitespace-pre-wrap break-words',
-          isResolved ? 'line-through text-neutral-600' : 'text-neutral-300',
+          isResolved ? 'line-through text-pewter' : 'text-neutral-300',
         ].join(' ')}
       >
         {comment.content}
@@ -80,7 +80,7 @@ function CommentItem({
 
       {/* Resolved-by line */}
       {isResolved && comment.resolvedBy && comment.resolvedAt !== undefined && (
-        <p className="text-xs text-neutral-600 font-mono">
+        <p className="text-xs text-pewter font-mono">
           Resolved by {comment.resolvedBy} at {formatTime(comment.resolvedAt)}
         </p>
       )}
@@ -156,7 +156,7 @@ export function CommentThread({
     <div className="flex flex-col gap-4 px-6 py-4">
       {/* Error banners */}
       {resolveError && (
-        <div className="text-xs text-red-400 bg-red-950/40 border border-red-900/50 rounded px-3 py-2">
+        <div className="text-xs text-destructive-400 bg-destructive-900/40 border border-destructive-700/50 rounded px-3 py-2">
           {resolveError}
         </div>
       )}
@@ -221,7 +221,7 @@ export function CommentThread({
           className="w-full bg-transparent text-sm text-neutral-300 placeholder-neutral-600 resize-none outline-none disabled:opacity-50 disabled:cursor-not-allowed"
         />
         {composeError && (
-          <p className="text-xs text-red-400">{composeError}</p>
+          <p className="text-xs text-destructive-400">{composeError}</p>
         )}
         <div className="flex justify-end">
           <button

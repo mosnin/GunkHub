@@ -49,7 +49,7 @@ describe('markRunTimedOut safety invariants', () => {
 
   it('expiry is idempotent: already-timed_out runs are not re-patched', () => {
     // A run with status "timed_out" returns early from markRunTimedOut
-    const runStatus = 'timed_out'
+    const runStatus: string = 'timed_out'
     const wouldPatch = runStatus === 'running'
     expect(wouldPatch).toBe(false)
   })

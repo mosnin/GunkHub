@@ -59,10 +59,10 @@ export function VerificationFailureDetail({ status }: VerificationFailureDetailP
   return (
     <div className="mt-3 space-y-2">
       {issues.map((issue, i) => (
-        <div key={i} className="border-l-2 border-red-900 pl-3 py-1">
-          <p className="text-xs font-medium text-red-400">{issue.title}</p>
+        <div key={i} className="border-l-2 border-destructive-700 pl-3 py-1">
+          <p className="text-xs font-medium text-destructive-400">{issue.title}</p>
           <p className="text-xs text-neutral-500 mt-0.5">{issue.detail}</p>
-          <p className="text-xs text-neutral-600 mt-0.5">{issue.hint}</p>
+          <p className="text-xs text-pewter mt-0.5">{issue.hint}</p>
         </div>
       ))}
     </div>

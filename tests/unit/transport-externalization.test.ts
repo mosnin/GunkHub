@@ -1,5 +1,5 @@
 import { HttpTransport } from '@agent-flight-recorder/sdk'
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest'
 
 import type { CreateEventRequest } from '@agent-flight-recorder/contracts'
 
@@ -8,6 +8,8 @@ import type { CreateEventRequest } from '@agent-flight-recorder/contracts'
 // ---------------------------------------------------------------------------
 
 type FetchMockImpl = (url: string, init?: RequestInit) => Promise<Response>
+type FetchArgs = Parameters<FetchMockImpl>
+type FetchRet = ReturnType<FetchMockImpl>
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -70,19 +72,24 @@ function makeSmallPayloadEvent(runId: string, seqNum: number): CreateEventReques
   }
 }
 
+/** UTF-8 byte length — matches the threshold check the transport performs. */
+function byteLength(s: string): number {
+  return new TextEncoder().encode(s).length
+}
+
 /** Verify that the large payload event actually exceeds the threshold. */
 function assertLargePayloadIsActuallyLarge(event: CreateEventRequest): void {
-  const serialized = JSON.stringify(event.payload)
-  if (serialized.length <= 10240) {
-    throw new Error(`Test helper makeLargePayloadEvent produced a payload of only ${serialized.length} bytes — it must exceed 10240`)
+  const bytes = byteLength(JSON.stringify(event.payload))
+  if (bytes <= 10240) {
+    throw new Error(`Test helper makeLargePayloadEvent produced a payload of only ${bytes} bytes — it must exceed 10240`)
   }
 }
 
 /** Verify that the small payload event actually fits under the threshold. */
 function assertSmallPayloadIsActuallySmall(event: CreateEventRequest): void {
-  const serialized = JSON.stringify(event.payload)
-  if (serialized.length > 10240) {
-    throw new Error(`Test helper makeSmallPayloadEvent produced a payload of ${serialized.length} bytes — it must be <= 10240`)
+  const bytes = byteLength(JSON.stringify(event.payload))
+  if (bytes > 10240) {
+    throw new Error(`Test helper makeSmallPayloadEvent produced a payload of ${bytes} bytes — it must be <= 10240`)
   }
 }
 
@@ -92,7 +99,7 @@ function assertSmallPayloadIsActuallySmall(event: CreateEventRequest): void {
 
 describe('HttpTransport.sendEvents — small payloads (no externalization)', () => {
   let transport: HttpTransport
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockFetch: Mock<FetchArgs, FetchRet>
 
   beforeEach(() => {
     transport = new HttpTransport(ENDPOINT)
@@ -106,7 +113,7 @@ describe('HttpTransport.sendEvents — small payloads (no externalization)', () 
     const event = makeSmallPayloadEvent(RUN_ID, 1)
     assertSmallPayloadIsActuallySmall(event)
 
-    mockFetch = vi.fn<FetchMockImpl>(async () => jsonResponse(mockEventsResponse, 201))
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async () => jsonResponse(mockEventsResponse, 201))
     vi.stubGlobal('fetch', mockFetch)
 
     await transport.sendEvents([event], auth)
@@ -117,7 +124,7 @@ describe('HttpTransport.sendEvents — small payloads (no externalization)', () 
   it('fetch URL for small payload is the events endpoint, not the upload endpoint', async () => {
     const event = makeSmallPayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async () => jsonResponse(mockEventsResponse, 201))
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async () => jsonResponse(mockEventsResponse, 201))
     vi.stubGlobal('fetch', mockFetch)
 
     await transport.sendEvents([event], auth)
@@ -130,7 +137,7 @@ describe('HttpTransport.sendEvents — small payloads (no externalization)', () 
   it('small payload event returns success when /api/events returns 201', async () => {
     const event = makeSmallPayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async () => jsonResponse(mockEventsResponse, 201))
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async () => jsonResponse(mockEventsResponse, 201))
     vi.stubGlobal('fetch', mockFetch)
 
     const result = await transport.sendEvents([event], auth)
@@ -146,13 +153,13 @@ describe('HttpTransport.sendEvents — small payloads (no externalization)', () 
     ]
     events.forEach(assertSmallPayloadIsActuallySmall)
 
-    mockFetch = vi.fn<FetchMockImpl>(async () => jsonResponse(mockEventsResponse, 201))
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async () => jsonResponse(mockEventsResponse, 201))
     vi.stubGlobal('fetch', mockFetch)
 
     await transport.sendEvents(events, auth)
 
     const eventsCalls = mockFetch.mock.calls.filter(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )
     expect(eventsCalls).toHaveLength(1)
   })
@@ -164,7 +171,7 @@ describe('HttpTransport.sendEvents — small payloads (no externalization)', () 
       makeSmallPayloadEvent(RUN_ID, 3),
     ]
 
-    mockFetch = vi.fn<FetchMockImpl>(async () => jsonResponse(mockEventsResponse, 201))
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async () => jsonResponse(mockEventsResponse, 201))
     vi.stubGlobal('fetch', mockFetch)
 
     await transport.sendEvents(events, auth)
@@ -173,7 +180,7 @@ describe('HttpTransport.sendEvents — small payloads (no externalization)', () 
   })
 
   it('sendEvents with empty events array returns immediately with no fetch calls', async () => {
-    mockFetch = vi.fn<FetchMockImpl>(async () => jsonResponse(mockEventsResponse, 201))
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async () => jsonResponse(mockEventsResponse, 201))
     vi.stubGlobal('fetch', mockFetch)
 
     const result = await transport.sendEvents([], auth)
@@ -182,7 +189,7 @@ describe('HttpTransport.sendEvents — small payloads (no externalization)', () 
     // with an empty array. The transport always issues the POST — verify it's called once
     // for the events endpoint only (no upload).
     const uploadCalls = mockFetch.mock.calls.filter(
-      ([url]: [string]) => (url as string).includes('artifacts/upload')
+      ([url]: FetchArgs) => (url as string).includes('artifacts/upload')
     )
     expect(uploadCalls).toHaveLength(0)
     expect(result.success).toBe(true)
@@ -195,7 +202,7 @@ describe('HttpTransport.sendEvents — small payloads (no externalization)', () 
 
 describe('HttpTransport.sendEvents — large payloads (externalization triggered)', () => {
   let transport: HttpTransport
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockFetch: Mock<FetchArgs, FetchRet>
 
   beforeEach(() => {
     transport = new HttpTransport(ENDPOINT)
@@ -210,7 +217,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
     assertLargePayloadIsActuallyLarge(event)
 
     const callOrder: string[] = []
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) {
         callOrder.push('upload')
         return jsonResponse(mockUploadResponse)
@@ -228,7 +235,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
   it('fetch is called exactly twice for a large payload event (upload then events)', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -242,7 +249,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
   it('the upload call goes to the correct URL: ${endpoint}/api/artifacts/upload', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -251,7 +258,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
     await transport.sendEvents([event], auth)
 
     const uploadCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).includes('artifacts/upload')
+      ([url]: FetchArgs) => (url as string).includes('artifacts/upload')
     )
     expect(uploadCall).toBeDefined()
     expect(uploadCall![0] as string).toBe(`${ENDPOINT}/api/artifacts/upload`)
@@ -260,7 +267,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
   it('the upload call uses method POST with x-api-key header', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -269,7 +276,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
     await transport.sendEvents([event], auth)
 
     const uploadCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).includes('artifacts/upload')
+      ([url]: FetchArgs) => (url as string).includes('artifacts/upload')
     )!
     const init = uploadCall[1] as RequestInit
     expect(init.method).toBe('POST')
@@ -280,7 +287,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
   it('the upload request body contains the event runId', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -289,7 +296,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
     await transport.sendEvents([event], auth)
 
     const uploadCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).includes('artifacts/upload')
+      ([url]: FetchArgs) => (url as string).includes('artifacts/upload')
     )!
     const init = uploadCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as Record<string, unknown>
@@ -299,7 +306,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
   it('after successful upload, the events call payload has type "_externalized"', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -308,7 +315,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
     await transport.sendEvents([event], auth)
 
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as { events: Array<{ payload: { type: string } }> }
@@ -318,7 +325,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
   it('after successful upload, the events call payload._artifact.storageKey matches upload response', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -327,7 +334,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
     await transport.sendEvents([event], auth)
 
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as {
@@ -339,7 +346,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
   it('the event originalType in the pointer matches the original event type "llm.request"', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -348,7 +355,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
     await transport.sendEvents([event], auth)
 
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as {
@@ -364,7 +371,7 @@ describe('HttpTransport.sendEvents — large payloads (externalization triggered
 
 describe('HttpTransport.sendEvents — mixed batches', () => {
   let transport: HttpTransport
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockFetch: Mock<FetchArgs, FetchRet>
 
   beforeEach(() => {
     transport = new HttpTransport(ENDPOINT)
@@ -381,7 +388,7 @@ describe('HttpTransport.sendEvents — mixed batches', () => {
       makeSmallPayloadEvent(RUN_ID, 3),
     ]
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -390,10 +397,10 @@ describe('HttpTransport.sendEvents — mixed batches', () => {
     await transport.sendEvents(events, auth)
 
     const uploadCalls = mockFetch.mock.calls.filter(
-      ([url]: [string]) => (url as string).includes('artifacts/upload')
+      ([url]: FetchArgs) => (url as string).includes('artifacts/upload')
     )
     const eventsCalls = mockFetch.mock.calls.filter(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )
     expect(uploadCalls).toHaveLength(1)
     expect(eventsCalls).toHaveLength(1)
@@ -405,7 +412,7 @@ describe('HttpTransport.sendEvents — mixed batches', () => {
     const smallEvent2 = makeSmallPayloadEvent(RUN_ID, 3)
     const events = [largeEvent, smallEvent1, smallEvent2]
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -414,7 +421,7 @@ describe('HttpTransport.sendEvents — mixed batches', () => {
     await transport.sendEvents(events, auth)
 
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as { events: unknown[] }
@@ -425,7 +432,7 @@ describe('HttpTransport.sendEvents — mixed batches', () => {
     const largeEvent = makeLargePayloadEvent(RUN_ID, 1)
     const smallEvent = makeSmallPayloadEvent(RUN_ID, 2)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -434,7 +441,7 @@ describe('HttpTransport.sendEvents — mixed batches', () => {
     await transport.sendEvents([largeEvent, smallEvent], auth)
 
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as {
@@ -448,7 +455,7 @@ describe('HttpTransport.sendEvents — mixed batches', () => {
     const largeEvent = makeLargePayloadEvent(RUN_ID, 7)
     const smallEvent = makeSmallPayloadEvent(RUN_ID, 8)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -457,7 +464,7 @@ describe('HttpTransport.sendEvents — mixed batches', () => {
     await transport.sendEvents([largeEvent, smallEvent], auth)
 
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as {
@@ -474,7 +481,7 @@ describe('HttpTransport.sendEvents — mixed batches', () => {
 
 describe('HttpTransport.sendEvents — externalization failure', () => {
   let transport: HttpTransport
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockFetch: Mock<FetchArgs, FetchRet>
 
   beforeEach(() => {
     transport = new HttpTransport(ENDPOINT)
@@ -487,7 +494,7 @@ describe('HttpTransport.sendEvents — externalization failure', () => {
   it('upload returns 401: sendEvents returns { success: false, retryable: false }', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) {
         return new Response(JSON.stringify({ message: 'Unauthorized' }), {
           status: 401,
@@ -509,7 +516,7 @@ describe('HttpTransport.sendEvents — externalization failure', () => {
   it('upload returns 500: sendEvents returns { success: false, retryable: false }', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) {
         return new Response('Internal Server Error', { status: 500 })
       }
@@ -530,7 +537,7 @@ describe('HttpTransport.sendEvents — externalization failure', () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
     const networkErrorMessage = 'fetch failed: ECONNREFUSED'
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) {
         throw new Error(networkErrorMessage)
       }
@@ -550,7 +557,7 @@ describe('HttpTransport.sendEvents — externalization failure', () => {
   it('when externalization fails, /api/events is NOT called', async () => {
     const event = makeLargePayloadEvent(RUN_ID, 1)
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) {
         return new Response('Unauthorized', { status: 401 })
       }
@@ -561,7 +568,7 @@ describe('HttpTransport.sendEvents — externalization failure', () => {
     await transport.sendEvents([event], auth)
 
     const eventsCalls = mockFetch.mock.calls.filter(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )
     expect(eventsCalls).toHaveLength(0)
   })
@@ -573,11 +580,11 @@ describe('HttpTransport.sendEvents — externalization failure', () => {
 
 describe('HttpTransport.sendEvents — pointer shape correctness', () => {
   let transport: HttpTransport
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockFetch: Mock<FetchArgs, FetchRet>
 
   beforeEach(() => {
     transport = new HttpTransport(ENDPOINT)
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
       return jsonResponse(mockEventsResponse, 201)
     })
@@ -590,7 +597,7 @@ describe('HttpTransport.sendEvents — pointer shape correctness', () => {
 
   function getPointerPayload(): Record<string, unknown> {
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as {
@@ -634,7 +641,7 @@ describe('HttpTransport.sendEvents — pointer shape correctness', () => {
     await transport.sendEvents([event], auth)
 
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as {
@@ -651,7 +658,7 @@ describe('HttpTransport.sendEvents — pointer shape correctness', () => {
 
 describe('HttpTransport.sendEvents — upload cache deduplication', () => {
   let transport: HttpTransport
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockFetch: Mock<FetchArgs, FetchRet>
 
   beforeEach(() => {
     transport = new HttpTransport(ENDPOINT)
@@ -701,7 +708,7 @@ describe('HttpTransport.sendEvents — upload cache deduplication', () => {
     ]
     let uploadCallCount = 0
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) {
         const resp = uploadResponses[uploadCallCount]!
         uploadCallCount++
@@ -715,14 +722,14 @@ describe('HttpTransport.sendEvents — upload cache deduplication', () => {
 
     // Upload should be called exactly once (cache hit on second event)
     const uploadCalls = mockFetch.mock.calls.filter(
-      ([url]: [string]) => (url as string).includes('artifacts/upload')
+      ([url]: FetchArgs) => (url as string).includes('artifacts/upload')
     )
     expect(uploadCalls).toHaveLength(1)
 
     // Both events in the final POST /api/events body should have type '_externalized'
     // and share the same artifactId
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as {
@@ -750,7 +757,7 @@ describe('HttpTransport.sendEvents — upload cache deduplication', () => {
     ]
     let uploadCallCountDiff = 0
 
-    mockFetch = vi.fn<FetchMockImpl>(async (url) => {
+    mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
       if (url.includes('artifacts/upload')) {
         const resp = uploadResponsesForDiff[uploadCallCountDiff]!
         uploadCallCountDiff++
@@ -764,13 +771,13 @@ describe('HttpTransport.sendEvents — upload cache deduplication', () => {
 
     // Upload should be called twice (one per unique payload)
     const uploadCalls = mockFetch.mock.calls.filter(
-      ([url]: [string]) => (url as string).includes('artifacts/upload')
+      ([url]: FetchArgs) => (url as string).includes('artifacts/upload')
     )
     expect(uploadCalls).toHaveLength(2)
 
     // Both events should be externalized with different artifactIds
     const eventsCall = mockFetch.mock.calls.find(
-      ([url]: [string]) => (url as string).endsWith('/api/events')
+      ([url]: FetchArgs) => (url as string).endsWith('/api/events')
     )!
     const init = eventsCall[1] as RequestInit
     const body = JSON.parse(init.body as string) as {

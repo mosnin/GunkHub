@@ -5,6 +5,7 @@ import type {
   CreateRunRequest,
   CreateRunResponse,
   CreateEventRequest,
+  Run,
 } from '@agent-flight-recorder/contracts'
 import type { Transport, TransportAuth } from '@agent-flight-recorder/sdk'
 
@@ -26,13 +27,13 @@ const createMockTransport = (): Transport => ({
       tags: req.tags ?? [],
       triggeredBy: req.triggeredBy,
       sdkVersion: req.sdkVersion,
-    },
+    } as Run,
   })),
   sendEvents: vi.fn(async (_events: CreateEventRequest[], _auth: TransportAuth) => ({
     success: true as const,
     eventIds: _events.map((_, i) => `evt_mock_${i}`),
   })),
-  updateRunStatus: vi.fn(async () => {}),
+  updateRunStatus: vi.fn(async () => ({ success: true as const, eventIds: [] })),
 })
 
 // ---------------------------------------------------------------------------
@@ -261,6 +262,121 @@ describe('Recorder', () => {
     const finalBatch = captured[captured.length - 1]!
     const ascending = [...finalBatch].sort((a, b) => a - b)
     expect(finalBatch).toEqual(ascending)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Lifecycle ordering, sequence contiguity, and buffer overflow
+// ---------------------------------------------------------------------------
+
+describe('Recorder — lifecycle ordering & durability invariants', () => {
+  /** Transport that records every event it is asked to send, in order. */
+  const createCapturingTransport = (): { transport: Transport; sent: CreateEventRequest[] } => {
+    const sent: CreateEventRequest[] = []
+    const transport = createMockTransport()
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        sent.push(...events)
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+    return { transport, sent }
+  }
+
+  it('RUN_STARTED is the first event and the terminal event is last (endRun)', async () => {
+    const { transport, sent } = createCapturingTransport()
+    const rec = new Recorder(
+      { endpoint: 'http://localhost:3000', apiKey: 'k', agentId: 'a' },
+      transport,
+    )
+    await rec.startRun('input')
+    rec.recordEvent('custom', { type: 'custom', data: '1' })
+    rec.recordEvent('llm.request', { type: 'llm.request', model: 'gpt-4o', messages: [] })
+    await rec.endRun('done')
+
+    expect(sent[0]!.type).toBe('run.started')
+    expect(sent[sent.length - 1]!.type).toBe('run.completed')
+    // Sequence numbers are contiguous, ascending, and start at 1.
+    const seqs = sent.map((e) => e.sequenceNumber)
+    expect(seqs).toEqual(seqs.map((_, i) => i + 1))
+  })
+
+  it('terminal run.failed is last on failRun', async () => {
+    const { transport, sent } = createCapturingTransport()
+    const rec = new Recorder(
+      { endpoint: 'http://localhost:3000', apiKey: 'k', agentId: 'a' },
+      transport,
+    )
+    await rec.startRun('input')
+    rec.recordEvent('custom', { type: 'custom', data: 'x' })
+    await rec.failRun(new Error('boom'))
+
+    expect(sent[0]!.type).toBe('run.started')
+    expect(sent[sent.length - 1]!.type).toBe('run.failed')
+  })
+
+  it('a non-contiguous sequence number is rejected by the server and surfaced in the result', async () => {
+    // Transport mimics the backend contiguity check: sequence numbers must arrive
+    // contiguously starting at 1. A gap makes the flush fail (not silently pass).
+    const transport = createMockTransport()
+    let expectedNext = 1
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        for (const e of events) {
+          if (e.sequenceNumber !== expectedNext) {
+            return {
+              success: false as const,
+              error: `non-contiguous sequence: expected ${expectedNext}, got ${e.sequenceNumber}`,
+              retryable: false,
+            }
+          }
+          expectedNext++
+        }
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+
+    const rec = new Recorder(
+      { endpoint: 'http://localhost:3000', apiKey: 'k', agentId: 'a' },
+      transport,
+    )
+    await rec.startRun('input') // run.started seq 1
+    rec.recordEvent('custom', { type: 'custom', data: 'a' }) // seq 2
+    // Inject a deliberate gap (seq jumps to 10).
+    rec.recordEvent('custom', { type: 'custom', data: 'b' }, { sequenceNumber: 10 })
+
+    const result = await rec.flush()
+    expect(result.success).toBe(false)
+    expect(result.errors[0]!.error).toContain('non-contiguous')
+  })
+
+  it('buffer overflow drops oldest non-terminal events but always preserves terminal + run.started', async () => {
+    const { transport, sent } = createCapturingTransport()
+    const rec = new Recorder(
+      {
+        endpoint: 'http://localhost:3000',
+        apiKey: 'k',
+        agentId: 'a',
+        // Large batch size so nothing auto-flushes; tiny buffer cap to force drops.
+        options: { maxBatchSize: 1000, maxBufferSize: 3 },
+      },
+      transport,
+    )
+    await rec.startRun('input') // run.started (protected)
+    for (let i = 0; i < 5; i++) {
+      rec.recordEvent('custom', { type: 'custom', data: `c${i}` })
+    }
+    // Record a terminal event directly; it must survive the overflow policy.
+    rec.recordEvent('run.failed', { type: 'run.failed', error: { message: 'x' }, duration_ms: 1 })
+
+    const result = await rec.flush()
+    const types = sent.map((e) => e.type)
+    // Protected events survive despite the buffer being far over capacity.
+    expect(types).toContain('run.started')
+    expect(types).toContain('run.failed')
+    // Oldest custom events were dropped; the dropped count is surfaced.
+    expect(result.droppedEvents).toBeGreaterThan(0)
+    expect(sent.length).toBeLessThan(1 + 5 + 1)
   })
 })
 

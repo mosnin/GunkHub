@@ -68,8 +68,9 @@ class MockTransport implements Transport {
     return { success: true, eventIds: events.map((_, i) => `evt_mock_${Date.now()}_${i}`) }
   }
 
-  async updateRunStatus(runId: string, status: string, endedAt?: number, _auth?: TransportAuth): Promise<void> {
+  async updateRunStatus(runId: string, status: string, endedAt?: number, _auth?: TransportAuth): Promise<TransportResponse> {
     console.log(`[MockTransport] updateRunStatus → ${runId} = ${status}  endedAt=${endedAt}`)
+    return { success: true, eventIds: [] }
   }
 }
 

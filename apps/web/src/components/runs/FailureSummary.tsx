@@ -17,16 +17,16 @@ export function FailureSummary({ summary }: FailureSummaryProps) {
   return (
     <div
       className={[
-        'mx-6 mt-4 rounded-md border px-4 py-3',
+        'mx-6 mt-4 rounded-[4px] border px-4 py-3',
         isFailed
-          ? 'bg-red-950/30 border-red-900/60'
-          : 'bg-amber-950/30 border-amber-900/60',
+          ? 'bg-destructive-900/30 border-destructive-700/60'
+          : 'bg-destructive-900/15 border-destructive-700/40',
       ].join(' ')}
       role="alert"
     >
       {/* Status line */}
       <div className="flex items-center gap-2 mb-2">
-        <span aria-hidden="true" className={isFailed ? 'text-red-500' : 'text-amber-500'}>
+        <span aria-hidden="true" className={isFailed ? 'text-destructive-500' : 'text-destructive-400/70'}>
           {isFailed ? (
             // X icon
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
@@ -49,7 +49,7 @@ export function FailureSummary({ summary }: FailureSummaryProps) {
         <span
           className={[
             'text-sm font-semibold',
-            isFailed ? 'text-red-300' : 'text-amber-300',
+            isFailed ? 'text-destructive-400' : 'text-destructive-400/80',
           ].join(' ')}
         >
           {isFailed ? 'Run Failed' : 'Incomplete'}
@@ -67,7 +67,7 @@ export function FailureSummary({ summary }: FailureSummaryProps) {
       {summary.primaryFailure && (
         <div className="mb-2">
           <span className="text-xs text-neutral-500">Primary cause: </span>
-          <span className="text-xs font-mono text-red-400">
+          <span className="text-xs font-mono text-destructive-400">
             {summary.primaryFailure.type}
           </span>
           <span className="text-xs font-mono text-neutral-500">
@@ -83,7 +83,7 @@ export function FailureSummary({ summary }: FailureSummaryProps) {
 
       {/* Incomplete message (no primary failure to show) */}
       {isIncomplete && !summary.primaryFailure && (
-        <p className="text-xs text-amber-400/80 mb-2">
+        <p className="text-xs text-destructive-400/80 mb-2">
           This run has no terminal event. It may still be in progress or was interrupted.
         </p>
       )}
@@ -98,10 +98,10 @@ export function FailureSummary({ summary }: FailureSummaryProps) {
               .map((fp) => (
                 <li key={fp.eventId} className="text-xs font-mono">
                   <span className="text-neutral-500">{fp.type}</span>
-                  <span className="text-neutral-700"> at </span>
+                  <span className="text-pewter"> at </span>
                   <span className="text-neutral-500">#{fp.sequenceNumber}</span>
                   {fp.errorMessage && (
-                    <span className="text-neutral-600 font-sans ml-2">{fp.errorMessage.slice(0, 80)}</span>
+                    <span className="text-pewter font-sans ml-2">{fp.errorMessage.slice(0, 80)}</span>
                   )}
                 </li>
               ))}

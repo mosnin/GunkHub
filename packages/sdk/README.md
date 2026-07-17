@@ -232,16 +232,25 @@ The `Transport` interface abstracts the network layer:
 interface Transport {
   createRun(req: CreateRunRequest, auth: TransportAuth): Promise<CreateRunResponse>
   sendEvents(events: CreateEventRequest[], auth: TransportAuth): Promise<TransportResponse>
-  updateRunStatus(runId: string, status: string, endedAt?: number, auth?: TransportAuth): Promise<void>
+  updateRunStatus(runId: string, status: string, endedAt?: number, auth?: TransportAuth): Promise<TransportResponse>
 }
 ```
 
-`HttpTransport` is the default implementation and targets the Agent Flight Recorder HTTP API. You can inject a custom transport (e.g., for testing) via the second argument to `new Recorder(config, transport)`.
+`updateRunStatus` returns a `TransportResponse` so a failed terminal status transition is surfaced (via `FlushResult.errors`) instead of leaving the run stuck "running".
 
-> **Note:** `HttpTransport` is currently stubbed and will throw `not yet implemented`. Full HTTP transport is coming in v1.1. For now, supply your own `Transport` implementation or use the `MockTransport` shown in `examples/basic_run.ts`.
+`HttpTransport` is the default implementation and targets the Agent Flight Recorder HTTP API. Its retry and batching strategies are injectable:
+
+```typescript
+new HttpTransport(endpoint, {
+  timeoutMs: 10_000,
+  retryStrategy: createRetryStrategy({ maxRetries: 5, backoffMs: 250 }),
+})
+```
+
+You can inject a custom transport (e.g., for testing) via the second argument to `new Recorder(config, transport)`. When you let `Recorder` construct its own `HttpTransport`, `RecorderOptions.maxRetries` / `retryBackoffMs` are threaded into the retry strategy.
 
 ---
 
 ## Version
 
-v0.1.0 — transport implementation coming in v1.1.
+v0.2.0 — `HttpTransport` implemented (retry, batching, timeout, payload externalization). `Transport.updateRunStatus` now returns `TransportResponse` (breaking).

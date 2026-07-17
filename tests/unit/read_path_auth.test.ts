@@ -162,8 +162,8 @@ describe('Artifact download — route-level orgId guard', () => {
     // If the authenticated user belongs to org-A but the artifact belongs to org-B,
     // the route guard (userId present AND orgId matches artifact's org) rejects the request.
     // We model this as: orgId extracted from auth !== artifact's orgId → reject.
-    const authOrgId = 'org-A'
-    const artifactOrgId = 'org-B'
+    const authOrgId: string = 'org-A'
+    const artifactOrgId: string = 'org-B'
     const crossOrgAccessAllowed = authOrgId === artifactOrgId
     expect(crossOrgAccessAllowed).toBe(false)
   })

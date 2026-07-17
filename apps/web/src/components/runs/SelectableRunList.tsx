@@ -92,7 +92,7 @@ export function SelectableRunList({
               <span className="text-neutral-400">
                 {selectedEligible.length} selected
                 {selectedIds.size > selectedEligible.length && (
-                  <span className="text-neutral-600 ml-1">
+                  <span className="text-pewter ml-1">
                     ({selectedIds.size - selectedEligible.length} non-terminal skipped)
                   </span>
                 )}
@@ -103,7 +103,7 @@ export function SelectableRunList({
                   setSelectedIds(new Set())
                   setBulkResult(null)
                 }}
-                className="text-neutral-600 hover:text-neutral-400 transition-colors duration-100"
+                className="text-pewter hover:text-cloud transition-colors duration-100"
               >
                 clear
               </button>
@@ -111,7 +111,7 @@ export function SelectableRunList({
                 type="button"
                 onClick={handleBulkReverify}
                 disabled={selectedEligible.length === 0}
-                className="ml-auto px-2 py-0.5 rounded border text-xs font-mono transition-colors duration-100 border-primary-800 text-primary-400 hover:text-primary-300 hover:border-primary-700 disabled:text-neutral-700 disabled:border-neutral-800"
+                className="ml-auto px-2 py-0.5 rounded border text-xs font-mono transition-colors duration-100 border-primary-800 text-primary-400 hover:text-primary-300 hover:border-primary-700 disabled:text-pewter disabled:border-neutral-800"
               >
                 Re-verify {selectedEligible.length}
               </button>
@@ -123,16 +123,16 @@ export function SelectableRunList({
                   <span className="text-neon-glow">{bulkResult.succeeded.length} verified</span>
                 )}
                 {bulkResult.succeeded.length > 0 && bulkResult.failed.length > 0 && (
-                  <span className="text-neutral-600 mx-1">·</span>
+                  <span className="text-pewter mx-1">·</span>
                 )}
                 {bulkResult.failed.length > 0 && (
-                  <span className="text-red-500">{bulkResult.failed.length} failed</span>
+                  <span className="text-destructive-500">{bulkResult.failed.length} failed</span>
                 )}
               </span>
               <button
                 type="button"
                 onClick={() => setBulkResult(null)}
-                className="ml-auto text-neutral-600 hover:text-neutral-400 transition-colors duration-100"
+                className="ml-auto text-pewter hover:text-cloud transition-colors duration-100"
               >
                 dismiss
               </button>
@@ -224,7 +224,7 @@ export function SelectableRunList({
                       )}
                       {wasFailed && (
                         <span
-                          className="text-red-600 text-xs"
+                          className="text-destructive-500 text-xs"
                           aria-label="re-verify failed"
                           title={bulkResult?.errors[run.id]}
                         >
@@ -244,7 +244,7 @@ export function SelectableRunList({
                         <IntegrityBadge status={verificationStatus} />
                       </Link>
                     ) : (
-                      <span className="text-xs text-neutral-700">—</span>
+                      <span className="text-xs text-pewter">—</span>
                     )}
                   </td>
                   <td className="px-4 py-3">
@@ -263,7 +263,7 @@ export function SelectableRunList({
                           {agentVersionLabels[run.agentVersionId]}
                         </span>
                       ) : (
-                        <span className="text-xs text-neutral-700">—</span>
+                        <span className="text-xs text-pewter">—</span>
                       )}
                     </Link>
                   </td>
@@ -296,7 +296,7 @@ export function SelectableRunList({
                         </span>
                       ))}
                       {(run.tags ?? []).length > 3 && (
-                        <span className="text-xs text-neutral-600 font-mono">
+                        <span className="text-xs text-pewter font-mono">
                           +{(run.tags ?? []).length - 3}
                         </span>
                       )}

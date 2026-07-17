@@ -5,10 +5,21 @@ import { ApiKeysSection } from '@/components/settings/ApiKeysSection'
 import { SdkSetupSnippet } from '@/components/settings/SdkSetupSnippet'
 import { SystemHealthPanel } from '@/components/settings/SystemHealthPanel'
 import { Card } from '@/components/ui/Card'
+import { listApiKeys, type ApiKeySummary } from '@/lib/services/api_keys'
 
 export const metadata: Metadata = { title: 'Settings' }
 
-export default function SettingsPage() {
+export default async function SettingsPage() {
+  // Server-render the initial API key list so the client component does not
+  // fetch via useEffect.
+  let initialKeys: ApiKeySummary[] = []
+  let keysError: string | null = null
+  try {
+    initialKeys = await listApiKeys()
+  } catch (err) {
+    keysError = err instanceof Error ? err.message : 'Failed to load keys'
+  }
+
   return (
     <div className="p-6 max-w-3xl mx-auto">
       <PageHeader title="Settings" />
@@ -56,14 +67,14 @@ export default function SettingsPage() {
                 </thead>
                 <tbody>
                   <tr>
-                    <td colSpan={3} className="px-4 py-8 text-center text-sm text-neutral-600">
+                    <td colSpan={3} className="px-4 py-8 text-center text-sm text-pewter">
                       No members to display.
                     </td>
                   </tr>
                 </tbody>
               </table>
             </div>
-            <p className="text-xs text-neutral-600">
+            <p className="text-xs text-pewter">
               Manage members through your{' '}
               <span className="text-neutral-500">Clerk dashboard</span>.
             </p>
@@ -77,7 +88,7 @@ export default function SettingsPage() {
         <SystemHealthPanel />
 
         {/* API Keys — functional UI (route handled by Team A at /api/api-keys) */}
-        <ApiKeysSection />
+        <ApiKeysSection initialKeys={initialKeys} loadError={keysError} />
       </div>
     </div>
   )
