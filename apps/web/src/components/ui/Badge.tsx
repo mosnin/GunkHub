@@ -7,30 +7,38 @@ interface BadgeProps {
   className?: string
 }
 
-const statusConfig: Record<RunStatus, { label: string; className: string }> = {
+// Status pills carry a small status dot for at-a-glance scanning (design.md:
+// high signal, calm technical palette). Only live/terminal states glow.
+const statusConfig: Record<RunStatus, { label: string; className: string; dot: string }> = {
   pending: {
     label: 'pending',
-    className: 'bg-neutral-800 text-neutral-400 border-neutral-700',
+    className: 'bg-graphite text-ash border-graphite-light',
+    dot: 'bg-pewter',
   },
   running: {
     label: 'running',
     className: 'bg-primary-900 text-primary-300 border-primary-800',
+    dot: 'bg-neon-glow shadow-[0_0_6px_rgba(52,213,154,0.8)] animate-neon-pulse',
   },
   completed: {
     label: 'completed',
     className: 'bg-success-900 text-success-400 border-success-700',
+    dot: 'bg-neon-glow shadow-[0_0_6px_rgba(52,213,154,0.6)]',
   },
   failed: {
     label: 'failed',
     className: 'bg-destructive-900 text-destructive-400 border-destructive-700',
+    dot: 'bg-destructive-500 shadow-[0_0_6px_rgba(255,54,33,0.6)]',
   },
   cancelled: {
     label: 'cancelled',
-    className: 'bg-neutral-800 text-neutral-500 border-neutral-700',
+    className: 'bg-graphite text-pewter border-graphite-light',
+    dot: 'bg-pewter',
   },
   timed_out: {
     label: 'timed out',
     className: 'bg-warning-900 text-warning-400 border-warning-700',
+    dot: 'bg-warning-500',
   },
 }
 
@@ -39,11 +47,12 @@ export function Badge({ status, className }: BadgeProps) {
   return (
     <span
       className={cn(
-        'inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium border',
+        'inline-flex items-center gap-1.5 px-2 py-0.5 rounded-[4px] text-xs font-mono font-medium border',
         config.className,
         className
       )}
     >
+      <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', config.dot)} aria-hidden="true" />
       {config.label}
     </span>
   )

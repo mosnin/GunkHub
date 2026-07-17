@@ -50,7 +50,7 @@ function NewKeyModal({ result, onClose }: { result: GenerateResult; onClose: () 
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-      <div className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl w-full max-w-md mx-4">
+      <div className="bg-graphite-deep border border-graphite-light rounded-[4px] w-full max-w-md mx-4">
         <div className="px-5 py-4 border-b border-neutral-800 flex items-center justify-between">
           <h3 className="text-sm font-semibold text-neutral-100">API Key Created</h3>
           <button

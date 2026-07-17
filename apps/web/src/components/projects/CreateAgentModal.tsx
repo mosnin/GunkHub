@@ -61,7 +61,7 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
       onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
     >
-      <div className="w-full max-w-md mx-4 rounded-lg border border-neutral-700 bg-neutral-900 shadow-xl">
+      <div className="w-full max-w-md mx-4 rounded-[4px] border border-graphite-light bg-graphite-deep">
         {/* Header */}
         <div className="px-5 py-4 border-b border-neutral-800">
           <h2 className="text-sm font-semibold text-neutral-100">New Agent</h2>

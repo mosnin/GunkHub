@@ -8,20 +8,41 @@ import { RunList } from '@/components/runs/RunList'
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
 import { ErrorState } from '@/components/ui/ErrorState'
+import { Reveal, RevealGroup, RevealItem } from '@/components/ui/Motion'
 import { getRecentFailedVerifications } from '@/lib/services/projection_verify'
 import { listRuns } from '@/lib/services/runs'
 import { truncateId, formatRelativeTime } from '@/lib/utils'
 
 export const metadata: Metadata = { title: 'Dashboard' }
 
-function StatCard({ label, value }: { label: string; value: string }) {
+// Bento stat tile: layered near-black surface, GeistMono value, optional accent.
+function StatTile({
+  label,
+  value,
+  accent = 'neutral',
+  hint,
+}: {
+  label: string
+  value: string
+  accent?: 'neutral' | 'neon' | 'warn'
+  hint?: string
+}) {
+  const dot =
+    accent === 'neon' ? 'bg-neon-glow shadow-[0_0_8px_rgba(52,213,154,0.7)]'
+    : accent === 'warn' ? 'bg-destructive-500 shadow-[0_0_8px_rgba(255,54,33,0.6)]'
+    : 'bg-graphite-light'
+  const valueColor =
+    accent === 'neon' ? 'text-neon-glow' : accent === 'warn' ? 'text-destructive-500' : 'text-whiteout'
   return (
-    <Card>
-      <div className="px-4 py-4">
-        <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">{label}</p>
-        <p className="mt-1.5 text-2xl font-semibold text-neutral-100 font-mono">{value}</p>
+    <RevealItem className="neon-surface relative overflow-hidden p-5">
+      <div className="scanline opacity-60" aria-hidden="true" />
+      <div className="flex items-center gap-2">
+        <span className={`w-1.5 h-1.5 rounded-full ${dot}`} aria-hidden="true" />
+        <p className="font-mono text-[11px] uppercase tracking-wider text-ash">{label}</p>
       </div>
-    </Card>
+      <p className={`mt-3 font-mono text-[40px] leading-none font-medium tabular-nums ${valueColor}`}>{value}</p>
+      {hint && <p className="mt-2 text-xs text-pewter">{hint}</p>}
+    </RevealItem>
   )
 }
 
@@ -76,12 +97,12 @@ export default async function DashboardPage() {
         </div>
       ) : (
         <>
-          {/* Stats row */}
-          <div className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <StatCard label="Recent Runs" value={String(totalRuns)} />
-            <StatCard label="Failed" value={String(failedRuns)} />
-            <StatCard label="Active" value={String(activeRuns)} />
-          </div>
+          {/* Bento stats row */}
+          <RevealGroup className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <StatTile label="Recent Runs" value={String(totalRuns)} hint="in the last window" />
+            <StatTile label="Failed" value={String(failedRuns)} accent={failedRuns > 0 ? 'warn' : 'neutral'} hint="need attention" />
+            <StatTile label="Active" value={String(activeRuns)} accent={activeRuns > 0 ? 'neon' : 'neutral'} hint="running now" />
+          </RevealGroup>
 
           {hasRuns ? (
             <>
@@ -99,8 +120,8 @@ export default async function DashboardPage() {
                 </div>
 
                 {failedVerifications.length === 0 ? (
-                  <div className="flex items-center gap-2 px-3 py-2.5 rounded-md border border-neutral-800 text-xs text-neutral-600 font-mono">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-800 shrink-0" aria-hidden="true" />
+                  <div className="flex items-center gap-2 px-3 py-2.5 rounded-[4px] border border-graphite text-xs text-ash font-mono">
+                    <span className="w-1.5 h-1.5 rounded-full bg-neon-muted shrink-0" aria-hidden="true" />
                     No recent verification issues
                   </div>
                 ) : (
@@ -130,10 +151,10 @@ export default async function DashboardPage() {
               </div>
 
               {/* Recent Runs list */}
-              <div className="mt-8">
+              <Reveal className="mt-8">
                 <h2 className="text-sm font-semibold text-neutral-300 mb-4">Recent Runs</h2>
                 <RunList runs={runs} />
-              </div>
+              </Reveal>
             </>
           ) : (
             /* Getting Started guide — only show when there are no runs yet */

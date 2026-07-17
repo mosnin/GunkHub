@@ -79,13 +79,13 @@ export function Sidebar() {
   const pathname = usePathname()
 
   return (
-    <aside className="w-[220px] border-r border-neutral-800 bg-neutral-950 flex flex-col py-4 px-3 shrink-0">
+    <aside className="w-[220px] border-r border-graphite-light bg-blackout flex flex-col py-4 px-3 shrink-0">
       {/* Logo */}
       <div className="flex items-center gap-2.5 px-2 mb-6">
-        <div className="w-7 h-7 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center shrink-0">
-          <span className="text-xs font-bold font-mono text-neutral-100">AFR</span>
+        <div className="w-7 h-7 rounded-[4px] bg-neon-glow flex items-center justify-center shrink-0">
+          <span className="text-[10px] font-semibold font-mono text-blackout">AFR</span>
         </div>
-        <span className="text-xs text-neutral-500 leading-tight">Agent Flight Recorder</span>
+        <span className="text-xs text-ash leading-tight">Agent Flight Recorder</span>
       </div>
 
       {/* Nav */}
@@ -96,14 +96,21 @@ export function Sidebar() {
             <Link
               key={item.href}
               href={item.href}
+              aria-current={isActive ? 'page' : undefined}
               className={cn(
-                'flex items-center gap-2.5 px-2 py-2 rounded-md text-sm transition-colors duration-100',
+                'relative flex items-center gap-2.5 px-2.5 py-2 rounded-[4px] text-sm transition-colors duration-150',
                 isActive
-                  ? 'bg-neutral-800 text-white'
-                  : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-900/50'
+                  ? 'bg-graphite text-whiteout'
+                  : 'text-ash hover:text-whiteout hover:bg-graphite-deep'
               )}
             >
-              <span className="shrink-0">{item.icon}</span>
+              {isActive && (
+                <span
+                  className="absolute left-0 top-1/2 -translate-y-1/2 h-4 w-0.5 rounded-full bg-neon-glow shadow-[0_0_8px_rgba(52,213,154,0.8)]"
+                  aria-hidden="true"
+                />
+              )}
+              <span className={cn('shrink-0', isActive && 'text-neon-glow')}>{item.icon}</span>
               <span>{item.label}</span>
             </Link>
           )
