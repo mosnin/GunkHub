@@ -101,6 +101,9 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
   const [seekState, setSeekState] = useState<SeekState>('idle')
   const [followTail, setFollowTail] = useState(isLive)
   const [unseenCount, setUnseenCount] = useState(0)
+  // True when the most recent live poll failed — drives the "reconnecting…"
+  // stale indicator; cleared on the next successful poll.
+  const [pollFailed, setPollFailed] = useState(false)
 
   // Keep a stable ref to followTail for use inside polling effect closures
   const followTailRef = useRef(isLive)
@@ -166,8 +169,12 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       // earliest events and never the newly-appended tail on runs > one page.
       const maxSeq = maxSeqRef.current
       const res = await fetch(`/api/runs/${runId}/events?limit=200&afterSeq=${maxSeq}`)
-      if (!res.ok) return
+      if (!res.ok) {
+        setPollFailed(true)
+        return
+      }
       const data = (await res.json()) as ListEventsResponse
+      setPollFailed(false)
       // Dedup against the LIVE id set (ref), not the stale closure array.
       const known = knownIdsRef.current
       const brandNew = data.events.filter((e) => !known.has(e.id))
@@ -193,7 +200,9 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       // all pages are loaded and we are tailing; re-seeding it from page 1's cursor
       // restarts pagination and re-appends already-loaded pages every tick.
     } catch {
-      // Non-fatal: ignore failed polls
+      // Non-fatal, but surfaced: mark the stream stale so the UI can show a
+      // "reconnecting…" indicator instead of silently freezing.
+      setPollFailed(true)
     }
   }
 
@@ -332,6 +341,7 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       followTail={followTail}
       unseenCount={unseenCount}
       onResume={handleResume}
+      pollFailed={pollFailed}
     />
   )
 }
@@ -357,6 +367,7 @@ interface EventInspectorInnerProps {
   followTail?: boolean
   unseenCount?: number
   onResume?: () => void
+  pollFailed?: boolean
 }
 
 function EventInspectorInner({
@@ -380,6 +391,7 @@ function EventInspectorInner({
   followTail = false,
   unseenCount = 0,
   onResume,
+  pollFailed = false,
 }: EventInspectorInnerProps) {
   // Sync ?event=<sequenceNumber> into the URL without navigation
   useEffect(() => {
@@ -401,7 +413,15 @@ function EventInspectorInner({
         <div className="px-3 py-2 border-b border-neutral-800 flex items-center justify-between">
           <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Events</p>
           {isLive && (
-            <div className="flex items-center gap-2">
+            /* Polite live region so screen readers are told about newly streamed
+               events (the count, not every event). */
+            <div role="status" aria-live="polite" className="flex items-center gap-2">
+              {pollFailed && (
+                <span className="flex items-center gap-1.5 text-xs font-mono text-pewter">
+                  <span className="w-1.5 h-1.5 rounded-full bg-destructive-500 shrink-0" aria-hidden="true" />
+                  reconnecting…
+                </span>
+              )}
               {!followTail && unseenCount > 0 && onResume && (
                 <button
                   onClick={onResume}
@@ -454,7 +474,7 @@ function EventInspectorInner({
 
         <div
           tabIndex={0}
-          className="outline-none"
+          className="outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-neon-glow"
           onFocus={() => { if (focusedIdx === -1) setFocusedIdx(0) }}
           onKeyDown={handleListKeyDown}
         >
@@ -483,11 +503,11 @@ function EventInspectorInner({
                     }
                   }}
                   className={[
-                    'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75 outline-none focus:ring-1 focus:ring-inset focus:ring-neutral-600',
+                    'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75 outline-none focus:ring-1 focus:ring-inset focus:ring-neon-glow',
                     selectedEvent?.id === evt.id
                       ? 'bg-neutral-900 text-neutral-200'
                       : 'hover:bg-neutral-900/60 text-neutral-400',
-                    focusedIdx === absIdx ? 'ring-1 ring-inset ring-neutral-600' : '',
+                    focusedIdx === absIdx ? 'ring-1 ring-inset ring-neon-glow' : '',
                   ].join(' ')}
                 >
                   <span className="text-xs font-mono">{evt.type}</span>

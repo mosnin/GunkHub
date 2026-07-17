@@ -105,8 +105,10 @@ export function Sidebar() {
               )}
             >
               {isActive && (
+                /* Active-nav tick with the sanctioned accent glow token —
+                   see design.md "Glow" (status/live indicators only). */
                 <span
-                  className="absolute left-0 top-1/2 -translate-y-1/2 h-4 w-0.5 rounded-full bg-neon-glow shadow-[0_0_8px_rgba(52,213,154,0.8)]"
+                  className="absolute left-0 top-1/2 -translate-y-1/2 h-4 w-0.5 rounded-full bg-neon-glow shadow-[var(--shadow-glow)]"
                   aria-hidden="true"
                 />
               )}

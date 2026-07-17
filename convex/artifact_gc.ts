@@ -3,9 +3,10 @@
 // ever referenced the artifact) to prevent unbounded growth in Convex and
 // Vercel Blob storage.
 //
-// Orphan definition: an artifact record whose _creationTime is older than
-// ORPHAN_AGE_MS and for which no event in the same run has a payload with
-// type "_externalized" referencing this artifact's _id.
+// Orphan definition: a RUN-LEVEL artifact (no eventId) whose createdAt is older
+// than ORPHAN_AGE_MS, whose parent run is TERMINAL, and for which no event in
+// the same run has a payload with type "_externalized" referencing this
+// artifact's _id. Event-attached artifacts are permanently retained.
 //
 // Safety: the 24-hour age threshold ensures that artifacts created during an
 // in-progress run (blob uploaded, event not yet flushed) are never deleted.
@@ -57,10 +58,30 @@ export const getOrphanCandidates = internalQuery({
   },
 });
 
+// Terminal run statuses — a run in one of these states can never gain new events,
+// so its artifact reference set is final and safe to evaluate.
+const TERMINAL_RUN_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "timed_out",
+]);
+
 /**
- * Returns true if any event in the given run has an _externalized payload that
- * references the given artifact ID. If true, the artifact is reachable and must
- * not be deleted.
+ * Returns true if the artifact is still reachable and must NOT be deleted.
+ *
+ * Semantics:
+ * - Event-attached artifacts (eventId set, event exists) are permanently
+ *   retained — they are recorded data hanging off the immutable event log.
+ * - Run-level artifacts (eventId === undefined) — the actual orphan case, e.g.
+ *   the SDK uploaded a blob but the externalized event never flushed — are
+ *   collectable ONLY when ALL of:
+ *     (a) the parent run is TERMINAL (no new events can arrive),
+ *     (b) the artifact is older than the 24 h safety threshold (guaranteed by
+ *         getOrphanCandidates' createdAt cutoff), and
+ *     (c) no event payload's `_externalized` pointer references its id
+ *         (pointer shape: payload._artifact.artifactId — see contracts
+ *         ExternalizedPayload).
  */
 export const isArtifactReferenced = internalQuery({
   args: {
@@ -72,17 +93,20 @@ export const isArtifactReferenced = internalQuery({
     // Artifact already gone (deleted by a concurrent run) — nothing to reclaim.
     if (!artifact) return true;
 
-    // (1) Run-level artifact (no eventId): it "hangs off the Run" per CLAUDE.md.
-    // Runs are immutable and never deleted, so this artifact is always reachable.
-    // We cannot distinguish a legitimate run-level artifact from a dedup-race
-    // leftover, and destroying recorded data is unacceptable — so keep it.
-    if (artifact.eventId === undefined) return true;
+    if (artifact.eventId !== undefined) {
+      // Event-attached artifact: permanently retained while its event exists.
+      const event = await ctx.db.get(artifact.eventId);
+      if (event) return true;
+      // Dangling eventId (should not happen — events are never deleted). Fall
+      // through to the pointer scan before declaring it reclaimable.
+    } else {
+      // Run-level artifact: only collectable once the run is terminal. A missing
+      // run (purged via ADR 001) leaves the artifact unreachable — collectable.
+      const run = await ctx.db.get(args.runId);
+      if (run && !TERMINAL_RUN_STATUSES.has(run.status)) return true;
+    }
 
-    // (2) Event-attached artifact: reachable as long as its event exists.
-    const event = await ctx.db.get(artifact.eventId);
-    if (event) return true;
-
-    // (3) Fallback: some event's _externalized payload references it by id.
+    // Pointer scan: some event's _externalized payload may reference it by id.
     const events = await ctx.db
       .query("events")
       .withIndex("by_run", (q) => q.eq("runId", args.runId))
@@ -102,8 +126,8 @@ export const isArtifactReferenced = internalQuery({
       }
     }
 
-    // eventId is set but points to a missing event and nothing else references it:
-    // a genuine dangling pointer. Safe to reclaim.
+    // Older than the safety threshold, run terminal (or gone), and nothing
+    // references it: a genuine orphan. Safe to reclaim.
     return false;
   },
 });

@@ -31,3 +31,32 @@ export const STALE_RUN_TIMEOUT_MS = 24 * 60 * 60 * 1000;
  * Mirrors GC_CANDIDATE_PAGE_SIZE for consistency.
  */
 export const STALE_RUN_BATCH_SIZE = 100;
+
+/**
+ * Write ceiling: maximum events per run. Sequence numbers are contiguous from 1,
+ * so `sequenceNumber > MAX_EVENTS_PER_RUN` is an exact, O(1) "run is full" check
+ * enforced in both createEvent and sdkCreateEvents. A run at this size is far
+ * beyond what the UI can usefully render (MAX_EVENTS_PER_REPLAY is 10k) — the cap
+ * exists to stop a runaway agent from growing one run without bound.
+ */
+export const MAX_EVENTS_PER_RUN = 50_000;
+
+/**
+ * Write ceiling: maximum artifact records per run. Checked with a bounded
+ * `.take(MAX_ARTIFACTS_PER_RUN)` count on the by_run index — cheap at this size
+ * and requires no denormalized counter on the run document.
+ */
+export const MAX_ARTIFACTS_PER_RUN = 1_000;
+
+/**
+ * Default ingest rate limit (events/min) applied to newly created API keys when
+ * the caller does not specify one. Explicit values override; pre-existing keys
+ * with rateLimitPerMin unset remain unlimited (back-compat).
+ */
+export const DEFAULT_RATE_LIMIT_PER_MIN = 600;
+
+/**
+ * Maximum documents deleted per purge/retention internal-mutation batch
+ * (ADR 001). Small enough to stay well inside Convex transaction limits.
+ */
+export const PURGE_BATCH_SIZE = 100;

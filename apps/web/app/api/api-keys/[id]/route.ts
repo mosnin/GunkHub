@@ -4,7 +4,8 @@ import { NextResponse } from 'next/server'
 import type { ApiError } from '@agent-flight-recorder/contracts'
 
 import { convex } from '@/lib/convexFunctions'
-import { getAuthedClient } from '@/lib/convexServer'
+import { ConvexTimeoutError, getAuthedClient, withConvexTimeout } from '@/lib/convexServer'
+import { getRequestId, logger } from '@/lib/logger'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ConvexArgs = Record<string, any>
@@ -22,7 +23,8 @@ interface RouteParams {
   params: { id: string }
 }
 
-export async function DELETE(_req: Request, { params }: RouteParams) {
+export async function DELETE(req: Request, { params }: RouteParams) {
+  const requestId = getRequestId(req)
   const { userId, orgId: clerkOrgId } = auth()
   if (!userId || !clerkOrgId) {
     return NextResponse.json<ApiError>(
@@ -33,9 +35,9 @@ export async function DELETE(_req: Request, { params }: RouteParams) {
 
   try {
     const client = await getAuthedClient()
-    await convexMutation(client, convex.api_keys.revokeApiKey, {
+    await withConvexTimeout(convexMutation(client, convex.api_keys.revokeApiKey, {
       keyId: params.id,
-    })
+    }))
 
     return NextResponse.json({ revoked: true })
   } catch (err) {
@@ -46,6 +48,21 @@ export async function DELETE(_req: Request, { params }: RouteParams) {
     if (message.toLowerCase().includes('already revoked')) {
       return NextResponse.json<ApiError>({ code: 'CONFLICT', message: 'API key is already revoked' }, { status: 409 })
     }
-    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
+    logger.error('API key revocation failed', {
+      requestId,
+      route: '/api/api-keys/[id]',
+      orgId: clerkOrgId,
+      err,
+    })
+    if (err instanceof ConvexTimeoutError) {
+      return NextResponse.json<ApiError>(
+        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
+        { status: 503, headers: { 'x-request-id': requestId } },
+      )
+    }
+    return NextResponse.json<ApiError>(
+      { code: 'INTERNAL_ERROR', message: `${message} (request ${requestId})` },
+      { status: 500, headers: { 'x-request-id': requestId } },
+    )
   }
 }

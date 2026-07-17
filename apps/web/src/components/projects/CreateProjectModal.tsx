@@ -103,11 +103,11 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 onChange={(e) => setName(e.target.value)}
                 maxLength={80}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
+                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
               />
               {slug && (
                 <p className="mt-1.5 text-xs text-pewter font-mono">
-                  slug: <span className="text-neutral-500">{slug}</span>
+                  slug: <span className="text-neutral-400">{slug}</span>
                 </p>
               )}
             </div>
@@ -125,7 +125,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreated }: CreateProject
                 onChange={(e) => setDescription(e.target.value)}
                 maxLength={200}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
+                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
               />
             </div>
 

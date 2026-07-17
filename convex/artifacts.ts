@@ -4,7 +4,12 @@ import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
 import { requireOrgMembership } from "./auth.js";
-import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
+import { afrError } from "./helpers/errors.js";
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_ARTIFACTS_PER_RUN,
+  MAX_PAGE_SIZE,
+} from "./helpers/pagination.js";
 
 /**
  * List artifacts associated with a run, bounded by `limit` (default
@@ -75,6 +80,18 @@ export const createArtifact = mutation({
     // Recording an artifact is a write; a read-only viewer must not be able to do
     // it (P0 authorization gate — mirrors createEvent).
     await requireOrgMembership(ctx, run.orgId, { minimumRole: "member" });
+
+    // Write ceiling: bounded count on the by_run index (cheap at this cap size).
+    const existingForRun = await ctx.db
+      .query("artifacts")
+      .withIndex("by_run", (q) => q.eq("runId", args.runId))
+      .take(MAX_ARTIFACTS_PER_RUN);
+    if (existingForRun.length >= MAX_ARTIFACTS_PER_RUN) {
+      throw afrError(
+        "ARTIFACT_LIMIT_EXCEEDED",
+        `Run has reached the maximum of ${MAX_ARTIFACTS_PER_RUN} artifacts`,
+      );
+    }
 
     // If an eventId is provided verify it belongs to the same run
     if (args.eventId !== undefined) {

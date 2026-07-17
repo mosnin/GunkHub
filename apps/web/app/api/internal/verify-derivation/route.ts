@@ -3,7 +3,15 @@ import { type NextRequest, NextResponse } from 'next/server'
 import type { Event, Run } from '@agent-flight-recorder/contracts'
 
 import { env } from '@/lib/env'
+import { getRequestId, logger } from '@/lib/logger'
+import { createRateLimiter, getClientIp } from '@/lib/rateLimit'
 import { verifyProjectionIntegrity } from '@/lib/replay/verify'
+
+const ROUTE = '/api/internal/verify-derivation'
+
+// Best-effort per-instance rate limit for this shared-secret route
+// (60 req/min/IP). Durable rate limiting stays in Convex — see lib/rateLimit.ts.
+const rateLimiter = createRateLimiter(60)
 
 // POST /api/internal/verify-derivation
 //
@@ -27,14 +35,36 @@ import { verifyProjectionIntegrity } from '@/lib/replay/verify'
 // }
 
 export async function POST(req: NextRequest) {
-  // Reject if INTERNAL_VERIFY_SECRET is not configured on this deployment
+  const requestId = getRequestId(req)
+
+  if (!rateLimiter.check(getClientIp(req))) {
+    return NextResponse.json(
+      { error: 'Too many requests', requestId },
+      { status: 429, headers: { 'x-request-id': requestId, 'retry-after': '60' } },
+    )
+  }
+
+  // Reject if INTERNAL_VERIFY_SECRET is not configured on this deployment.
+  // This var is optional by design — the Convex verifyRecentRuns action falls
+  // back to sequence-only verification when this route is unavailable — so we
+  // report 503 with the variable name instead of throwing via assertServerEnv.
   if (!env.INTERNAL_VERIFY_SECRET) {
-    return NextResponse.json({ error: 'Not configured' }, { status: 503 })
+    logger.warn('Missing env var INTERNAL_VERIFY_SECRET — verify-derivation disabled', {
+      requestId,
+      route: ROUTE,
+    })
+    return NextResponse.json(
+      { error: 'Not configured: INTERNAL_VERIFY_SECRET is unset', requestId },
+      { status: 503, headers: { 'x-request-id': requestId } },
+    )
   }
 
   const secret = req.headers.get('x-internal-secret')
   if (secret !== env.INTERNAL_VERIFY_SECRET) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    return NextResponse.json(
+      { error: 'Unauthorized', requestId },
+      { status: 401, headers: { 'x-request-id': requestId } },
+    )
   }
 
   let body: unknown

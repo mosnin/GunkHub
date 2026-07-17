@@ -209,7 +209,7 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
               onKeyDown={handleKeyDown}
               onBlur={commitInput}
               placeholder="Add tag…"
-              className="bg-transparent text-xs font-mono text-neutral-300 placeholder-neutral-700 border-b border-neutral-700 focus:border-neutral-500 outline-none w-24 py-0.5"
+              className="bg-transparent text-xs font-mono text-neutral-300 placeholder-neutral-500 border-b border-neutral-700 focus:border-neutral-500 outline-none w-24 py-0.5"
               autoFocus
               disabled={isPending}
             />

@@ -5,6 +5,11 @@
 import { v } from "convex/values";
 
 import { mutation, query } from "./_generated/server.js";
+import { afrError } from "./helpers/errors.js";
+import {
+  MAX_ARTIFACTS_PER_RUN,
+  MAX_EVENTS_PER_RUN,
+} from "./helpers/pagination.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
 import type { MutationCtx, QueryCtx } from "./_generated/server.js";
@@ -345,6 +350,15 @@ export const sdkCreateEvents = mutation({
         );
       }
 
+      // --- Write ceiling: sequences are contiguous from 1, so the sequence ---
+      // number IS the event count — an exact O(1) per-run cap check.
+      if (evt.sequenceNumber > MAX_EVENTS_PER_RUN) {
+        throw afrError(
+          "EVENT_LIMIT_EXCEEDED",
+          `Run ${evt.runId} has reached the maximum of ${MAX_EVENTS_PER_RUN} events`,
+        );
+      }
+
       const state = await loadRunState(runId);
 
       // --- Event Log Rule 5: nothing may follow a terminal event ---
@@ -500,6 +514,18 @@ export const sdkCreateArtifact = mutation({
 
     if (existing !== null) {
       return existing;
+    }
+
+    // Write ceiling: bounded count on the by_run index (cheap at this cap size).
+    const existingForRun = await ctx.db
+      .query("artifacts")
+      .withIndex("by_run", (q) => q.eq("runId", runId))
+      .take(MAX_ARTIFACTS_PER_RUN);
+    if (existingForRun.length >= MAX_ARTIFACTS_PER_RUN) {
+      throw afrError(
+        "ARTIFACT_LIMIT_EXCEEDED",
+        `Run ${args.runId} has reached the maximum of ${MAX_ARTIFACTS_PER_RUN} artifacts`,
+      );
     }
 
     const eventId = args.eventId ? (args.eventId as Id<"events">) : undefined;

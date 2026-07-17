@@ -1,7 +1,9 @@
 import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
-import { requireOrgMembership } from "./auth.js";
+import { recordAuditEvent } from "./audit.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 /**
  * Create a new version for an agent. Requires admin role.
@@ -18,6 +20,7 @@ export const createAgentVersion = mutation({
     const agent = await ctx.db.get(args.agentId);
     if (!agent) throw new Error("Agent not found");
 
+    const { userId } = await getAuthContext(ctx);
     await requireOrgMembership(ctx, agent.orgId, { minimumRole: "admin" });
 
     const trimmedVersion = args.version.trim();
@@ -50,6 +53,16 @@ export const createAgentVersion = mutation({
 
     const doc = await ctx.db.get(id);
     if (!doc) throw new Error("Failed to create agent version");
+
+    await recordAuditEvent(ctx, {
+      orgId: agent.orgId,
+      actorClerkUserId: userId,
+      action: "agent_version.created",
+      targetType: "agent_version",
+      targetId: String(id),
+      metadata: { agentId: String(args.agentId), version: trimmedVersion },
+    });
+
     return doc;
   },
 });
@@ -67,11 +80,12 @@ export const listAgentVersions = query({
 
     await requireOrgMembership(ctx, agent.orgId);
 
+    // Bounded: at most MAX_PAGE_SIZE versions returned (no unbounded .collect()).
     return await ctx.db
       .query("agent_versions")
       .withIndex("by_agent", (q) => q.eq("agentId", args.agentId))
       .order("desc")
-      .collect();
+      .take(MAX_PAGE_SIZE);
   },
 });
 

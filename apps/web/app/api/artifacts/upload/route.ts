@@ -30,10 +30,17 @@ import { type NextRequest, NextResponse } from 'next/server'
 import type { ApiError } from '@agent-flight-recorder/contracts'
 
 import { convex } from '@/lib/convexFunctions'
-import { getPublicClient, hashApiKey } from '@/lib/convexServer'
+import {
+  ConvexTimeoutError,
+  getPublicClient,
+  hashApiKey,
+  withConvexTimeout,
+} from '@/lib/convexServer'
+import { getRequestId, logger } from '@/lib/logger'
 import { PAYLOAD_EXTERNALIZATION_THRESHOLD, getStorageAdapter, sha256Hex } from '@/lib/storage'
 
 export async function POST(req: NextRequest) {
+  const requestId = getRequestId(req)
   const apiKey = req.headers.get('x-api-key')
   if (!apiKey) {
     return NextResponse.json<ApiError>(
@@ -96,8 +103,15 @@ export async function POST(req: NextRequest) {
   // read-only check verifies the key (existence/revocation/expiration/scope) and
   // that it owns the run, throwing before a single byte is uploaded.
   try {
-    await client.query(convex.sdk_ingest.checkIngestAuth, { apiKeyHash, runId })
+    await withConvexTimeout(client.query(convex.sdk_ingest.checkIngestAuth, { apiKeyHash, runId }))
   } catch (err) {
+    if (err instanceof ConvexTimeoutError) {
+      logger.error('Ingest auth check timed out', { requestId, route: '/api/artifacts/upload', err })
+      return NextResponse.json<ApiError>(
+        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
+        { status: 503, headers: { 'x-request-id': requestId } },
+      )
+    }
     const message = err instanceof Error ? err.message : 'Unauthorized'
     const status = message.includes('Run not found') ? 404 : 401
     return NextResponse.json<ApiError>(
@@ -115,7 +129,7 @@ export async function POST(req: NextRequest) {
     await adapter.upload(storageKey, serialized, mimeType)
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const artifact = await client.mutation(convex.sdk_ingest.sdkCreateArtifact, {
+    const artifact = await withConvexTimeout(client.mutation(convex.sdk_ingest.sdkCreateArtifact, {
       apiKeyHash,
       runId,
       name,
@@ -125,7 +139,7 @@ export async function POST(req: NextRequest) {
       storageBucket,
       checksum,
       ...(eventId !== undefined && { eventId }),
-    })
+    }))
 
     const doc = artifact as Record<string, unknown>
     return NextResponse.json(
@@ -146,6 +160,16 @@ export async function POST(req: NextRequest) {
         { status: 401 }
       )
     }
-    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
+    logger.error('Artifact upload failed', { requestId, route: '/api/artifacts/upload', err })
+    if (err instanceof ConvexTimeoutError) {
+      return NextResponse.json<ApiError>(
+        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
+        { status: 503, headers: { 'x-request-id': requestId } }
+      )
+    }
+    return NextResponse.json<ApiError>(
+      { code: 'INTERNAL_ERROR', message: `${message} (request ${requestId})` },
+      { status: 500, headers: { 'x-request-id': requestId } }
+    )
   }
 }

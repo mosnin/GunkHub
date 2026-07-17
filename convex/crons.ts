@@ -30,4 +30,13 @@ crons.daily(
   makeFunctionReference<"action">("projection_verify:verifyRecentRuns"),
 );
 
+// Daily retention enforcement (ADR 001). Runs at 01:00 UTC, before artifact GC,
+// so GC sees the post-retention state. Deletes terminal runs older than an org's
+// opt-in retentionDays window; orgs without retentionDays are never touched.
+crons.daily(
+  "enforce-retention",
+  { hourUTC: 1, minuteUTC: 0 },
+  makeFunctionReference<"action">("retention:enforceRetention"),
+);
+
 export default crons;

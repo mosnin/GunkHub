@@ -1,4 +1,8 @@
+import { PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER } from '@agent-flight-recorder/contracts'
+
 import { externalizePayloadIfLarge, uploadArtifact } from './externalize.js'
+import { warnIfInsecureEndpoint } from './transport.js'
+import { SDK_VERSION } from './version.js'
 
 import type {
   RunStartedPayload,
@@ -24,9 +28,51 @@ export interface FlightRecorderConfig {
   agentVersionId?: string
   /**
    * SDK version string included in run creation payloads.
-   * Defaults to '0.1.0'.
+   * Defaults to the package version ({@link SDK_VERSION}).
    */
   sdkVersion?: string
+  /**
+   * Maximum number of concurrent in-flight HTTP requests across all
+   * RunRecorders created by this FlightRecorder. Bounds `Promise.all` fan-outs
+   * of `recordEvent` so they cannot open unbounded connections. Default: 8.
+   */
+  maxConcurrentRequests?: number
+  /**
+   * Suppress the one-time console warning emitted when `baseUrl` uses plain
+   * HTTP to a non-localhost host (API key would transit in cleartext).
+   * Default: false.
+   */
+  allowInsecureEndpoint?: boolean
+}
+
+/**
+ * Minimal counting semaphore used to bound concurrent in-flight requests.
+ * FIFO: waiters are released in acquisition order.
+ */
+class Semaphore {
+  private inFlight = 0
+  private readonly waiters: (() => void)[] = []
+
+  constructor(private readonly limit: number) {}
+
+  /** Resolves when a slot is available. Pair every acquire with a release. */
+  async acquire(): Promise<void> {
+    if (this.inFlight < this.limit) {
+      this.inFlight++
+      return
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve))
+  }
+
+  /** Release a slot, waking the oldest waiter if any (slot transfers to it). */
+  release(): void {
+    const next = this.waiters.shift()
+    if (next) {
+      next() // slot ownership transfers; inFlight unchanged
+    } else {
+      this.inFlight--
+    }
+  }
 }
 
 /**
@@ -60,6 +106,8 @@ export class FlightRecorder {
   readonly agentId: string
   private readonly agentVersionId: string | undefined
   private readonly sdkVersion: string
+  /** Bounds concurrent in-flight requests across all RunRecorders. */
+  private readonly semaphore: Semaphore
 
   /**
    * Create a new FlightRecorder.
@@ -71,7 +119,22 @@ export class FlightRecorder {
     this.apiKey = config.apiKey
     this.agentId = config.agentId
     this.agentVersionId = config.agentVersionId
-    this.sdkVersion = config.sdkVersion ?? '0.1.0'
+    this.sdkVersion = config.sdkVersion ?? SDK_VERSION
+    this.semaphore = new Semaphore(config.maxConcurrentRequests ?? 8)
+    warnIfInsecureEndpoint(this.baseUrl, config.allowInsecureEndpoint)
+  }
+
+  /**
+   * Run `op` while holding a concurrency slot (released on settle).
+   * @internal Used by RunRecorder to bound recordEvent fan-outs.
+   */
+  async _withRequestSlot<T>(op: () => Promise<T>): Promise<T> {
+    await this.semaphore.acquire()
+    try {
+      return await op()
+    } finally {
+      this.semaphore.release()
+    }
   }
 
   /**
@@ -103,6 +166,7 @@ export class FlightRecorder {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': this.apiKey,
+        [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
       },
       body: JSON.stringify(body),
     })
@@ -193,8 +257,16 @@ export class RunRecorder {
    * @throws Error if the request fails (network failure, upload failure, or non-2xx response).
    */
   async recordEvent(type: string, payload: unknown, parentEventId?: string): Promise<string> {
+    // Sequence numbers are assigned synchronously in call order, BEFORE queuing
+    // on the concurrency semaphore, so contiguity is preserved under fan-out.
     const seq = this.nextSequence()
+    // Bound un-buffered fan-outs (e.g. Promise.all over many recordEvent calls)
+    // to `maxConcurrentRequests` in-flight HTTP requests.
+    return this.fr._withRequestSlot(() => this._sendEvent(type, payload, seq, parentEventId))
+  }
 
+  /** Perform the externalize + POST for one event. Runs while holding a request slot. */
+  private async _sendEvent(type: string, payload: unknown, seq: number, parentEventId?: string): Promise<string> {
     // Externalize oversized payloads through the shared helper so this path
     // enforces the same >10 KB rule as HttpTransport. Failures propagate.
     const outgoingPayload = await externalizePayloadIfLarge(
@@ -219,6 +291,7 @@ export class RunRecorder {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': this.fr.apiKey,
+        [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
       },
       body: JSON.stringify(body),
     })
@@ -316,6 +389,7 @@ export class RunRecorder {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': this.fr.apiKey,
+        [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
       },
       body: JSON.stringify({ status, endedAt: Date.now() }),
     })

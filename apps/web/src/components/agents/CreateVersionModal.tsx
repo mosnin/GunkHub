@@ -119,7 +119,7 @@ export function CreateVersionModal({
                 onChange={(e) => setVersion(e.target.value)}
                 maxLength={64}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
+                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
               />
             </div>
 
@@ -138,7 +138,7 @@ export function CreateVersionModal({
                 value={changelog}
                 onChange={(e) => setChangelog(e.target.value)}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
+                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
               />
             </div>
 
@@ -157,7 +157,7 @@ export function CreateVersionModal({
                 value={configSnapshotRaw}
                 onChange={(e) => setConfigSnapshotRaw(e.target.value)}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm font-mono bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
+                className="w-full px-3 py-2 text-sm font-mono bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
               />
             </div>
 

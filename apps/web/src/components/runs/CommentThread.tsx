@@ -218,7 +218,7 @@ export function CommentThread({
           placeholder="Add a comment..."
           rows={3}
           disabled={isPendingCreate}
-          className="w-full bg-transparent text-sm text-neutral-300 placeholder-neutral-600 resize-none outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+          className="w-full bg-transparent text-sm text-neutral-300 placeholder-neutral-500 resize-none outline-none disabled:opacity-50 disabled:cursor-not-allowed"
         />
         {composeError && (
           <p className="text-xs text-destructive-400">{composeError}</p>

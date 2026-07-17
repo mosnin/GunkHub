@@ -4,7 +4,13 @@
 import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
+import { recordAuditEvent } from "./audit.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { afrError } from "./helpers/errors.js";
+import {
+  DEFAULT_RATE_LIMIT_PER_MIN,
+  MAX_PAGE_SIZE,
+} from "./helpers/pagination.js";
 
 /**
  * Create a new API key record for an organization.
@@ -30,8 +36,15 @@ export const createApiKey = mutation({
       throw new Error("expiresAt must be in the future");
     }
     if (args.rateLimitPerMin !== undefined && args.rateLimitPerMin <= 0) {
-      throw new Error("rateLimitPerMin must be a positive number");
+      throw afrError(
+        "INVALID_ARGUMENT",
+        "rateLimitPerMin must be a positive number",
+      );
     }
+
+    // Default write ceiling: a key created without an explicit rate limit gets a
+    // sane default instead of unlimited ingest. Explicit values still override.
+    const rateLimitPerMin = args.rateLimitPerMin ?? DEFAULT_RATE_LIMIT_PER_MIN;
 
     const now = Date.now();
     const keyId = await ctx.db.insert("api_keys", {
@@ -44,13 +57,28 @@ export const createApiKey = mutation({
       revokedAt: undefined,
       expiresAt: args.expiresAt,
       scopes: args.scopes,
-      rateLimitPerMin: args.rateLimitPerMin,
+      rateLimitPerMin,
       rateWindowStart: undefined,
       rateWindowCount: undefined,
     });
 
     const key = await ctx.db.get(keyId);
     if (!key) throw new Error("Failed to create API key");
+
+    await recordAuditEvent(ctx, {
+      orgId: args.orgId,
+      actorClerkUserId: userId,
+      action: "api_key.created",
+      targetType: "api_key",
+      targetId: String(keyId),
+      metadata: {
+        name: args.name,
+        scopes: args.scopes,
+        expiresAt: args.expiresAt,
+        rateLimitPerMin,
+      },
+    });
+
     return key;
   },
 });
@@ -65,10 +93,11 @@ export const listApiKeys = query({
   handler: async (ctx, args) => {
     await requireOrgMembership(ctx, args.orgId);
 
+    // Bounded: at most MAX_PAGE_SIZE keys returned (no unbounded .collect()).
     const keys = await ctx.db
       .query("api_keys")
       .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
-      .collect();
+      .take(MAX_PAGE_SIZE);
 
     // Filter out revoked keys — revokedAt is set when a key is revoked.
     // SECURITY: never return keyHash. sdk_ingest authenticates on possession of
@@ -107,6 +136,7 @@ export const revokeApiKey = mutation({
       throw new Error("API key not found");
     }
 
+    const { userId } = await getAuthContext(ctx);
     await requireOrgMembership(ctx, key.orgId, { minimumRole: "admin" });
 
     if (key.revokedAt !== undefined) {
@@ -114,6 +144,15 @@ export const revokeApiKey = mutation({
     }
 
     await ctx.db.patch(args.keyId, { revokedAt: Date.now() });
+
+    await recordAuditEvent(ctx, {
+      orgId: key.orgId,
+      actorClerkUserId: userId,
+      action: "api_key.revoked",
+      targetType: "api_key",
+      targetId: String(args.keyId),
+      metadata: { name: key.name },
+    });
 
     return await ctx.db.get(args.keyId);
   },

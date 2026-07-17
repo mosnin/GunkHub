@@ -28,7 +28,7 @@ function StatTile({
   hint?: string
 }) {
   const dot =
-    accent === 'neon' ? 'bg-neon-glow shadow-[0_0_8px_rgba(52,213,154,0.7)]'
+    accent === 'neon' ? 'bg-neon-glow shadow-[var(--shadow-glow)]' // sanctioned accent glow — design.md "Glow"
     : accent === 'warn' ? 'bg-destructive-500 shadow-[0_0_8px_rgba(255,54,33,0.6)]'
     : 'bg-graphite-light'
   const valueColor =
@@ -163,7 +163,7 @@ export default async function DashboardPage() {
               <Card>
                 <div className="px-5 py-4 border-b border-neutral-800">
                   <p className="text-sm font-medium text-neutral-200">Record your first run in 4 steps</p>
-                  <p className="mt-0.5 text-xs text-neutral-500">
+                  <p className="mt-0.5 text-xs text-neutral-400">
                     No run recorded yet. Follow the steps below.
                   </p>
                 </div>
@@ -175,7 +175,7 @@ export default async function DashboardPage() {
                     </div>
                     <div>
                       <p className="text-xs font-medium text-neutral-300">Create a project</p>
-                      <p className="mt-0.5 text-xs text-neutral-500">
+                      <p className="mt-0.5 text-xs text-neutral-400">
                         Projects group your agents and their runs.
                       </p>
                       <a
@@ -194,7 +194,7 @@ export default async function DashboardPage() {
                     </div>
                     <div>
                       <p className="text-xs font-medium text-neutral-300">Create an agent</p>
-                      <p className="mt-0.5 text-xs text-neutral-500">
+                      <p className="mt-0.5 text-xs text-neutral-400">
                         Within your project, create an agent to represent the code you&#39;re instrumenting.
                       </p>
                     </div>
@@ -207,7 +207,7 @@ export default async function DashboardPage() {
                     </div>
                     <div>
                       <p className="text-xs font-medium text-neutral-300">Generate an API key</p>
-                      <p className="mt-0.5 text-xs text-neutral-500">
+                      <p className="mt-0.5 text-xs text-neutral-400">
                         The SDK uses this key to authenticate when recording runs.
                       </p>
                       <a
@@ -226,7 +226,7 @@ export default async function DashboardPage() {
                     </div>
                     <div>
                       <p className="text-xs font-medium text-neutral-300">Install the SDK and record a run</p>
-                      <p className="mt-0.5 text-xs text-neutral-500">
+                      <p className="mt-0.5 text-xs text-neutral-400">
                         Install the SDK, add your agent ID from the project page, and record your first run.
                       </p>
                       <div className="mt-2">

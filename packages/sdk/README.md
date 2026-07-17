@@ -77,9 +77,15 @@ Creates a new recorder instance.
 | `agentVersionId` | `string` | No | Optional agent version identifier (semver recommended) |
 | `options.flushIntervalMs` | `number` | No | Flush buffered events every N ms. Default: `1000` |
 | `options.maxBatchSize` | `number` | No | Force-flush when buffer reaches this size. Default: `100` |
+| `options.maxBufferSize` | `number` | No | Hard cap on buffered events; oldest non-lifecycle events are dropped on overflow. Default: `10000` |
 | `options.maxRetries` | `number` | No | Max retry attempts for failed sends. Default: `3` |
 | `options.retryBackoffMs` | `number` | No | Initial retry backoff in ms. Default: `500` |
-| `options.debug` | `boolean` | No | Log debug output to console. Default: `false` |
+| `options.debug` | `boolean` | No | Log SDK diagnostics (flush results, drops, spool errors) to console. Default: `false` |
+| `options.spool` | `EventSpool` | No | Persistent write-ahead spool for at-least-once delivery (see Durability). Default: none |
+| `options.onDrop` | `(count, reason) => void` | No | Called when events are dropped on buffer overflow |
+| `options.onFlushError` | `(error) => void` | No | Called when a background (timer / maxBatchSize) flush fails |
+| `options.onSpoolError` | `(error) => void` | No | Called when spool I/O fails (spool writes are best-effort) |
+| `options.allowInsecureEndpoint` | `boolean` | No | Suppress the plain-HTTP endpoint warning. Default: `false` |
 
 The optional second argument `transport` accepts any object implementing the `Transport` interface. When omitted, `HttpTransport` is used.
 
@@ -161,6 +167,65 @@ const result: FlushResult = await recorder.flush()
 ```
 
 Safe to call at any time; no-ops if the buffer is empty.
+
+---
+
+### `recorder.recover()`
+
+Drains the configured spool and re-sends everything a previous process left undelivered (events and pending run-status transitions). Call on startup, before starting new runs. No-op (returns `success: true`) when no spool is configured. Entries that still cannot be delivered are re-appended to the spool for the next attempt.
+
+```typescript
+const recovered: FlushResult = await recorder.recover()
+```
+
+---
+
+## Durability & delivery semantics
+
+### Without a spool (default): at-most-once
+
+Events live only in the in-memory buffer until a flush succeeds. The loss window is everything not yet acknowledged by the server, bounded by:
+
+- up to `flushIntervalMs` (default 1 s) of recent events between background flushes, plus
+- up to `maxBatchSize` (default 100) events awaiting the next forced flush, plus
+- anything retained after failed flushes, capped at `maxBufferSize` (default 10 000) events.
+
+All of it is lost if the process exits (crash, OOM, SIGKILL) before delivery. `endRun()`/`failRun()` retry the final flush 3 times; if the terminal event still cannot be delivered, the returned `FlushResult` contains an explicit "terminal event UNDELIVERED" error, background retries continue best-effort, and the recorder is released so a new run can start.
+
+### With a spool: at-least-once
+
+Configure `options.spool` to get a persistent write-ahead log:
+
+```typescript
+import { Recorder, FileSpool } from '@agent-flight-recorder/sdk'
+
+const recorder = new Recorder({
+  endpoint, apiKey, agentId,
+  options: { spool: new FileSpool('/var/tmp/afr/worker-1.jsonl') },
+})
+await recorder.recover() // re-send anything a previous process left behind
+```
+
+- `recordEvent` appends to the spool (best-effort, non-blocking; failures go to `onSpoolError`) before delivery is attempted.
+- A successful flush removes the acknowledged events from the spool.
+- If a terminal flush fails, the terminal event and the run-status transition intent are persisted before `endRun`/`failRun` returns.
+- `recover()` (next startup) drains the spool and re-sends.
+
+Delivery becomes at-least-once: a crash between server acknowledgement and spool cleanup causes re-sends, which the server deduplicates by run + `sequenceNumber`. `FileSpool` is Node-only (JSONL file, created lazily; the SDK's main entry stays browser/edge-safe because `node:fs` is loaded via a guarded dynamic import only when FileSpool is used). It is deliberately `flock`-free: one recorder in one process per spool path — use distinct paths per worker.
+
+### Observability of loss
+
+- `onDrop(count, 'buffer_overflow')` fires when `maxBufferSize` forces drops (lifecycle events are never dropped).
+- `onFlushError(error)` fires when a fire-and-forget background flush (timer or maxBatchSize trigger) fails; foreground `flush()`/`endRun()`/`failRun()` report errors via their returned `FlushResult` instead.
+- `FlushResult.droppedEvents` carries the cumulative drop count.
+
+---
+
+## Security
+
+- **Transport security is TLS via the platform's `fetch`.** The SDK uses the runtime's default certificate validation (Node's bundled CA store, or the platform trust store). There is no certificate pinning and no custom TLS configuration; if you need either, inject a custom `Transport`.
+- **Plain-HTTP warning.** Configuring a non-`https` endpoint that is not localhost logs a one-time `console.warn` (the API key and payloads would transit in cleartext). Suppress with `allowInsecureEndpoint: true` if you terminate TLS elsewhere (e.g. a sidecar).
+- **Authentication** is the `x-api-key` header on every request. Every request also carries the wire protocol version as `x-afr-protocol` (currently `1`) so future backends can gate protocol changes.
 
 ---
 
@@ -251,6 +316,19 @@ You can inject a custom transport (e.g., for testing) via the second argument to
 
 ---
 
+## FlightRecorder (un-buffered path)
+
+`FlightRecorder`/`RunRecorder` POST each event immediately instead of buffering. Additional config:
+
+| Config field | Type | Required | Description |
+|---|---|---|---|
+| `maxConcurrentRequests` | `number` | No | Cap on concurrent in-flight requests across `Promise.all` fan-outs. Default: `8` |
+| `allowInsecureEndpoint` | `boolean` | No | Suppress the plain-HTTP endpoint warning. Default: `false` |
+
+---
+
 ## Version
+
+v0.3.0 — Durability: pluggable `EventSpool` write-ahead spool (`FileSpool` Node implementation), `recorder.recover()`, terminal-delivery guarantee (recorder is never wedged by a failed finalize; undelivered terminal events are surfaced and spooled). Observability: `onDrop` / `onFlushError` / `onSpoolError` callbacks, `debug` logging wired. Wire protocol: `x-afr-protocol` header on every request; `SDK_VERSION` single-sourced. Transport polish: plain-HTTP endpoint warning, `maxConcurrentRequests` bound on the un-buffered path.
 
 v0.2.0 — `HttpTransport` implemented (retry, batching, timeout, payload externalization). `Transport.updateRunStatus` now returns `TransportResponse` (breaking).

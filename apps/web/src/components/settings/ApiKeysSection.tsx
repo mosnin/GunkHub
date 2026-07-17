@@ -85,7 +85,7 @@ function NewKeyModal({ result, onClose }: { result: GenerateResult; onClose: () 
           </div>
 
           <div>
-            <p className="text-xs font-medium text-neutral-500 mb-1.5 uppercase tracking-wider">Your API Key</p>
+            <p className="text-xs font-medium text-neutral-400 mb-1.5 uppercase tracking-wider">Your API Key</p>
             <CodeBlock content={result.key} maxHeight="60px" />
           </div>
 
@@ -171,7 +171,7 @@ function RevokeButton({ keyId, onRevoked }: RevokeButtonProps) {
       ) : (
         <button
           onClick={() => setConfirming(true)}
-          className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors duration-100"
+          className="text-xs text-neutral-400 hover:text-neutral-300 transition-colors duration-100"
         >
           Revoke
         </button>
@@ -236,7 +236,7 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
       <Card>
         <div className="px-5 py-4 border-b border-neutral-800">
           <h2 className="text-sm font-semibold text-neutral-200">API Keys</h2>
-          <p className="mt-0.5 text-xs text-neutral-500">
+          <p className="mt-0.5 text-xs text-neutral-400">
             Used to authenticate the SDK when recording runs.
           </p>
         </div>
@@ -249,7 +249,7 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
               value={keyName}
               onChange={(e) => setKeyName(e.target.value)}
               placeholder="Key name (e.g. production)"
-              className="flex-1 max-w-xs bg-neutral-900 border border-neutral-700 text-neutral-200 text-sm px-3 py-1.5 rounded focus:outline-none focus:ring-1 focus:ring-neutral-500 placeholder-neutral-600"
+              className="flex-1 max-w-xs bg-neutral-900 border border-neutral-700 text-neutral-200 text-sm px-3 py-1.5 rounded focus:outline-none focus:ring-1 focus:ring-neon-glow placeholder-neutral-500"
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && keyName.trim() && !generating) {
                   void handleGenerate()
@@ -274,7 +274,7 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
           {fetchError ? (
             <p className="text-destructive-400 text-sm">{fetchError}</p>
           ) : keys.length === 0 ? (
-            <p className="text-sm text-neutral-500">
+            <p className="text-sm text-neutral-400">
               No API keys yet. Enter a name above and generate one to start recording runs.
             </p>
           ) : (
@@ -282,16 +282,16 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-neutral-800 bg-neutral-900">
-                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider w-1/3">
+                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/3">
                       Name
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider w-1/4">
+                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/4">
                       Created
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider w-1/4">
+                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/4">
                       Last used
                     </th>
-                    <th className="px-4 py-3 text-right text-xs font-medium text-neutral-500 uppercase tracking-wider w-1/6">
+                    <th className="px-4 py-3 text-right text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/6">
                       {/* Revoke column */}
                     </th>
                   </tr>
@@ -303,7 +303,7 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
                       <td className="px-4 py-3 font-mono text-xs text-neutral-400">
                         {formatDate(k.createdAt)}
                       </td>
-                      <td className="px-4 py-3 font-mono text-xs text-neutral-500">
+                      <td className="px-4 py-3 font-mono text-xs text-neutral-400">
                         {k.lastUsedAt ? formatDate(k.lastUsedAt) : 'Never'}
                       </td>
                       <td className="px-4 py-3 text-right">

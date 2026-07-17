@@ -10,7 +10,14 @@ import { NextResponse } from 'next/server'
 import type { ApiError } from '@agent-flight-recorder/contracts'
 
 import { convex } from '@/lib/convexFunctions'
-import { getAuthedClient, hashApiKey, resolveConvexOrgId } from '@/lib/convexServer'
+import {
+  ConvexTimeoutError,
+  getAuthedClient,
+  hashApiKey,
+  resolveConvexOrgId,
+  withConvexTimeout,
+} from '@/lib/convexServer'
+import { getRequestId, logger } from '@/lib/logger'
 
 // Convex returns untyped documents; we cast through unknown to avoid unsafe-any
 // while still accessing the fields we know are present on the api_keys table.
@@ -54,6 +61,7 @@ async function convexQuery(
 // ---------------------------------------------------------------------------
 
 export async function POST(req: Request) {
+  const requestId = getRequestId(req)
   const { userId, orgId: clerkOrgId } = auth()
   if (!userId || !clerkOrgId) {
     return NextResponse.json<ApiError>(
@@ -131,14 +139,14 @@ export async function POST(req: Request) {
     const keyHash = hashApiKey(rawKey)
 
     const client = await getAuthedClient()
-    const keyDoc = (await convexMutation(client, convex.api_keys.createApiKey, {
+    const keyDoc = (await withConvexTimeout(convexMutation(client, convex.api_keys.createApiKey, {
       orgId: convexOrgId,
       name: name.trim(),
       keyHash,
       ...(expiresAt !== undefined && { expiresAt }),
       ...(scopes !== undefined && { scopes }),
       ...(rateLimitPerMin !== undefined && { rateLimitPerMin }),
-    })) as ApiKeyDoc
+    }))) as ApiKeyDoc
 
     // The raw key is returned ONCE and never stored — caller must persist it securely.
     return NextResponse.json(
@@ -154,7 +162,22 @@ export async function POST(req: Request) {
     )
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Internal error'
-    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
+    logger.error('API key creation failed', {
+      requestId,
+      route: '/api/api-keys',
+      orgId: clerkOrgId,
+      err,
+    })
+    if (err instanceof ConvexTimeoutError) {
+      return NextResponse.json<ApiError>(
+        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
+        { status: 503, headers: { 'x-request-id': requestId } },
+      )
+    }
+    return NextResponse.json<ApiError>(
+      { code: 'INTERNAL_ERROR', message: `${message} (request ${requestId})` },
+      { status: 500, headers: { 'x-request-id': requestId } },
+    )
   }
 }
 
@@ -162,7 +185,8 @@ export async function POST(req: Request) {
 // GET /api/api-keys — list API keys for the authenticated org
 // ---------------------------------------------------------------------------
 
-export async function GET() {
+export async function GET(req: Request) {
+  const requestId = getRequestId(req)
   const { userId, orgId: clerkOrgId } = auth()
   if (!userId || !clerkOrgId) {
     return NextResponse.json<ApiError>(
@@ -174,9 +198,9 @@ export async function GET() {
   try {
     const convexOrgId = await resolveConvexOrgId(clerkOrgId)
     const client = await getAuthedClient()
-    const keys = (await convexQuery(client, convex.api_keys.listApiKeys, {
+    const keys = (await withConvexTimeout(convexQuery(client, convex.api_keys.listApiKeys, {
       orgId: convexOrgId,
-    })) as ApiKeyDoc[]
+    }))) as ApiKeyDoc[]
 
     // Return only safe fields — never the raw key or hash
     const now = Date.now()
@@ -193,6 +217,21 @@ export async function GET() {
     return NextResponse.json({ keys: safeKeys })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Internal error'
-    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
+    logger.error('API key listing failed', {
+      requestId,
+      route: '/api/api-keys',
+      orgId: clerkOrgId,
+      err,
+    })
+    if (err instanceof ConvexTimeoutError) {
+      return NextResponse.json<ApiError>(
+        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
+        { status: 503, headers: { 'x-request-id': requestId } },
+      )
+    }
+    return NextResponse.json<ApiError>(
+      { code: 'INTERNAL_ERROR', message: `${message} (request ${requestId})` },
+      { status: 500, headers: { 'x-request-id': requestId } },
+    )
   }
 }

@@ -6,6 +6,12 @@ export interface Organization {
   plan: "free" | "pro" | "enterprise";
   createdAt: number;
   updatedAt: number;
+  /**
+   * Optional retention window in days (ADR 001). When set, terminal runs older
+   * than the window are deleted by the daily retention cron. Unset = retain
+   * forever.
+   */
+  retentionDays?: number;
 }
 
 export interface Project {

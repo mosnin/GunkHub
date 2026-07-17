@@ -1,7 +1,9 @@
 import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
-import { requireOrgMembership } from "./auth.js";
+import { recordAuditEvent } from "./audit.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 /**
  * List all projects belonging to an organization.
@@ -13,10 +15,11 @@ export const listProjects = query({
   handler: async (ctx, args) => {
     await requireOrgMembership(ctx, args.orgId);
 
+    // Bounded: at most MAX_PAGE_SIZE projects returned (no unbounded .collect()).
     const projects = await ctx.db
       .query("projects")
       .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
-      .collect();
+      .take(MAX_PAGE_SIZE);
 
     return projects;
   },
@@ -50,6 +53,7 @@ export const createProject = mutation({
     description: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
+    const { userId } = await getAuthContext(ctx);
     await requireOrgMembership(ctx, args.orgId, { minimumRole: "admin" });
 
     // Enforce slug uniqueness within the org
@@ -78,6 +82,16 @@ export const createProject = mutation({
 
     const project = await ctx.db.get(projectId);
     if (!project) throw new Error("Failed to create project");
+
+    await recordAuditEvent(ctx, {
+      orgId: args.orgId,
+      actorClerkUserId: userId,
+      action: "project.created",
+      targetType: "project",
+      targetId: String(projectId),
+      metadata: { name: args.name, slug: args.slug },
+    });
+
     return project;
   },
 });
@@ -98,6 +112,7 @@ export const updateProject = mutation({
       throw new Error("Project not found");
     }
     // Mutating a project requires "admin" (matches createProject).
+    const { userId } = await getAuthContext(ctx);
     await requireOrgMembership(ctx, project.orgId, { minimumRole: "admin" });
 
     const patch: { name?: string; description?: string; updatedAt: number } = {
@@ -107,6 +122,15 @@ export const updateProject = mutation({
     if (args.description !== undefined) patch.description = args.description;
 
     await ctx.db.patch(args.projectId, patch);
+
+    await recordAuditEvent(ctx, {
+      orgId: project.orgId,
+      actorClerkUserId: userId,
+      action: "project.updated",
+      targetType: "project",
+      targetId: String(args.projectId),
+      metadata: { name: args.name, description: args.description },
+    });
 
     return await ctx.db.get(args.projectId);
   },

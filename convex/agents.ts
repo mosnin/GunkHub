@@ -1,7 +1,9 @@
 import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
-import { requireOrgMembership } from "./auth.js";
+import { recordAuditEvent } from "./audit.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 /**
  * List all agents belonging to an organization (not filtered by project).
@@ -16,10 +18,11 @@ export const listAgentsByOrg = query({
   handler: async (ctx, args) => {
     await requireOrgMembership(ctx, args.orgId);
 
+    // Bounded: at most MAX_PAGE_SIZE agents returned (no unbounded .collect()).
     const agents = await ctx.db
       .query("agents")
       .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
-      .collect();
+      .take(MAX_PAGE_SIZE);
 
     return agents;
   },
@@ -39,10 +42,11 @@ export const listAgents = query({
     }
     await requireOrgMembership(ctx, project.orgId);
 
+    // Bounded: at most MAX_PAGE_SIZE agents returned (no unbounded .collect()).
     const agents = await ctx.db
       .query("agents")
       .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
-      .collect();
+      .take(MAX_PAGE_SIZE);
 
     return agents;
   },
@@ -80,7 +84,11 @@ export const createAgent = mutation({
     if (!project) {
       throw new Error("Project not found");
     }
-    await requireOrgMembership(ctx, project.orgId);
+    // P0 authorization gate: creating an agent is a structural change, gated to
+    // "admin" like createProject (above it in the hierarchy) and
+    // createAgentVersion (below it). Previously this defaulted to viewer.
+    const { userId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, project.orgId, { minimumRole: "admin" });
 
     const now = Date.now();
     const agentId = await ctx.db.insert("agents", {
@@ -95,6 +103,16 @@ export const createAgent = mutation({
 
     const agent = await ctx.db.get(agentId);
     if (!agent) throw new Error("Failed to create agent");
+
+    await recordAuditEvent(ctx, {
+      orgId: project.orgId,
+      actorClerkUserId: userId,
+      action: "agent.created",
+      targetType: "agent",
+      targetId: String(agentId),
+      metadata: { name: args.name, slug: args.slug, projectId: String(args.projectId) },
+    });
+
     return agent;
   },
 });

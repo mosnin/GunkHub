@@ -90,6 +90,15 @@ async function runHappyPath(transport: Transport) {
       options: {
         flushIntervalMs: 5000,
         maxBatchSize: 50,
+        // Observability of loss: these fire when telemetry is at risk.
+        onDrop: (count, reason) => console.warn(`[example] dropped ${count} event(s): ${reason}`),
+        onFlushError: (error) => console.warn(`[example] background flush failed: ${error}`),
+        // Durability (opt-in, Node-only): persist events to a JSONL write-ahead
+        // spool so a crash can't lose them; re-send on startup with recover().
+        //   import { FileSpool } from '@agent-flight-recorder/sdk'
+        //   spool: new FileSpool('/var/tmp/afr/worker-1.jsonl'),
+        //   onSpoolError: (error) => console.warn('spool error:', error),
+        // then, before starting runs:  await recorder.recover()
       },
     },
     transport

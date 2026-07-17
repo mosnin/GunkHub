@@ -7,8 +7,16 @@ import { NextResponse } from 'next/server'
 import { Webhook } from 'svix'
 
 import { convex } from '@/lib/convexFunctions'
-import { getPublicClient } from '@/lib/convexServer'
-import { env } from '@/lib/env'
+import { ConvexTimeoutError, getPublicClient, withConvexTimeout } from '@/lib/convexServer'
+import { assertServerEnv, env } from '@/lib/env'
+import { getRequestId, logger } from '@/lib/logger'
+import { createRateLimiter, getClientIp } from '@/lib/rateLimit'
+
+const ROUTE = '/api/webhooks/clerk'
+
+// Best-effort per-instance rate limit for this unauthenticated route
+// (60 req/min/IP). Durable rate limiting stays in Convex — see lib/rateLimit.ts.
+const rateLimiter = createRateLimiter(60)
 
 // ---------------------------------------------------------------------------
 // Clerk webhook event shapes (minimal — only the fields we consume)
@@ -50,14 +58,25 @@ interface ClerkWebhookEvent {
 // ---------------------------------------------------------------------------
 
 export async function POST(req: Request) {
-  const webhookSecret = env.CLERK_WEBHOOK_SECRET
-  if (!webhookSecret) {
-    console.error('CLERK_WEBHOOK_SECRET is not set')
+  const requestId = getRequestId(req)
+
+  if (!rateLimiter.check(getClientIp(req))) {
     return NextResponse.json(
-      { error: 'Webhook secret not configured' },
-      { status: 500 },
+      { error: 'Too many requests', requestId },
+      { status: 429, headers: { 'x-request-id': requestId, 'retry-after': '60' } },
     )
   }
+
+  try {
+    assertServerEnv('CLERK_WEBHOOK_SECRET', 'CONVEX_WEBHOOK_SECRET')
+  } catch (err) {
+    logger.error('Webhook route misconfigured', { requestId, route: ROUTE, err })
+    return NextResponse.json(
+      { error: 'Webhook secret not configured', requestId },
+      { status: 500, headers: { 'x-request-id': requestId } },
+    )
+  }
+  const webhookSecret = env.CLERK_WEBHOOK_SECRET
 
   // Collect the Svix headers required for signature verification
   const headerPayload = headers()
@@ -93,10 +112,10 @@ export async function POST(req: Request) {
       'svix-signature': svixSignature,
     }) as ClerkWebhookEvent
   } catch (err) {
-    console.error('Svix signature verification failed:', err)
+    logger.error('Svix signature verification failed', { requestId, route: ROUTE, err })
     return NextResponse.json(
-      { error: 'Invalid signature' },
-      { status: 400 },
+      { error: 'Invalid signature', requestId },
+      { status: 400, headers: { 'x-request-id': requestId } },
     )
   }
 
@@ -120,14 +139,28 @@ export async function POST(req: Request) {
         break
     }
   } catch (err) {
-    console.error(`Failed to handle Clerk webhook event "${event.type}":`, err)
+    logger.error(`Failed to handle Clerk webhook event "${event.type}"`, {
+      requestId,
+      route: ROUTE,
+      eventType: event.type,
+      err,
+    })
+    if (err instanceof ConvexTimeoutError) {
+      return NextResponse.json(
+        { error: 'Backend unavailable', requestId },
+        { status: 503, headers: { 'x-request-id': requestId } },
+      )
+    }
     return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 },
+      { error: 'Internal server error', requestId },
+      { status: 500, headers: { 'x-request-id': requestId } },
     )
   }
 
-  return NextResponse.json({ received: true }, { status: 200 })
+  return NextResponse.json(
+    { received: true },
+    { status: 200, headers: { 'x-request-id': requestId } },
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -136,12 +169,14 @@ export async function POST(req: Request) {
 
 async function handleOrganizationUpsert(data: ClerkOrganizationData) {
   const client = getPublicClient()
-  await client.mutation(convex.organizations.upsertOrganization, {
-    webhookSecret: env.CONVEX_WEBHOOK_SECRET,
-    clerkOrgId: data.id,
-    name: data.name,
-    slug: data.slug,
-  })
+  await withConvexTimeout(
+    client.mutation(convex.organizations.upsertOrganization, {
+      webhookSecret: env.CONVEX_WEBHOOK_SECRET,
+      clerkOrgId: data.id,
+      name: data.name,
+      slug: data.slug,
+    }),
+  )
 }
 
 async function handleOrganizationMembershipCreated(
@@ -153,19 +188,23 @@ async function handleOrganizationMembershipCreated(
   // Ensure the org record exists before creating the membership.
   // In normal Clerk flow, organization.created fires first, but we handle
   // reordered delivery defensively.
-  await client.mutation(convex.organizations.upsertOrganization, {
-    webhookSecret: env.CONVEX_WEBHOOK_SECRET,
-    clerkOrgId: org.id,
-    name: org.name,
-    slug: org.slug,
-  })
+  await withConvexTimeout(
+    client.mutation(convex.organizations.upsertOrganization, {
+      webhookSecret: env.CONVEX_WEBHOOK_SECRET,
+      clerkOrgId: org.id,
+      name: org.name,
+      slug: org.slug,
+    }),
+  )
 
   // Create or update the user membership record in Convex.
   // Without this row, requireOrgMembership rejects the user on every query/mutation.
-  await client.mutation(convex.organizations.upsertMembership, {
-    webhookSecret: env.CONVEX_WEBHOOK_SECRET,
-    clerkUserId: data.public_user_data.user_id,
-    clerkOrgId: org.id,
-    role: clerkRoleToInternal(data.role),
-  })
+  await withConvexTimeout(
+    client.mutation(convex.organizations.upsertMembership, {
+      webhookSecret: env.CONVEX_WEBHOOK_SECRET,
+      clerkUserId: data.public_user_data.user_id,
+      clerkOrgId: org.id,
+      role: clerkRoleToInternal(data.role),
+    }),
+  )
 }

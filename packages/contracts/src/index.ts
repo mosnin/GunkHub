@@ -6,3 +6,4 @@ export * from "./auth.js";
 export * from "./artifacts.js";
 export * from "./replay.js";
 export * from "./diff.js";
+export * from "./protocol.js";

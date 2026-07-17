@@ -3,11 +3,18 @@ import { type NextRequest, NextResponse } from 'next/server'
 import type { ApiError } from '@agent-flight-recorder/contracts'
 
 import { convex } from '@/lib/convexFunctions'
-import { getPublicClient, hashApiKey } from '@/lib/convexServer'
+import {
+  ConvexTimeoutError,
+  getPublicClient,
+  hashApiKey,
+  withConvexTimeout,
+} from '@/lib/convexServer'
+import { getRequestId, logger } from '@/lib/logger'
 import { PAYLOAD_EXTERNALIZATION_THRESHOLD } from '@/lib/storage'
 
 // POST /api/events — batch append events from the SDK (x-api-key auth)
 export async function POST(req: NextRequest) {
+  const requestId = getRequestId(req)
   const apiKey = req.headers.get('x-api-key')
   if (!apiKey) {
     return NextResponse.json<ApiError>(
@@ -60,7 +67,7 @@ export async function POST(req: NextRequest) {
   try {
     const client = getPublicClient()
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const result = await client.mutation(convex.sdk_ingest.sdkCreateEvents, {
+    const result = await withConvexTimeout(client.mutation(convex.sdk_ingest.sdkCreateEvents, {
       apiKeyHash: hashApiKey(apiKey),
       events: (events as Record<string, unknown>[]).map((evt) => ({
         runId: evt['runId'] as string,
@@ -70,7 +77,7 @@ export async function POST(req: NextRequest) {
         payload: evt['payload'],
         ...(evt['parentEventId'] !== undefined && { parentEventId: evt['parentEventId'] as string }),
       })),
-    })
+    }))
 
     const res = result as { eventIds: string[] }
     return NextResponse.json({ eventIds: res.eventIds }, { status: 201 })
@@ -82,6 +89,16 @@ export async function POST(req: NextRequest) {
         { status: 401 }
       )
     }
-    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
+    logger.error('Event ingestion failed', { requestId, route: '/api/events', err })
+    if (err instanceof ConvexTimeoutError) {
+      return NextResponse.json<ApiError>(
+        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
+        { status: 503, headers: { 'x-request-id': requestId } }
+      )
+    }
+    return NextResponse.json<ApiError>(
+      { code: 'INTERNAL_ERROR', message: `${message} (request ${requestId})` },
+      { status: 500, headers: { 'x-request-id': requestId } }
+    )
   }
 }

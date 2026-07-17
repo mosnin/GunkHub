@@ -3,7 +3,9 @@
 import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
-import { requireOrgMembership } from "./auth.js";
+import { recordAuditEvent } from "./audit.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 /**
@@ -32,6 +34,25 @@ export const listRuns = query({
     await requireOrgMembership(ctx, args.orgId);
 
     const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+
+    // TENANCY: the agent/project filters use NON-org-scoped indexes
+    // (by_agent_started / by_project_started), so validate that the supplied id
+    // actually belongs to the caller's org BEFORE querying — mirroring
+    // createRun's reference validation. The post-hoc orgId filter below would
+    // already return zero rows for a foreign id, but failing loudly here makes
+    // a cross-org probe indistinguishable from a missing record.
+    if (args.agentId !== undefined) {
+      const agent = await ctx.db.get(args.agentId);
+      if (!agent || agent.orgId !== args.orgId) {
+        throw afrError("NOT_FOUND", "Agent not found in this organization");
+      }
+    }
+    if (args.projectId !== undefined) {
+      const project = await ctx.db.get(args.projectId);
+      if (!project || project.orgId !== args.orgId) {
+        throw afrError("NOT_FOUND", "Project not found in this organization");
+      }
+    }
 
     let runsQuery;
 
@@ -193,6 +214,7 @@ export const updateRunStatus = mutation({
     if (!run) throw new Error("Run not found");
 
     // Changing a run's lifecycle status requires "admin" (matches updateRunTags).
+    const { userId } = await getAuthContext(ctx);
     await requireOrgMembership(ctx, run.orgId, { minimumRole: "admin" });
 
     const TERMINAL_STATUSES = new Set([
@@ -229,6 +251,15 @@ export const updateRunStatus = mutation({
         : args.endedAt,
     });
 
+    await recordAuditEvent(ctx, {
+      orgId: run.orgId,
+      actorClerkUserId: userId,
+      action: "run.status_updated",
+      targetType: "run",
+      targetId: String(args.runId),
+      metadata: { from: run.status, to: args.status },
+    });
+
     return await ctx.db.get(args.runId);
   },
 });
@@ -246,12 +277,22 @@ export const updateRunTags = mutation({
     const run = await ctx.db.get(args.runId);
     if (!run) throw new Error("Run not found");
 
+    const { userId } = await getAuthContext(ctx);
     await requireOrgMembership(ctx, run.orgId, { minimumRole: "admin" });
 
     // Normalize: trim whitespace, deduplicate, discard empty strings
     const normalized = [...new Set(args.tags.map((t) => t.trim()).filter(Boolean))];
 
     await ctx.db.patch(args.runId, { tags: normalized });
+
+    await recordAuditEvent(ctx, {
+      orgId: run.orgId,
+      actorClerkUserId: userId,
+      action: "run.tags_updated",
+      targetType: "run",
+      targetId: String(args.runId),
+      metadata: { tags: normalized },
+    });
 
     const updated = await ctx.db.get(args.runId);
     if (!updated) throw new Error("Run not found after update");

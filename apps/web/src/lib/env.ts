@@ -32,3 +32,22 @@ if (typeof window !== 'undefined') {
 // Server-only vars (CLERK_SECRET_KEY, CLERK_WEBHOOK_SECRET) are validated
 // lazily in the route handlers that consume them, not at module load time.
 // Throwing at import time breaks `next build` where env vars are absent.
+
+type ServerEnvVar = keyof typeof env
+
+/**
+ * Assert that the named server env vars are set, throwing an error that names
+ * every missing variable. Call this at FIRST USE inside a route handler — never
+ * at module scope, which would break `next build` where env vars are absent.
+ *
+ *   assertServerEnv('CLERK_WEBHOOK_SECRET', 'CONVEX_WEBHOOK_SECRET')
+ */
+export function assertServerEnv(...names: ServerEnvVar[]): void {
+  const missing = names.filter((name) => !env[name])
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required env var${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}. ` +
+        'See .env.example for setup instructions.',
+    )
+  }
+}

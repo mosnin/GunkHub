@@ -20,6 +20,10 @@ export {
   createRetryStrategy,
 } from './transport.js'
 export { FlightRecorder, RunRecorder } from './flight-recorder.js'
+// FileSpool loads node:fs via a guarded dynamic import only when its methods
+// run, so exporting it here keeps the main entry browser/edge-safe.
+export { FileSpool } from './file-spool.js'
+export { SDK_VERSION } from './version.js'
 
 export type {
   RecorderConfig,
@@ -29,6 +33,8 @@ export type {
   FlushResult,
   FlushError,
   TransportResponse,
+  EventSpool,
+  StoredEvent,
 } from './types.js'
 
 export type {

@@ -96,6 +96,19 @@ The design feels like a high-end server room after dark — a pure black void wh
 |------|-------|-------|
 | lg | `rgba(0, 0, 0, 0.4) 0px 8px 20px 0px` | `--shadow-lg` |
 
+### Glow
+
+| Name | Value | Token |
+|------|-------|-------|
+| glow | `0 0 8px rgba(52, 213, 154, 0.7)` | `--shadow-glow` |
+
+The accent glow is the signature "data glow" of live/status indicator dots — a
+soft Neon Glow halo that reads as powered-on hardware in the dark server room.
+It is sanctioned **only** for small status/live dots (≤ 8px) and the active-nav
+tick: elements that carry state, never decoration. It must never be used for
+elevation — depth remains layered near-black surfaces (see Elevation). Use the
+`--shadow-glow` token rather than ad-hoc box-shadow values.
+
 ### Layout
 
 - **Page max-width:** 1200px
@@ -287,6 +300,8 @@ The page structure is full-bleed black, creating an immersive, infinite canvas. 
 
   /* Shadows */
   --shadow-lg: rgba(0, 0, 0, 0.4) 0px 8px 20px 0px;
+  /* Accent glow — live/status dots only, never elevation (see Glow) */
+  --shadow-glow: 0 0 8px rgba(52, 213, 154, 0.7);
 }
 ```
 
@@ -362,5 +377,7 @@ The page structure is full-bleed black, creating an immersive, infinite canvas. 
 
   /* Shadows */
   --shadow-lg: rgba(0, 0, 0, 0.4) 0px 8px 20px 0px;
+  /* Accent glow — live/status dots only, never elevation (see Glow) */
+  --shadow-glow: 0 0 8px rgba(52, 213, 154, 0.7);
 }
 ```

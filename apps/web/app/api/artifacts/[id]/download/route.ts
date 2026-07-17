@@ -5,12 +5,14 @@ import type { ApiError } from '@agent-flight-recorder/contracts'
 
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient } from '@/lib/convexServer'
+import { getRequestId, logger } from '@/lib/logger'
 
 interface RouteParams {
   params: { id: string }
 }
 
-export async function GET(_req: NextRequest, { params }: RouteParams) {
+export async function GET(req: NextRequest, { params }: RouteParams) {
+  const requestId = getRequestId(req)
   const { userId, orgId } = auth()
   if (!userId || !orgId) {
     return NextResponse.json<ApiError>(
@@ -79,9 +81,15 @@ export async function GET(_req: NextRequest, { params }: RouteParams) {
         { status: 404 }
       )
     }
+    logger.error('Artifact download failed', {
+      requestId,
+      route: '/api/artifacts/[id]/download',
+      orgId,
+      err,
+    })
     return NextResponse.json<ApiError>(
-      { code: 'INTERNAL_ERROR', message },
-      { status: 500 }
+      { code: 'INTERNAL_ERROR', message: `${message} (request ${requestId})` },
+      { status: 500, headers: { 'x-request-id': requestId } }
     )
   }
 }

@@ -13,6 +13,7 @@ import { RunHeader } from '@/components/runs/RunHeader'
 import { Timeline } from '@/components/runs/Timeline'
 import { VerificationPanel } from '@/components/runs/VerificationPanel'
 import { ErrorState } from '@/components/ui/ErrorState'
+import { InlineError } from '@/components/ui/InlineError'
 import { LoadingState } from '@/components/ui/LoadingState'
 import { getAgent } from '@/lib/services/agents'
 import { listArtifacts } from '@/lib/services/artifacts'
@@ -89,7 +90,12 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
     fetchError = msg
   }
 
-  // Additive results — non-fatal, defaults retained on rejection.
+  // Additive results — non-fatal, defaults retained on rejection, but track
+  // per-section failure so the UI shows an inline error instead of a
+  // misleading empty state.
+  const replayFailed = replaySettled.status === 'rejected'
+  const artifactsFailed = artifactsSettled.status === 'rejected'
+  const commentsFailed = commentsSettled.status === 'rejected'
   if (replaySettled.status === 'fulfilled') failureSummary = replaySettled.value.failureSummary
   if (artifactsSettled.status === 'fulfilled') artifactsData = artifactsSettled.value
   if (commentsSettled.status === 'fulfilled') commentsData = commentsSettled.value
@@ -164,8 +170,12 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
       />
 
       {/* Failure summary panel — additive, shown only when there is a failure or incomplete run */}
-      {failureSummary && (
-        <FailureSummaryPanel summary={failureSummary} />
+      {replayFailed ? (
+        <div className="px-6 pt-3">
+          <InlineError message="Couldn't load the failure analysis for this run — refresh to retry." />
+        </div>
+      ) : (
+        failureSummary && <FailureSummaryPanel summary={failureSummary} />
       )}
 
       {/* Verification panel — shown only for terminal runs */}
@@ -220,14 +230,26 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
           </Suspense>
         )}
         {activeTab === 'artifacts' && (
-          <Suspense fallback={<LoadingState message="Loading artifacts..." />}>
-            <ArtifactList artifacts={artifactsData.artifacts} />
-          </Suspense>
+          artifactsFailed ? (
+            <div className="p-6">
+              <InlineError message="Couldn't load artifacts — refresh to retry." />
+            </div>
+          ) : (
+            <Suspense fallback={<LoadingState message="Loading artifacts..." />}>
+              <ArtifactList artifacts={artifactsData.artifacts} />
+            </Suspense>
+          )
         )}
         {activeTab === 'comments' && (
-          <Suspense fallback={<LoadingState message="Loading comments..." />}>
-            <CommentThread targetId={runId} targetType="run" initialComments={commentsData} />
-          </Suspense>
+          commentsFailed ? (
+            <div className="p-6">
+              <InlineError message="Couldn't load comments — refresh to retry." />
+            </div>
+          ) : (
+            <Suspense fallback={<LoadingState message="Loading comments..." />}>
+              <CommentThread targetId={runId} targetType="run" initialComments={commentsData} />
+            </Suspense>
+          )
         )}
       </div>
     </div>

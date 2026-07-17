@@ -133,7 +133,8 @@ export default function RootPage() {
               ].join(' ')}
             >
               <div className="mb-3 flex items-center gap-2.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-neon-glow shadow-[0_0_8px_rgba(52,213,154,0.7)]" />
+                {/* Sanctioned accent glow token — design.md "Glow" (status dots only) */}
+                <span className="w-1.5 h-1.5 rounded-full bg-neon-glow shadow-[var(--shadow-glow)]" />
                 <h3 className="text-[15px] font-medium text-whiteout">{f.k}</h3>
               </div>
               <p className="text-sm leading-relaxed text-ash">{f.d}</p>

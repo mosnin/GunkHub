@@ -4,7 +4,12 @@ import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
 import { requireOrgMembership } from "./auth.js";
-import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
+import { afrError } from "./helpers/errors.js";
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_EVENTS_PER_RUN,
+  MAX_PAGE_SIZE,
+} from "./helpers/pagination.js";
 
 // Event types that must be the last event in a run (CLAUDE.md Event Log Rule 5).
 const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
@@ -183,6 +188,15 @@ export const createEvent = mutation({
     if (!Number.isInteger(args.sequenceNumber) || args.sequenceNumber < 1) {
       throw new Error(
         `Invalid sequenceNumber ${args.sequenceNumber}: must be a positive integer`,
+      );
+    }
+
+    // Write ceiling: sequences are contiguous from 1, so the sequence number IS
+    // the event count — an exact O(1) per-run cap check.
+    if (args.sequenceNumber > MAX_EVENTS_PER_RUN) {
+      throw afrError(
+        "EVENT_LIMIT_EXCEEDED",
+        `Run has reached the maximum of ${MAX_EVENTS_PER_RUN} events`,
       );
     }
 

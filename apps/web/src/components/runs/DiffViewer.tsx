@@ -14,6 +14,11 @@ interface DiffViewerProps {
   loading?: boolean
 }
 
+// Windowed rendering (parity with Timeline/EventInspector): only this many diff
+// rows are mounted at once; "earlier / later" expanders shift the window. Keeps
+// the DOM bounded even for 10k-event diffs.
+const WINDOW_SIZE = 100
+
 // Event type text treatment. design.md restricts colour to Neon Glow, the red
 // alert, and greys — event types are read from the mono label itself, so only
 // run lifecycle gets the single Neon accent; every other type is neutral.
@@ -70,10 +75,13 @@ function FieldChangesTable({ changes }: FieldChangesTableProps) {
 interface EventDiffRowProps {
   entry: EventDiff
   isFirstDivergence: boolean
+  expanded: boolean
+  onToggleExpanded: () => void
 }
 
-function EventDiffRow({ entry, isFirstDivergence }: EventDiffRowProps) {
-  const [expanded, setExpanded] = useState(false)
+// Expand state is lifted to DiffResult (keyed by sequence number) so it survives
+// the row unmounting when the window shifts.
+function EventDiffRow({ entry, isFirstDivergence, expanded, onToggleExpanded }: EventDiffRowProps) {
   const cfg = kindConfig[entry.kind]
   const type = entry.leftEvent?.type ?? entry.rightEvent?.type
   const changes = entry.changes ?? []
@@ -107,7 +115,7 @@ function EventDiffRow({ entry, isFirstDivergence }: EventDiffRowProps) {
           </span>
           {hasChanges && (
             <button
-              onClick={() => setExpanded((v) => !v)}
+              onClick={onToggleExpanded}
               className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors duration-75 flex items-center gap-1"
             >
               {expanded ? 'hide' : `${changes.length} changes`}
@@ -162,7 +170,7 @@ function RunSelector() {
             value={left}
             onChange={(e) => setLeft(e.target.value)}
             placeholder="Paste run ID..."
-            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-600 font-mono outline-none focus:border-neutral-600 transition-colors duration-75"
+            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-500 font-mono outline-none focus:border-neutral-600 transition-colors duration-75"
           />
         </div>
         <div className="flex flex-col gap-1.5">
@@ -175,7 +183,7 @@ function RunSelector() {
             value={right}
             onChange={(e) => setRight(e.target.value)}
             placeholder="Paste run ID..."
-            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-600 font-mono outline-none focus:border-neutral-600 transition-colors duration-75"
+            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-500 font-mono outline-none focus:border-neutral-600 transition-colors duration-75"
           />
         </div>
       </div>
@@ -201,6 +209,30 @@ interface DiffResultProps {
 function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps) {
   const { summary, leftRunId, rightRunId, eventDiffs } = diff
   const firstDivergenceIndex = eventDiffs.findIndex((e) => e.kind !== 'same')
+
+  // Windowed rendering — center the initial window on the first divergence (the
+  // row engineers care about) when one exists, else start at the top.
+  const [windowStart, setWindowStart] = useState(() =>
+    firstDivergenceIndex > 0
+      ? Math.max(0, Math.min(firstDivergenceIndex - Math.floor(WINDOW_SIZE / 2), eventDiffs.length - WINDOW_SIZE))
+      : 0
+  )
+  // Per-row "changes" expansion, keyed by sequence number so it survives window shifts.
+  const [expandedSeqs, setExpandedSeqs] = useState<ReadonlySet<number>>(new Set<number>())
+
+  function toggleExpanded(seq: number) {
+    setExpandedSeqs((prev) => {
+      const next = new Set(prev)
+      if (next.has(seq)) next.delete(seq)
+      else next.add(seq)
+      return next
+    })
+  }
+
+  const windowEnd = Math.min(eventDiffs.length, windowStart + WINDOW_SIZE)
+  const visibleDiffs = eventDiffs.slice(windowStart, windowEnd)
+  const earlierCount = windowStart
+  const laterCount = eventDiffs.length - windowEnd
 
   return (
     <div className="flex flex-col gap-4">
@@ -267,13 +299,39 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
           />
         ) : (
           <div className="divide-y divide-neutral-800/50">
-            {eventDiffs.map((entry, i) => (
+            {/* Earlier rows expander */}
+            {earlierCount > 0 && (
+              <div className="flex justify-center py-1.5">
+                <button
+                  onClick={() => setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))}
+                  className="px-4 py-1.5 text-xs font-mono rounded border border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600 transition-colors duration-100"
+                >
+                  ↑ {earlierCount} earlier
+                </button>
+              </div>
+            )}
+
+            {visibleDiffs.map((entry, i) => (
               <EventDiffRow
                 key={`${entry.sequenceNumber}-${entry.kind}`}
                 entry={entry}
-                isFirstDivergence={i === firstDivergenceIndex && firstDivergenceIndex !== -1}
+                isFirstDivergence={windowStart + i === firstDivergenceIndex && firstDivergenceIndex !== -1}
+                expanded={expandedSeqs.has(entry.sequenceNumber)}
+                onToggleExpanded={() => toggleExpanded(entry.sequenceNumber)}
               />
             ))}
+
+            {/* Later rows expander */}
+            {laterCount > 0 && (
+              <div className="flex justify-center py-1.5">
+                <button
+                  onClick={() => setWindowStart(windowStart + WINDOW_SIZE)}
+                  className="px-4 py-1.5 text-xs font-mono rounded border border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600 transition-colors duration-100"
+                >
+                  ↓ {laterCount} later
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

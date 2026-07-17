@@ -1,3 +1,5 @@
+import { PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER } from '@agent-flight-recorder/contracts'
+
 import { externalizePayloadIfLarge, uploadArtifact, type ArtifactPointer } from './externalize.js'
 
 import type { TransportResponse } from './types.js'
@@ -39,6 +41,42 @@ export interface HttpTransportOptions {
   retryStrategy?: RetryStrategy
   /** Batching policy. Default: {@link defaultBatchingStrategy}. */
   batchingStrategy?: BatchingStrategy
+  /**
+   * Suppress the one-time console warning emitted when the endpoint uses
+   * plain HTTP to a non-localhost host. Default: false.
+   */
+  allowInsecureEndpoint?: boolean
+}
+
+/** Endpoints already warned about, so each is warned at most once per process. */
+const warnedInsecureEndpoints = new Set<string>()
+
+/**
+ * Warn (once per endpoint, per process) when a configured endpoint is plain
+ * HTTP to a non-loopback host — the API key and all recorded payloads would
+ * transit the network in cleartext. `localhost` / `127.0.0.1` / `::1` /
+ * `*.localhost` are exempt (local development). Suppressible via
+ * `allowInsecureEndpoint: true`. Unparseable endpoints are ignored here; they
+ * fail loudly at request time instead.
+ */
+export function warnIfInsecureEndpoint(endpoint: string, allowInsecureEndpoint?: boolean): void {
+  if (allowInsecureEndpoint) return
+  let url: URL
+  try {
+    url = new URL(endpoint)
+  } catch {
+    return
+  }
+  if (url.protocol !== 'http:') return
+  const host = url.hostname
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]' || host.endsWith('.localhost')) {
+    return
+  }
+  if (warnedInsecureEndpoints.has(endpoint)) return
+  warnedInsecureEndpoints.add(endpoint)
+  console.warn(
+    `[afr-sdk] Endpoint "${endpoint}" uses plain HTTP to a non-localhost host — the API key and recorded payloads will be sent in cleartext. Use https://, or pass allowInsecureEndpoint: true to suppress this warning.`
+  )
 }
 
 export class HttpTransport implements Transport {
@@ -60,6 +98,7 @@ export class HttpTransport implements Transport {
     this.timeoutMs = opts.timeoutMs ?? 10_000
     this.retryStrategy = opts.retryStrategy ?? defaultRetryStrategy
     this.batchingStrategy = opts.batchingStrategy ?? defaultBatchingStrategy
+    warnIfInsecureEndpoint(endpoint, opts.allowInsecureEndpoint)
   }
 
   /** The batching strategy this transport was configured with. */
@@ -113,6 +152,7 @@ export class HttpTransport implements Transport {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'x-api-key': auth.apiKey,
+      [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
     }
 
     let attempt = 0
@@ -198,6 +238,7 @@ export class HttpTransport implements Transport {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'x-api-key': auth.apiKey,
+      [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
     }
 
     // Pre-externalize any events whose payload exceeds the threshold. Done before
@@ -312,6 +353,7 @@ export class HttpTransport implements Transport {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'x-api-key': auth.apiKey,
+      [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
     }
 
     const body: Record<string, unknown> = { status }

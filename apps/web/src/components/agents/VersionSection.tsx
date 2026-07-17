@@ -55,7 +55,7 @@ export function VersionSection({ agentId, versions: initialVersions, nextCursor:
       <VersionHistory versions={allVersions} />
       {(cursor !== null || loadError !== null) && (
         <div className="mt-2 flex flex-col items-start gap-1">
-          {loadError && <p className="text-xs text-red-400">{loadError}</p>}
+          {loadError && <p className="text-xs text-destructive-400">{loadError}</p>}
           {cursor !== null && (
             <button
               onClick={handleLoadMore}

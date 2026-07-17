@@ -18,6 +18,8 @@
   --color-graphite-deep: #151617;
   --color-depth: #0a0a0b;
   --color-blackout: #000000;
+  /* Sanctioned accent glow (design.md "Glow") — live/status dots only, never elevation. */
+  --shadow-glow: 0 0 8px rgba(52, 213, 154, 0.7);
   --font-inter: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-geistmono: 'Geist Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
@@ -117,7 +119,8 @@
     height: 6px;
     border-radius: 9999px;
     background-color: var(--color-neon-glow);
-    box-shadow: 0 0 8px rgba(52, 213, 154, 0.7);
+    /* Sanctioned accent glow token — see design.md "Glow" (status dots only). */
+    box-shadow: var(--shadow-glow);
     margin-right: 10px;
     vertical-align: middle;
   }

@@ -1,7 +1,8 @@
 import { Events, buildEvent } from './events.js'
 import { HttpTransport, createRetryStrategy, type Transport } from './transport.js'
+import { SDK_VERSION } from './version.js'
 
-import type { RecorderConfig, RunContext, RecordEventOptions, FlushResult } from './types.js'
+import type { RecorderConfig, RunContext, RecordEventOptions, FlushResult, EventSpool, StoredEvent } from './types.js'
 import type { RunStatus, EventType, EventPayload } from '@agent-flight-recorder/contracts'
 
 /** Minimal shape of the Node `process` global we depend on (avoids @types/node). */
@@ -46,6 +47,11 @@ export class Recorder {
   /** Cumulative count of events dropped from the buffer due to overflow. */
   private droppedEventCount = 0
 
+  // Serializes spool I/O so append/clear operations apply in program order even
+  // though they are launched fire-and-forget. Without this, a recordEvent
+  // append racing a post-flush resync could duplicate or lose spool entries.
+  private spoolChain: Promise<void> = Promise.resolve()
+
   private processHandlersInstalled = false
   private readonly onBeforeExit = (): void => {
     // Best-effort flush as the event loop drains. Never rejects into the host.
@@ -72,6 +78,9 @@ export class Recorder {
           ...(config.options?.maxRetries !== undefined && { maxRetries: config.options.maxRetries }),
           ...(config.options?.retryBackoffMs !== undefined && { backoffMs: config.options.retryBackoffMs }),
         }),
+        ...(config.options?.allowInsecureEndpoint !== undefined && {
+          allowInsecureEndpoint: config.options.allowInsecureEndpoint,
+        }),
       })
     if (config.options?.captureProcessExit) {
       this.installProcessHandlers()
@@ -94,7 +103,7 @@ export class Recorder {
         ...(this.config.agentVersionId !== undefined && { agentVersionId: this.config.agentVersionId }),
         metadata: runConfig,
         tags: [],
-        sdkVersion: '0.1.0',
+        sdkVersion: SDK_VERSION,
       },
       { apiKey: this.config.apiKey }
     )
@@ -133,24 +142,28 @@ export class Recorder {
       ...(options?.timestamp !== undefined && { timestamp: options.timestamp }),
     }
 
-    this.eventBuffer.push(
-      buildEvent(
-        this.runContext.runId,
-        '', // orgId resolved server-side from API key
-        type,
-        payload,
-        seq,
-        eventOptions
-      )
+    const event = buildEvent(
+      this.runContext.runId,
+      '', // orgId resolved server-side from API key
+      type,
+      payload,
+      seq,
+      eventOptions
     )
+    this.eventBuffer.push(event)
+
+    // Write-ahead: persist to the spool (if configured) before delivery is
+    // attempted. Best-effort and non-blocking — spool failure never breaks
+    // recording; it is surfaced via onSpoolError.
+    this.spoolOp((spool) => spool.append([{ kind: 'event', event }]))
 
     this.enforceBufferLimit()
 
     const maxBatch = this.config.options?.maxBatchSize ?? 100
     if (this.eventBuffer.length >= maxBatch) {
       // Fire-and-forget: a throwing custom Transport must not surface as an
-      // unhandled rejection in the host.
-      void this.flush().catch(() => {})
+      // unhandled rejection in the host. Failures are routed to onFlushError.
+      this.backgroundFlush()
     }
   }
 
@@ -166,16 +179,27 @@ export class Recorder {
     if (max <= 0 || this.eventBuffer.length <= max) return
 
     let toDrop = this.eventBuffer.length - max
+    let droppedNow = 0
     const kept: ReturnType<typeof buildEvent>[] = []
     for (const ev of this.eventBuffer) {
       if (toDrop > 0 && !PROTECTED_EVENT_TYPES.has(ev.type)) {
         toDrop--
-        this.droppedEventCount++
+        droppedNow++
         continue
       }
       kept.push(ev)
     }
     this.eventBuffer = kept
+
+    if (droppedNow > 0) {
+      this.droppedEventCount += droppedNow
+      this.debugLog(`buffer overflow: dropped ${droppedNow} event(s) (cumulative: ${this.droppedEventCount})`)
+      try {
+        this.config.options?.onDrop?.(droppedNow, 'buffer_overflow')
+      } catch {
+        // Consumer callback must never crash the recorder.
+      }
+    }
   }
 
   /**
@@ -234,8 +258,21 @@ export class Recorder {
     const result = await this.transport.sendEvents(batch, { apiKey: this.config.apiKey })
 
     if (result.success) {
+      this.debugLog(`flush ok: ${batch.length} event(s) submitted`)
+      // Spool resync: the flushed events are acknowledged, so remove them from
+      // the write-ahead spool. With only append/drain/clear available, resync =
+      // clear + re-append whatever is still unacknowledged. The remaining-buffer
+      // snapshot is taken synchronously here; events recorded later have their
+      // own append operations queued AFTER this resync on the spool chain, so
+      // nothing is duplicated or lost.
+      const remaining = this.eventBuffer.map((event): StoredEvent => ({ kind: 'event', event }))
+      this.spoolOp(async (spool) => {
+        await spool.clear()
+        if (remaining.length > 0) await spool.append(remaining)
+      })
       return { success: true, eventsSubmitted: batch.length, errors: [], droppedEvents: this.droppedEventCount }
     }
+    this.debugLog(`flush failed (${batch.length} event(s) retained): ${result.error}`)
 
     // DURABILITY: the send failed, so the batch is NOT persisted. Return it to the
     // FRONT of the buffer (ahead of any events appended during the await) so a
@@ -282,7 +319,8 @@ export class Recorder {
     // and event delivery are independent concerns. A failed transition must NOT be
     // swallowed — otherwise the run is stuck "running" forever, invisibly. Surface
     // it into the returned FlushResult.
-    const statusResult = await this.transport.updateRunStatus(runId, status, Date.now(), {
+    const endedAt = Date.now()
+    const statusResult = await this.transport.updateRunStatus(runId, status, endedAt, {
       apiKey: this.config.apiKey,
     })
     if (!statusResult.success) {
@@ -298,15 +336,54 @@ export class Recorder {
           },
         ],
       }
+      // Persist the status-transition intent so recover() (in this or a later
+      // process) can complete the transition. Without a spool the intent is
+      // retried by nothing — the run stays "running" server-side until a human
+      // or a reaper intervenes; the returned error is the only signal.
+      if (this.config.options?.spool) {
+        this.spoolOp((spool) => spool.append([{ kind: 'status', runId, status, endedAt }]))
+      }
     }
 
-    if (this.eventBuffer.length > 0) {
-      // Terminal events could not be delivered yet. Keep retrying in the
-      // background rather than dropping them; the caller sees success:false.
+    const undelivered = this.eventBuffer.length
+    if (undelivered > 0) {
+      // The terminal event (and possibly earlier events) could NOT be delivered
+      // after all attempts. Surface an explicit error so the caller knows the
+      // run's telemetry is incomplete, keep retrying in the background
+      // best-effort, and — critically — do NOT wedge the recorder: runContext
+      // is cleared below so a new run can start.
+      const spooled = this.config.options?.spool !== undefined
+      result = {
+        ...result,
+        success: false,
+        errors: [
+          ...result.errors,
+          {
+            eventIndex: -1,
+            error:
+              `Terminal event for run "${runId}" is UNDELIVERED after ${maxFinalizeAttempts} flush attempts ` +
+              `(${undelivered} event(s) still buffered). ` +
+              (spooled
+                ? 'The events are persisted in the spool — call recover() (e.g. on next startup) to re-send them.'
+                : 'No spool is configured: the events remain in memory and will be retried in the background, but are LOST if the process exits.'),
+            retryable: true,
+          },
+        ],
+      }
       this.scheduleFlush()
-      return result
     }
 
+    // Ensure pending spool writes (write-ahead events + any status intent) have
+    // settled before we return, so a caller that exits immediately after
+    // endRun()/failRun() leaves a complete spool behind. The chain never rejects.
+    if (this.config.options?.spool) {
+      await this.spoolChain
+    }
+
+    // Always release the recorder — a run that failed to finalize cleanly must
+    // not block future runs. Undelivered events stay in the buffer/spool and
+    // carry their own runId, so background retries and recover() still deliver
+    // them after a new run starts.
     this.runContext = null
     return result
   }
@@ -368,12 +445,159 @@ export class Recorder {
     this.processHandlersInstalled = false
   }
 
+  /**
+   * Drain the configured spool and re-send everything a previous process (or a
+   * failed finalize) left undelivered: spooled events go through
+   * `transport.sendEvents`, spooled status-transition intents through
+   * `transport.updateRunStatus`. Entries that fail to send are re-appended to
+   * the spool so a later recover() can try again — delivery is at-least-once,
+   * and duplicates are deduped server-side by run + sequenceNumber.
+   *
+   * Call this on startup, BEFORE starting new runs, when using a spool. A
+   * no-op returning `success: true` when no spool is configured or the spool
+   * is empty. Never throws; spool/transport failures are reported in the
+   * returned `FlushResult.errors`.
+   */
+  async recover(): Promise<FlushResult> {
+    const spool = this.config.options?.spool
+    if (!spool) {
+      return { success: true, eventsSubmitted: 0, errors: [], droppedEvents: this.droppedEventCount }
+    }
+
+    let entries: StoredEvent[]
+    try {
+      // Let any pending write-ahead appends settle first (the chain never
+      // rejects), then drain. Call recover() before starting new runs so no
+      // concurrent appends race the drain.
+      await this.spoolChain
+      entries = await spool.drain()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.notifySpoolError(`spool drain failed during recover: ${message}`)
+      return {
+        success: false,
+        eventsSubmitted: 0,
+        errors: [{ eventIndex: -1, error: `Spool drain failed: ${message}`, retryable: true }],
+        droppedEvents: this.droppedEventCount,
+      }
+    }
+
+    if (entries.length === 0) {
+      return { success: true, eventsSubmitted: 0, errors: [], droppedEvents: this.droppedEventCount }
+    }
+    this.debugLog(`recover: draining ${entries.length} spooled entr(y/ies)`)
+
+    const errors: FlushResult['errors'] = []
+    const failed: StoredEvent[] = []
+    let submitted = 0
+
+    const events = entries.filter((e): e is StoredEvent & { kind: 'event' } => e.kind === 'event')
+    if (events.length > 0) {
+      const res = await this.transport.sendEvents(
+        events.map((e) => e.event),
+        { apiKey: this.config.apiKey }
+      )
+      if (res.success) {
+        submitted += events.length
+      } else {
+        errors.push({ eventIndex: -1, error: `Recovery send failed: ${res.error}`, retryable: res.retryable })
+        failed.push(...events)
+      }
+    }
+
+    for (const intent of entries) {
+      if (intent.kind !== 'status') continue
+      const res = await this.transport.updateRunStatus(intent.runId, intent.status, intent.endedAt, {
+        apiKey: this.config.apiKey,
+      })
+      if (!res.success) {
+        errors.push({
+          eventIndex: -1,
+          error: `Recovery status transition for run "${intent.runId}" failed: ${res.error}`,
+          retryable: res.retryable,
+        })
+        failed.push(intent)
+      }
+    }
+
+    if (failed.length > 0) {
+      // Put undeliverable entries back so a later recover() can retry them.
+      this.spoolOp((s) => s.append(failed))
+      await this.spoolChain
+    }
+
+    return {
+      success: errors.length === 0,
+      eventsSubmitted: submitted,
+      errors,
+      droppedEvents: this.droppedEventCount,
+    }
+  }
+
+  /**
+   * Launch a fire-and-forget flush whose failure is routed to `onFlushError`
+   * (and debug logging) instead of being silently discarded. Used by the flush
+   * timer and the maxBatchSize trigger, whose FlushResults have no caller.
+   */
+  private backgroundFlush(): void {
+    void this.flush()
+      .then((result) => {
+        if (!result.success) {
+          this.notifyFlushError(result.errors.map((e) => e.error).join('; '))
+        }
+      })
+      .catch((err) => {
+        this.notifyFlushError(err instanceof Error ? err.message : String(err))
+      })
+  }
+
+  private notifyFlushError(error: string): void {
+    this.debugLog(`background flush failed: ${error}`)
+    try {
+      this.config.options?.onFlushError?.(error)
+    } catch {
+      // Consumer callback must never crash the recorder.
+    }
+  }
+
+  private notifySpoolError(error: string): void {
+    this.debugLog(`spool error: ${error}`)
+    try {
+      this.config.options?.onSpoolError?.(error)
+    } catch {
+      // Consumer callback must never crash the recorder.
+    }
+  }
+
+  /**
+   * Enqueue a best-effort spool operation on the serialization chain. No-op
+   * when no spool is configured (zero cost). Failures never propagate — they
+   * are surfaced via `onSpoolError`.
+   */
+  private spoolOp(op: (spool: EventSpool) => Promise<void>): void {
+    const spool = this.config.options?.spool
+    if (!spool) return
+    this.spoolChain = this.spoolChain
+      .then(() => op(spool))
+      .catch((err) => {
+        this.notifySpoolError(err instanceof Error ? err.message : String(err))
+      })
+  }
+
+  /** Log a diagnostic line when `options.debug` is enabled. */
+  private debugLog(message: string): void {
+    if (this.config.options?.debug) {
+      console.log(`[afr-sdk] ${message}`)
+    }
+  }
+
   private scheduleFlush(): void {
     const interval = this.config.options?.flushIntervalMs ?? 1000
     this.flushTimer = setTimeout(() => {
       // Guard the fire-and-forget flush: a throwing custom Transport must not
-      // surface as an unhandled rejection in the host process.
-      void this.flush().catch(() => {})
+      // surface as an unhandled rejection in the host process. Failures are
+      // routed to onFlushError instead of being silently discarded.
+      this.backgroundFlush()
       this.scheduleFlush()
     }, interval)
     // Do not keep the Node event loop alive on the recurring flush timer. Without

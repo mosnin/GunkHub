@@ -13,6 +13,11 @@ export default defineSchema({
     ),
     createdAt: v.number(),
     updatedAt: v.number(),
+    // Optional retention window (ADR 001 — data retention and erasure). When set,
+    // the daily enforceRetention cron deletes TERMINAL runs (and their events,
+    // artifacts, comments, verification results) started more than retentionDays
+    // days ago. Unset = retain forever (default).
+    retentionDays: v.optional(v.number()),
   }).index("by_clerk_org_id", ["clerkOrgId"]),
 
   projects: defineTable({
@@ -169,4 +174,22 @@ export default defineSchema({
   })
     .index("by_run", ["runId"])
     .index("by_org_verified", ["orgId", "verifiedAt"]),
+
+  // APPEND-ONLY admin audit trail. Like the events table, rows are never updated
+  // or deleted (sole exception: ADR 001 org purge, which erases the whole org's
+  // partition). Every privileged mutation writes one row via recordAuditEvent.
+  audit_log: defineTable({
+    orgId: v.id("organizations"),
+    // Clerk user ID of the actor, or the literal "clerk-webhook" for changes
+    // applied by the Clerk webhook (e.g. membership role changes).
+    actorClerkUserId: v.string(),
+    // Closed set of action names — see AUDIT_ACTIONS in convex/audit.ts.
+    action: v.string(),
+    targetType: v.string(),
+    targetId: v.string(),
+    timestamp: v.number(),
+    // Freeform action-specific context (e.g. old/new role, status transition).
+    // v.any() is justified: the shape varies per action and is display-only.
+    metadata: v.optional(v.any()),
+  }).index("by_org", ["orgId", "timestamp"]),
 });

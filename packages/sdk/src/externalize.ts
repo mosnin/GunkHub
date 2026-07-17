@@ -1,4 +1,4 @@
-import { PAYLOAD_EXTERNALIZATION_THRESHOLD } from '@agent-flight-recorder/contracts'
+import { PAYLOAD_EXTERNALIZATION_THRESHOLD, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER } from '@agent-flight-recorder/contracts'
 
 import type { EventType, ExternalizedPayload } from '@agent-flight-recorder/contracts'
 
@@ -52,6 +52,7 @@ export async function uploadArtifact(
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'x-api-key': apiKey,
+    [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
   }
 
   const response = await doFetch(url, {

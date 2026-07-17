@@ -39,7 +39,7 @@ export default async function SettingsPage() {
               type="text"
               readOnly
               placeholder="Your organization name"
-              className="w-full max-w-sm h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-400 placeholder-neutral-600 cursor-not-allowed outline-none"
+              className="w-full max-w-sm h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-400 placeholder-neutral-500 cursor-not-allowed outline-none"
             />
           </div>
         </Card>

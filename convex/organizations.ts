@@ -3,6 +3,7 @@
 import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
+import { WEBHOOK_ACTOR, recordAuditEvent } from "./audit.js";
 
 /**
  * Shared-secret gate for webhook-only lifecycle mutations.
@@ -221,6 +222,20 @@ export const upsertMembership = mutation({
       // Idempotent: only patch if the role changed
       if (existing.role !== args.role) {
         await ctx.db.patch(existing._id, { role: args.role });
+        // Audit trail: role changes are privileged. The actor is the webhook —
+        // the human actor lives in Clerk's own audit log.
+        await recordAuditEvent(ctx, {
+          orgId: org._id,
+          actorClerkUserId: WEBHOOK_ACTOR,
+          action: "membership.upserted",
+          targetType: "user_membership",
+          targetId: String(existing._id),
+          metadata: {
+            clerkUserId: args.clerkUserId,
+            oldRole: existing.role,
+            newRole: args.role,
+          },
+        });
       }
       const updated = await ctx.db.get(existing._id);
       if (!updated) throw new Error("Membership record disappeared after patch");
@@ -232,6 +247,15 @@ export const upsertMembership = mutation({
       orgId: org._id,
       role: args.role,
       joinedAt: Date.now(),
+    });
+
+    await recordAuditEvent(ctx, {
+      orgId: org._id,
+      actorClerkUserId: WEBHOOK_ACTOR,
+      action: "membership.upserted",
+      targetType: "user_membership",
+      targetId: String(membershipId),
+      metadata: { clerkUserId: args.clerkUserId, newRole: args.role },
     });
 
     const membership = await ctx.db.get(membershipId);

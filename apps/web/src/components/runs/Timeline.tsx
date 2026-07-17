@@ -78,6 +78,9 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
   const listRef = useRef<HTMLDivElement>(null)
   const [followTail, setFollowTail] = useState(isLive)
   const [unseenCount, setUnseenCount] = useState(0)
+  // True when the most recent live poll failed — drives the "reconnecting…"
+  // stale indicator; cleared on the next successful poll.
+  const [pollFailed, setPollFailed] = useState(false)
 
   // Keep a stable ref to extraEvents for use inside the polling effect closure
   const extraEventsRef = useRef<Event[]>(extraEvents)
@@ -143,8 +146,12 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
       for (const e of events ?? []) if (e.sequenceNumber > maxSeq) maxSeq = e.sequenceNumber
       for (const e of currentExtra) if (e.sequenceNumber > maxSeq) maxSeq = e.sequenceNumber
       const res = await fetch(`/api/runs/${runId}/events?limit=200&afterSeq=${maxSeq}`)
-      if (!res.ok) return
+      if (!res.ok) {
+        setPollFailed(true)
+        return
+      }
       const data = (await res.json()) as ListEventsResponse
+      setPollFailed(false)
       const allIds = new Set([...(events ?? []).map((e) => e.id), ...currentExtra.map((e) => e.id)])
       const brandNew = data.events.filter((e) => !allIds.has(e.id))
       if (brandNew.length > 0) {
@@ -172,6 +179,10 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
           } else {
             await pollFromStart()
           }
+        } catch {
+          // Network failure mid-poll — surface as the stale indicator instead
+          // of swallowing (and avoid an unhandled rejection).
+          setPollFailed(true)
         } finally {
           inFlightRef.current = false
         }
@@ -233,9 +244,16 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
 
   return (
     <div className="px-6 py-4">
-      {/* Live / follow-tail indicator */}
+      {/* Live / follow-tail indicator — polite live region so screen readers are
+          told about newly streamed events (the count, not every event). */}
       {isLive && (
-        <div className="flex items-center justify-end gap-3 px-6 pb-1">
+        <div role="status" aria-live="polite" className="flex items-center justify-end gap-3 px-6 pb-1">
+          {pollFailed && (
+            <span className="flex items-center gap-1.5 text-xs font-mono text-pewter">
+              <span className="w-1.5 h-1.5 rounded-full bg-destructive-500 shrink-0" aria-hidden="true" />
+              reconnecting…
+            </span>
+          )}
           {!followTail && unseenCount > 0 && (
             <button
               onClick={handleResume}
@@ -268,7 +286,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
           tabIndex={0}
           onKeyDown={handleKeyDown}
           onFocus={() => { if (focusedIndex === -1) setFocusedIndex(0) }}
-          className="flex flex-col gap-1.5 outline-none focus:outline-none"
+          className="flex flex-col gap-1.5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-neon-glow"
         >
           {/* Earlier events navigation button */}
           {windowStart > 0 && (
@@ -295,7 +313,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
                 key={event.id}
                 className={[
                   'flex items-start gap-3 rounded',
-                  focusedIndex === absIdx ? 'ring-1 ring-neutral-600' : '',
+                  focusedIndex === absIdx ? 'ring-1 ring-neon-glow' : '',
                 ].join(' ')}
               >
                 <div

@@ -1,12 +1,18 @@
 'use client'
 
-import { motion, type HTMLMotionProps } from 'framer-motion'
+import { MotionConfig, motion, type HTMLMotionProps } from 'framer-motion'
 
 import type { ReactNode } from 'react'
 
 // Shared motion primitives for the Neon UI. Reveals are subtle (opacity + small
-// translate), honor prefers-reduced-motion via framer's built-in reducedMotion,
-// and stagger children for an orchestrated page-load (design.md motion guidance).
+// translate) and stagger children for an orchestrated page-load (design.md
+// motion guidance).
+//
+// Accessibility: framer-motion does NOT honor prefers-reduced-motion by default
+// (its default is reducedMotion: 'never'). Each primitive therefore wraps its
+// content in <MotionConfig reducedMotion="user"> so transform animations are
+// disabled for users who request reduced motion — regardless of which tree
+// (landing or authed app) the primitive renders in.
 
 const easeOut = [0.16, 1, 0.3, 1] as const
 
@@ -18,15 +24,17 @@ export function Reveal({
   ...props
 }: { children: ReactNode; delay?: number; className?: string } & HTMLMotionProps<'div'>) {
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.5, ease: easeOut, delay }}
-      className={className}
-      {...props}
-    >
-      {children}
-    </motion.div>
+    <MotionConfig reducedMotion="user">
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5, ease: easeOut, delay }}
+        className={className}
+        {...props}
+      >
+        {children}
+      </motion.div>
+    </MotionConfig>
   )
 }
 
@@ -41,15 +49,17 @@ export function RevealGroup({
   stagger?: number
 }) {
   return (
-    <motion.div
-      initial="hidden"
-      whileInView="show"
-      viewport={{ once: true, margin: '-60px' }}
-      variants={{ show: { transition: { staggerChildren: stagger } } }}
-      className={className}
-    >
-      {children}
-    </motion.div>
+    <MotionConfig reducedMotion="user">
+      <motion.div
+        initial="hidden"
+        whileInView="show"
+        viewport={{ once: true, margin: '-60px' }}
+        variants={{ show: { transition: { staggerChildren: stagger } } }}
+        className={className}
+      >
+        {children}
+      </motion.div>
+    </MotionConfig>
   )
 }
 
@@ -60,15 +70,17 @@ export function RevealItem({
   ...props
 }: { children: ReactNode; className?: string } & HTMLMotionProps<'div'>) {
   return (
-    <motion.div
-      variants={{
-        hidden: { opacity: 0, y: 14 },
-        show: { opacity: 1, y: 0, transition: { duration: 0.5, ease: easeOut } },
-      }}
-      className={className}
-      {...props}
-    >
-      {children}
-    </motion.div>
+    <MotionConfig reducedMotion="user">
+      <motion.div
+        variants={{
+          hidden: { opacity: 0, y: 14 },
+          show: { opacity: 1, y: 0, transition: { duration: 0.5, ease: easeOut } },
+        }}
+        className={className}
+        {...props}
+      >
+        {children}
+      </motion.div>
+    </MotionConfig>
   )
 }
