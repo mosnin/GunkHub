@@ -46,7 +46,7 @@ function CheckPill({ label, ran, passed }: CheckPillProps) {
   if (passed) {
     return (
       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-neutral-500 border border-neutral-800">
-        <span className="w-1.5 h-1.5 rounded-full bg-emerald-700" aria-hidden="true" />
+        <span className="w-1.5 h-1.5 rounded-full bg-neon-glow" aria-hidden="true" />
         {label}
       </span>
     )

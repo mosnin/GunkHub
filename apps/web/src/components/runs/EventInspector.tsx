@@ -405,7 +405,7 @@ function EventInspectorInner({
               {!followTail && unseenCount > 0 && onResume && (
                 <button
                   onClick={onResume}
-                  className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono bg-emerald-950 border border-emerald-800 text-emerald-400 hover:text-emerald-300 hover:border-emerald-700 transition-colors duration-100"
+                  className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono bg-primary-900 border border-primary-800 text-neon-glow hover:text-primary-300 hover:border-primary-700 transition-colors duration-100"
                 >
                   ↓ {unseenCount} new — resume
                 </button>
@@ -419,7 +419,7 @@ function EventInspectorInner({
                 title={followTail ? 'Following tail — click to pause' : 'Tail paused — click to resume'}
               >
                 {followTail && (
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-neon-glow animate-neon-pulse" aria-hidden="true" />
                 )}
                 <span>{followTail ? 'live' : 'paused'}</span>
               </button>

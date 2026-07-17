@@ -120,7 +120,7 @@ export function SelectableRunList({
             <>
               <span className="text-neutral-400">
                 {bulkResult.succeeded.length > 0 && (
-                  <span className="text-emerald-600">{bulkResult.succeeded.length} verified</span>
+                  <span className="text-neon-glow">{bulkResult.succeeded.length} verified</span>
                 )}
                 {bulkResult.succeeded.length > 0 && bulkResult.failed.length > 0 && (
                   <span className="text-neutral-600 mx-1">·</span>
@@ -220,7 +220,7 @@ export function SelectableRunList({
                         {truncateId(run.id, 12)}
                       </Link>
                       {wasSucceeded && (
-                        <span className="text-emerald-600 text-xs" aria-label="re-verified">✓</span>
+                        <span className="text-neon-glow text-xs" aria-label="re-verified">✓</span>
                       )}
                       {wasFailed && (
                         <span

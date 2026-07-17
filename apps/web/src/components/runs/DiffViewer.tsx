@@ -20,7 +20,7 @@ function typeColorClass(type: string | undefined): string {
   if (type.startsWith('llm.') || type.startsWith('LLM_')) return 'text-violet-400'
   if (type.startsWith('tool.') || type.startsWith('TOOL_')) return 'text-amber-400'
   if (type.startsWith('http.') || type.startsWith('HTTP_')) return 'text-sky-400'
-  if (type.startsWith('run.') || type.startsWith('RUN_')) return 'text-emerald-400'
+  if (type.startsWith('run.') || type.startsWith('RUN_')) return 'text-neon-glow'
   if (type.startsWith('memory.') || type.startsWith('MEMORY_')) return 'text-pink-400'
   if (type.startsWith('retrieval.') || type.startsWith('RETRIEVAL_')) return 'text-cyan-400'
   return 'text-neutral-400'
@@ -31,7 +31,7 @@ const kindConfig: Record<
   { prefix: string; border: string; bg: string; text: string }
 > = {
   same:    { prefix: ' ', border: 'border-l-neutral-700', bg: '',                  text: 'text-neutral-500' },
-  added:   { prefix: '+', border: 'border-l-emerald-600', bg: 'bg-emerald-950/20', text: 'text-emerald-400' },
+  added:   { prefix: '+', border: 'border-l-primary-700', bg: 'bg-primary-900/20', text: 'text-neon-glow' },
   removed: { prefix: '-', border: 'border-l-red-600',     bg: 'bg-red-950/20',     text: 'text-red-400'    },
   changed: { prefix: '~', border: 'border-l-amber-600',   bg: 'bg-amber-950/20',   text: 'text-amber-400'  },
 }
@@ -47,7 +47,7 @@ function FieldChangesTable({ changes }: FieldChangesTableProps) {
         <tr className="text-neutral-600">
           <th className="text-left px-2 py-1 w-1/3 font-medium">field</th>
           <th className="text-left px-2 py-1 w-1/3 font-medium text-red-600">left</th>
-          <th className="text-left px-2 py-1 w-1/3 font-medium text-emerald-600">right</th>
+          <th className="text-left px-2 py-1 w-1/3 font-medium text-neon-glow">right</th>
         </tr>
       </thead>
       <tbody>
@@ -57,7 +57,7 @@ function FieldChangesTable({ changes }: FieldChangesTableProps) {
             <td className="px-2 py-1 text-red-400/80 truncate max-w-0 w-1/3">
               {JSON.stringify(change.left)}
             </td>
-            <td className="px-2 py-1 text-emerald-400/80 truncate max-w-0 w-1/3">
+            <td className="px-2 py-1 text-neon-glow/80 truncate max-w-0 w-1/3">
               {JSON.stringify(change.right)}
             </td>
           </tr>
@@ -223,7 +223,7 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
 
         {/* Summary badges */}
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-950/40 border border-emerald-900/50 text-xs font-mono font-medium text-emerald-400">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-primary-900/40 border border-primary-800/50 text-xs font-mono font-medium text-neon-glow">
             +{summary.added} added
           </span>
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-red-950/40 border border-red-900/50 text-xs font-mono font-medium text-red-400">

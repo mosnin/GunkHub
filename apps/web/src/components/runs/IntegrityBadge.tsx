@@ -45,10 +45,10 @@ export function IntegrityBadge({ status }: IntegrityBadgeProps) {
   if (status.checksRan.includes('replay')) {
     return (
       <span
-        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-emerald-700 border border-emerald-900"
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-neon-glow border border-primary-800"
         title={`Full derivation verified ${when}: ${title}`}
       >
-        <span className="w-1.5 h-1.5 rounded-full bg-emerald-600" aria-hidden="true" />
+        <span className="w-1.5 h-1.5 rounded-full bg-neon-glow" aria-hidden="true" />
         verified
       </span>
     )

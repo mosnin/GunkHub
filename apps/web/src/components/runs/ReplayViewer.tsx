@@ -17,7 +17,7 @@ function actorBorderClass(frame: ReplayFrame): string {
   switch (frame.actor) {
     case 'llm':       return 'border-l-violet-600'
     case 'tool':      return 'border-l-amber-600'
-    case 'system':    return 'border-l-emerald-600'
+    case 'system':    return 'border-l-primary-700'
     case 'http':      return 'border-l-sky-600'
     case 'memory':    return 'border-l-pink-600'
     case 'retrieval': return 'border-l-cyan-600'
@@ -31,7 +31,7 @@ function actorDotClass(frame: ReplayFrame): string {
   switch (frame.actor) {
     case 'llm':       return 'bg-violet-600'
     case 'tool':      return 'bg-amber-600'
-    case 'system':    return 'bg-emerald-600'
+    case 'system':    return 'bg-neon-glow'
     case 'http':      return 'bg-sky-600'
     case 'memory':    return 'bg-pink-600'
     case 'retrieval': return 'bg-cyan-600'
@@ -91,7 +91,7 @@ function FrameRow({ frame, isActive, onClick }: FrameRowProps) {
         #{frame.event.sequenceNumber}
       </span>
       {frame.status === 'terminal' && (
-        <span className="shrink-0 text-xs font-mono text-emerald-600 mt-0.5">
+        <span className="shrink-0 text-xs font-mono text-neon-glow mt-0.5">
           end
         </span>
       )}
@@ -252,7 +252,7 @@ function FrameDetail({ frame }: FrameDetailProps) {
             </span>
           )}
           {frame.status === 'terminal' && (
-            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-900">
+            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-primary-900 text-neon-glow border border-primary-800">
               terminal
             </span>
           )}

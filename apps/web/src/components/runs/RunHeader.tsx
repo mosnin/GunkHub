@@ -151,7 +151,7 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
         )}
         {isLive && liveStatus === 'running' && (
           <span className="flex items-center gap-1 text-xs font-mono text-neutral-600">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
+            <span className="w-1.5 h-1.5 rounded-full bg-neon-glow animate-neon-pulse" aria-hidden="true" />
             live
           </span>
         )}
