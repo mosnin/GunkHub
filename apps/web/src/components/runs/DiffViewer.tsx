@@ -96,21 +96,34 @@ function EventDiffRow({ entry, isFirstDivergence, expanded, onToggleExpanded }: 
         </div>
       )}
       <div
-        className={[
-          'border-l-2 px-3 py-2',
-          cfg.border,
-          cfg.bg,
-          entry.kind === 'same' ? 'opacity-50' : '',
-        ].join(' ')}
+        className={['border-l-2 px-3 py-2', cfg.border, cfg.bg].join(' ')}
       >
         <div className="flex items-center gap-2">
-          <span className={['font-mono text-xs w-4 shrink-0 select-none', cfg.text].join(' ')}>
+          {/* De-emphasis for `same` rows is applied to the glyph/seq only — the
+              type label stays fully legible (contrast requirement). */}
+          <span
+            className={[
+              'font-mono text-xs w-4 shrink-0 select-none',
+              cfg.text,
+              entry.kind === 'same' ? 'opacity-60' : '',
+            ].join(' ')}
+          >
             {cfg.prefix}
           </span>
-          <span className="font-mono text-xs text-pewter w-8 shrink-0">
+          <span
+            className={[
+              'font-mono text-xs text-pewter w-8 shrink-0',
+              entry.kind === 'same' ? 'opacity-60' : '',
+            ].join(' ')}
+          >
             #{entry.sequenceNumber}
           </span>
-          <span className={['font-mono text-xs flex-1 truncate', typeColorClass(type)].join(' ')}>
+          <span
+            className={[
+              'font-mono text-xs flex-1 truncate',
+              entry.kind === 'same' ? 'text-neutral-400' : typeColorClass(type),
+            ].join(' ')}
+          >
             {type ?? '(no event)'}
           </span>
           {hasChanges && (
@@ -170,7 +183,7 @@ function RunSelector() {
             value={left}
             onChange={(e) => setLeft(e.target.value)}
             placeholder="Paste run ID..."
-            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-500 font-mono outline-none focus:border-neutral-600 transition-colors duration-75"
+            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-500 font-mono outline-none focus:ring-1 focus:ring-neon-glow focus:border-neon-muted transition-colors duration-75"
           />
         </div>
         <div className="flex flex-col gap-1.5">
@@ -183,7 +196,7 @@ function RunSelector() {
             value={right}
             onChange={(e) => setRight(e.target.value)}
             placeholder="Paste run ID..."
-            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-500 font-mono outline-none focus:border-neutral-600 transition-colors duration-75"
+            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-500 font-mono outline-none focus:ring-1 focus:ring-neon-glow focus:border-neon-muted transition-colors duration-75"
           />
         </div>
       </div>
@@ -264,7 +277,7 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-neutral-800 border border-neutral-600 text-xs font-mono font-semibold text-neutral-200">
             ~{summary.changed} changed
           </span>
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-neutral-800 border border-neutral-700 text-xs font-mono font-medium text-neutral-500">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-neutral-800 border border-neutral-700 text-xs font-mono font-medium text-neutral-400">
             ={summary.same} same
           </span>
           {summary.statusChanged && (
@@ -372,6 +385,10 @@ export function DiffViewer({ diff, incomparable, incomparableReason, loading }: 
 
   return (
     <DiffResult
+      // Key by run pair so window position and expanded rows reset when the
+      // compared pair changes (stale-state bug: React reuses component state
+      // across different diffs otherwise).
+      key={`${diff.leftRunId}:${diff.rightRunId}`}
       diff={diff}
       incomparable={incomparable}
       incomparableReason={incomparableReason}

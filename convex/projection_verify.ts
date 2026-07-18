@@ -164,6 +164,19 @@ export const _upsertVerificationResult = internalMutation({
     failureSummaryPassed: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
+    // Run-existence guard: verification can race ADR 001 purge/retention — the
+    // run may have been deleted between the verify action reading its events
+    // and this upsert. Inserting a row for a purged run would leave an orphaned
+    // verification_results record (and, for a purged ORG, would violate the
+    // erasure guarantee), so skip instead.
+    const run = await ctx.db.get(args.runId);
+    if (!run) {
+      console.warn(
+        `projection_verify: skipping verification upsert for missing (purged?) run ${String(args.runId)}`,
+      );
+      return;
+    }
+
     // Remove any existing result for this run
     const existing = await ctx.db
       .query("verification_results")

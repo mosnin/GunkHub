@@ -43,12 +43,14 @@ export interface EventSpool {
   /** Append entries to the spool (durable before resolve). */
   append(entries: StoredEvent[]): Promise<void>
   /**
-   * Return ALL spooled entries, in append order, and remove them from the
-   * spool. The caller (Recorder.recover) re-appends whatever it fails to
-   * deliver, so a crash mid-recovery loses at most what drain() handed out
-   * after it was already re-sent — duplicates, not losses.
+   * Return ALL spooled entries, in append order, WITHOUT removing them.
+   * `Recorder.recover()` peeks, attempts delivery, and only then rewrites the
+   * spool with the entries that were NOT acknowledged (peek → send → ack). A
+   * crash mid-recovery therefore re-sends already-delivered entries on the
+   * next recover — duplicates (deduped server-side by run + sequenceNumber),
+   * never losses.
    */
-  drain(): Promise<StoredEvent[]>
+  peek(): Promise<StoredEvent[]>
   /** Remove all entries from the spool. */
   clear(): Promise<void>
 }
@@ -66,10 +68,19 @@ export interface RecorderConfig {
   options?: RecorderOptions
 }
 
+/**
+ * Why events were dropped, as reported to `RecorderOptions.onDrop`:
+ * - `'buffer_overflow'` — the in-memory buffer exceeded `maxBufferSize`.
+ * - `'spool_overflow'` — the persistent spool exceeded `maxSpoolEntries`.
+ * - `'rejected_by_server'` — the server permanently rejected a run's batch
+ *   (`RUN_NOT_ACTIVE` / `SEQUENCE_CONFLICT`); retrying can never succeed.
+ */
+export type DropReason = 'buffer_overflow' | 'spool_overflow' | 'rejected_by_server'
+
 export interface RecorderOptions {
-  /** Flush events after this many ms of inactivity. Default: 1000 */
+  /** Flush events after this many ms of inactivity. Must be >= 1. Default: 1000 */
   flushIntervalMs?: number
-  /** Max events to buffer before force-flush. Default: 100 */
+  /** Max events to buffer before force-flush. Must be >= 1. Default: 100 */
   maxBatchSize?: number
   /**
    * Hard cap on the number of events retained in the in-memory buffer. When a
@@ -78,9 +89,17 @@ export interface RecorderOptions {
    * OLDEST non-terminal events, always preserving lifecycle-critical events
    * (run.started and the terminal run.completed/run.failed/run.cancelled). The
    * number of dropped events is surfaced via `FlushResult.droppedEvents`.
-   * Default: 10000.
+   * Must be >= 1. Default: 10000.
    */
   maxBufferSize?: number
+  /**
+   * Hard cap on the number of entries retained in the persistent spool (when
+   * `spool` is configured). On overflow the recorder drops the OLDEST
+   * non-lifecycle spooled events (from both the spool and the in-memory
+   * buffer, so the two stay consistent) and fires
+   * `onDrop(count, 'spool_overflow')`. Must be >= 1. Default: 50000.
+   */
+  maxSpoolEntries?: number
   /** Max retry attempts for failed sends. Default: 3 */
   maxRetries?: number
   /** Initial retry backoff in ms. Default: 500 */
@@ -107,12 +126,12 @@ export interface RecorderOptions {
    */
   onSpoolError?: (error: string) => void
   /**
-   * Called when events are dropped from the in-memory buffer. Currently the
-   * only reason is `'buffer_overflow'` (see `maxBufferSize`). `count` is the
-   * number of events dropped by this occurrence (not cumulative). Must not
-   * throw; exceptions are swallowed.
+   * Called when events are dropped. `count` is the number of events dropped
+   * by this occurrence (not cumulative); `reason` is one of {@link DropReason}
+   * (`'buffer_overflow'`, `'spool_overflow'`, or `'rejected_by_server'`).
+   * Must not throw; exceptions are swallowed.
    */
-  onDrop?: (count: number, reason: 'buffer_overflow') => void
+  onDrop?: (count: number, reason: DropReason) => void
   /**
    * Called when a background (fire-and-forget) flush fails — the timer-driven
    * flush and the maxBatchSize-triggered flush, whose `FlushResult`s have no
@@ -149,6 +168,17 @@ export interface RunContext {
 }
 
 export interface RecordEventOptions {
+  /**
+   * Override the auto-assigned sequence number.
+   *
+   * HAZARD: the server requires sequence numbers within a run to be
+   * contiguous, ascending, and non-repeating, starting at 1. The recorder's
+   * internal counter does NOT advance when you pass an override, so a value
+   * ahead of (or behind) the auto counter makes the whole batch permanently
+   * undeliverable (`SEQUENCE_CONFLICT`) and the affected run's events will be
+   * DROPPED. Only use this if you assign EVERY sequence number for the run
+   * yourself. Almost all callers should omit it.
+   */
   sequenceNumber?: number
   parentEventId?: string
   timestamp?: number
@@ -159,11 +189,20 @@ export interface FlushResult {
   eventsSubmitted: number
   errors: FlushError[]
   /**
-   * Cumulative count of events dropped from the buffer due to overflow
-   * (see `RecorderOptions.maxBufferSize`). Zero in the normal case. A non-zero
-   * value means telemetry was lost because the server could not keep up.
+   * Cumulative count of events dropped so far (buffer overflow, spool
+   * overflow, or permanent server rejection — see {@link DropReason}). Zero in
+   * the normal case. A non-zero value means telemetry was lost.
    */
   droppedEvents?: number
+  /**
+   * Set by `endRun()`/`failRun()` when the run-status transition was NOT
+   * issued because the terminal event is still undelivered (buffered/spooled).
+   * The server reconciles the run's status from the terminal event when it
+   * arrives, so patching the status first would prematurely close the run and
+   * make the pending events permanently rejectable (`RUN_NOT_ACTIVE`). The
+   * transition is deferred to event delivery instead.
+   */
+  statusTransitionDeferred?: boolean
 }
 
 export interface FlushError {
@@ -174,11 +213,23 @@ export interface FlushError {
 
 export type TransportResponse = {
   success: true
+  /**
+   * Server-assigned event IDs, in submission order, when the response body
+   * provides them (`{ eventIds: [...] }`). Empty for responses that don't
+   * (e.g. status updates).
+   */
   eventIds: string[]
 } | {
   success: false
   error: string
   retryable: boolean
+  /**
+   * Stable machine-readable error code parsed from the server's JSON error
+   * body (`{ code, message }`) when present — e.g. `RUN_NOT_ACTIVE`,
+   * `SEQUENCE_CONFLICT`, `RATE_LIMITED`. The recorder uses it to distinguish
+   * permanently-rejected batches from transient failures.
+   */
+  code?: string
 }
 
 // Ensure imported types are used (re-exported via index)

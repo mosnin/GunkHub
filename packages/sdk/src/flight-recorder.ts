@@ -34,7 +34,8 @@ export interface FlightRecorderConfig {
   /**
    * Maximum number of concurrent in-flight HTTP requests across all
    * RunRecorders created by this FlightRecorder. Bounds `Promise.all` fan-outs
-   * of `recordEvent` so they cannot open unbounded connections. Default: 8.
+   * of `recordEvent` so they cannot open unbounded connections. Must be >= 1.
+   * Default: 8.
    */
   maxConcurrentRequests?: number
   /**
@@ -113,8 +114,19 @@ export class FlightRecorder {
    * Create a new FlightRecorder.
    *
    * @param config - Recorder configuration including API key, base URL, and agent ID.
+   * @throws TypeError if `maxConcurrentRequests` is present but < 1.
    */
   constructor(config: FlightRecorderConfig) {
+    if (
+      config.maxConcurrentRequests !== undefined &&
+      (typeof config.maxConcurrentRequests !== 'number' ||
+        Number.isNaN(config.maxConcurrentRequests) ||
+        config.maxConcurrentRequests < 1)
+    ) {
+      throw new TypeError(
+        `FlightRecorderConfig.maxConcurrentRequests must be >= 1 (got ${String(config.maxConcurrentRequests)})`
+      )
+    }
     this.baseUrl = config.baseUrl.replace(/\/$/, '')
     this.apiKey = config.apiKey
     this.agentId = config.agentId

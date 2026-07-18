@@ -138,26 +138,34 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
   function handleLoadMore() {
     if (!cursor) return
     setLoadError(null)
-    const prevTotal = (events?.length ?? 0) + extraEvents.length
     startTransition(async () => {
       try {
         const params = new URLSearchParams({ cursor, limit: '200' })
         const res = await fetch(`/api/runs/${runId}/events?${params.toString()}`)
         if (!res.ok) throw new Error(`Failed to load events (${res.status})`)
         const data = (await res.json()) as ListEventsResponse
-        const newTotal = prevTotal + data.events.length
-        setExtraEvents((prev) => [...prev, ...data.events])
+        setPollFailed(false)
+        // Dedup against the live id set so a re-fetched page cannot append
+        // duplicates (same defence Timeline has).
+        const known = knownIdsRef.current
+        const fresh = data.events.filter((e) => !known.has(e.id))
+        const prevTotal = (events?.length ?? 0) + extraEvents.length
+        const newTotal = prevTotal + fresh.length
+        if (fresh.length > 0) setExtraEvents((prev) => [...prev, ...fresh])
         setCursor(data.nextCursor)
         // Auto-advance only when following tail; otherwise accumulate unseen count
-        if (data.events.length > 0) {
+        if (fresh.length > 0) {
           if (followTailRef.current) {
             setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
           } else {
-            setUnseenCount((prev) => prev + data.events.length)
+            setUnseenCount((prev) => prev + fresh.length)
           }
         }
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load more events')
+        // When live-polling via the cursor path, a failure must also surface as
+        // the stale/reconnecting indicator, not just an inline load error.
+        if (isLive) setPollFailed(true)
       }
     })
   }
@@ -296,7 +304,7 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
     }
   }
 
-  function handleListKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+  function handleListKeyDown(e: React.KeyboardEvent<HTMLElement>) {
     if (allEvents.length === 0) return
     if (e.key === 'ArrowDown') {
       e.preventDefault()
@@ -315,6 +323,16 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       setSelectedId(allEvents[prev]?.id ?? null)
       if (prev < windowStart) {
         setWindowStart(Math.max(0, prev))
+      }
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      // Options are not individually focusable (listbox pattern) — activation
+      // of the focused option happens here on the container.
+      e.preventDefault()
+      const focused = allEvents[focusedIdx]
+      if (focused) {
+        setFollowTail(false)
+        setSelectedId(focused.id)
+        ensureSelectedVisible(focusedIdx)
       }
     }
   }
@@ -356,7 +374,7 @@ interface EventInspectorInnerProps {
   windowStart: number
   setWindowStart: (start: number) => void
   ensureSelectedVisible: (absIdx: number) => void
-  handleListKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void
+  handleListKeyDown: (e: React.KeyboardEvent<HTMLElement>) => void
   cursor: string | undefined
   loadError: string | null
   isPending: boolean
@@ -393,6 +411,9 @@ function EventInspectorInner({
   onResume,
   pollFailed = false,
 }: EventInspectorInnerProps) {
+  // Copied feedback for the "Copy link" action
+  const [linkCopied, setLinkCopied] = useState(false)
+
   // Sync ?event=<sequenceNumber> into the URL without navigation
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -472,54 +493,56 @@ function EventInspectorInner({
           </button>
         )}
 
-        <div
+        {/* Listbox pattern: the container holds focus (tabIndex 0) and exposes
+            the roving focus via aria-activedescendant; options are not
+            individually focusable. */}
+        <ul
+          role="listbox"
+          aria-label="Events"
           tabIndex={0}
-          className="outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-neon-glow"
+          aria-activedescendant={
+            focusedIdx >= windowStart &&
+            focusedIdx < windowStart + WINDOW_SIZE &&
+            allEvents[focusedIdx]
+              ? `evtopt-${allEvents[focusedIdx].id}`
+              : undefined
+          }
+          className="divide-y divide-neutral-800/60 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-neon-glow"
           onFocus={() => { if (focusedIdx === -1) setFocusedIdx(0) }}
           onKeyDown={handleListKeyDown}
         >
-          <ul className="divide-y divide-neutral-800/60">
-            {windowedEvents.map((evt, relIdx) => {
-              const absIdx = windowStart + relIdx
-              return (
-                <li
-                  key={evt.id}
-                  role="button"
-                  tabIndex={0}
-                  aria-pressed={selectedEvent?.id === evt.id}
-                  onClick={() => {
-                    setFollowTail(false)
-                    setSelectedId(evt.id)
-                    setFocusedIdx(absIdx)
-                    ensureSelectedVisible(absIdx)
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault()
-                      setFollowTail(false)
-                      setSelectedId(evt.id)
-                      setFocusedIdx(absIdx)
-                      ensureSelectedVisible(absIdx)
-                    }
-                  }}
-                  className={[
-                    'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75 outline-none focus:ring-1 focus:ring-inset focus:ring-neon-glow',
-                    selectedEvent?.id === evt.id
-                      ? 'bg-neutral-900 text-neutral-200'
-                      : 'hover:bg-neutral-900/60 text-neutral-400',
-                    focusedIdx === absIdx ? 'ring-1 ring-inset ring-neon-glow' : '',
-                  ].join(' ')}
-                >
-                  <span className="text-xs font-mono">{evt.type}</span>
-                  {(evt.payload as { type: string }).type === '_externalized' && (
-                    <span className="text-pewter text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
-                  )}
-                  <span className="text-xs font-mono text-pewter">#{evt.sequenceNumber}</span>
-                </li>
-              )
-            })}
-          </ul>
-        </div>
+          {windowedEvents.map((evt, relIdx) => {
+            const absIdx = windowStart + relIdx
+            return (
+              <li
+                key={evt.id}
+                id={`evtopt-${evt.id}`}
+                role="option"
+                tabIndex={-1}
+                aria-selected={selectedEvent?.id === evt.id}
+                onClick={() => {
+                  setFollowTail(false)
+                  setSelectedId(evt.id)
+                  setFocusedIdx(absIdx)
+                  ensureSelectedVisible(absIdx)
+                }}
+                className={[
+                  'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75',
+                  selectedEvent?.id === evt.id
+                    ? 'bg-neutral-900 text-neutral-200'
+                    : 'hover:bg-neutral-900/60 text-neutral-400',
+                  focusedIdx === absIdx ? 'ring-1 ring-inset ring-neon-glow' : '',
+                ].join(' ')}
+              >
+                <span className="text-xs font-mono">{evt.type}</span>
+                {(evt.payload as { type: string }).type === '_externalized' && (
+                  <span className="text-pewter text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
+                )}
+                <span className="text-xs font-mono text-pewter">#{evt.sequenceNumber}</span>
+              </li>
+            )
+          })}
+        </ul>
 
         {/* Window navigation — below */}
         {belowCount > 0 && (
@@ -557,12 +580,19 @@ function EventInspectorInner({
           {selectedEvent && (
             <button
               onClick={() => {
-                void navigator.clipboard.writeText(window.location.href)
+                void navigator.clipboard.writeText(window.location.href).then(() => {
+                  setLinkCopied(true)
+                  setTimeout(() => setLinkCopied(false), 1500)
+                })
               }}
               title="Copy link to this event"
-              className="text-xs font-mono text-pewter hover:text-neutral-300 transition-colors duration-75 px-2 py-0.5 rounded hover:bg-neutral-800"
+              aria-label="Copy link to this event"
+              className={[
+                'text-xs font-mono transition-colors duration-75 px-2 py-0.5 rounded hover:bg-neutral-800',
+                linkCopied ? 'text-neon-glow' : 'text-pewter hover:text-neutral-300',
+              ].join(' ')}
             >
-              Copy link
+              {linkCopied ? 'Copied ✓' : 'Copy link'}
             </button>
           )}
         </div>

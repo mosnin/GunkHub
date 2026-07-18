@@ -10,13 +10,25 @@
 // sdk_ingest.ts to afrError codes in a follow-up pass (kept out of this change
 // to avoid churning every existing test's message assertions at once).
 
-/** Closed set of machine-readable error codes. */
+/**
+ * Closed set of machine-readable error codes.
+ *
+ * The API-facing subset (RUN_NOT_ACTIVE, SEQUENCE_CONFLICT, EVENT_LIMIT_EXCEEDED,
+ * ARTIFACT_LIMIT_EXCEEDED, RATE_LIMITED, COMMENT_LIMIT_EXCEEDED) is mirrored in
+ * packages/contracts/src/api_errors.ts (AFR_API_ERROR_CODES) — the web layer maps
+ * them to 4xx statuses and the SDK treats them as non-retryable. These code
+ * strings are a cross-boundary contract: NEVER rename an existing code.
+ */
 export type AfrErrorCode =
   | "FORBIDDEN"
   | "UNAUTHORIZED"
   | "NOT_FOUND"
+  | "RUN_NOT_ACTIVE"
+  | "SEQUENCE_CONFLICT"
   | "EVENT_LIMIT_EXCEEDED"
   | "ARTIFACT_LIMIT_EXCEEDED"
+  | "RATE_LIMITED"
+  | "COMMENT_LIMIT_EXCEEDED"
   | "INVALID_ARGUMENT"
   | "PURGE_FAILED";
 

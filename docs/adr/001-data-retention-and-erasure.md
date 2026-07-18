@@ -25,9 +25,12 @@ destroys the product's core trust guarantee.
 
 1. **Org purge (`retention:purgeOrganization`)** — an `internalAction` that cascades
    deletion of ALL data belonging to a single organization, in dependency order:
-   comments → verification_results → per-run artifacts (with best-effort blob
-   deletion, failures logged) and events → runs → agent_versions → agents →
-   projects → api_keys → memberships → audit_log → the organization record itself.
+   api_keys → memberships → comments → verification_results → per-run artifacts
+   (with best-effort blob deletion, failures logged) and events → runs →
+   agent_versions → agents → projects → audit_log → the organization record itself.
+   API keys and memberships go FIRST so live SDK ingestion and user sessions lose
+   their credentials before any data is touched — otherwise an active agent could
+   race the sweeper and re-insert runs/events into a partially-purged org.
    It is batched (≤ ~100 docs per internal mutation call) and re-schedules itself
    via `ctx.scheduler` until drained, respecting Convex transaction limits.
    It is NOT publicly callable — it is invoked only from the Convex dashboard/CLI

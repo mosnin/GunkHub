@@ -1,3 +1,4 @@
+import Link from 'next/link'
 import { notFound } from 'next/navigation'
 
 import type { Metadata } from 'next'
@@ -48,13 +49,13 @@ export default async function EventDetailPage({ params }: EventDetailPageProps) 
     <div className="p-6 max-w-4xl">
       {/* Breadcrumb */}
       <nav className="mb-4 flex items-center gap-2 text-xs text-neutral-500">
-        <a href={`/runs/${runId}`} className="hover:text-neutral-300 transition-colors">
+        <Link href={`/runs/${runId}`} className="hover:text-neutral-300 transition-colors">
           Run
-        </a>
+        </Link>
         <span>/</span>
-        <a href={`/runs/${runId}?tab=events`} className="hover:text-neutral-300 transition-colors">
+        <Link href={`/runs/${runId}?tab=events`} className="hover:text-neutral-300 transition-colors">
           Events
-        </a>
+        </Link>
         <span>/</span>
         <span className="font-mono text-neutral-400">{eventId.slice(-8)}</span>
       </nav>
@@ -75,12 +76,12 @@ export default async function EventDetailPage({ params }: EventDetailPageProps) 
         {event.parentEventId && (
           <div className="text-xs text-neutral-500">
             Parent:{' '}
-            <a
+            <Link
               href={`/runs/${runId}/events/${event.parentEventId}`}
               className="font-mono text-primary-400 hover:text-primary-300 transition-colors"
             >
               {event.parentEventId.slice(-8)}
-            </a>
+            </Link>
           </div>
         )}
       </div>

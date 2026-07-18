@@ -1,6 +1,12 @@
+import Link from 'next/link'
+
 interface EmptyStateAction {
   label: string
-  onClick: (() => void) | undefined
+  /** Client-side action. Ignored when `href` is provided. */
+  onClick?: (() => void) | undefined
+  /** Internal route — renders a next/link styled like the action button, so
+      server components can wire an action without a client handler. */
+  href?: string
 }
 
 interface EmptyStateProps {
@@ -8,6 +14,10 @@ interface EmptyStateProps {
   description?: string
   action?: EmptyStateAction
 }
+
+// Whiteout pill CTA (design.md: primary actions are Whiteout pills).
+const ACTION_CLASSES =
+  'mt-5 inline-flex items-center px-[18px] py-2 text-sm font-medium rounded-full bg-whiteout hover:bg-cloud text-graphite-deep transition-colors duration-150'
 
 export function EmptyState({ title, description, action }: EmptyStateProps) {
   return (
@@ -30,14 +40,15 @@ export function EmptyState({ title, description, action }: EmptyStateProps) {
       {description && (
         <p className="mt-1.5 text-sm text-neutral-500 max-w-sm leading-relaxed">{description}</p>
       )}
-      {action && action.onClick && (
-        <button
-          onClick={action.onClick}
-          className="mt-5 inline-flex items-center px-[18px] py-2 text-sm font-medium rounded-full bg-whiteout hover:bg-cloud text-graphite-deep transition-colors duration-150"
-        >
+      {action && action.href ? (
+        <Link href={action.href} className={ACTION_CLASSES}>
+          {action.label}
+        </Link>
+      ) : action && action.onClick ? (
+        <button onClick={action.onClick} className={ACTION_CLASSES}>
           {action.label}
         </button>
-      )}
+      ) : null}
     </div>
   )
 }

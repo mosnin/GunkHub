@@ -78,16 +78,19 @@ Creates a new recorder instance.
 | `options.flushIntervalMs` | `number` | No | Flush buffered events every N ms. Default: `1000` |
 | `options.maxBatchSize` | `number` | No | Force-flush when buffer reaches this size. Default: `100` |
 | `options.maxBufferSize` | `number` | No | Hard cap on buffered events; oldest non-lifecycle events are dropped on overflow. Default: `10000` |
+| `options.maxSpoolEntries` | `number` | No | Hard cap on spooled entries; oldest non-lifecycle spooled events are dropped on overflow (from the buffer too). Default: `50000` |
 | `options.maxRetries` | `number` | No | Max retry attempts for failed sends. Default: `3` |
 | `options.retryBackoffMs` | `number` | No | Initial retry backoff in ms. Default: `500` |
 | `options.debug` | `boolean` | No | Log SDK diagnostics (flush results, drops, spool errors) to console. Default: `false` |
 | `options.spool` | `EventSpool` | No | Persistent write-ahead spool for at-least-once delivery (see Durability). Default: none |
-| `options.onDrop` | `(count, reason) => void` | No | Called when events are dropped on buffer overflow |
+| `options.onDrop` | `(count, reason) => void` | No | Called when events are dropped. `reason` is `'buffer_overflow'`, `'spool_overflow'`, or `'rejected_by_server'` |
 | `options.onFlushError` | `(error) => void` | No | Called when a background (timer / maxBatchSize) flush fails |
 | `options.onSpoolError` | `(error) => void` | No | Called when spool I/O fails (spool writes are best-effort) |
 | `options.allowInsecureEndpoint` | `boolean` | No | Suppress the plain-HTTP endpoint warning. Default: `false` |
 
 The optional second argument `transport` accepts any object implementing the `Transport` interface. When omitted, `HttpTransport` is used.
+
+Numeric options (`flushIntervalMs`, `maxBatchSize`, `maxBufferSize`, `maxSpoolEntries`) must be `>= 1`; the constructor throws a `TypeError` otherwise. The same applies to `HttpTransportOptions.timeoutMs` and `FlightRecorderConfig.maxConcurrentRequests`.
 
 ---
 
@@ -119,13 +122,14 @@ recorder.recordEvent('llm.request', Events.llmRequest('gpt-4o', messages).payloa
 
 // With options
 recorder.recordEvent('custom', { data: 'value' }, {
-  sequenceNumber: 5,    // override auto-incrementing sequence number
   parentEventId: 'evt_parent',  // link to a parent event
   timestamp: Date.now(),        // override event timestamp
 })
 ```
 
-Throws if no run is active.
+Throws if no run is active, or if a terminal event (`run.completed` / `run.failed` / `run.cancelled`) has already been recorded for the current run — the server rejects events after the terminal one, so accepting more would poison the pending batch.
+
+> **`sequenceNumber` override hazard.** `RecordEventOptions.sequenceNumber` overrides the auto-assigned sequence number, but the recorder's internal counter does NOT advance for overrides, and the server requires sequence numbers to be contiguous, ascending, and non-repeating within a run. A stray override makes the run's whole batch permanently undeliverable (`SEQUENCE_CONFLICT`), and its events will be dropped. Only use it if you assign every sequence number for the run yourself; almost all callers should omit it.
 
 ---
 
@@ -135,9 +139,12 @@ Completes the run successfully, flushes all buffered events, and returns a `Flus
 
 ```typescript
 const result: FlushResult = await recorder.endRun({ answer: 'Done!' })
-// result.success          — boolean
-// result.eventsSubmitted  — number of events sent
-// result.errors           — array of FlushError (empty on success)
+// result.success                  — boolean
+// result.eventsSubmitted          — number of events sent
+// result.errors                   — array of FlushError (empty on success)
+// result.statusTransitionDeferred — true when the run-status transition was
+//   skipped because the terminal event is still undelivered; the server
+//   reconciles the run's status from the terminal event when it arrives
 ```
 
 Throws if no run is active.
@@ -172,7 +179,7 @@ Safe to call at any time; no-ops if the buffer is empty.
 
 ### `recorder.recover()`
 
-Drains the configured spool and re-sends everything a previous process left undelivered (events and pending run-status transitions). Call on startup, before starting new runs. No-op (returns `success: true`) when no spool is configured. Entries that still cannot be delivered are re-appended to the spool for the next attempt.
+Re-sends everything a previous process left undelivered in the configured spool (events and pending run-status transitions), batched per run so one undeliverable run cannot block the others. Uses peek → send → ack semantics: entries are read without being removed, and the spool is only rewritten (keeping undelivered entries) after delivery is attempted — a crash mid-recovery re-sends duplicates, never loses data. Runs the server rejects permanently (`RUN_NOT_ACTIVE` / `SEQUENCE_CONFLICT`) are dropped and reported via `onDrop(count, 'rejected_by_server')`. Call on startup, before starting new runs. No-op (returns `success: true`) when no spool is configured.
 
 ```typescript
 const recovered: FlushResult = await recorder.recover()
@@ -190,7 +197,9 @@ Events live only in the in-memory buffer until a flush succeeds. The loss window
 - up to `maxBatchSize` (default 100) events awaiting the next forced flush, plus
 - anything retained after failed flushes, capped at `maxBufferSize` (default 10 000) events.
 
-All of it is lost if the process exits (crash, OOM, SIGKILL) before delivery. `endRun()`/`failRun()` retry the final flush 3 times; if the terminal event still cannot be delivered, the returned `FlushResult` contains an explicit "terminal event UNDELIVERED" error, background retries continue best-effort, and the recorder is released so a new run can start.
+All of it is lost if the process exits (crash, OOM, SIGKILL) before delivery. `endRun()`/`failRun()` retry the final flush 3 times; if the terminal event still cannot be delivered, the returned `FlushResult` contains an explicit "terminal event UNDELIVERED" error plus `statusTransitionDeferred: true`, background retries continue best-effort, and the recorder is released so a new run can start.
+
+Flushes are batched **per run**: buffered events are grouped by `runId` and each run's batch is sent separately, so a stranded run (e.g. one whose payload cannot be externalized) never blocks delivery for other runs. Per-run failures are reported individually in `FlushResult.errors`. While a run's terminal event is undelivered, the SDK does **not** patch the run's status — the server reconciles status from the terminal event when it arrives; patching first would close the run server-side and make the pending events permanently rejectable (`RUN_NOT_ACTIVE`). Batches the server rejects permanently (`RUN_NOT_ACTIVE` / `SEQUENCE_CONFLICT` in the error body's `code`) are dropped observably instead of being retried forever.
 
 ### With a spool: at-least-once
 
@@ -207,15 +216,16 @@ await recorder.recover() // re-send anything a previous process left behind
 ```
 
 - `recordEvent` appends to the spool (best-effort, non-blocking; failures go to `onSpoolError`) before delivery is attempted.
-- A successful flush removes the acknowledged events from the spool.
-- If a terminal flush fails, the terminal event and the run-status transition intent are persisted before `endRun`/`failRun` returns.
-- `recover()` (next startup) drains the spool and re-sends.
+- A successful flush removes the acknowledged events from the spool. Permanently rejected events are removed too (and reported via `onDrop`).
+- If a terminal flush fails, the terminal event is persisted before `endRun`/`failRun` returns; the run-status transition is deferred to its delivery (`statusTransitionDeferred: true`).
+- `recover()` (next startup) re-sends with **peek → send → ack** semantics: spooled entries are read *without* being removed, delivery is attempted per run, and only then is the spool rewritten with what could not be delivered. A crash at any point during recovery re-sends duplicates on the next attempt — it never loses entries.
+- The spool is capped at `maxSpoolEntries` (default 50 000); overflow drops the oldest non-lifecycle entries and fires `onDrop(count, 'spool_overflow')`.
 
-Delivery becomes at-least-once: a crash between server acknowledgement and spool cleanup causes re-sends, which the server deduplicates by run + `sequenceNumber`. `FileSpool` is Node-only (JSONL file, created lazily; the SDK's main entry stays browser/edge-safe because `node:fs` is loaded via a guarded dynamic import only when FileSpool is used). It is deliberately `flock`-free: one recorder in one process per spool path — use distinct paths per worker.
+Delivery becomes at-least-once: re-sends are deduplicated server-side by run + `sequenceNumber`. `FileSpool` is Node-only (JSONL file, created lazily; the SDK's main entry stays browser/edge-safe because `node:fs` is loaded via a guarded dynamic import only when FileSpool is used). It is deliberately `flock`-free: one recorder in one process per spool path — use distinct paths per worker. By default appends land in the OS page cache (durable across a process crash, not across power loss); pass `new FileSpool(path, { fsync: true })` to fsync every append to stable storage.
 
 ### Observability of loss
 
-- `onDrop(count, 'buffer_overflow')` fires when `maxBufferSize` forces drops (lifecycle events are never dropped).
+- `onDrop(count, reason)` fires whenever events are dropped, with `reason` one of `'buffer_overflow'` (`maxBufferSize`), `'spool_overflow'` (`maxSpoolEntries`), or `'rejected_by_server'` (permanent `RUN_NOT_ACTIVE` / `SEQUENCE_CONFLICT` rejection). Lifecycle events are never dropped by the overflow policies.
 - `onFlushError(error)` fires when a fire-and-forget background flush (timer or maxBatchSize trigger) fails; foreground `flush()`/`endRun()`/`failRun()` report errors via their returned `FlushResult` instead.
 - `FlushResult.droppedEvents` carries the cumulative drop count.
 
@@ -226,6 +236,7 @@ Delivery becomes at-least-once: a crash between server acknowledgement and spool
 - **Transport security is TLS via the platform's `fetch`.** The SDK uses the runtime's default certificate validation (Node's bundled CA store, or the platform trust store). There is no certificate pinning and no custom TLS configuration; if you need either, inject a custom `Transport`.
 - **Plain-HTTP warning.** Configuring a non-`https` endpoint that is not localhost logs a one-time `console.warn` (the API key and payloads would transit in cleartext). Suppress with `allowInsecureEndpoint: true` if you terminate TLS elsewhere (e.g. a sidecar).
 - **Authentication** is the `x-api-key` header on every request. Every request also carries the wire protocol version as `x-afr-protocol` (currently `1`) so future backends can gate protocol changes.
+- **Rate limiting.** The backend enforces a per-API-key ingest rate limit over a fixed one-minute window; run creation and artifact uploads each charge 1 unit against the same window as events. Exceeding it returns the `RATE_LIMITED` error code — the SDK retains the affected events and retries them on a later flush.
 
 ---
 
@@ -303,6 +314,8 @@ interface Transport {
 
 `updateRunStatus` returns a `TransportResponse` so a failed terminal status transition is surfaced (via `FlushResult.errors`) instead of leaving the run stuck "running".
 
+`TransportResponse` carries the server-assigned `eventIds` on success, and on failure an optional stable `code` parsed from the server's JSON error body (e.g. `RUN_NOT_ACTIVE`, `SEQUENCE_CONFLICT`) that the recorder uses to recognize permanently rejected batches.
+
 `HttpTransport` is the default implementation and targets the Agent Flight Recorder HTTP API. Its retry and batching strategies are injectable:
 
 ```typescript
@@ -328,6 +341,8 @@ You can inject a custom transport (e.g., for testing) via the second argument to
 ---
 
 ## Version
+
+v0.3.1 — Stranded-run fix: the run-status transition is deferred (never patched) while the terminal event is undelivered, so retried events can no longer be poisoned into `RUN_NOT_ACTIVE`; flush and `recover()` batch events per run so one stranded run cannot block others; permanent server rejections (`RUN_NOT_ACTIVE`/`SEQUENCE_CONFLICT`) drop the affected run's events observably (`onDrop(count, 'rejected_by_server')`). Spool hardening: `recover()` uses peek → send → ack (crash mid-recovery duplicates, never loses; `EventSpool.drain` replaced by `peek` in the interface), `maxSpoolEntries` cap with `'spool_overflow'` drops, buffer-overflow drops now also remove the events from the spool, opt-in `FileSpool` `fsync`. Guards: constructor `TypeError`s for invalid numeric options, `recordEvent` throws after a terminal event, a throwing custom Transport lands in `FlushResult.errors`. `TransportResponse` now surfaces real server `eventIds` and error `code`s.
 
 v0.3.0 — Durability: pluggable `EventSpool` write-ahead spool (`FileSpool` Node implementation), `recorder.recover()`, terminal-delivery guarantee (recorder is never wedged by a failed finalize; undelivered terminal events are surfaced and spooled). Observability: `onDrop` / `onFlushError` / `onSpoolError` callbacks, `debug` logging wired. Wire protocol: `x-afr-protocol` header on every request; `SDK_VERSION` single-sourced. Transport polish: plain-HTTP endpoint warning, `maxConcurrentRequests` bound on the un-buffered path.
 

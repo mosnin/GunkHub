@@ -40,6 +40,7 @@ export function SelectableRunList({
       <EmptyState
         title="No runs recorded yet."
         description="Runs will appear here once your agents start recording. Instrument your first agent with the SDK."
+        action={{ label: 'Set up recording in Settings', href: '/settings' }}
       />
     )
   }
@@ -84,7 +85,11 @@ export function SelectableRunList({
     <div>
       {/* Bulk action bar — shown when runs are selected or a result is available */}
       {(someSelected || bulkResult !== null) && (
-        <div className="mb-2 flex items-center gap-3 px-3 py-2 rounded-md border border-neutral-800 bg-neutral-900 text-xs font-mono">
+        <div
+          role="status"
+          aria-live="polite"
+          className="mb-2 flex items-center gap-3 px-3 py-2 rounded-md border border-neutral-800 bg-neutral-900 text-xs font-mono"
+        >
           {isPending ? (
             <span className="text-neutral-500">Re-verifying…</span>
           ) : someSelected ? (
@@ -107,11 +112,24 @@ export function SelectableRunList({
               >
                 clear
               </button>
+              {selectedIds.size === 2 && (
+                /* Diff entry bridge — exactly 2 selected runs can be compared.
+                   Selection (insertion) order maps to left/right. */
+                <Link
+                  href={`/diff?left=${encodeURIComponent([...selectedIds][0] ?? '')}&right=${encodeURIComponent([...selectedIds][1] ?? '')}`}
+                  className="ml-auto px-2 py-0.5 rounded border text-xs font-mono transition-colors duration-100 border-neutral-700 text-neutral-300 hover:text-neutral-100 hover:border-neutral-600"
+                >
+                  Compare runs
+                </Link>
+              )}
               <button
                 type="button"
                 onClick={handleBulkReverify}
                 disabled={selectedEligible.length === 0}
-                className="ml-auto px-2 py-0.5 rounded border text-xs font-mono transition-colors duration-100 border-primary-800 text-primary-400 hover:text-primary-300 hover:border-primary-700 disabled:text-pewter disabled:border-neutral-800"
+                className={[
+                  selectedIds.size === 2 ? '' : 'ml-auto',
+                  'px-2 py-0.5 rounded border text-xs font-mono transition-colors duration-100 border-primary-800 text-primary-400 hover:text-primary-300 hover:border-primary-700 disabled:text-pewter disabled:border-neutral-800',
+                ].join(' ')}
               >
                 Re-verify {selectedEligible.length}
               </button>

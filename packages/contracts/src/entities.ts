@@ -12,6 +12,12 @@ export interface Organization {
    * forever.
    */
   retentionDays?: number;
+  /**
+   * Set when the identity provider reports the organization as deleted. The
+   * actual erasure (ADR 001 purge) stays operator-invoked; this timestamp makes
+   * the pending obligation visible.
+   */
+  pendingDeletionAt?: number;
 }
 
 export interface Project {
@@ -84,6 +90,13 @@ export interface Artifact {
   storageBucket: string;
   checksum: string;
   createdAt: number;
+  /**
+   * GC bookkeeping (sticky reference): the id of an event whose `_externalized`
+   * payload points at this artifact. Once set, the artifact is permanently
+   * excluded from orphan-candidate scans (events are immutable, so a reference
+   * can never be un-made). Internal bookkeeping — not meaningful to display.
+   */
+  referencedByEventId?: string;
 }
 
 export interface Comment {

@@ -107,6 +107,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
         const res = await fetch(`/api/runs/${runId}/events?${params.toString()}`)
         if (!res.ok) throw new Error(`Failed to load events (${res.status})`)
         const data = (await res.json()) as ListEventsResponse
+        setPollFailed(false)
         // Dedup against already-loaded events so a re-fetched page cannot append
         // duplicates (defence-in-depth alongside the cursor-reset fix below).
         const known = new Set([
@@ -128,9 +129,12 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
         }
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load more events')
+        // When live-polling via the cursor path, a failure must also surface as
+        // the stale/reconnecting indicator, not just an inline load error.
+        if (isLive) setPollFailed(true)
       }
     })
-  }, [cursor, runId, events])
+  }, [cursor, runId, events, isLive])
 
   // Live polling effect — re-runs when cursor changes to pick up the right strategy
   useEffect(() => {
@@ -284,6 +288,16 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
         <div
           ref={listRef}
           tabIndex={0}
+          /* role=group supports aria-activedescendant, exposing the roving
+             focus position to AT while keeping the inner expand buttons real
+             buttons (a listbox would flatten them). */
+          role="group"
+          aria-label="Event timeline"
+          aria-activedescendant={
+            focusedIndex >= windowStart && focusedIndex < windowEnd && allEvents[focusedIndex]
+              ? `tlrow-${allEvents[focusedIndex].id}`
+              : undefined
+          }
           onKeyDown={handleKeyDown}
           onFocus={() => { if (focusedIndex === -1) setFocusedIndex(0) }}
           className="flex flex-col gap-1.5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-neon-glow"
@@ -311,6 +325,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
             return (
               <div
                 key={event.id}
+                id={`tlrow-${event.id}`}
                 className={[
                   'flex items-start gap-3 rounded',
                   focusedIndex === absIdx ? 'ring-1 ring-neon-glow' : '',

@@ -18,17 +18,17 @@ const statusConfig: Record<RunStatus, { label: string; className: string; dot: s
   running: {
     label: 'running',
     className: 'bg-primary-900 text-primary-300 border-primary-800',
-    dot: 'bg-neon-glow shadow-[0_0_6px_rgba(52,213,154,0.8)] animate-neon-pulse',
+    dot: 'bg-neon-glow shadow-[var(--shadow-glow)] animate-neon-pulse',
   },
   completed: {
     label: 'completed',
     className: 'bg-success-900 text-success-400 border-success-700',
-    dot: 'bg-neon-glow shadow-[0_0_6px_rgba(52,213,154,0.6)]',
+    dot: 'bg-neon-glow shadow-[var(--shadow-glow)]',
   },
   failed: {
     label: 'failed',
     className: 'bg-destructive-900 text-destructive-400 border-destructive-700',
-    dot: 'bg-destructive-500 shadow-[0_0_6px_rgba(255,54,33,0.6)]',
+    dot: 'bg-destructive-500 shadow-[var(--shadow-glow-warn)]',
   },
   cancelled: {
     label: 'cancelled',

@@ -1,5 +1,5 @@
+import Link from 'next/link'
 import { notFound } from 'next/navigation'
-import { Suspense } from 'react'
 
 import type { Artifact, Comment, FailureSummary } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
@@ -14,7 +14,6 @@ import { Timeline } from '@/components/runs/Timeline'
 import { VerificationPanel } from '@/components/runs/VerificationPanel'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { InlineError } from '@/components/ui/InlineError'
-import { LoadingState } from '@/components/ui/LoadingState'
 import { getAgent } from '@/lib/services/agents'
 import { listArtifacts } from '@/lib/services/artifacts'
 import { listComments } from '@/lib/services/comments'
@@ -158,7 +157,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
       <RunHeader
         runId={runId}
         status={run.status}
-        agentName={run.agentId}
+        agentName={breadcrumbAgentName ?? run.agentId}
         agentVersionLabel={agentVersionLabel}
         startedAt={run.startedAt}
         endedAt={run.endedAt}
@@ -187,9 +186,11 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         />
       )}
 
-      {/* Tab bar */}
+      {/* Section navigation — these are links that change the URL, not a
+          client-side tab switcher, so they carry nav/aria-current semantics
+          rather than tablist/tab roles. */}
       <div className="border-b border-neutral-800 px-6 mt-3">
-        <nav className="-mb-px flex gap-6" role="tablist">
+        <nav aria-label="Run sections" className="-mb-px flex gap-6">
           {TABS.map((tab) => {
             const isActive = tab.id === activeTab
             // Replay tab links to the dedicated replay page instead of a tab panel
@@ -198,11 +199,10 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
                 ? `/runs/${runId}/replay`
                 : `/runs/${runId}?tab=${tab.id}`
             return (
-              <a
+              <Link
                 key={tab.id}
                 href={href}
-                role="tab"
-                aria-selected={isActive}
+                aria-current={isActive ? 'page' : undefined}
                 className={[
                   'pb-3 text-sm font-medium border-b-2 transition-colors duration-100 whitespace-nowrap',
                   isActive
@@ -211,23 +211,20 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
                 ].join(' ')}
               >
                 {tab.label}
-              </a>
+              </Link>
             )
           })}
         </nav>
       </div>
 
-      {/* Tab content */}
+      {/* Tab content — data is already fetched above, so these render
+          synchronously (no Suspense boundary needed). */}
       <div className="flex-1 overflow-y-auto">
         {activeTab === 'timeline' && (
-          <Suspense fallback={<LoadingState message="Loading timeline..." />}>
-            <Timeline runId={runId} events={events} initialNextCursor={initialNextCursor} isLive={run.status === 'running'} />
-          </Suspense>
+          <Timeline runId={runId} events={events} initialNextCursor={initialNextCursor} isLive={run.status === 'running'} />
         )}
         {activeTab === 'events' && (
-          <Suspense fallback={<LoadingState message="Loading events..." />}>
-            <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} initialEventSeq={initialEventSeq} isLive={run.status === 'running'} />
-          </Suspense>
+          <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} initialEventSeq={initialEventSeq} isLive={run.status === 'running'} />
         )}
         {activeTab === 'artifacts' && (
           artifactsFailed ? (
@@ -235,9 +232,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
               <InlineError message="Couldn't load artifacts — refresh to retry." />
             </div>
           ) : (
-            <Suspense fallback={<LoadingState message="Loading artifacts..." />}>
-              <ArtifactList artifacts={artifactsData.artifacts} />
-            </Suspense>
+            <ArtifactList artifacts={artifactsData.artifacts} />
           )
         )}
         {activeTab === 'comments' && (
@@ -246,9 +241,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
               <InlineError message="Couldn't load comments — refresh to retry." />
             </div>
           ) : (
-            <Suspense fallback={<LoadingState message="Loading comments..." />}>
-              <CommentThread targetId={runId} targetType="run" initialComments={commentsData} />
-            </Suspense>
+            <CommentThread targetId={runId} targetType="run" initialComments={commentsData} />
           )
         )}
       </div>

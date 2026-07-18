@@ -10,12 +10,32 @@
 //
 // Safety: the 24-hour age threshold ensures that artifacts created during an
 // in-progress run (blob uploaded, event not yet flushed) are never deleted.
+//
+// ECONOMICS (sticky references + bounded scans): the naive design re-scanned
+// every event of every candidate's run on every daily GC — O(artifacts×events)
+// forever, and a `.collect()` on a ~50k-event run blows the query read limit.
+// Two fixes:
+//   1. STICKY REFERENCE — when the pointer scan (or, normally, sdkCreateEvents
+//      at write time) finds that an event references an artifact, the artifact
+//      is patched with `referencedByEventId`. Events are immutable, so a
+//      reference can never be un-made: the artifact permanently leaves the
+//      candidate set. Artifacts are metadata pointers, NOT events — patching
+//      this GC bookkeeping field does not violate event-log immutability.
+//   2. BOUNDED SCANS — the pointer scan pages through events (no `.collect()`),
+//      caps events examined per candidate, and the action caps TOTAL events
+//      examined per invocation; unresolved candidates carry over to the next
+//      scheduled run (they remain in the candidate set until resolved).
 
 import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
 import { internalAction, internalMutation, internalQuery } from "./_generated/server.js";
-import { GC_CANDIDATE_PAGE_SIZE } from "./helpers/pagination.js";
+import {
+  GC_CANDIDATE_PAGE_SIZE,
+  GC_EVENT_SCAN_PAGE_SIZE,
+  GC_MAX_EVENTS_PER_CANDIDATE,
+  GC_MAX_EVENTS_PER_INVOCATION,
+} from "./helpers/pagination.js";
 
 import type { Id } from "./_generated/dataModel.js";
 
@@ -26,13 +46,17 @@ const ORPHAN_AGE_MS = 24 * 60 * 60 * 1000;
 // Internal function references — used by cleanOrphanedArtifacts action.
 // We use makeFunctionReference because Convex _generated/api is not committed.
 const _getOrphanCandidates = makeFunctionReference<"query">("artifact_gc:getOrphanCandidates");
-const _isArtifactReferenced = makeFunctionReference<"query">("artifact_gc:isArtifactReferenced");
+const _checkArtifactReference = makeFunctionReference<"query">("artifact_gc:checkArtifactReference");
+const _markArtifactReferenced = makeFunctionReference<"mutation">("artifact_gc:markArtifactReferenced");
 const _deleteArtifactRecord = makeFunctionReference<"mutation">("artifact_gc:deleteArtifactRecord");
 
 /**
  * Returns one page of artifact records whose createdAt is older than ORPHAN_AGE_MS,
  * ordered oldest-first via the by_created_at index. At most GC_CANDIDATE_PAGE_SIZE
  * candidates are returned per call. Pass the returned nextCursor to page forward.
+ *
+ * Artifacts with a sticky `referencedByEventId` are excluded — a reference to an
+ * immutable event can never be un-made, so they are permanently non-orphans.
  *
  * These are candidates for orphan detection — not guaranteed to be orphaned yet.
  */
@@ -46,6 +70,7 @@ export const getOrphanCandidates = internalQuery({
     const page = await ctx.db
       .query("artifacts")
       .withIndex("by_created_at", (q) => q.lt("createdAt", cutoff))
+      .filter((q) => q.eq(q.field("referencedByEventId"), undefined))
       .paginate({
         numItems: GC_CANDIDATE_PAGE_SIZE,
         cursor: args.cursor ?? null,
@@ -67,8 +92,22 @@ const TERMINAL_RUN_STATUSES = new Set([
   "timed_out",
 ]);
 
+/** Verdict of a bounded reference check for one candidate artifact. */
+export interface ReferenceCheckResult {
+  /**
+   * "referenced"    → must NOT be deleted (sticky-stampable if referencingEventId set)
+   * "orphan"        → safe to reclaim
+   * "indeterminate" → scan budget exhausted before a verdict; keep, retry later
+   */
+  verdict: "referenced" | "orphan" | "indeterminate";
+  /** Set when the pointer scan found the referencing event (for sticky stamping). */
+  referencingEventId?: Id<"events">;
+  /** Events examined by this check (counted against the invocation budget). */
+  eventsScanned: number;
+}
+
 /**
- * Returns true if the artifact is still reachable and must NOT be deleted.
+ * Bounded reference check for one candidate artifact.
  *
  * Semantics:
  * - Event-attached artifacts (eventId set, event exists) are permanently
@@ -82,53 +121,108 @@ const TERMINAL_RUN_STATUSES = new Set([
  *     (c) no event payload's `_externalized` pointer references its id
  *         (pointer shape: payload._artifact.artifactId — see contracts
  *         ExternalizedPayload).
+ *
+ * The pointer scan is PAGED (never `.collect()`) and stops after
+ * min(maxEventsToScan, GC_MAX_EVENTS_PER_CANDIDATE) events. If the budget runs
+ * out before the run's events are exhausted, the verdict is "indeterminate" and
+ * the artifact is kept for a later invocation — deletion requires a full scan.
  */
-export const isArtifactReferenced = internalQuery({
+export const checkArtifactReference = internalQuery({
   args: {
     artifactId: v.id("artifacts"),
     runId: v.id("runs"),
+    maxEventsToScan: v.number(),
   },
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<ReferenceCheckResult> => {
     const artifact = await ctx.db.get(args.artifactId);
     // Artifact already gone (deleted by a concurrent run) — nothing to reclaim.
-    if (!artifact) return true;
+    if (!artifact) return { verdict: "referenced", eventsScanned: 0 };
+
+    // Sticky reference already stamped — permanently retained.
+    if (artifact.referencedByEventId !== undefined) {
+      return { verdict: "referenced", eventsScanned: 0 };
+    }
 
     if (artifact.eventId !== undefined) {
       // Event-attached artifact: permanently retained while its event exists.
       const event = await ctx.db.get(artifact.eventId);
-      if (event) return true;
+      if (event) return { verdict: "referenced", eventsScanned: 0 };
       // Dangling eventId (should not happen — events are never deleted). Fall
       // through to the pointer scan before declaring it reclaimable.
     } else {
       // Run-level artifact: only collectable once the run is terminal. A missing
       // run (purged via ADR 001) leaves the artifact unreachable — collectable.
       const run = await ctx.db.get(args.runId);
-      if (run && !TERMINAL_RUN_STATUSES.has(run.status)) return true;
-    }
-
-    // Pointer scan: some event's _externalized payload may reference it by id.
-    const events = await ctx.db
-      .query("events")
-      .withIndex("by_run", (q) => q.eq("runId", args.runId))
-      .collect();
-
-    const idStr = args.artifactId as string;
-    for (const e of events) {
-      const payload = e.payload as {
-        type?: string;
-        _artifact?: { artifactId?: string };
-      };
-      if (
-        payload.type === "_externalized" &&
-        payload._artifact?.artifactId === idStr
-      ) {
-        return true;
+      if (run && !TERMINAL_RUN_STATUSES.has(run.status)) {
+        return { verdict: "referenced", eventsScanned: 0 };
       }
     }
 
-    // Older than the safety threshold, run terminal (or gone), and nothing
-    // references it: a genuine orphan. Safe to reclaim.
-    return false;
+    // Pointer scan: some event's _externalized payload may reference it by id.
+    // Paged and budget-bounded — see module header.
+    const budget = Math.max(
+      0,
+      Math.min(args.maxEventsToScan, GC_MAX_EVENTS_PER_CANDIDATE),
+    );
+    const idStr = args.artifactId as string;
+    let scanned = 0;
+    let cursor: string | null = null;
+
+    while (scanned < budget) {
+      const page = await ctx.db
+        .query("events")
+        .withIndex("by_run", (q) => q.eq("runId", args.runId))
+        .paginate({
+          numItems: Math.min(GC_EVENT_SCAN_PAGE_SIZE, budget - scanned),
+          cursor,
+        });
+
+      for (const e of page.page) {
+        scanned++;
+        const payload = e.payload as {
+          type?: string;
+          _artifact?: { artifactId?: string };
+        };
+        if (
+          payload.type === "_externalized" &&
+          payload._artifact?.artifactId === idStr
+        ) {
+          return {
+            verdict: "referenced",
+            referencingEventId: e._id,
+            eventsScanned: scanned,
+          };
+        }
+      }
+
+      if (page.isDone) {
+        // Full scan completed: run terminal (or gone), older than the safety
+        // threshold, and nothing references it — a genuine orphan.
+        return { verdict: "orphan", eventsScanned: scanned };
+      }
+      cursor = page.continueCursor;
+    }
+
+    // Budget exhausted before the run's events were exhausted: no verdict.
+    return { verdict: "indeterminate", eventsScanned: scanned };
+  },
+});
+
+/**
+ * Stamp an artifact with the event that references it (sticky reference), so it
+ * permanently leaves the GC candidate set. Patches ARTIFACT metadata only —
+ * never an event — so event-log immutability is untouched. Idempotent: an
+ * already-stamped or already-deleted artifact is a no-op.
+ */
+export const markArtifactReferenced = internalMutation({
+  args: {
+    artifactId: v.id("artifacts"),
+    eventId: v.id("events"),
+  },
+  handler: async (ctx, args) => {
+    const artifact = await ctx.db.get(args.artifactId);
+    if (!artifact || artifact.referencedByEventId !== undefined) return;
+    await ctx.db.patch(args.artifactId, { referencedByEventId: args.eventId });
   },
 });
 
@@ -150,11 +244,17 @@ export const deleteArtifactRecord = internalMutation({
  * make outbound HTTP requests (blob DELETE) and call internal queries/mutations.
  *
  * Algorithm:
- *   1. Load all orphan candidates (artifacts older than 24 h).
- *   2. For each, check whether any event references it.
- *   3. If unreferenced, DELETE the blob from Vercel Blob storage.
- *   4. Delete the Convex artifact record.
- *   5. Log results.
+ *   1. Page through orphan candidates (artifacts older than 24 h without a
+ *      sticky reference).
+ *   2. For each, run a bounded reference check (paged pointer scan).
+ *   3. Referenced with a known referencing event → stamp the sticky reference
+ *      so the artifact never re-enters the candidate set.
+ *   4. Orphaned → DELETE the blob from Vercel Blob storage, then the record.
+ *   5. Indeterminate (scan budget exhausted) → keep; retry next invocation.
+ *
+ * Budgets: at most MAX_PAGES candidate pages and GC_MAX_EVENTS_PER_INVOCATION
+ * events examined per invocation; the remainder carries over to the next
+ * scheduled run.
  *
  * If BLOB_STORE_TOKEN is not set in Convex env vars, blob deletion is skipped
  * and a warning is logged. The Convex record is still deleted to prevent
@@ -177,22 +277,25 @@ export const cleanOrphanedArtifacts = internalAction({
 
     // Bound total pages per run so a pathological backlog cannot exceed the action
     // time budget, but page THROUGH candidates rather than only ever touching the
-    // first page. Referenced artifacts are permanent residents of the candidate
-    // set (oldest-first), so a single-page GC starves: it re-examines the same
-    // immortal head every day and never reaches real orphans behind them.
+    // first page. Sticky references shrink the immortal head of the candidate set
+    // over time; anything unprocessed carries over to the next scheduled run.
     const MAX_PAGES = 50;
 
     let batch = 0;
     let cleaned = 0;
     let skipped = 0;
+    let stamped = 0;
+    let indeterminate = 0;
     let blobErrors = 0;
     let checkErrors = 0;
     let recordErrors = 0;
+    let eventsScanned = 0;
 
     let cursor: string | undefined = undefined;
     let pages = 0;
+    let scanBudgetExhausted = false;
 
-    for (;;) {
+    outer: for (;;) {
       const { candidates, nextCursor }: {
         candidates: Array<{ _id: Id<"artifacts">; runId: Id<"runs">; storageKey: string }>;
         nextCursor: string | undefined;
@@ -200,11 +303,18 @@ export const cleanOrphanedArtifacts = internalAction({
       batch += candidates.length;
 
       for (const artifact of candidates) {
-        let referenced: boolean;
+        const remainingScanBudget = GC_MAX_EVENTS_PER_INVOCATION - eventsScanned;
+        if (remainingScanBudget <= 0) {
+          scanBudgetExhausted = true;
+          break outer;
+        }
+
+        let check: ReferenceCheckResult;
         try {
-          referenced = await ctx.runQuery(_isArtifactReferenced, {
+          check = await ctx.runQuery(_checkArtifactReference, {
             artifactId: artifact._id,
             runId: artifact.runId,
+            maxEventsToScan: remainingScanBudget,
           });
         } catch (err) {
           console.error(
@@ -213,8 +323,29 @@ export const cleanOrphanedArtifacts = internalAction({
           checkErrors++;
           continue;
         }
+        eventsScanned += check.eventsScanned;
 
-        if (referenced) {
+        if (check.verdict === "indeterminate") {
+          // No verdict within budget — keep and retry in a later invocation.
+          indeterminate++;
+          continue;
+        }
+
+        if (check.verdict === "referenced") {
+          if (check.referencingEventId !== undefined) {
+            // Sticky-stamp so this artifact permanently leaves the candidate set.
+            try {
+              await ctx.runMutation(_markArtifactReferenced, {
+                artifactId: artifact._id,
+                eventId: check.referencingEventId,
+              });
+              stamped++;
+            } catch (err) {
+              console.error(
+                `Artifact GC: failed to stamp sticky reference on artifact ${String(artifact._id)}: ${String(err)}`,
+              );
+            }
+          }
           skipped++;
           continue;
         }
@@ -270,10 +401,27 @@ export const cleanOrphanedArtifacts = internalAction({
       cursor = nextCursor;
     }
 
+    if (scanBudgetExhausted) {
+      console.log(
+        `Artifact GC: event-scan budget (${GC_MAX_EVENTS_PER_INVOCATION}) exhausted; remaining candidates carry over to the next scheduled run.`,
+      );
+    }
+
     console.log(
-      `Artifact GC: batch=${batch} pages=${pages} cleaned=${cleaned} skipped=${skipped} ` +
+      `Artifact GC: batch=${batch} pages=${pages} cleaned=${cleaned} skipped=${skipped} stamped=${stamped} ` +
+        `indeterminate=${indeterminate} eventsScanned=${eventsScanned} ` +
         `blobErrors=${blobErrors} checkErrors=${checkErrors} recordErrors=${recordErrors}`,
     );
-    return { batch, cleaned, skipped, blobErrors, checkErrors, recordErrors };
+    return {
+      batch,
+      cleaned,
+      skipped,
+      stamped,
+      indeterminate,
+      eventsScanned,
+      blobErrors,
+      checkErrors,
+      recordErrors,
+    };
   },
 });

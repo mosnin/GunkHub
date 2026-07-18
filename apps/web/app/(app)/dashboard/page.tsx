@@ -1,3 +1,5 @@
+import Link from 'next/link'
+
 import type { FailedVerification } from '@/lib/services/projection_verify'
 import type { Run } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
@@ -29,7 +31,7 @@ function StatTile({
 }) {
   const dot =
     accent === 'neon' ? 'bg-neon-glow shadow-[var(--shadow-glow)]' // sanctioned accent glow — design.md "Glow"
-    : accent === 'warn' ? 'bg-destructive-500 shadow-[0_0_8px_rgba(255,54,33,0.6)]'
+    : accent === 'warn' ? 'bg-destructive-500 shadow-[var(--shadow-glow-warn)]' // sanctioned warn glow — design.md "Glow"
     : 'bg-graphite-light'
   const valueColor =
     accent === 'neon' ? 'text-neon-glow' : accent === 'warn' ? 'text-destructive-500' : 'text-whiteout'
@@ -38,7 +40,7 @@ function StatTile({
       <div className="scanline opacity-60" aria-hidden="true" />
       <div className="flex items-center gap-2">
         <span className={`w-1.5 h-1.5 rounded-full ${dot}`} aria-hidden="true" />
-        <p className="font-mono text-[11px] uppercase tracking-wider text-ash">{label}</p>
+        <p className="font-mono text-[11px] uppercase tracking-wider text-pewter">{label}</p>
       </div>
       <p className={`mt-3 font-mono text-[40px] leading-none font-medium tabular-nums ${valueColor}`}>{value}</p>
       {hint && <p className="mt-2 text-xs text-pewter">{hint}</p>}
@@ -110,13 +112,13 @@ export default async function DashboardPage() {
               <div className="mt-8">
                 <div className="flex items-center justify-between mb-3">
                   <h2 className="text-sm font-semibold text-neutral-300">Verification Issues</h2>
-                  <a
+                  <Link
                     href="/runs?verify=failed"
                     className="text-xs text-pewter hover:text-cloud transition-colors duration-100 font-mono"
                     title="View all failed — use the Runs page to bulk re-verify"
                   >
                     view all failed →
-                  </a>
+                  </Link>
                 </div>
 
                 {failedVerifications.length === 0 ? (
@@ -127,7 +129,7 @@ export default async function DashboardPage() {
                 ) : (
                   <div className="rounded-md border border-neutral-800 divide-y divide-neutral-800">
                     {failedVerifications.map((fv) => (
-                      <a
+                      <Link
                         key={fv.runId}
                         href={`/runs/${fv.runId}`}
                         className="flex items-center gap-3 px-3 py-2.5 hover:bg-neutral-900 transition-colors duration-100"
@@ -144,7 +146,7 @@ export default async function DashboardPage() {
                         <span className="text-xs text-pewter shrink-0 ml-auto">
                           {formatRelativeTime(fv.verifiedAt)}
                         </span>
-                      </a>
+                      </Link>
                     ))}
                   </div>
                 )}
@@ -178,12 +180,12 @@ export default async function DashboardPage() {
                       <p className="mt-0.5 text-xs text-neutral-400">
                         Projects group your agents and their runs.
                       </p>
-                      <a
+                      <Link
                         href="/projects"
                         className="mt-1.5 inline-flex text-xs text-primary-400 hover:text-primary-300 underline underline-offset-2 transition-colors duration-100"
                       >
                         Go to Projects →
-                      </a>
+                      </Link>
                     </div>
                   </div>
 
@@ -210,12 +212,12 @@ export default async function DashboardPage() {
                       <p className="mt-0.5 text-xs text-neutral-400">
                         The SDK uses this key to authenticate when recording runs.
                       </p>
-                      <a
+                      <Link
                         href="/settings"
                         className="mt-1.5 inline-flex text-xs text-primary-400 hover:text-primary-300 underline underline-offset-2 transition-colors duration-100"
                       >
                         Go to Settings →
-                      </a>
+                      </Link>
                     </div>
                   </div>
 

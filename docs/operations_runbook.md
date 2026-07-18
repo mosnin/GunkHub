@@ -284,3 +284,66 @@ Convex `organizations` table.
 
 **Fix:** Generate a new API key from the settings page (or directly in Convex if the
 settings UI is not available), update the SDK configuration, and retry.
+
+---
+
+## Secret rotation: CONVEX_WEBHOOK_SECRET / INTERNAL_VERIFY_SECRET
+
+Both are shared secrets that must match on TWO deployments at once:
+
+- `CONVEX_WEBHOOK_SECRET` — set on the Vercel project (used by
+  `/api/webhooks/clerk` when calling the webhook-only Convex lifecycle
+  mutations) AND on the Convex deployment (which validates it).
+- `INTERNAL_VERIFY_SECRET` — set on the Vercel project (validated by
+  `/api/internal/verify-derivation`) AND on the Convex deployment (sent by the
+  `verifyRecentRuns` action).
+
+**Current procedure (coordinated update — brief mismatch window):**
+
+1. Generate a new high-entropy secret: `openssl rand -hex 32`.
+2. Update the value in BOTH places back-to-back, Convex first:
+   - Convex: Dashboard → Deployment → Settings → Environment Variables.
+   - Vercel: Project → Settings → Environment Variables → Production.
+3. Redeploy the Vercel project (Convex env changes apply to new function
+   executions automatically; Vercel requires a redeploy).
+4. Verify:
+   - `CONVEX_WEBHOOK_SECRET`: create a throwaway Clerk org (or use Clerk's
+     webhook "Resend") and confirm the org record appears in Convex.
+   - `INTERNAL_VERIFY_SECRET`: wait for (or manually trigger) the next
+     `verifyRecentRuns` cycle and confirm runs get verification results, not
+     401s, in the Vercel function logs for `/api/internal/verify-derivation`.
+5. During the window between steps 2 and 3, calls fail closed (401 /
+   rejected mutation). Both paths are retryable — Clerk webhooks can be
+   resent, and verification falls back to sequence-only checks — so a short
+   window is acceptable. Rotate during low-traffic hours.
+
+**Future work — dual-accept window:** teach the validating side to accept
+`SECRET` OR `SECRET_PREVIOUS` for a bounded overlap period, so rotation never
+fails closed. Tracked as an ops improvement; not implemented yet.
+
+---
+
+## Backup and disaster recovery
+
+**Data of record:** all product data (orgs, projects, agents, runs, events,
+artifacts metadata, comments) lives in Convex. Artifact payload BLOBS live in
+Vercel Blob storage; event records store only pointers + SHA-256 checksums.
+
+**Backup capability:**
+
+- Convex supports full-deployment snapshot export (Dashboard → Settings →
+  Backup/Export, or `npx convex export`) producing a ZIP of all tables, and
+  point-in-time restore via snapshot import on paid plans.
+- Vercel Blob objects are durable managed storage; blobs are content-addressed
+  by checksum in our storage keys, so a Convex restore never points at
+  ambiguous blob content. Blobs themselves are not separately backed up today.
+
+**Targets:** RPO and RTO are TBD by the operator — no formal targets have been
+committed for v1. Until they are set, the working assumption is: RPO = age of
+the most recent Convex snapshot export (run exports at least weekly), RTO =
+time to import the snapshot into a fresh deployment plus a Vercel redeploy
+(order of hours).
+
+**Restore drill (recommended before GA):** export a snapshot, import it into a
+scratch Convex deployment, point a preview Vercel deployment at it, and confirm
+runs, events, and artifact downloads all resolve.

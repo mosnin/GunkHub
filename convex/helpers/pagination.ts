@@ -60,3 +60,29 @@ export const DEFAULT_RATE_LIMIT_PER_MIN = 600;
  * (ADR 001). Small enough to stay well inside Convex transaction limits.
  */
 export const PURGE_BATCH_SIZE = 100;
+
+/**
+ * Write ceiling: maximum comments per target (run or event). Enforced in
+ * createComment with a COMMENT_LIMIT_EXCEEDED typed error. Checked with a
+ * bounded `.take(MAX_COMMENTS_PER_TARGET)` count on the by_target index.
+ */
+export const MAX_COMMENTS_PER_TARGET = 500;
+
+/**
+ * Artifact GC scan bounds. The GC's pointer scan reads a run's events in pages
+ * of GC_EVENT_SCAN_PAGE_SIZE instead of `.collect()`ing them (a ~50k-event run
+ * would blow the query read limit). GC_MAX_EVENTS_PER_INVOCATION caps the TOTAL
+ * events examined across all candidates in one GC invocation; remaining
+ * candidates carry over to the next scheduled run (they stay in the candidate
+ * set until resolved).
+ */
+export const GC_EVENT_SCAN_PAGE_SIZE = 500;
+export const GC_MAX_EVENTS_PER_CANDIDATE = 5_000;
+export const GC_MAX_EVENTS_PER_INVOCATION = 100_000;
+
+/**
+ * Valid range for organizations.retentionDays (ADR 001), enforced by
+ * updateRetentionPolicy.
+ */
+export const MIN_RETENTION_DAYS = 1;
+export const MAX_RETENTION_DAYS = 3_650;

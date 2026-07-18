@@ -156,7 +156,10 @@ export function CommentThread({
     <div className="flex flex-col gap-4 px-6 py-4">
       {/* Error banners */}
       {resolveError && (
-        <div className="text-xs text-destructive-400 bg-destructive-900/40 border border-destructive-700/50 rounded px-3 py-2">
+        <div
+          role="alert"
+          className="text-xs text-destructive-400 bg-destructive-900/40 border border-destructive-700/50 rounded px-3 py-2"
+        >
           {resolveError}
         </div>
       )}
@@ -212,16 +215,25 @@ export function CommentThread({
 
       {/* Compose area */}
       <div className="border border-neutral-800 rounded-md bg-neutral-900 p-3 flex flex-col gap-2">
+        {/* Visually hidden label — the placeholder alone is not an accessible name */}
+        <label htmlFor="comment-compose" className="sr-only">
+          Add a comment
+        </label>
         <textarea
+          id="comment-compose"
           value={composeText}
           onChange={(e) => setComposeText(e.target.value)}
           placeholder="Add a comment..."
           rows={3}
           disabled={isPendingCreate}
+          aria-invalid={composeError ? true : undefined}
+          aria-describedby={composeError ? 'comment-compose-error' : undefined}
           className="w-full bg-transparent text-sm text-neutral-300 placeholder-neutral-500 resize-none outline-none disabled:opacity-50 disabled:cursor-not-allowed"
         />
         {composeError && (
-          <p className="text-xs text-destructive-400">{composeError}</p>
+          <p id="comment-compose-error" role="alert" className="text-xs text-destructive-400">
+            {composeError}
+          </p>
         )}
         <div className="flex justify-end">
           <button

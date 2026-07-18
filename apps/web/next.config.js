@@ -15,6 +15,10 @@
 //   img-src     — Clerk avatar CDN (img.clerk.com) plus data: URIs.
 //   frame-src   — Cloudflare Turnstile iframe.
 //   worker-src  — blob: workers used by Next.js/Clerk runtime.
+//   report-uri/report-to — violations POST to /api/csp-report (log-only sink)
+//                 so the Report-Only soak produces observable data. report-uri
+//                 is the legacy directive; report-to targets the named
+//                 endpoint declared in the Reporting-Endpoints header below.
 const reportOnlyCsp = [
   "default-src 'self'",
   "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://*.clerk.accounts.dev https://challenges.cloudflare.com",
@@ -24,6 +28,8 @@ const reportOnlyCsp = [
   'frame-src https://challenges.cloudflare.com',
   "worker-src 'self' blob:",
   "frame-ancestors 'none'",
+  'report-uri /api/csp-report',
+  'report-to csp-endpoint',
 ].join('; ')
 
 // Standard security header set applied to every route. The enforced CSP is
@@ -45,6 +51,11 @@ const securityHeaders = [
   {
     key: 'Content-Security-Policy-Report-Only',
     value: reportOnlyCsp,
+  },
+  {
+    // Named reporting endpoint used by the `report-to` directive above.
+    key: 'Reporting-Endpoints',
+    value: 'csp-endpoint="/api/csp-report"',
   },
   {
     key: 'Permissions-Policy',

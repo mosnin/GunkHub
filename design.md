@@ -101,6 +101,7 @@ The design feels like a high-end server room after dark — a pure black void wh
 | Name | Value | Token |
 |------|-------|-------|
 | glow | `0 0 8px rgba(52, 213, 154, 0.7)` | `--shadow-glow` |
+| glow-warn | `0 0 8px rgba(255, 54, 33, 0.6)` | `--shadow-glow-warn` |
 
 The accent glow is the signature "data glow" of live/status indicator dots — a
 soft Neon Glow halo that reads as powered-on hardware in the dark server room.
@@ -108,6 +109,12 @@ It is sanctioned **only** for small status/live dots (≤ 8px) and the active-na
 tick: elements that carry state, never decoration. It must never be used for
 elevation — depth remains layered near-black surfaces (see Elevation). Use the
 `--shadow-glow` token rather than ad-hoc box-shadow values.
+
+`--shadow-glow-warn` is the destructive/warn counterpart, using the System
+Warning red. It is sanctioned **only** for small status dots (≤ 8px) that carry
+a failed/alert state (e.g. a failed-run badge dot). Never for elevation, text,
+borders, or any element larger than a status dot. As with the accent glow, use
+the token — never ad-hoc red box-shadow literals.
 
 ### Layout
 
@@ -302,6 +309,8 @@ The page structure is full-bleed black, creating an immersive, infinite canvas. 
   --shadow-lg: rgba(0, 0, 0, 0.4) 0px 8px 20px 0px;
   /* Accent glow — live/status dots only, never elevation (see Glow) */
   --shadow-glow: 0 0 8px rgba(52, 213, 154, 0.7);
+  /* Destructive/warn glow — failed/alert status dots only (see Glow) */
+  --shadow-glow-warn: 0 0 8px rgba(255, 54, 33, 0.6);
 }
 ```
 
@@ -379,5 +388,7 @@ The page structure is full-bleed black, creating an immersive, infinite canvas. 
   --shadow-lg: rgba(0, 0, 0, 0.4) 0px 8px 20px 0px;
   /* Accent glow — live/status dots only, never elevation (see Glow) */
   --shadow-glow: 0 0 8px rgba(52, 213, 154, 0.7);
+  /* Destructive/warn glow — failed/alert status dots only (see Glow) */
+  --shadow-glow-warn: 0 0 8px rgba(255, 54, 33, 0.6);
 }
 ```

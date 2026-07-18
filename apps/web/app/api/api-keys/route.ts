@@ -5,19 +5,18 @@
 import { randomBytes } from 'node:crypto'
 
 import { auth } from '@clerk/nextjs/server'
-import { NextResponse } from 'next/server'
+import { type NextRequest, NextResponse } from 'next/server'
 
 import type { ApiError } from '@agent-flight-recorder/contracts'
 
+import { withApiHandler } from '@/lib/apiHandler'
 import { convex } from '@/lib/convexFunctions'
 import {
-  ConvexTimeoutError,
   getAuthedClient,
   hashApiKey,
   resolveConvexOrgId,
   withConvexTimeout,
 } from '@/lib/convexServer'
-import { getRequestId, logger } from '@/lib/logger'
 
 // Convex returns untyped documents; we cast through unknown to avoid unsafe-any
 // while still accessing the fields we know are present on the api_keys table.
@@ -60,8 +59,7 @@ async function convexQuery(
 // POST /api/api-keys — generate a new API key for the authenticated org
 // ---------------------------------------------------------------------------
 
-export async function POST(req: Request) {
-  const requestId = getRequestId(req)
+export const POST = withApiHandler('/api/api-keys', async (req: NextRequest, ctx) => {
   const { userId, orgId: clerkOrgId } = auth()
   if (!userId || !clerkOrgId) {
     return NextResponse.json<ApiError>(
@@ -69,6 +67,7 @@ export async function POST(req: Request) {
       { status: 401 },
     )
   }
+  ctx.setOrgId(clerkOrgId)
 
   let body: Record<string, unknown>
   try {
@@ -133,60 +132,39 @@ export async function POST(req: Request) {
     scopes = rawScopes as string[]
   }
 
-  try {
-    const convexOrgId = await resolveConvexOrgId(clerkOrgId)
-    const rawKey = randomBytes(32).toString('hex')
-    const keyHash = hashApiKey(rawKey)
+  const convexOrgId = await resolveConvexOrgId(clerkOrgId)
+  const rawKey = randomBytes(32).toString('hex')
+  const keyHash = hashApiKey(rawKey)
 
-    const client = await getAuthedClient()
-    const keyDoc = (await withConvexTimeout(convexMutation(client, convex.api_keys.createApiKey, {
-      orgId: convexOrgId,
-      name: name.trim(),
-      keyHash,
-      ...(expiresAt !== undefined && { expiresAt }),
-      ...(scopes !== undefined && { scopes }),
-      ...(rateLimitPerMin !== undefined && { rateLimitPerMin }),
-    }))) as ApiKeyDoc
+  const client = await getAuthedClient()
+  const keyDoc = (await withConvexTimeout(convexMutation(client, convex.api_keys.createApiKey, {
+    orgId: convexOrgId,
+    name: name.trim(),
+    keyHash,
+    ...(expiresAt !== undefined && { expiresAt }),
+    ...(scopes !== undefined && { scopes }),
+    ...(rateLimitPerMin !== undefined && { rateLimitPerMin }),
+  }))) as ApiKeyDoc
 
-    // The raw key is returned ONCE and never stored — caller must persist it securely.
-    return NextResponse.json(
-      {
-        id: keyDoc._id,
-        name: keyDoc.name,
-        createdAt: keyDoc.createdAt,
-        expiresAt: keyDoc.expiresAt,
-        scopes: keyDoc.scopes,
-        key: rawKey,
-      },
-      { status: 201 },
-    )
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Internal error'
-    logger.error('API key creation failed', {
-      requestId,
-      route: '/api/api-keys',
-      orgId: clerkOrgId,
-      err,
-    })
-    if (err instanceof ConvexTimeoutError) {
-      return NextResponse.json<ApiError>(
-        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
-        { status: 503, headers: { 'x-request-id': requestId } },
-      )
-    }
-    return NextResponse.json<ApiError>(
-      { code: 'INTERNAL_ERROR', message: `${message} (request ${requestId})` },
-      { status: 500, headers: { 'x-request-id': requestId } },
-    )
-  }
-}
+  // The raw key is returned ONCE and never stored — caller must persist it securely.
+  return NextResponse.json(
+    {
+      id: keyDoc._id,
+      name: keyDoc.name,
+      createdAt: keyDoc.createdAt,
+      expiresAt: keyDoc.expiresAt,
+      scopes: keyDoc.scopes,
+      key: rawKey,
+    },
+    { status: 201 },
+  )
+})
 
 // ---------------------------------------------------------------------------
 // GET /api/api-keys — list API keys for the authenticated org
 // ---------------------------------------------------------------------------
 
-export async function GET(req: Request) {
-  const requestId = getRequestId(req)
+export const GET = withApiHandler('/api/api-keys', async (_req: NextRequest, ctx) => {
   const { userId, orgId: clerkOrgId } = auth()
   if (!userId || !clerkOrgId) {
     return NextResponse.json<ApiError>(
@@ -194,44 +172,25 @@ export async function GET(req: Request) {
       { status: 401 },
     )
   }
+  ctx.setOrgId(clerkOrgId)
 
-  try {
-    const convexOrgId = await resolveConvexOrgId(clerkOrgId)
-    const client = await getAuthedClient()
-    const keys = (await withConvexTimeout(convexQuery(client, convex.api_keys.listApiKeys, {
-      orgId: convexOrgId,
-    }))) as ApiKeyDoc[]
+  const convexOrgId = await resolveConvexOrgId(clerkOrgId)
+  const client = await getAuthedClient()
+  const keys = (await withConvexTimeout(convexQuery(client, convex.api_keys.listApiKeys, {
+    orgId: convexOrgId,
+  }))) as ApiKeyDoc[]
 
-    // Return only safe fields — never the raw key or hash
-    const now = Date.now()
-    const safeKeys = keys.map((k) => ({
-      id: k._id,
-      name: k.name,
-      createdAt: k.createdAt,
-      lastUsedAt: k.lastUsedAt,
-      expiresAt: k.expiresAt,
-      scopes: k.scopes,
-      expired: k.expiresAt !== undefined && k.expiresAt <= now,
-    }))
+  // Return only safe fields — never the raw key or hash
+  const now = Date.now()
+  const safeKeys = keys.map((k) => ({
+    id: k._id,
+    name: k.name,
+    createdAt: k.createdAt,
+    lastUsedAt: k.lastUsedAt,
+    expiresAt: k.expiresAt,
+    scopes: k.scopes,
+    expired: k.expiresAt !== undefined && k.expiresAt <= now,
+  }))
 
-    return NextResponse.json({ keys: safeKeys })
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Internal error'
-    logger.error('API key listing failed', {
-      requestId,
-      route: '/api/api-keys',
-      orgId: clerkOrgId,
-      err,
-    })
-    if (err instanceof ConvexTimeoutError) {
-      return NextResponse.json<ApiError>(
-        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
-        { status: 503, headers: { 'x-request-id': requestId } },
-      )
-    }
-    return NextResponse.json<ApiError>(
-      { code: 'INTERNAL_ERROR', message: `${message} (request ${requestId})` },
-      { status: 500, headers: { 'x-request-id': requestId } },
-    )
-  }
-}
+  return NextResponse.json({ keys: safeKeys })
+})

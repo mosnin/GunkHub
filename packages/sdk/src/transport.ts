@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER } from '@agent-flight-recorder/contracts'
+import { PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, parseAfrApiErrorCode } from '@agent-flight-recorder/contracts'
 
 import { externalizePayloadIfLarge, uploadArtifact, type ArtifactPointer } from './externalize.js'
 
@@ -35,7 +35,7 @@ export interface RetryStrategy {
 
 /** Options for constructing an {@link HttpTransport}. */
 export interface HttpTransportOptions {
-  /** Per-request timeout in milliseconds. Default: 10 000 ms. */
+  /** Per-request timeout in milliseconds. Must be >= 1. Default: 10 000 ms. */
   timeoutMs?: number
   /** Retry policy for transient failures. Default: {@link defaultRetryStrategy}. */
   retryStrategy?: RetryStrategy
@@ -95,6 +95,9 @@ export class HttpTransport implements Transport {
   constructor(endpoint: string, options?: HttpTransportOptions | number) {
     this.endpoint = endpoint
     const opts: HttpTransportOptions = typeof options === 'number' ? { timeoutMs: options } : options ?? {}
+    if (opts.timeoutMs !== undefined && (typeof opts.timeoutMs !== 'number' || Number.isNaN(opts.timeoutMs) || opts.timeoutMs < 1)) {
+      throw new TypeError(`HttpTransportOptions.timeoutMs must be >= 1 (got ${String(opts.timeoutMs)})`)
+    }
     this.timeoutMs = opts.timeoutMs ?? 10_000
     this.retryStrategy = opts.retryStrategy ?? defaultRetryStrategy
     this.batchingStrategy = opts.batchingStrategy ?? defaultBatchingStrategy
@@ -297,19 +300,37 @@ export class HttpTransport implements Transport {
       }
 
       if (response.ok) {
-        return { success: true, eventIds: [] }
+        // Surface the server-assigned event IDs when the response body carries
+        // them ({ eventIds: [...] } from POST /api/events).
+        let eventIds: string[] = []
+        try {
+          const body = (await response.json()) as { eventIds?: unknown }
+          if (Array.isArray(body.eventIds)) {
+            eventIds = body.eventIds.filter((id): id is string => typeof id === 'string')
+          }
+        } catch {
+          // ignore parse failure — success without IDs
+        }
+        return { success: true, eventIds }
       }
 
-      // 4xx — client error, not retryable
+      // 4xx — client error, not retryable. Parse the stable error `code` when
+      // the JSON body provides one so the Recorder can distinguish permanent
+      // rejections (RUN_NOT_ACTIVE / SEQUENCE_CONFLICT) from other failures.
+      // Fall back to scanning the message for a "CODE: ..." prefix (the
+      // backend's error format) when the body carries no explicit code field.
       if (response.status >= 400 && response.status < 500) {
         let message = `HTTP ${response.status}`
+        let code: string | undefined
         try {
-          const body = (await response.json()) as { message?: string }
+          const body = (await response.json()) as { message?: string; code?: string }
           if (body.message) message = body.message
+          if (typeof body.code === 'string') code = body.code
         } catch {
           // ignore parse failure
         }
-        return { success: false, retryable: false, error: message }
+        code ??= parseAfrApiErrorCode(message)
+        return { success: false, retryable: false, error: message, ...(code !== undefined && { code }) }
       }
 
       // 5xx — server error, retryable
@@ -390,16 +411,20 @@ export class HttpTransport implements Transport {
         return { success: true, eventIds: [] }
       }
 
-      // 4xx — client error, not retryable
+      // 4xx — client error, not retryable. The stable `code` (when present)
+      // lets callers recognize e.g. RUN_NOT_ACTIVE as "already terminal".
       if (response.status >= 400 && response.status < 500) {
         let message = `HTTP ${response.status}`
+        let code: string | undefined
         try {
-          const parsed = (await response.json()) as { message?: string }
+          const parsed = (await response.json()) as { message?: string; code?: string }
           if (parsed.message) message = parsed.message
+          if (typeof parsed.code === 'string') code = parsed.code
         } catch {
           // ignore parse failure
         }
-        return { success: false, retryable: false, error: message }
+        code ??= parseAfrApiErrorCode(message)
+        return { success: false, retryable: false, error: message, ...(code !== undefined && { code }) }
       }
 
       // 5xx — retryable

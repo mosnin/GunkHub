@@ -35,7 +35,9 @@ export type {
   TransportResponse,
   EventSpool,
   StoredEvent,
+  DropReason,
 } from './types.js'
+export type { FileSpoolOptions } from './file-spool.js'
 
 export type {
   Transport,

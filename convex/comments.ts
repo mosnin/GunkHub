@@ -2,7 +2,12 @@ import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
-import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
+import { afrError } from "./helpers/errors.js";
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_COMMENTS_PER_TARGET,
+  MAX_PAGE_SIZE,
+} from "./helpers/pagination.js";
 
 import type { Id } from "./_generated/dataModel.js";
 
@@ -67,6 +72,22 @@ export const createComment = mutation({
       if (!event || event.orgId !== args.orgId) {
         throw new Error("Comment target event not found in this organization");
       }
+    }
+
+    // Write ceiling: bounded count on the by_target index (cheap at this cap
+    // size). Stops a runaway client from growing one target's comment thread
+    // without bound.
+    const existingForTarget = await ctx.db
+      .query("comments")
+      .withIndex("by_target", (q) =>
+        q.eq("targetId", args.targetId).eq("targetType", args.targetType),
+      )
+      .take(MAX_COMMENTS_PER_TARGET);
+    if (existingForTarget.length >= MAX_COMMENTS_PER_TARGET) {
+      throw afrError(
+        "COMMENT_LIMIT_EXCEEDED",
+        `Target ${args.targetType} has reached the maximum of ${MAX_COMMENTS_PER_TARGET} comments`,
+      );
     }
 
     const now = Date.now();

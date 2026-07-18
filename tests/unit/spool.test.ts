@@ -47,10 +47,8 @@ class MemorySpool implements EventSpool {
     if (this.failAppends) throw new Error('disk full')
     this.entries.push(...entries)
   }
-  async drain(): Promise<StoredEvent[]> {
-    const out = this.entries
-    this.entries = []
-    return out
+  async peek(): Promise<StoredEvent[]> {
+    return [...this.entries]
   }
   async clear(): Promise<void> {
     this.entries = []
@@ -177,7 +175,7 @@ describe('Recorder — terminal delivery guarantee', () => {
     await expect(rec.startRun('second')).resolves.toBeDefined()
   })
 
-  it('persists terminal event and status intent to the spool when finalize fails', async () => {
+  it('persists the terminal event to the spool and DEFERS the status transition when finalize fails', async () => {
     failAll()
     const spool = new MemorySpool()
     const rec = makeRecorder(transport, spool)
@@ -189,13 +187,17 @@ describe('Recorder — terminal delivery guarantee', () => {
     expect(result.errors.some((e) => e.error.includes('spool'))).toBe(true)
     expect(rec.activeRun).toBeNull()
 
-    // The terminal run.completed event is in the spool (write-ahead)...
+    // The terminal run.completed event is in the spool (write-ahead).
     const eventEntries = spool.entries.filter((e) => e.kind === 'event')
     expect(eventEntries.some((e) => e.kind === 'event' && e.event.type === 'run.completed')).toBe(true)
-    // ...and so is the status-transition intent.
-    const statusEntries = spool.entries.filter((e) => e.kind === 'status')
-    expect(statusEntries).toHaveLength(1)
-    expect(statusEntries[0]).toMatchObject({ kind: 'status', runId: 'run_spool_001', status: 'completed' })
+    // Stranded-run poison-pill fix: while the terminal event is undelivered,
+    // the run status must NOT be patched (that would make the pending events
+    // permanently rejectable as RUN_NOT_ACTIVE). The server reconciles status
+    // from the terminal event on arrival, so NO status intent is spooled and
+    // the deferral is surfaced in the FlushResult.
+    expect(transport.updateRunStatus).not.toHaveBeenCalled()
+    expect(result.statusTransitionDeferred).toBe(true)
+    expect(spool.entries.filter((e) => e.kind === 'status')).toHaveLength(0)
   })
 
   it('recover() re-sends spooled events and status intents, then empties the spool', async () => {
@@ -313,6 +315,36 @@ describe('FileSpool', () => {
     }
   })
 
+  it('peek returns entries WITHOUT removing them (peek → send → ack safety)', async () => {
+    const { dir, path } = await makeTmpPath()
+    try {
+      const spool = new FileSpool(path)
+      await spool.append([sampleEvent(1), sampleEvent(2)])
+
+      const peeked = await spool.peek()
+      expect(peeked).toHaveLength(2)
+      // A second peek still sees everything — nothing was truncated, so a
+      // crash between peek and delivery loses nothing.
+      expect(await spool.peek()).toHaveLength(2)
+      // Only an explicit clear (the "ack") removes entries.
+      await spool.clear()
+      expect(await spool.peek()).toEqual([])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('fsync: true appends durably without changing observable behavior', async () => {
+    const { dir, path } = await makeTmpPath()
+    try {
+      const spool = new FileSpool(path, { fsync: true })
+      await spool.append([sampleEvent(1)])
+      expect(await spool.peek()).toHaveLength(1)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('clear empties the spool', async () => {
     const { dir, path } = await makeTmpPath()
     try {
@@ -350,14 +382,12 @@ describe('FileSpool', () => {
       const result = await rec2.recover()
       expect(result.success).toBe(true)
       expect(result.eventsSubmitted).toBe(3) // run.started, custom, run.completed
-      expect(transport2.updateRunStatus).toHaveBeenCalledWith(
-        'run_spool_001',
-        'completed',
-        expect.any(Number),
-        expect.any(Object),
-      )
+      // No status intent was spooled (the transition was deferred to event
+      // delivery — the server reconciles status from the terminal event), so
+      // recovery only re-sends events.
+      expect(transport2.updateRunStatus).not.toHaveBeenCalled()
       // Spool is empty after successful recovery.
-      expect(await new FileSpool(path).drain()).toEqual([])
+      expect(await new FileSpool(path).peek()).toEqual([])
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

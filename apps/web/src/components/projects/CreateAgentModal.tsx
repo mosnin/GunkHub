@@ -92,6 +92,8 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
                 onChange={(e) => setName(e.target.value)}
                 maxLength={80}
                 disabled={isPending}
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? 'create-agent-error' : undefined}
                 className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
               />
             </div>
@@ -115,7 +117,11 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
 
             {/* Error */}
             {error && (
-              <p className="text-xs text-destructive-400 bg-destructive-900/30 border border-destructive-800/50 rounded-md px-3 py-2">
+              <p
+                id="create-agent-error"
+                role="alert"
+                className="text-xs text-destructive-400 bg-destructive-900/30 border border-destructive-800/50 rounded-md px-3 py-2"
+              >
                 {error}
               </p>
             )}

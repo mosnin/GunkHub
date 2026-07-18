@@ -10,6 +10,11 @@ on:
   pull_request:
     branches:
       - main
+  # Weekly advisory sweep: runs ONLY the dependency-audit job (all other jobs
+  # are gated on `github.event_name != 'schedule'`) so new GHSA advisories
+  # surface even when no PR lands. Mondays 06:00 UTC.
+  schedule:
+    - cron: "0 6 * * 1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,6 +30,9 @@ jobs:
   typecheck:
     name: Typecheck
     runs-on: ubuntu-latest
+    # Scheduled runs are advisory sweeps — only dependency-audit runs.
+    # Downstream jobs (build/test/integration) skip automatically via `needs`.
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -62,6 +70,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -99,18 +108,12 @@ jobs:
   dependency-audit:
     # Gates on known critical/high vulnerabilities in production dependencies.
     # Runs as a separate job so registry flakiness never blocks typecheck/build.
+    # Also runs on the weekly `schedule` trigger so new advisories surface
+    # without waiting for a PR.
     #
     # Advisories that cannot be remediated on the current dependency lines are
-    # ignored via `pnpm.auditConfig.ignoreGhsas` in the root package.json:
-    #   - GHSA-h25m-26qc-wcjf, GHSA-q4gf-8mx6-v5v3, GHSA-8h8q-6873-q5fj,
-    #     GHSA-c4j6-fc7j-m34r, GHSA-36qx-fr4f-26g5 — Next.js advisories whose
-    #     patched range is only >=15.x; we are on the latest 14.2.x (14.2.35),
-    #     which contains all backported 14.2-line security fixes. Revisit on
-    #     the Next 15 upgrade.
-    #   - GHSA-w24r-5266-9c3c — @clerk/clerk-react, transitive via
-    #     @clerk/nextjs@5.x (pins clerk-react 5.12.0) and convex. Fixed range
-    #     (>=5.61.6) requires @clerk/shared 3.x, incompatible with the 5.x
-    #     line. Revisit on the Clerk 6 upgrade.
+    # ignored via `pnpm.auditConfig.ignoreGhsas` in the root package.json.
+    # Per-GHSA rationale and revisit conditions: docs/ops/audit_ignores.md.
     # Any NEW high/critical advisory fails this job.
     name: Dependency Audit
     runs-on: ubuntu-latest
@@ -138,6 +141,7 @@ jobs:
   schema-drift:
     name: Schema Drift Check
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

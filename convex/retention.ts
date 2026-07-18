@@ -116,7 +116,11 @@ async function purgeRunSlice(
   }
 
   // 4. Events — the ONLY place recorded events are ever deleted (ADR 001).
-  //    Event-targeted comments are removed alongside each event.
+  //    Event-targeted comments are removed alongside each event. Comment
+  //    deletions COUNT AGAINST THE BATCH BUDGET: a comment-heavy event must not
+  //    blow the transaction bound, so we bail mid-page when the budget runs out
+  //    (the event is only deleted after ALL its comments are gone, so the next
+  //    batch resumes on the same event with its remaining comments).
   if (remaining() > 0) {
     const want = remaining();
     const events = await ctx.db
@@ -124,15 +128,24 @@ async function purgeRunSlice(
       .withIndex("by_run", (q) => q.eq("runId", runId))
       .take(want);
     for (const e of events) {
+      if (remaining() <= 0) {
+        return { deleted, storageKeys, done: false };
+      }
       const eventComments = await ctx.db
         .query("comments")
         .withIndex("by_target", (q) =>
           q.eq("targetId", e._id as string).eq("targetType", "event"),
         )
-        .collect();
+        .take(remaining());
       for (const c of eventComments) {
         await ctx.db.delete(c._id);
         deleted++;
+      }
+      // Budget exhausted mid-comment-page (or exactly at the boundary — there
+      // may be more comments than we could take): keep the event for the next
+      // batch rather than orphaning any of its remaining comments.
+      if (remaining() <= 0) {
+        return { deleted, storageKeys, done: false };
       }
       await ctx.db.delete(e._id);
       deleted++;
@@ -159,9 +172,11 @@ async function purgeRunSlice(
 /**
  * Delete one batch (≤ PURGE_BATCH_SIZE docs) of an organization's data, in
  * dependency order. Called repeatedly by purgeOrganization until done=true.
- * Order: org-level comments → org verification_results → runs (each fully via
- * purgeRunSlice) → agent_versions → agents → projects → api_keys →
- * memberships → audit_log (LAST — see ADR 001) → the organization record.
+ * Order: api_keys → memberships (FIRST — cutting credentials before data means
+ * live SDK ingestion and user sessions cannot race the sweeper and write into a
+ * partially-purged org) → org-level comments → org verification_results → runs
+ * (each fully via purgeRunSlice) → agent_versions → agents → projects →
+ * audit_log (LAST — see ADR 001) → the organization record.
  */
 export const purgeOrganizationBatch = internalMutation({
   args: { orgId: v.id("organizations") },
@@ -170,6 +185,31 @@ export const purgeOrganizationBatch = internalMutation({
     let deleted = 0;
     const storageKeys: string[] = [];
     const remaining = (): number => budget - deleted;
+
+    // 0a. API keys FIRST: once these rows are gone, every sdk_ingest mutation
+    //     fails its key lookup, so live ingestion cannot race the purge and
+    //     insert runs/events/artifacts behind the sweeper.
+    const keys = await ctx.db
+      .query("api_keys")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .take(remaining());
+    for (const k of keys) {
+      await ctx.db.delete(k._id);
+      deleted++;
+    }
+    if (remaining() <= 0) return { deleted, storageKeys, done: false };
+
+    // 0b. Memberships next, for the same reason on the Clerk-JWT path: without
+    //     a membership row, requireOrgMembership rejects every user write.
+    const memberships = await ctx.db
+      .query("user_memberships")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .take(remaining());
+    for (const m of memberships) {
+      await ctx.db.delete(m._id);
+      deleted++;
+    }
+    if (remaining() <= 0) return { deleted, storageKeys, done: false };
 
     // 1. Comments (org-scoped index catches run- and event-targeted alike).
     const comments = await ctx.db
@@ -240,29 +280,7 @@ export const purgeOrganizationBatch = internalMutation({
     }
     if (remaining() <= 0) return { deleted, storageKeys, done: false };
 
-    // 6. API keys.
-    const keys = await ctx.db
-      .query("api_keys")
-      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
-      .take(remaining());
-    for (const k of keys) {
-      await ctx.db.delete(k._id);
-      deleted++;
-    }
-    if (remaining() <= 0) return { deleted, storageKeys, done: false };
-
-    // 7. Memberships.
-    const memberships = await ctx.db
-      .query("user_memberships")
-      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
-      .take(remaining());
-    for (const m of memberships) {
-      await ctx.db.delete(m._id);
-      deleted++;
-    }
-    if (remaining() <= 0) return { deleted, storageKeys, done: false };
-
-    // 8. Audit log — deleted LAST so the trail survives as long as possible.
+    // 6. Audit log — deleted LAST so the trail survives as long as possible.
     //    The terminal purge record goes to the function log (ADR 001): a row in
     //    the org's own audit_log cannot survive the org's erasure.
     const auditRows = await ctx.db
@@ -275,7 +293,7 @@ export const purgeOrganizationBatch = internalMutation({
     }
     if (remaining() <= 0) return { deleted, storageKeys, done: false };
 
-    // 9. The organization record itself.
+    // 7. The organization record itself.
     const org = await ctx.db.get(args.orgId);
     if (org) {
       await ctx.db.delete(args.orgId);
@@ -322,12 +340,18 @@ async function deleteBlobsBestEffort(storageKeys: string[]): Promise<number> {
  * offboarding/erasure request. Re-schedules itself until drained.
  */
 export const purgeOrganization = internalAction({
-  args: { orgId: v.id("organizations") },
+  args: {
+    orgId: v.id("organizations"),
+    // Test/ops override for the per-invocation batch cap. Internal-only surface;
+    // defaults to MAX_BATCHES_PER_INVOCATION.
+    maxBatches: v.optional(v.number()),
+  },
   handler: async (ctx, args): Promise<{ deleted: number; done: boolean }> => {
     let totalDeleted = 0;
     let blobFailures = 0;
+    const maxBatches = args.maxBatches ?? MAX_BATCHES_PER_INVOCATION;
 
-    for (let batch = 0; batch < MAX_BATCHES_PER_INVOCATION; batch++) {
+    for (let batch = 0; batch < maxBatches; batch++) {
       const result: BatchResult = await ctx.runMutation(_purgeOrganizationBatch, {
         orgId: args.orgId,
       });
@@ -345,7 +369,7 @@ export const purgeOrganization = internalAction({
     }
 
     console.log(
-      `Purge org=${String(args.orgId)}: not drained after ${MAX_BATCHES_PER_INVOCATION} batches (deleted=${totalDeleted}); re-scheduling`,
+      `Purge org=${String(args.orgId)}: not drained after ${maxBatches} batches (deleted=${totalDeleted}); re-scheduling`,
     );
     await ctx.scheduler.runAfter(0, _purgeOrganization, { orgId: args.orgId });
     return { deleted: totalDeleted, done: false };

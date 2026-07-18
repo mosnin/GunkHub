@@ -1,3 +1,5 @@
+import Link from 'next/link'
+
 import type { Agent, Run } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
@@ -159,7 +161,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
               const active = s === 'all' ? !searchParams.status : searchParams.status === s
               const href = buildHref(baseParams, { status: s === 'all' ? undefined : s })
               return (
-                <a
+                <Link
                   key={s}
                   href={href}
                   className={[
@@ -170,7 +172,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
                   ].join(' ')}
                 >
                   {s}
-                </a>
+                </Link>
               )
             })}
           </div>
@@ -184,7 +186,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
               const active = r === 'all' ? !searchParams.range : searchParams.range === r
               const href = buildHref(baseParams, { range: r === 'all' ? undefined : r })
               return (
-                <a
+                <Link
                   key={r}
                   href={href}
                   className={[
@@ -195,7 +197,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
                   ].join(' ')}
                 >
                   {r}
-                </a>
+                </Link>
               )
             })}
           </div>
@@ -209,7 +211,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
               const active = verifyFilter === v
               const href = buildHref(baseParams, { verify: v === 'all' ? undefined : v })
               return (
-                <a
+                <Link
                   key={v}
                   href={href}
                   className={[
@@ -220,7 +222,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
                   ].join(' ')}
                 >
                   {v}
-                </a>
+                </Link>
               )
             })}
           </div>
@@ -232,7 +234,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
             <span className="text-xs text-pewter font-medium uppercase tracking-wider">Agent</span>
             <div className="flex gap-1 flex-wrap">
               {/* "All agents" option */}
-              <a
+              <Link
                 href={buildHref(baseParams, { agentId: undefined })}
                 className={[
                   'px-2 py-1 rounded text-xs font-mono font-medium border transition-colors duration-100',
@@ -242,11 +244,11 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
                 ].join(' ')}
               >
                 all
-              </a>
+              </Link>
               {agents.map((agent) => {
                 const active = searchParams.agentId === agent.id
                 return (
-                  <a
+                  <Link
                     key={agent.id}
                     href={buildHref(baseParams, { agentId: agent.id })}
                     title={agent.name}
@@ -258,13 +260,22 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
                     ].join(' ')}
                   >
                     {agent.slug ?? agent.name}
-                  </a>
+                  </Link>
                 )
               })}
             </div>
           </div>
         )}
       </div>
+
+      {/* Integrity-filter honesty note — verification filtering happens after
+          fetching this page of runs, so it only narrows the current page.
+          Server-side filtering is future work. */}
+      {verifyFilter !== 'all' && !error && (
+        <p className="mt-3 text-xs text-pewter font-mono">
+          Integrity filter “{verifyFilter}” is applied within this page of results only.
+        </p>
+      )}
 
       <div className="mt-4">
         {error ? (
@@ -287,7 +298,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
         <div className="mt-4 flex items-center justify-between border-t border-neutral-800 pt-3">
           <div>
             {searchParams.cursor && (
-              <a
+              <Link
                 href={buildHref(
                   { ...baseParams, projectId: searchParams.projectId },
                   { cursor: undefined },
@@ -295,12 +306,12 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
                 className="px-2 py-1 rounded text-xs font-mono font-medium border bg-transparent text-neutral-400 border-neutral-800 hover:text-neutral-200 hover:border-neutral-700 transition-colors duration-100"
               >
                 ← First page
-              </a>
+              </Link>
             )}
           </div>
           <div>
             {runs?.nextCursor && (
-              <a
+              <Link
                 href={buildHref(
                   { ...baseParams, projectId: searchParams.projectId },
                   { cursor: runs.nextCursor },
@@ -308,7 +319,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
                 className="px-2 py-1 rounded text-xs font-mono font-medium border bg-transparent text-neutral-400 border-neutral-800 hover:text-neutral-200 hover:border-neutral-700 transition-colors duration-100"
               >
                 Older runs →
-              </a>
+              </Link>
             )}
           </div>
         </div>

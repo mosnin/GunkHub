@@ -29,6 +29,7 @@ import { type NextRequest, NextResponse } from 'next/server'
 
 import type { ApiError } from '@agent-flight-recorder/contracts'
 
+import { mapAfrErrorResponse, withApiHandler } from '@/lib/apiHandler'
 import { convex } from '@/lib/convexFunctions'
 import {
   ConvexTimeoutError,
@@ -36,140 +37,131 @@ import {
   hashApiKey,
   withConvexTimeout,
 } from '@/lib/convexServer'
-import { getRequestId, logger } from '@/lib/logger'
 import { PAYLOAD_EXTERNALIZATION_THRESHOLD, getStorageAdapter, sha256Hex } from '@/lib/storage'
 
-export async function POST(req: NextRequest) {
-  const requestId = getRequestId(req)
-  const apiKey = req.headers.get('x-api-key')
-  if (!apiKey) {
-    return NextResponse.json<ApiError>(
-      { code: 'UNAUTHORIZED', message: 'API key required' },
-      { status: 401 }
-    )
-  }
-
-  let body: Record<string, unknown>
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    body = await req.json()
-  } catch {
-    return NextResponse.json<ApiError>(
-      { code: 'BAD_REQUEST', message: 'Invalid JSON body' },
-      { status: 400 }
-    )
-  }
-
-  const runId = body['runId']
-  const name = body['name']
-  const mimeType = body['mimeType']
-  const payload = body['payload']
-
-  if (!runId || typeof runId !== 'string') {
-    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'runId is required' }, { status: 422 })
-  }
-  if (!name || typeof name !== 'string') {
-    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'name is required' }, { status: 422 })
-  }
-  if (!mimeType || typeof mimeType !== 'string') {
-    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'mimeType is required' }, { status: 422 })
-  }
-  if (payload === undefined || payload === null) {
-    return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'payload is required' }, { status: 422 })
-  }
-
-  const eventId = typeof body['eventId'] === 'string' ? body['eventId'] : undefined
-
-  const serialized = JSON.stringify(payload)
-
-  // Only externalize genuinely large payloads — reject under-threshold uploads.
-  if (serialized.length < PAYLOAD_EXTERNALIZATION_THRESHOLD) {
-    return NextResponse.json<ApiError>(
-      {
-        code: 'VALIDATION_ERROR',
-        message: `Payload is ${String(serialized.length)} bytes — below the 10 KB threshold. Ship this payload inline in the event.`,
-      },
-      { status: 422 }
-    )
-  }
-
-  const apiKeyHash = hashApiKey(apiKey)
-  const client = getPublicClient()
-  const adapter = getStorageAdapter()
-
-  // AUTHENTICATE BEFORE touching blob storage. Previously the payload was written
-  // to blob storage first and the key validated only afterward (by sdkCreateArtifact),
-  // so any caller sending a bogus x-api-key could write arbitrary blobs. This
-  // read-only check verifies the key (existence/revocation/expiration/scope) and
-  // that it owns the run, throwing before a single byte is uploaded.
-  try {
-    await withConvexTimeout(client.query(convex.sdk_ingest.checkIngestAuth, { apiKeyHash, runId }))
-  } catch (err) {
-    if (err instanceof ConvexTimeoutError) {
-      logger.error('Ingest auth check timed out', { requestId, route: '/api/artifacts/upload', err })
+export const POST = withApiHandler(
+  '/api/artifacts/upload',
+  async (req: NextRequest, ctx) => {
+    const apiKey = req.headers.get('x-api-key')
+    if (!apiKey) {
       return NextResponse.json<ApiError>(
-        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
-        { status: 503, headers: { 'x-request-id': requestId } },
-      )
-    }
-    const message = err instanceof Error ? err.message : 'Unauthorized'
-    const status = message.includes('Run not found') ? 404 : 401
-    return NextResponse.json<ApiError>(
-      { code: status === 404 ? 'NOT_FOUND' : 'UNAUTHORIZED', message },
-      { status },
-    )
-  }
-
-  const checksum = await sha256Hex(serialized)
-  // Key format: <apiKeyPrefix>/<runId>/<checksumPrefix>-<name>
-  const storageKey = `${apiKeyHash.slice(0, 8)}/${runId}/${checksum.slice(0, 16)}-${name}`
-  const storageBucket = 'default'
-
-  try {
-    await adapter.upload(storageKey, serialized, mimeType)
-
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const artifact = await withConvexTimeout(client.mutation(convex.sdk_ingest.sdkCreateArtifact, {
-      apiKeyHash,
-      runId,
-      name,
-      mimeType,
-      size: serialized.length,
-      storageKey,
-      storageBucket,
-      checksum,
-      ...(eventId !== undefined && { eventId }),
-    }))
-
-    const doc = artifact as Record<string, unknown>
-    return NextResponse.json(
-      {
-        artifactId: (doc['_id'] ?? doc['id']) as string,
-        storageKey,
-        storageBucket,
-        checksum,
-        size: serialized.length,
-      },
-      { status: 201 }
-    )
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Internal error'
-    if (message === 'Unauthorized' || message === 'Run not found') {
-      return NextResponse.json<ApiError>(
-        { code: 'UNAUTHORIZED', message: 'Invalid API key or run not found' },
+        { code: 'UNAUTHORIZED', message: 'API key required' },
         { status: 401 }
       )
     }
-    logger.error('Artifact upload failed', { requestId, route: '/api/artifacts/upload', err })
-    if (err instanceof ConvexTimeoutError) {
+
+    let body: Record<string, unknown>
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      body = await req.json()
+    } catch {
       return NextResponse.json<ApiError>(
-        { code: 'SERVICE_UNAVAILABLE', message: `Backend unavailable (request ${requestId})` },
-        { status: 503, headers: { 'x-request-id': requestId } }
+        { code: 'BAD_REQUEST', message: 'Invalid JSON body' },
+        { status: 400 }
       )
     }
-    return NextResponse.json<ApiError>(
-      { code: 'INTERNAL_ERROR', message: `${message} (request ${requestId})` },
-      { status: 500, headers: { 'x-request-id': requestId } }
-    )
-  }
-}
+
+    const runId = body['runId']
+    const name = body['name']
+    const mimeType = body['mimeType']
+    const payload = body['payload']
+
+    if (!runId || typeof runId !== 'string') {
+      return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'runId is required' }, { status: 422 })
+    }
+    if (!name || typeof name !== 'string') {
+      return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'name is required' }, { status: 422 })
+    }
+    if (!mimeType || typeof mimeType !== 'string') {
+      return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'mimeType is required' }, { status: 422 })
+    }
+    if (payload === undefined || payload === null) {
+      return NextResponse.json<ApiError>({ code: 'VALIDATION_ERROR', message: 'payload is required' }, { status: 422 })
+    }
+
+    const eventId = typeof body['eventId'] === 'string' ? body['eventId'] : undefined
+
+    const serialized = JSON.stringify(payload)
+
+    // Only externalize genuinely large payloads — reject under-threshold uploads.
+    if (serialized.length < PAYLOAD_EXTERNALIZATION_THRESHOLD) {
+      return NextResponse.json<ApiError>(
+        {
+          code: 'VALIDATION_ERROR',
+          message: `Payload is ${String(serialized.length)} bytes — below the 10 KB threshold. Ship this payload inline in the event.`,
+        },
+        { status: 422 }
+      )
+    }
+
+    const apiKeyHash = hashApiKey(apiKey)
+    const client = getPublicClient()
+    const adapter = getStorageAdapter()
+
+    // AUTHENTICATE BEFORE touching blob storage. Previously the payload was written
+    // to blob storage first and the key validated only afterward (by sdkCreateArtifact),
+    // so any caller sending a bogus x-api-key could write arbitrary blobs. This
+    // read-only check verifies the key (existence/revocation/expiration/scope) and
+    // that it owns the run, throwing before a single byte is uploaded.
+    try {
+      await withConvexTimeout(client.query(convex.sdk_ingest.checkIngestAuth, { apiKeyHash, runId }))
+    } catch (err) {
+      if (err instanceof ConvexTimeoutError) throw err // wrapper maps to 503 + log
+      const message = err instanceof Error ? err.message : 'Unauthorized'
+      const status = message.includes('Run not found') ? 404 : 401
+      return NextResponse.json<ApiError>(
+        {
+          code: status === 404 ? 'NOT_FOUND' : 'UNAUTHORIZED',
+          message: status === 404 ? 'Run not found' : 'Invalid API key',
+        },
+        { status },
+      )
+    }
+
+    const checksum = await sha256Hex(serialized)
+    // Key format: <apiKeyPrefix>/<runId>/<checksumPrefix>-<name>
+    const storageKey = `${apiKeyHash.slice(0, 8)}/${runId}/${checksum.slice(0, 16)}-${name}`
+    const storageBucket = 'default'
+
+    try {
+      await adapter.upload(storageKey, serialized, mimeType)
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const artifact = await withConvexTimeout(client.mutation(convex.sdk_ingest.sdkCreateArtifact, {
+        apiKeyHash,
+        runId,
+        name,
+        mimeType,
+        size: serialized.length,
+        storageKey,
+        storageBucket,
+        checksum,
+        ...(eventId !== undefined && { eventId }),
+      }))
+
+      const doc = artifact as Record<string, unknown>
+      return NextResponse.json(
+        {
+          artifactId: (doc['_id'] ?? doc['id']) as string,
+          storageKey,
+          storageBucket,
+          checksum,
+          size: serialized.length,
+        },
+        { status: 201 }
+      )
+    } catch (err) {
+      // Stable afrError codes (e.g. ARTIFACT_LIMIT_EXCEEDED → 422).
+      const mapped = mapAfrErrorResponse(err, ctx.requestId)
+      if (mapped) return mapped
+      if (err instanceof Error && (err.message === 'Unauthorized' || err.message === 'Run not found')) {
+        return NextResponse.json<ApiError>(
+          { code: 'UNAUTHORIZED', message: 'Invalid API key or run not found' },
+          { status: 401 }
+        )
+      }
+      throw err
+    }
+  },
+  { rateLimit: { key: 'apiKey', limitPerMin: 120 } }
+)

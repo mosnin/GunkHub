@@ -20,6 +20,8 @@
   --color-blackout: #000000;
   /* Sanctioned accent glow (design.md "Glow") — live/status dots only, never elevation. */
   --shadow-glow: 0 0 8px rgba(52, 213, 154, 0.7);
+  /* Sanctioned destructive/warn glow (design.md "Glow") — status dots only. */
+  --shadow-glow-warn: 0 0 8px rgba(255, 54, 33, 0.6);
   --font-inter: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-geistmono: 'Geist Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
@@ -130,7 +132,27 @@
   .scanline,
   .animate-data-stream,
   .animate-neon-pulse,
-  .animate-fade-up {
+  .animate-fade-up,
+  .animate-pulse {
     animation: none !important;
+  }
+
+  /* Deliberate exception: the loading spinner keeps spinning under reduced
+     motion — it is the only signal that the app is working, and removing it
+     would read as a hang. It is slowed to 2s so the motion is gentle. */
+  .animate-spin {
+    animation-duration: 2s !important;
+  }
+}
+
+/* Forced colors (Windows High Contrast): box-shadow focus rings are removed by
+   the OS, so :focus-visible must fall back to a real outline. Tailwind's
+   `outline-none` utility emits `outline: 2px solid transparent` (which forced
+   colors repaints), but this !important rule guarantees a visible indicator on
+   every focusable element regardless of utility overrides. */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: 3px solid Highlight !important;
+    outline-offset: 2px;
   }
 }

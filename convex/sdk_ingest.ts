@@ -62,6 +62,77 @@ async function resolveApiKey(
   return apiKey;
 }
 
+// ---------------------------------------------------------------------------
+// Per-key fixed-window rate limiting (shared by sdkCreateRun, sdkCreateEvents,
+// and sdkCreateArtifact — one counter per key across all ingest write surfaces).
+//
+// HOT-KEY CONTENTION MITIGATION: Convex serializes writes to a document, so
+// patching the api_key doc on every ingest call would serialize all ingest for
+// a busy key. The counter is therefore APPROXIMATE for single-unit calls:
+//   - The counter doc is always patched when the minute window CHANGES.
+//   - Within a window, single-unit calls flush the counter only on ~1 in
+//     RATE_FLUSH_STRIDE calls, adding RATE_FLUSH_STRIDE units per flush
+//     (unbiased in expectation, à la Morris counting). Between flushes the
+//     stored count lags by at most ~RATE_FLUSH_STRIDE units per concurrent
+//     stream, so the effective limit is `rateLimitPerMin ± O(RATE_FLUSH_STRIDE)`
+//     — accurate enough for abuse protection, which is what this limit is for.
+//   - SMALL limits (≤ RATE_EXACT_THRESHOLD) are counted exactly, because there
+//     a stride-sized error would swallow the whole budget (and exact tests
+//     stay deterministic).
+//   - Batch calls (sdkCreateEvents) always flush exactly: one patch per batch
+//     is already amortized over the batch's events.
+// ---------------------------------------------------------------------------
+const RATE_FLUSH_STRIDE = 25;
+const RATE_EXACT_THRESHOLD = 4 * RATE_FLUSH_STRIDE; // ≤100/min: exact counting
+
+/**
+ * Enforce the key's fixed one-minute-window rate limit, counting `units` against
+ * it. Throws a stable RATE_LIMITED error when the limit would be exceeded. The
+ * whole mutation is transactional, so on rejection nothing is committed.
+ */
+async function enforceRateLimit(
+  ctx: MutationCtx,
+  apiKey: Doc<"api_keys">,
+  units: number,
+): Promise<void> {
+  const limit = apiKey.rateLimitPerMin;
+  if (limit === undefined) return;
+
+  const window = Math.floor(Date.now() / 60_000);
+  const inSameWindow = apiKey.rateWindowStart === window;
+  const currentCount = inSameWindow ? apiKey.rateWindowCount ?? 0 : 0;
+  const newCount = currentCount + units;
+
+  if (newCount > limit) {
+    throw afrError(
+      "RATE_LIMITED",
+      `Rate limit exceeded: ${limit} ingest units/min for this API key`,
+    );
+  }
+
+  const exact = units > 1 || limit <= RATE_EXACT_THRESHOLD;
+  if (!inSameWindow) {
+    // Window rolled over — always persist the reset.
+    await ctx.db.patch(apiKey._id, {
+      rateWindowStart: window,
+      rateWindowCount: units,
+    });
+  } else if (exact) {
+    await ctx.db.patch(apiKey._id, {
+      rateWindowStart: window,
+      rateWindowCount: newCount,
+    });
+  } else if (Math.random() < 1 / RATE_FLUSH_STRIDE) {
+    // Approximate flush: account for the ~RATE_FLUSH_STRIDE unflushed calls
+    // this one statistically represents. Cap at the limit so a lucky double
+    // flush cannot push the stored count past it spuriously.
+    await ctx.db.patch(apiKey._id, {
+      rateWindowStart: window,
+      rateWindowCount: Math.min(currentCount + units * RATE_FLUSH_STRIDE, limit),
+    });
+  }
+}
+
 const TERMINAL_STATUSES = new Set([
   "completed",
   "failed",
@@ -179,6 +250,8 @@ export const sdkCreateRun = mutation({
   },
   handler: async (ctx, args) => {
     const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
+    // Run creation counts one unit against the same per-key ingest window.
+    await enforceRateLimit(ctx, apiKey, 1);
 
     const agentId = args.agentId as Id<"agents">;
     const agent = await ctx.db.get(agentId);
@@ -253,21 +326,7 @@ export const sdkCreateEvents = mutation({
     // Fixed-window ingest rate limiting (runaway-agent / abuse protection). The
     // whole mutation is transactional, so if the limit is exceeded nothing —
     // including the events and the lastUsedAt stamp — is committed.
-    if (apiKey.rateLimitPerMin !== undefined) {
-      const window = Math.floor(Date.now() / 60_000);
-      const inSameWindow = apiKey.rateWindowStart === window;
-      const currentCount = inSameWindow ? apiKey.rateWindowCount ?? 0 : 0;
-      const newCount = currentCount + args.events.length;
-      if (newCount > apiKey.rateLimitPerMin) {
-        throw new Error(
-          `Rate limit exceeded: ${apiKey.rateLimitPerMin} events/min for this API key`,
-        );
-      }
-      await ctx.db.patch(apiKey._id, {
-        rateWindowStart: window,
-        rateWindowCount: newCount,
-      });
-    }
+    await enforceRateLimit(ctx, apiKey, args.events.length);
 
     const eventIds: string[] = [];
 
@@ -328,7 +387,8 @@ export const sdkCreateEvents = mutation({
 
       // A genuinely new event may only be appended while the run is running.
       if (run.status !== "running") {
-        throw new Error(
+        throw afrError(
+          "RUN_NOT_ACTIVE",
           `Cannot append event to run with status "${run.status}". Run must be in "running" state.`,
         );
       }
@@ -363,14 +423,16 @@ export const sdkCreateEvents = mutation({
 
       // --- Event Log Rule 5: nothing may follow a terminal event ---
       if (state.hasTerminal) {
-        throw new Error(
+        throw afrError(
+          "RUN_NOT_ACTIVE",
           `Cannot append event to run ${evt.runId}: a terminal event has already been recorded`,
         );
       }
 
       const expected = state.maxSeq + 1;
       if (evt.sequenceNumber !== expected) {
-        throw new Error(
+        throw afrError(
+          "SEQUENCE_CONFLICT",
           `Non-contiguous sequenceNumber for run ${evt.runId}: expected ${expected}, got ${evt.sequenceNumber}`,
         );
       }
@@ -398,6 +460,38 @@ export const sdkCreateEvents = mutation({
         payload: evt.payload,
         parentEventId,
       });
+
+      // Sticky-reference backfill for artifact GC: an `_externalized` payload
+      // points at an artifact record; stamp that artifact with this event's id
+      // so it permanently leaves the GC's orphan-candidate set. Patching the
+      // ARTIFACT (metadata) — never the event — so event-log immutability holds.
+      // Best-effort: a malformed/foreign pointer is simply not stamped (the GC
+      // pointer scan remains the fallback).
+      const payloadPtr = evt.payload as {
+        type?: unknown;
+        _artifact?: { artifactId?: unknown };
+      } | null;
+      if (
+        payloadPtr !== null &&
+        typeof payloadPtr === "object" &&
+        payloadPtr.type === "_externalized" &&
+        typeof payloadPtr._artifact?.artifactId === "string"
+      ) {
+        const normalized = ctx.db.normalizeId(
+          "artifacts",
+          payloadPtr._artifact.artifactId,
+        );
+        if (normalized !== null) {
+          const artifact = await ctx.db.get(normalized);
+          if (
+            artifact &&
+            artifact.runId === runId &&
+            artifact.referencedByEventId === undefined
+          ) {
+            await ctx.db.patch(normalized, { referencedByEventId: eventId });
+          }
+        }
+      }
 
       // Reconcile run.status with the terminal event so the event log (source of
       // truth) and the run's status never disagree. A run.completed/run.failed
@@ -489,6 +583,8 @@ export const sdkCreateArtifact = mutation({
   },
   handler: async (ctx, args) => {
     const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
+    // Artifact creation counts one unit against the same per-key ingest window.
+    await enforceRateLimit(ctx, apiKey, 1);
 
     const runId = args.runId as Id<"runs">;
     const run = await ctx.db.get(runId);

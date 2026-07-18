@@ -2,6 +2,7 @@ export * from "./entities.js";
 export * from "./events.js";
 export * from "./status.js";
 export * from "./api.js";
+export * from "./api_errors.js";
 export * from "./auth.js";
 export * from "./artifacts.js";
 export * from "./replay.js";

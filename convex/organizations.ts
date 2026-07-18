@@ -4,6 +4,9 @@ import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
 import { WEBHOOK_ACTOR, recordAuditEvent } from "./audit.js";
+import { requireOrgMembership } from "./auth.js";
+import { afrError } from "./helpers/errors.js";
+import { MAX_RETENTION_DAYS, MIN_RETENTION_DAYS } from "./helpers/pagination.js";
 
 /**
  * Shared-secret gate for webhook-only lifecycle mutations.
@@ -261,5 +264,170 @@ export const upsertMembership = mutation({
     const membership = await ctx.db.get(membershipId);
     if (!membership) throw new Error("Failed to create membership");
     return membership;
+  },
+});
+
+/**
+ * Delete the user_memberships row for (clerkOrgId, clerkUserId). Called from
+ * the Clerk organizationMembership.deleted webhook event. Without this,
+ * requireOrgMembership keeps authorizing a user Clerk has already removed —
+ * a live authorization defect.
+ *
+ * Idempotent: a missing org or membership is a no-op ({ removed: false }) so
+ * Clerk's webhook retries and out-of-order deliveries never fail.
+ */
+export const removeMembership = mutation({
+  args: {
+    webhookSecret: v.string(),
+    clerkUserId: v.string(),
+    clerkOrgId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    assertWebhookSecret(args.webhookSecret);
+
+    const org = await ctx.db
+      .query("organizations")
+      .withIndex("by_clerk_org_id", (q) =>
+        q.eq("clerkOrgId", args.clerkOrgId),
+      )
+      .unique();
+    if (!org) {
+      return { removed: false as const };
+    }
+
+    const membership = await ctx.db
+      .query("user_memberships")
+      .withIndex("by_clerk_user", (q) =>
+        q.eq("clerkUserId", args.clerkUserId),
+      )
+      .filter((q) => q.eq(q.field("orgId"), org._id))
+      .unique();
+    if (!membership) {
+      return { removed: false as const };
+    }
+
+    await ctx.db.delete(membership._id);
+    await recordAuditEvent(ctx, {
+      orgId: org._id,
+      actorClerkUserId: WEBHOOK_ACTOR,
+      action: "membership.removed",
+      targetType: "user_membership",
+      targetId: String(membership._id),
+      metadata: { clerkUserId: args.clerkUserId, removedRole: membership.role },
+    });
+
+    return { removed: true as const };
+  },
+});
+
+/**
+ * Mark an organization as pending deletion. Called from the Clerk
+ * organization.deleted webhook event.
+ *
+ * Deliberately does NOT purge: ADR 001 keeps the cascade purge
+ * operator-invoked (retention:purgeOrganization from the dashboard/CLI on a
+ * verified erasure request). This mutation only stamps `pendingDeletionAt`,
+ * writes an audit row, and logs a structured warning — making the erasure
+ * obligation visible so an operator acts on it.
+ *
+ * Idempotent: an already-stamped org keeps its original timestamp.
+ */
+export const markOrganizationPendingDeletion = mutation({
+  args: {
+    webhookSecret: v.string(),
+    clerkOrgId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    assertWebhookSecret(args.webhookSecret);
+
+    const org = await ctx.db
+      .query("organizations")
+      .withIndex("by_clerk_org_id", (q) =>
+        q.eq("clerkOrgId", args.clerkOrgId),
+      )
+      .unique();
+    if (!org) {
+      return { marked: false as const };
+    }
+    if (org.pendingDeletionAt !== undefined) {
+      // Already marked — keep the original timestamp (webhook retry).
+      return { marked: true as const, pendingDeletionAt: org.pendingDeletionAt };
+    }
+
+    const now = Date.now();
+    await ctx.db.patch(org._id, { pendingDeletionAt: now });
+    await recordAuditEvent(ctx, {
+      orgId: org._id,
+      actorClerkUserId: WEBHOOK_ACTOR,
+      action: "org.deletion_requested",
+      targetType: "organization",
+      targetId: String(org._id),
+      metadata: { clerkOrgId: args.clerkOrgId, pendingDeletionAt: now },
+    });
+    // Structured warning: the ERASURE OBLIGATION now exists but nothing is
+    // deleted until an operator runs retention:purgeOrganization (ADR 001).
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        msg: "ORG_DELETION_REQUESTED — erasure obligation pending; run retention:purgeOrganization to fulfill it",
+        orgId: String(org._id),
+        clerkOrgId: args.clerkOrgId,
+        pendingDeletionAt: now,
+      }),
+    );
+
+    return { marked: true as const, pendingDeletionAt: now };
+  },
+});
+
+/**
+ * Set or clear the org's retention window (ADR 001). Admin-only. Omitting
+ * `retentionDays` clears the window (retain forever — the default).
+ */
+export const updateRetentionPolicy = mutation({
+  args: {
+    orgId: v.id("organizations"),
+    retentionDays: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    // Retention controls what gets DELETED — strictly admin.
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "admin" });
+
+    if (args.retentionDays !== undefined) {
+      if (
+        !Number.isInteger(args.retentionDays) ||
+        args.retentionDays < MIN_RETENTION_DAYS ||
+        args.retentionDays > MAX_RETENTION_DAYS
+      ) {
+        throw afrError(
+          "INVALID_ARGUMENT",
+          `retentionDays must be an integer between ${MIN_RETENTION_DAYS} and ${MAX_RETENTION_DAYS}`,
+        );
+      }
+    }
+
+    const org = await ctx.db.get(args.orgId);
+    if (!org) {
+      throw afrError("NOT_FOUND", "Organization not found");
+    }
+
+    const identity = await ctx.auth.getUserIdentity();
+    await ctx.db.patch(args.orgId, {
+      retentionDays: args.retentionDays,
+      updatedAt: Date.now(),
+    });
+    await recordAuditEvent(ctx, {
+      orgId: args.orgId,
+      actorClerkUserId: identity?.subject ?? "unknown",
+      action: "org.retention_updated",
+      targetType: "organization",
+      targetId: String(args.orgId),
+      metadata: {
+        oldRetentionDays: org.retentionDays ?? null,
+        newRetentionDays: args.retentionDays ?? null,
+      },
+    });
+
+    return await ctx.db.get(args.orgId);
   },
 });

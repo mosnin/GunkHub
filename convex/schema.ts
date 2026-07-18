@@ -18,6 +18,11 @@ export default defineSchema({
     // artifacts, comments, verification results) started more than retentionDays
     // days ago. Unset = retain forever (default).
     retentionDays: v.optional(v.number()),
+    // Set when Clerk reports organization.deleted. The purge itself stays
+    // operator-invoked (ADR 001) — this timestamp makes the pending erasure
+    // obligation visible so an operator can act on it. Cleared never; the org
+    // record is deleted wholesale by the purge.
+    pendingDeletionAt: v.optional(v.number()),
   }).index("by_clerk_org_id", ["clerkOrgId"]),
 
   projects: defineTable({
@@ -104,6 +109,14 @@ export default defineSchema({
     storageBucket: v.string(),
     checksum: v.string(),
     createdAt: v.number(),
+    // GC bookkeeping (sticky reference): once ANY event's `_externalized`
+    // payload is known to point at this artifact, the referencing event id is
+    // stamped here so the artifact permanently leaves the orphan-candidate set
+    // (events are immutable, so a reference can never be un-made). Artifacts are
+    // metadata pointers, NOT events — patching this field does not violate
+    // event-log immutability. Backfilled at write time by sdkCreateEvents and,
+    // as a fallback, by the GC's pointer scan.
+    referencedByEventId: v.optional(v.id("events")),
   })
     .index("by_run", ["runId"])
     .index("by_run_checksum", ["runId", "checksum"])

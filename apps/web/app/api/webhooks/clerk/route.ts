@@ -2,6 +2,7 @@
 // Authentication is via Svix signature verification (not Clerk JWT).
 // This route must remain unauthenticated at the HTTP level.
 
+import { makeFunctionReference } from 'convex/server'
 import { headers } from 'next/headers'
 import { NextResponse } from 'next/server'
 import { Webhook } from 'svix'
@@ -13,6 +14,13 @@ import { getRequestId, logger } from '@/lib/logger'
 import { createRateLimiter, getClientIp } from '@/lib/rateLimit'
 
 const ROUTE = '/api/webhooks/clerk'
+
+// Local references for webhook-only lifecycle mutations not (yet) exported from
+// lib/convexFunctions. This route owns the webhook↔convex contract.
+const removeMembershipRef = makeFunctionReference<'mutation'>('organizations:removeMembership')
+const markOrgPendingDeletionRef = makeFunctionReference<'mutation'>(
+  'organizations:markOrganizationPendingDeletion',
+)
 
 // Best-effort per-instance rate limit for this unauthenticated route
 // (60 req/min/IP). Durable rate limiting stays in Convex — see lib/rateLimit.ts.
@@ -134,6 +142,17 @@ export async function POST(req: Request) {
         await handleOrganizationMembershipCreated(data)
         break
       }
+      case 'organizationMembership.deleted': {
+        const data = event.data as unknown as ClerkOrganizationMembershipData
+        await handleOrganizationMembershipDeleted(data)
+        break
+      }
+      case 'organization.deleted': {
+        // Clerk sends a slimmer payload for deletions — only `id` is guaranteed.
+        const data = event.data as unknown as { id: string }
+        await handleOrganizationDeleted(data, requestId)
+        break
+      }
       default:
         // Unrecognised event type — acknowledge receipt without acting
         break
@@ -207,4 +226,41 @@ async function handleOrganizationMembershipCreated(
       role: clerkRoleToInternal(data.role),
     }),
   )
+}
+
+async function handleOrganizationMembershipDeleted(
+  data: ClerkOrganizationMembershipData,
+) {
+  // Revoke the membership row so requireOrgMembership stops authorizing a user
+  // Clerk has already removed. Idempotent on the Convex side — a missing org or
+  // membership is a no-op, so webhook retries and reordered deliveries are safe.
+  const client = getPublicClient()
+  await withConvexTimeout(
+    client.mutation(removeMembershipRef, {
+      webhookSecret: env.CONVEX_WEBHOOK_SECRET,
+      clerkUserId: data.public_user_data.user_id,
+      clerkOrgId: data.organization.id,
+    }),
+  )
+}
+
+async function handleOrganizationDeleted(data: { id: string }, requestId: string) {
+  // Deliberately NOT an auto-purge: ADR 001 keeps erasure operator-invoked
+  // (retention:purgeOrganization from the Convex dashboard/CLI on a verified
+  // request). We stamp pendingDeletionAt so the erasure obligation is visible,
+  // and log a structured warning so operators see it.
+  const client = getPublicClient()
+  const result: unknown = await withConvexTimeout(
+    client.mutation(markOrgPendingDeletionRef, {
+      webhookSecret: env.CONVEX_WEBHOOK_SECRET,
+      clerkOrgId: data.id,
+    }),
+  )
+  logger.warn('Clerk organization deleted — erasure obligation pending', {
+    requestId,
+    route: ROUTE,
+    clerkOrgId: data.id,
+    result,
+    action: 'Operator must run retention:purgeOrganization to fulfill erasure (ADR 001)',
+  })
 }

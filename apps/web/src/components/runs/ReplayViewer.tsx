@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import type { FailureSummary, ReplayFrame, ReplayProjection } from '@agent-flight-recorder/contracts'
 
@@ -9,6 +9,19 @@ import { EmptyState } from '@/components/ui/EmptyState'
 interface ReplayViewerProps {
   projection: ReplayProjection
   failureSummary: FailureSummary
+}
+
+// Windowed rendering (parity with Timeline/DiffViewer): only this many frames
+// are mounted at once, with earlier/later expanders. Keeps the DOM bounded for
+// 10k-frame replays.
+const WINDOW_SIZE = 100
+
+/** True when the keydown originated in a text-entry context — the replay
+    stepper must not hijack arrow keys from inputs/textareas/selects. */
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  const tag = target.tagName
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable
 }
 
 // Actor → left border treatment. design.md limits colour to Neon Glow, the red
@@ -37,13 +50,16 @@ interface FrameRowProps {
   frame: ReplayFrame
   isActive: boolean
   onClick: () => void
+  rowRef?: React.Ref<HTMLButtonElement>
 }
 
-function FrameRow({ frame, isActive, onClick }: FrameRowProps) {
+function FrameRow({ frame, isActive, onClick, rowRef }: FrameRowProps) {
   const indent = frame.depth * 16 // ml-4 = 16px per level
   return (
     <button
+      ref={rowRef}
       onClick={onClick}
+      aria-current={isActive ? 'true' : undefined}
       style={{ paddingLeft: `${8 + indent}px` }}
       className={[
         'w-full flex items-start gap-2 py-1.5 pr-3 text-left transition-colors duration-75',
@@ -93,6 +109,11 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
   const { frames } = projection
   const total = frames.length
 
+  // Frame-list window, centered on the current step initially. Expander buttons
+  // shift it; stepping outside the window recenters it (effect below).
+  const [windowStart, setWindowStart] = useState(0)
+  const activeRowRef = useRef<HTMLButtonElement | null>(null)
+
   const activeFrame = total > 0 ? frames[currentIndex] : null
 
   function goPrev() {
@@ -105,6 +126,8 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
+      // Never hijack arrow keys while the user is typing in a form control.
+      if (isEditableTarget(e.target)) return
       if (e.key === 'ArrowLeft') {
         e.preventDefault()
         setCurrentIndex((i) => Math.max(0, i - 1))
@@ -116,6 +139,21 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [total])
+
+  // Keep the active frame inside the window: when stepping crosses the window
+  // edge, recenter the window on the current step.
+  useEffect(() => {
+    if (currentIndex < windowStart || currentIndex >= windowStart + WINDOW_SIZE) {
+      setWindowStart(
+        Math.max(0, Math.min(currentIndex - Math.floor(WINDOW_SIZE / 2), total - WINDOW_SIZE))
+      )
+    }
+  }, [currentIndex, windowStart, total])
+
+  // Stepping scrolls the active frame into view within the frame list.
+  useEffect(() => {
+    activeRowRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [currentIndex, windowStart])
 
   if (total === 0) {
     return (
@@ -187,16 +225,38 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
 
       {/* Main split: frame list + frame detail */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Frame list */}
+        {/* Frame list — windowed to WINDOW_SIZE mounted rows */}
         <div className="w-72 shrink-0 border-r border-neutral-800 overflow-y-auto">
-          {frames.map((frame, i) => (
-            <FrameRow
-              key={frame.event.id}
-              frame={frame}
-              isActive={i === currentIndex}
-              onClick={() => setCurrentIndex(i)}
-            />
-          ))}
+          {windowStart > 0 && (
+            <button
+              onClick={() => setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))}
+              className="w-full text-left px-3 py-1.5 text-xs font-mono text-pewter hover:text-cloud border-b border-neutral-800 transition-colors duration-100"
+            >
+              ↑ {windowStart} earlier
+            </button>
+          )}
+          {frames.slice(windowStart, windowStart + WINDOW_SIZE).map((frame, relIdx) => {
+            const i = windowStart + relIdx
+            return (
+              <FrameRow
+                key={frame.event.id}
+                frame={frame}
+                isActive={i === currentIndex}
+                onClick={() => setCurrentIndex(i)}
+                rowRef={i === currentIndex ? activeRowRef : undefined}
+              />
+            )
+          })}
+          {windowStart + WINDOW_SIZE < total && (
+            <button
+              onClick={() =>
+                setWindowStart(Math.min(total - WINDOW_SIZE, windowStart + WINDOW_SIZE))
+              }
+              className="w-full text-left px-3 py-1.5 text-xs font-mono text-pewter hover:text-cloud border-t border-neutral-800 transition-colors duration-100"
+            >
+              ↓ {total - windowStart - WINDOW_SIZE} later
+            </button>
+          )}
         </div>
 
         {/* Frame detail */}

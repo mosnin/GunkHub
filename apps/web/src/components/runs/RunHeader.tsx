@@ -137,11 +137,12 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
     <div className="px-6 py-4 border-b border-neutral-800 bg-neutral-950">
       {/* Main row */}
       <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
-        {/* Run ID with copy button */}
+        {/* Run ID with copy button — the page's h1 (run detail has no other
+            top-level heading; sections below start at h2/h3). */}
         <div className="flex items-center gap-0.5">
-          <span className="font-mono text-sm text-neutral-100 tracking-tight">
+          <h1 className="font-mono text-sm text-neutral-100 tracking-tight">
             {truncateId(runId, 12)}
-          </span>
+          </h1>
           <CopyButton value={runId} />
         </div>
 
@@ -209,6 +210,9 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
               onKeyDown={handleKeyDown}
               onBlur={commitInput}
               placeholder="Add tag…"
+              aria-label="Add tag"
+              aria-invalid={errorMsg ? true : undefined}
+              aria-describedby={errorMsg ? 'tag-edit-error' : undefined}
               className="bg-transparent text-xs font-mono text-neutral-300 placeholder-neutral-500 border-b border-neutral-700 focus:border-neutral-500 outline-none w-24 py-0.5"
               autoFocus
               disabled={isPending}
@@ -239,7 +243,9 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
 
             {/* Error feedback */}
             {errorMsg && (
-              <span className="text-xs text-destructive-500 font-mono">{errorMsg}</span>
+              <span id="tag-edit-error" role="alert" className="text-xs text-destructive-500 font-mono">
+                {errorMsg}
+              </span>
             )}
           </>
         ) : (

@@ -1,3 +1,4 @@
+import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { cn } from '@/lib/utils'
 
 interface CodeBlockProps {
@@ -15,11 +16,10 @@ export function CodeBlock({ content, language, maxHeight = '400px', className }:
         className
       )}
     >
-      {language && (
-        <div className="px-3 py-1.5 border-b border-neutral-800 flex items-center justify-between">
-          <span className="text-xs font-mono text-neutral-500">{language}</span>
-        </div>
-      )}
+      <div className="px-3 py-1.5 border-b border-neutral-800 flex items-center justify-between">
+        <span className="text-xs font-mono text-neutral-500">{language ?? 'text'}</span>
+        <CopyToClipboardButton value={content} label="Copy code to clipboard" />
+      </div>
       <div
         className="overflow-auto p-4"
         style={{ maxHeight }}

@@ -170,7 +170,8 @@ export const createEvent = mutation({
 
     // A genuinely new event may only be appended while the run is running.
     if (run.status !== "running") {
-      throw new Error(
+      throw afrError(
+        "RUN_NOT_ACTIVE",
         `Cannot append event to run with status "${run.status}". Run must be in "running" state.`,
       );
     }
@@ -206,13 +207,15 @@ export const createEvent = mutation({
       .order("desc")
       .first();
     if (latest && TERMINAL_EVENT_TYPES.has(latest.type)) {
-      throw new Error(
+      throw afrError(
+        "RUN_NOT_ACTIVE",
         "Cannot append event: a terminal event has already been recorded for this run",
       );
     }
     const expected = (latest ? latest.sequenceNumber : 0) + 1;
     if (args.sequenceNumber !== expected) {
-      throw new Error(
+      throw afrError(
+        "SEQUENCE_CONFLICT",
         `Non-contiguous sequenceNumber: expected ${expected}, got ${args.sequenceNumber}`,
       );
     }

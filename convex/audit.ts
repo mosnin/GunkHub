@@ -29,6 +29,9 @@ export const AUDIT_ACTIONS = [
   "agent.created",
   "agent_version.created",
   "membership.upserted",
+  "membership.removed",
+  "org.deletion_requested",
+  "org.retention_updated",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

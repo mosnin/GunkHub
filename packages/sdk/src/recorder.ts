@@ -1,8 +1,19 @@
+import { NON_RETRYABLE_RUN_ERROR_CODES } from './api-errors.js'
 import { Events, buildEvent } from './events.js'
 import { HttpTransport, createRetryStrategy, type Transport } from './transport.js'
 import { SDK_VERSION } from './version.js'
 
-import type { RecorderConfig, RunContext, RecordEventOptions, FlushResult, EventSpool, StoredEvent } from './types.js'
+import type {
+  RecorderConfig,
+  RunContext,
+  RecordEventOptions,
+  FlushResult,
+  FlushError,
+  EventSpool,
+  StoredEvent,
+  DropReason,
+  TransportResponse,
+} from './types.js'
 import type { RunStatus, EventType, EventPayload } from '@agent-flight-recorder/contracts'
 
 /** Minimal shape of the Node `process` global we depend on (avoids @types/node). */
@@ -20,6 +31,13 @@ const PROTECTED_EVENT_TYPES: ReadonlySet<EventType> = new Set<EventType>([
   'run.cancelled',
 ])
 
+/** Terminal event types — recording one seals the run's event stream. */
+const TERMINAL_EVENT_TYPES: ReadonlySet<EventType> = new Set<EventType>([
+  'run.completed',
+  'run.failed',
+  'run.cancelled',
+])
+
 /** Return the Node process if we're running under Node, otherwise undefined. */
 function getNodeProcess(): NodeProcessLike | undefined {
   const p = (globalThis as { process?: unknown }).process
@@ -27,6 +45,25 @@ function getNodeProcess(): NodeProcessLike | undefined {
     return p as NodeProcessLike
   }
   return undefined
+}
+
+/** Throw a TypeError unless `value` is undefined or an integer-ish number >= 1. */
+function assertAtLeastOne(name: string, value: number | undefined): void {
+  if (value === undefined) return
+  if (typeof value !== 'number' || Number.isNaN(value) || value < 1) {
+    throw new TypeError(`RecorderOptions.${name} must be >= 1 (got ${String(value)})`)
+  }
+}
+
+/** Group events by runId, preserving first-appearance order of runs and event order within each run. */
+function groupByRun(events: ReturnType<typeof buildEvent>[]): Map<string, ReturnType<typeof buildEvent>[]> {
+  const groups = new Map<string, ReturnType<typeof buildEvent>[]>()
+  for (const ev of events) {
+    const group = groups.get(ev.runId)
+    if (group) group.push(ev)
+    else groups.set(ev.runId, [ev])
+  }
+  return groups
 }
 
 export class Recorder {
@@ -44,8 +81,32 @@ export class Recorder {
   // in-flight flush and preserves buffer order.
   private flushChain: Promise<unknown> = Promise.resolve()
 
-  /** Cumulative count of events dropped from the buffer due to overflow. */
+  /** Cumulative count of events dropped (overflow or permanent server rejection). */
   private droppedEventCount = 0
+
+  /**
+   * True once a terminal event (run.completed/failed/cancelled) has been
+   * buffered for the CURRENT run. Recording after that point is a caller bug —
+   * the server rejects events after the terminal one, which would poison the
+   * whole batch — so recordEvent throws instead. Reset by startRun.
+   */
+  private terminalBuffered = false
+
+  /**
+   * Status-transition intents that could not be delivered (and are also
+   * persisted to the spool when one is configured). Kept in memory so spool
+   * resyncs (clear + re-append of unacknowledged entries) never wipe a pending
+   * intent, and so recover() in the same process can retire them.
+   */
+  private pendingStatusIntents: (StoredEvent & { kind: 'status' })[] = []
+
+  /**
+   * Best-effort mirror of how many entries the spool currently holds, used to
+   * enforce `maxSpoolEntries` without re-reading the spool on every append.
+   * Kept in sync by the (serialized) spool operations; initialized from
+   * `peek()` by recover().
+   */
+  private spoolEntryCount = 0
 
   // Serializes spool I/O so append/clear operations apply in program order even
   // though they are launched fire-and-forget. Without this, a recordEvent
@@ -67,7 +128,20 @@ export class Recorder {
     if (proc) proc.exitCode = 1
   }
 
+  /**
+   * Create a Recorder.
+   *
+   * @param config - endpoint/apiKey/agentId plus optional tuning `options`.
+   * @param transport - optional custom Transport (defaults to HttpTransport).
+   * @throws TypeError if any numeric option is present but < 1
+   *   (`maxBatchSize`, `maxBufferSize`, `maxSpoolEntries`, `flushIntervalMs`).
+   */
   constructor(config: RecorderConfig, transport?: Transport) {
+    assertAtLeastOne('maxBatchSize', config.options?.maxBatchSize)
+    assertAtLeastOne('maxBufferSize', config.options?.maxBufferSize)
+    assertAtLeastOne('maxSpoolEntries', config.options?.maxSpoolEntries)
+    assertAtLeastOne('flushIntervalMs', config.options?.flushIntervalMs)
+
     this.config = config
     // When we own the transport, thread the retry-tuning options through so
     // maxRetries/retryBackoffMs actually take effect instead of being dead config.
@@ -116,6 +190,7 @@ export class Recorder {
     }
 
     this.sequenceCounter = 0
+    this.terminalBuffered = false
     this.recordEvent('run.started', Events.runStarted(this.runContext.runId, input, runConfig).payload)
 
     this.scheduleFlush()
@@ -124,6 +199,11 @@ export class Recorder {
 
   /**
    * Record an event in the current run.
+   *
+   * @throws Error if no run is active, or if a terminal event
+   *   (run.completed/run.failed/run.cancelled) has already been recorded for
+   *   the current run — the server rejects events after the terminal one, so
+   *   accepting more would poison the pending batch.
    */
   recordEvent(
     type: EventType,
@@ -132,6 +212,12 @@ export class Recorder {
   ): void {
     if (!this.runContext) {
       throw new Error('No active run. Call startRun() first.')
+    }
+    if (this.terminalBuffered) {
+      throw new Error(
+        `Cannot record "${type}": a terminal event has already been recorded for run "${this.runContext.runId}". ` +
+          'Events after the terminal event are rejected by the server and would poison the pending batch.'
+      )
     }
 
     const seq = options?.sequenceNumber ?? ++this.sequenceCounter
@@ -151,11 +237,14 @@ export class Recorder {
       eventOptions
     )
     this.eventBuffer.push(event)
+    if (TERMINAL_EVENT_TYPES.has(type)) {
+      this.terminalBuffered = true
+    }
 
     // Write-ahead: persist to the spool (if configured) before delivery is
     // attempted. Best-effort and non-blocking — spool failure never breaks
     // recording; it is surfaced via onSpoolError.
-    this.spoolOp((spool) => spool.append([{ kind: 'event', event }]))
+    this.spoolAppend([{ kind: 'event', event }])
 
     this.enforceBufferLimit()
 
@@ -172,11 +261,12 @@ export class Recorder {
    * drop the OLDEST non-protected events (protected = run.started and the
    * terminal events) until the buffer is back within bounds. Terminal telemetry
    * is the worst thing to lose, so it is never dropped. Dropped events are
-   * counted and surfaced via `FlushResult.droppedEvents`.
+   * counted and surfaced via `FlushResult.droppedEvents`, and removed from the
+   * spool too (via a resync) so spool and buffer stay consistent.
    */
   private enforceBufferLimit(): void {
     const max = this.config.options?.maxBufferSize ?? 10_000
-    if (max <= 0 || this.eventBuffer.length <= max) return
+    if (this.eventBuffer.length <= max) return
 
     let toDrop = this.eventBuffer.length - max
     let droppedNow = 0
@@ -192,13 +282,11 @@ export class Recorder {
     this.eventBuffer = kept
 
     if (droppedNow > 0) {
-      this.droppedEventCount += droppedNow
-      this.debugLog(`buffer overflow: dropped ${droppedNow} event(s) (cumulative: ${this.droppedEventCount})`)
-      try {
-        this.config.options?.onDrop?.(droppedNow, 'buffer_overflow')
-      } catch {
-        // Consumer callback must never crash the recorder.
-      }
+      this.notifyDrop(droppedNow, 'buffer_overflow')
+      // Keep the spool consistent with the buffer: without this, the dropped
+      // events would linger in the spool and be re-sent (or silently discarded
+      // by the next post-flush resync) — inconsistent and unobservable.
+      this.resyncSpool()
     }
   }
 
@@ -235,12 +323,15 @@ export class Recorder {
   }
 
   /**
-   * Flush all buffered events to the server.
-   */
-  /**
    * Flush buffered events to the server. Flushes are serialized: a call waits for
    * any in-flight flush to finish before it splices the buffer, so overlapping
    * flushes can never reorder events or double-send a batch.
+   *
+   * Events are sent in PER-RUN batches (grouped by runId), so one run whose
+   * batch the server cannot accept never blocks delivery for other runs.
+   * Per-run failures are surfaced individually in `FlushResult.errors`;
+   * successfully delivered runs' events are acknowledged (and removed from the
+   * spool) independently.
    */
   flush(): Promise<FlushResult> {
     const run = this.flushChain.then(() => this.flushOnce())
@@ -255,38 +346,79 @@ export class Recorder {
     }
 
     const batch = this.eventBuffer.splice(0)
-    const result = await this.transport.sendEvents(batch, { apiKey: this.config.apiKey })
+    const groups = groupByRun(batch)
 
-    if (result.success) {
-      this.debugLog(`flush ok: ${batch.length} event(s) submitted`)
-      // Spool resync: the flushed events are acknowledged, so remove them from
-      // the write-ahead spool. With only append/drain/clear available, resync =
-      // clear + re-append whatever is still unacknowledged. The remaining-buffer
-      // snapshot is taken synchronously here; events recorded later have their
-      // own append operations queued AFTER this resync on the spool chain, so
-      // nothing is duplicated or lost.
-      const remaining = this.eventBuffer.map((event): StoredEvent => ({ kind: 'event', event }))
-      this.spoolOp(async (spool) => {
-        await spool.clear()
-        if (remaining.length > 0) await spool.append(remaining)
+    const errors: FlushError[] = []
+    const retained: ReturnType<typeof buildEvent>[] = []
+    let submitted = 0
+
+    for (const [runId, events] of groups) {
+      let result: TransportResponse
+      try {
+        result = await this.transport.sendEvents(events, { apiKey: this.config.apiKey })
+      } catch (err) {
+        // Transport implementations must not throw, but a buggy custom
+        // Transport that does must land in FlushResult.errors — never reject
+        // flush() into customer agent code. Retain the events for retry.
+        result = {
+          success: false,
+          retryable: true,
+          error: `Transport threw: ${err instanceof Error ? err.message : String(err)}`,
+        }
+      }
+
+      if (result.success) {
+        submitted += events.length
+        this.debugLog(`flush ok: ${events.length} event(s) submitted for run "${runId}"`)
+        continue
+      }
+
+      if (result.code !== undefined && NON_RETRYABLE_RUN_ERROR_CODES.has(result.code)) {
+        // PERMANENT rejection for this run (run already terminal server-side, or
+        // sequence range already claimed). Retrying can never succeed, and
+        // retaining these events would poison every future flush and strand all
+        // other runs. Drop them (observably) and move on.
+        this.notifyDrop(events.length, 'rejected_by_server')
+        errors.push({
+          eventIndex: -1,
+          error: `Run "${runId}": batch permanently rejected by server (${result.code}): ${result.error}. ${events.length} event(s) dropped.`,
+          retryable: false,
+        })
+        this.debugLog(`flush: run "${runId}" permanently rejected (${result.code}), ${events.length} event(s) dropped`)
+        continue
+      }
+
+      // DURABILITY: the send failed transiently, so this run's events are NOT
+      // persisted. Retain them for a later flush — losing terminal
+      // (run.completed/run.failed) events is the worst failure mode for a
+      // flight recorder; never discard on transient failure.
+      this.debugLog(`flush failed for run "${runId}" (${events.length} event(s) retained): ${result.error}`)
+      errors.push({
+        eventIndex: -1,
+        error: `Run "${runId}": ${result.error}`,
+        retryable: result.retryable,
       })
-      return { success: true, eventsSubmitted: batch.length, errors: [], droppedEvents: this.droppedEventCount }
+      retained.push(...events)
     }
-    this.debugLog(`flush failed (${batch.length} event(s) retained): ${result.error}`)
 
-    // DURABILITY: the send failed, so the batch is NOT persisted. Return it to the
-    // FRONT of the buffer (ahead of any events appended during the await) so a
-    // later flush — or finalizeRun's flush — retries it instead of dropping it.
-    // Because flushes are serialized, no other flush spliced concurrently, so the
-    // buffer stays in ascending sequence order. Losing terminal
-    // (run.completed/run.failed) events is the worst failure mode for a flight
-    // recorder; never discard on failure.
-    this.eventBuffer.unshift(...batch)
+    // Return retained events to the FRONT of the buffer (ahead of any events
+    // appended during the awaits), preserving their original relative order —
+    // `retained` was filled in batch order, so per-run sequences stay ascending.
+    if (retained.length > 0) {
+      this.eventBuffer.unshift(...retained)
+    }
+
+    // Spool resync: acknowledged AND permanently-rejected events are removed;
+    // whatever is still unacknowledged (the current buffer) plus any pending
+    // status intents are rewritten. The snapshot is taken synchronously here;
+    // events recorded later queue their own appends AFTER this resync on the
+    // spool chain, so nothing is duplicated or lost.
+    this.resyncSpool()
 
     return {
-      success: false,
-      eventsSubmitted: 0,
-      errors: [{ eventIndex: -1, error: result.error, retryable: result.retryable }],
+      success: errors.length === 0,
+      eventsSubmitted: submitted,
+      errors,
       droppedEvents: this.droppedEventCount,
     }
   }
@@ -306,8 +438,8 @@ export class Recorder {
     // Drain the buffer with bounded retries. The terminal (run.completed/failed)
     // event is in this buffer; if the final flush fails we must NOT silently give
     // up — that strands the terminal event. Retry a few times, then, if still
-    // failing, re-arm the background flush timer and keep the run active so later
-    // flushes continue retrying instead of losing the telemetry.
+    // failing, re-arm the background flush timer and keep retrying in the
+    // background instead of losing the telemetry.
     const maxFinalizeAttempts = 3
     let result: FlushResult = { success: true, eventsSubmitted: 0, errors: [], droppedEvents: this.droppedEventCount }
     for (let attempt = 0; attempt < maxFinalizeAttempts; attempt++) {
@@ -315,37 +447,59 @@ export class Recorder {
       if (result.success || this.eventBuffer.length === 0) break
     }
 
-    // Transition the run status regardless (the run IS logically finished); status
-    // and event delivery are independent concerns. A failed transition must NOT be
-    // swallowed — otherwise the run is stuck "running" forever, invisibly. Surface
-    // it into the returned FlushResult.
+    const runHasUndelivered = this.eventBuffer.some((e) => e.runId === runId)
     const endedAt = Date.now()
-    const statusResult = await this.transport.updateRunStatus(runId, status, endedAt, {
-      apiKey: this.config.apiKey,
-    })
-    if (!statusResult.success) {
-      result = {
-        ...result,
-        success: false,
-        errors: [
-          ...result.errors,
-          {
-            eventIndex: -1,
-            error: `Run status transition to "${status}" failed: ${statusResult.error}`,
-            retryable: statusResult.retryable,
-          },
-        ],
-      }
-      // Persist the status-transition intent so recover() (in this or a later
-      // process) can complete the transition. Without a spool the intent is
-      // retried by nothing — the run stays "running" server-side until a human
-      // or a reaper intervenes; the returned error is the only signal.
-      if (this.config.options?.spool) {
-        this.spoolOp((spool) => spool.append([{ kind: 'status', runId, status, endedAt }]))
+
+    if (runHasUndelivered) {
+      // Do NOT transition the run status while this run's terminal event is
+      // still undelivered. The server reconciles run status from the terminal
+      // event when it arrives; patching the status first would close the run
+      // server-side and make the pending events permanently rejectable
+      // (RUN_NOT_ACTIVE) — the stranded-run poison pill. Defer the transition
+      // to event delivery (background retries / recover()).
+      result = { ...result, statusTransitionDeferred: true }
+      this.debugLog(
+        `finalize: run "${runId}" status transition deferred — terminal event undelivered; server will reconcile on event arrival`
+      )
+    } else {
+      // All of this run's events are delivered — transition the status. A failed
+      // transition must NOT be swallowed, otherwise the run is stuck "running"
+      // forever, invisibly. Surface it into the returned FlushResult.
+      const statusResult = await this.transport.updateRunStatus(runId, status, endedAt, {
+        apiKey: this.config.apiKey,
+      })
+      if (!statusResult.success) {
+        result = {
+          ...result,
+          success: false,
+          errors: [
+            ...result.errors,
+            {
+              eventIndex: -1,
+              error: `Run status transition to "${status}" failed: ${statusResult.error}`,
+              retryable: statusResult.retryable,
+            },
+          ],
+        }
+        // Persist the status-transition intent so recover() (in this or a later
+        // process) can complete the transition. Without a spool the intent is
+        // retried by nothing — the run stays "running" server-side until a human
+        // or a reaper intervenes; the returned error is the only signal.
+        const intent: StoredEvent & { kind: 'status' } = { kind: 'status', runId, status, endedAt }
+        this.pendingStatusIntents.push(intent)
+        if (this.config.options?.spool) {
+          this.spoolAppend([intent])
+        }
       }
     }
 
-    const undelivered = this.eventBuffer.length
+    // Keep retrying in the background whenever ANY events remain buffered —
+    // including a previous stranded run's — but only report THIS run's terminal
+    // event as undelivered when it actually is.
+    if (this.eventBuffer.length > 0) {
+      this.scheduleFlush()
+    }
+    const undelivered = this.eventBuffer.filter((e) => e.runId === runId).length
     if (undelivered > 0) {
       // The terminal event (and possibly earlier events) could NOT be delivered
       // after all attempts. Surface an explicit error so the caller knows the
@@ -362,7 +516,8 @@ export class Recorder {
             eventIndex: -1,
             error:
               `Terminal event for run "${runId}" is UNDELIVERED after ${maxFinalizeAttempts} flush attempts ` +
-              `(${undelivered} event(s) still buffered). ` +
+              `(${undelivered} event(s) still buffered). The run status transition is deferred until the ` +
+              'terminal event is delivered (the server reconciles status from it). ' +
               (spooled
                 ? 'The events are persisted in the spool — call recover() (e.g. on next startup) to re-send them.'
                 : 'No spool is configured: the events remain in memory and will be retried in the background, but are LOST if the process exits.'),
@@ -446,12 +601,19 @@ export class Recorder {
   }
 
   /**
-   * Drain the configured spool and re-send everything a previous process (or a
-   * failed finalize) left undelivered: spooled events go through
-   * `transport.sendEvents`, spooled status-transition intents through
-   * `transport.updateRunStatus`. Entries that fail to send are re-appended to
-   * the spool so a later recover() can try again — delivery is at-least-once,
-   * and duplicates are deduped server-side by run + sequenceNumber.
+   * Re-send everything a previous process (or a failed finalize) left
+   * undelivered in the configured spool: spooled events go through
+   * `transport.sendEvents` (batched PER RUN, so one undeliverable run cannot
+   * block the others), spooled status-transition intents through
+   * `transport.updateRunStatus`.
+   *
+   * Drain semantics are peek → send → ack: entries are READ without being
+   * removed, delivery is attempted, and only then is the spool rewritten with
+   * the entries that could not be delivered. A crash mid-recovery therefore
+   * re-sends duplicates (deduped server-side by run + sequenceNumber), never
+   * loses data. Runs the server rejects permanently (`RUN_NOT_ACTIVE` /
+   * `SEQUENCE_CONFLICT`) are dropped from the spool and reported via
+   * `onDrop(count, 'rejected_by_server')`.
    *
    * Call this on startup, BEFORE starting new runs, when using a spool. A
    * no-op returning `success: true` when no spool is configured or the spool
@@ -467,42 +629,75 @@ export class Recorder {
     let entries: StoredEvent[]
     try {
       // Let any pending write-ahead appends settle first (the chain never
-      // rejects), then drain. Call recover() before starting new runs so no
-      // concurrent appends race the drain.
+      // rejects), then peek. Call recover() before starting new runs so no
+      // concurrent appends race the peek → rewrite window.
       await this.spoolChain
-      entries = await spool.drain()
+      entries = await spool.peek()
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      this.notifySpoolError(`spool drain failed during recover: ${message}`)
+      this.notifySpoolError(`spool peek failed during recover: ${message}`)
       return {
         success: false,
         eventsSubmitted: 0,
-        errors: [{ eventIndex: -1, error: `Spool drain failed: ${message}`, retryable: true }],
+        errors: [{ eventIndex: -1, error: `Spool peek failed: ${message}`, retryable: true }],
         droppedEvents: this.droppedEventCount,
       }
     }
 
+    this.spoolEntryCount = entries.length
     if (entries.length === 0) {
       return { success: true, eventsSubmitted: 0, errors: [], droppedEvents: this.droppedEventCount }
     }
-    this.debugLog(`recover: draining ${entries.length} spooled entr(y/ies)`)
+    this.debugLog(`recover: recovering ${entries.length} spooled entr(y/ies)`)
 
     const errors: FlushResult['errors'] = []
-    const failed: StoredEvent[] = []
+    /** Entries that must survive in the spool for a later recover(). */
+    const kept: StoredEvent[] = []
     let submitted = 0
 
     const events = entries.filter((e): e is StoredEvent & { kind: 'event' } => e.kind === 'event')
-    if (events.length > 0) {
-      const res = await this.transport.sendEvents(
-        events.map((e) => e.event),
-        { apiKey: this.config.apiKey }
-      )
-      if (res.success) {
-        submitted += events.length
-      } else {
-        errors.push({ eventIndex: -1, error: `Recovery send failed: ${res.error}`, retryable: res.retryable })
-        failed.push(...events)
+    const groups = new Map<string, (StoredEvent & { kind: 'event' })[]>()
+    for (const entry of events) {
+      const group = groups.get(entry.event.runId)
+      if (group) group.push(entry)
+      else groups.set(entry.event.runId, [entry])
+    }
+
+    for (const [runId, runEntries] of groups) {
+      let res: TransportResponse
+      try {
+        res = await this.transport.sendEvents(
+          runEntries.map((e) => e.event),
+          { apiKey: this.config.apiKey }
+        )
+      } catch (err) {
+        res = {
+          success: false,
+          retryable: true,
+          error: `Transport threw: ${err instanceof Error ? err.message : String(err)}`,
+        }
       }
+      if (res.success) {
+        submitted += runEntries.length
+        continue
+      }
+      if (res.code !== undefined && NON_RETRYABLE_RUN_ERROR_CODES.has(res.code)) {
+        // Permanently undeliverable — drop from the spool instead of retrying
+        // forever on every future recover().
+        this.notifyDrop(runEntries.length, 'rejected_by_server')
+        errors.push({
+          eventIndex: -1,
+          error: `Recovery: run "${runId}" permanently rejected by server (${res.code}): ${res.error}. ${runEntries.length} spooled event(s) dropped.`,
+          retryable: false,
+        })
+        continue
+      }
+      errors.push({
+        eventIndex: -1,
+        error: `Recovery send failed for run "${runId}": ${res.error}`,
+        retryable: res.retryable,
+      })
+      kept.push(...runEntries)
     }
 
     for (const intent of entries) {
@@ -510,21 +705,31 @@ export class Recorder {
       const res = await this.transport.updateRunStatus(intent.runId, intent.status, intent.endedAt, {
         apiKey: this.config.apiKey,
       })
-      if (!res.success) {
-        errors.push({
-          eventIndex: -1,
-          error: `Recovery status transition for run "${intent.runId}" failed: ${res.error}`,
-          retryable: res.retryable,
-        })
-        failed.push(intent)
+      if (res.success || (!res.success && res.code !== undefined && NON_RETRYABLE_RUN_ERROR_CODES.has(res.code))) {
+        // Delivered — or the run is already terminal server-side, which means
+        // the transition is moot. Either way the intent is retired.
+        this.pendingStatusIntents = this.pendingStatusIntents.filter(
+          (p) => !(p.runId === intent.runId && p.status === intent.status)
+        )
+        continue
       }
+      errors.push({
+        eventIndex: -1,
+        error: `Recovery status transition for run "${intent.runId}" failed: ${res.error}`,
+        retryable: res.retryable,
+      })
+      kept.push(intent)
     }
 
-    if (failed.length > 0) {
-      // Put undeliverable entries back so a later recover() can retry them.
-      this.spoolOp((s) => s.append(failed))
-      await this.spoolChain
-    }
+    // Ack: rewrite the spool with only the entries that could not be delivered.
+    // This runs AFTER the sends — a crash before this point leaves the spool
+    // intact (duplicates on next recover, never losses).
+    this.spoolOp(async (s) => {
+      await s.clear()
+      if (kept.length > 0) await s.append(kept)
+      this.spoolEntryCount = kept.length
+    })
+    await this.spoolChain
 
     return {
       success: errors.length === 0,
@@ -569,6 +774,17 @@ export class Recorder {
     }
   }
 
+  /** Count dropped events and fire the onDrop callback (never throws). */
+  private notifyDrop(count: number, reason: DropReason): void {
+    this.droppedEventCount += count
+    this.debugLog(`dropped ${count} event(s) (${reason}; cumulative: ${this.droppedEventCount})`)
+    try {
+      this.config.options?.onDrop?.(count, reason)
+    } catch {
+      // Consumer callback must never crash the recorder.
+    }
+  }
+
   /**
    * Enqueue a best-effort spool operation on the serialization chain. No-op
    * when no spool is configured (zero cost). Failures never propagate — they
@@ -582,6 +798,67 @@ export class Recorder {
       .catch((err) => {
         this.notifySpoolError(err instanceof Error ? err.message : String(err))
       })
+  }
+
+  /**
+   * Append entries to the spool and enforce `maxSpoolEntries`. On overflow the
+   * OLDEST non-lifecycle spooled events are dropped — from the spool AND from
+   * the in-memory buffer, so the two stay consistent — and
+   * `onDrop(count, 'spool_overflow')` fires.
+   */
+  private spoolAppend(entries: StoredEvent[]): void {
+    if (!this.config.options?.spool) return
+    const max = this.config.options?.maxSpoolEntries ?? 50_000
+    this.spoolOp(async (spool) => {
+      await spool.append(entries)
+      this.spoolEntryCount += entries.length
+      if (this.spoolEntryCount <= max) return
+
+      // Overflow: rewrite the spool without the oldest droppable events.
+      const all = await spool.peek()
+      let toDrop = all.length - max
+      const kept: StoredEvent[] = []
+      const droppedKeys = new Set<string>()
+      for (const entry of all) {
+        if (toDrop > 0 && entry.kind === 'event' && !PROTECTED_EVENT_TYPES.has(entry.event.type)) {
+          toDrop--
+          droppedKeys.add(`${entry.event.runId}#${entry.event.sequenceNumber}`)
+          continue
+        }
+        kept.push(entry)
+      }
+      await spool.clear()
+      if (kept.length > 0) await spool.append(kept)
+      this.spoolEntryCount = kept.length
+
+      if (droppedKeys.size > 0) {
+        // Mirror the drop into the in-memory buffer so the same events are not
+        // re-sent from memory after being evicted from the spool.
+        this.eventBuffer = this.eventBuffer.filter(
+          (ev) => !droppedKeys.has(`${ev.runId}#${ev.sequenceNumber}`)
+        )
+        this.notifyDrop(droppedKeys.size, 'spool_overflow')
+      }
+    })
+  }
+
+  /**
+   * Rewrite the spool so it holds exactly the unacknowledged state: the
+   * current in-memory buffer plus any pending status-transition intents.
+   * Used after a flush (acked/rejected events removed) and after buffer
+   * overflow drops (dropped events removed).
+   */
+  private resyncSpool(): void {
+    if (!this.config.options?.spool) return
+    const remaining: StoredEvent[] = [
+      ...this.eventBuffer.map((event): StoredEvent => ({ kind: 'event', event })),
+      ...this.pendingStatusIntents,
+    ]
+    this.spoolOp(async (spool) => {
+      await spool.clear()
+      if (remaining.length > 0) await spool.append(remaining)
+      this.spoolEntryCount = remaining.length
+    })
   }
 
   /** Log a diagnostic line when `options.debug` is enabled. */
