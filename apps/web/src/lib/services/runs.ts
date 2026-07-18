@@ -44,9 +44,17 @@ export async function listRuns(params: ListRunsRequest): Promise<ListRunsRespons
   if (!org) throw new Error('Organization not found — run onboarding first')
 
   const orgDoc = org as Record<string, unknown>
+
+  // The integrity filter is answered by a dedicated, differently-indexed query
+  // (convex/runs.ts `listRunsByVerification`) — see that function's doc comment
+  // for why it isn't folded into `listRuns`. It wins over the other filters as
+  // the base result set; they still narrow within it.
+  const queryRef = params.verifyFilter !== undefined ? convex.runs.listRunsByVerification : convex.runs.listRuns
+
   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-  const result = await client.query(convex.runs.listRuns, {
+  const result = await client.query(queryRef, {
     orgId: orgDoc._id,
+    ...(params.verifyFilter !== undefined && { verifyFilter: params.verifyFilter }),
     ...(params.projectId !== undefined && { projectId: params.projectId }),
     ...(params.agentId !== undefined && { agentId: params.agentId }),
     ...(params.status !== undefined && { status: params.status }),

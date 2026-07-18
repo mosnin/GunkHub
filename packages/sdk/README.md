@@ -340,6 +340,149 @@ You can inject a custom transport (e.g., for testing) via the second argument to
 
 ---
 
+## Choosing `Recorder` vs `FlightRecorder`
+
+The SDK ships two entry points. Both cover the same event log rules (append-only,
+`run.started` first, terminal event last, automatic >10 KB payload
+externalization) — they differ in delivery timing, durability, and how much
+control you get over the transport.
+
+| | `Recorder` (buffered) | `FlightRecorder` / `RunRecorder` (un-buffered) |
+|---|---|---|
+| Delivery timing | Batched — flushed on a timer (`flushIntervalMs`, default 1000 ms) or at `maxBatchSize` (default 100) | Immediate — one HTTP request per `recordEvent`, awaited |
+| Crash durability | Optional `FileSpool` write-ahead log + `recover()` for at-least-once delivery | None — an event lost mid-flight (process killed before the `await` resolves) is simply gone |
+| Concurrency control | N/A — a single serialized flush chain | FIFO `Semaphore`, default `maxConcurrentRequests: 8`, shared across all `RunRecorder`s from one `FlightRecorder` |
+| Custom transport | Yes — inject any `Transport` via `new Recorder(config, transport)` (e.g. `MockTransport` in tests) | No — always real `fetch`; there is no injectable seam |
+| Best for | Long-lived servers, worker pools, durable agent loops | Short scripts, CLIs, one-shot jobs, Lambda invocations |
+
+Rule of thumb: if your process might exit right after the last event with no
+time for a background flush timer to ever fire, use `FlightRecorder`. If your
+process runs for a while and emits many events, use the buffered `Recorder` —
+batching amortizes HTTP overhead, and a `FileSpool` protects you from losing
+telemetry across a crash. See `examples/unbuffered_quickstart.ts` for the full
+tradeoff writeup, including the concurrency-semaphore note.
+
+---
+
+## Recipes
+
+Runnable, self-contained examples in `packages/sdk/examples/`. Each has a
+"Run" comment at the top with the exact `pnpm tsx` command.
+
+- **`basic_run.ts`** — the full lifecycle (`startRun` → `recordEvent` →
+  `endRun`/`failRun`) against a `MockTransport`, plus an optional
+  `FlightRecorder` path against a live server (`--live`).
+- **`durable_agent.ts`** — the production shape: `FileSpool` +
+  `recover()` on startup + `onDrop`/`onFlushError`/`onSpoolError` wired to
+  logging + `captureProcessExit` + a try/catch/finally that always ends the
+  run. Copy this as your starting point for a real worker.
+- **`llm_agent_loop.ts`** — instrumenting a realistic loop: `llm.request` /
+  `llm.response` around a model call, `tool.call` / `tool.result` around a
+  tool invocation, and the error path into `failRun` — including a documented
+  gotcha about preserving an error's `.code`.
+- **`large_payloads.ts`** — builds an intentionally oversized (>10 KB)
+  payload and records it exactly like any other event, with inline comments
+  explaining the automatic artifact-pointer + SHA-256 checksum story (Event
+  Log Rule 3).
+- **`unbuffered_quickstart.ts`** — the `FlightRecorder`/`RunRecorder` path for
+  short-lived scripts: the decision table above, the concurrency semaphore,
+  and the no-buffering tradeoff, in one file.
+
+---
+
+## Instrumenting popular agent shapes
+
+Short, framework-agnostic sketches for wiring the SDK into common agent
+patterns. These are **illustrative pseudocode, not real package APIs** —
+adapt the shape to whatever provider SDK or framework you actually use; only
+the `@agent-flight-recorder/sdk` calls are real.
+
+### (a) A plain OpenAI/Anthropic-style chat loop
+
+```typescript
+const recorder = new Recorder({ endpoint, apiKey, agentId })
+await recorder.startRun({ query: userMessage })
+
+const messages = [{ role: 'user', content: userMessage }]
+recorder.recordEvent('llm.request', Events.llmRequest(model, messages).payload)
+
+// const response = await client.chat.completions.create({ model, messages })  // sketch
+const response = { choices: [{ message: { content: '...' } }], usage: { /* ... */ } }
+
+recorder.recordEvent(
+  'llm.response',
+  Events.llmResponse(model, response.choices[0].message.content, {
+    prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, // map from response.usage
+  }, 'stop').payload
+)
+
+await recorder.endRun({ reply: response.choices[0].message.content })
+```
+
+### (b) A LangChain-style callback handler (sketch)
+
+Most agent frameworks expose a callback/hook interface with lifecycle events
+that map directly onto `Events.*` builders — treat each hook as a
+`recordEvent` call, using the framework's own request/run ID as a
+`parentEventId` for tree-shaped traces where it has one:
+
+```typescript
+// class AfrCallbackHandler implements FrameworkCallbackHandler {  // sketch — not a real base class
+//   constructor(private recorder: Recorder) {}
+//
+//   onLLMStart(model: string, prompts: string[]) {
+//     this.recorder.recordEvent('llm.request',
+//       Events.llmRequest(model, prompts.map(p => ({ role: 'user', content: p }))).payload)
+//   }
+//   onLLMEnd(output: { text: string; usage: object }) {
+//     this.recorder.recordEvent('llm.response',
+//       Events.llmResponse(model, output.text, output.usage as never, 'stop').payload)
+//   }
+//   onToolStart(toolName: string, input: unknown, callId: string) {
+//     this.recorder.recordEvent('tool.call', Events.toolCall(toolName, input, callId).payload)
+//   }
+//   onToolEnd(callId: string, output: unknown, durationMs: number) {
+//     this.recorder.recordEvent('tool.result', Events.toolResult(callId, output, durationMs).payload)
+//   }
+//   onChainError(error: Error) {
+//     void this.recorder.failRun(error)
+//   }
+// }
+```
+
+### (c) A plain while-loop tool agent
+
+```typescript
+const recorder = new Recorder({ endpoint, apiKey, agentId })
+await recorder.startRun({ query: userMessage })
+
+try {
+  let done = false
+  while (!done) {
+    recorder.recordEvent('llm.request', Events.llmRequest(model, messages).payload)
+    const step = await callModel(messages) // your own function
+    recorder.recordEvent('llm.response', Events.llmResponse(model, step.content, step.usage, step.finishReason).payload)
+
+    if (step.toolCall) {
+      recorder.recordEvent('tool.call', Events.toolCall(step.toolCall.name, step.toolCall.input, step.toolCall.id).payload)
+      const output = await runTool(step.toolCall) // your own function
+      recorder.recordEvent('tool.result', Events.toolResult(step.toolCall.id, output, output.durationMs).payload)
+      messages.push({ role: 'tool', content: JSON.stringify(output) })
+    } else {
+      done = true
+      await recorder.endRun({ reply: step.content })
+    }
+  }
+} catch (err) {
+  await recorder.failRun(err instanceof Error ? err : new Error(String(err)))
+}
+```
+
+See `examples/llm_agent_loop.ts` for a fully compiling, runnable version of
+this pattern (including the tool-error path).
+
+---
+
 ## Version
 
 v0.3.1 — Stranded-run fix: the run-status transition is deferred (never patched) while the terminal event is undelivered, so retried events can no longer be poisoned into `RUN_NOT_ACTIVE`; flush and `recover()` batch events per run so one stranded run cannot block others; permanent server rejections (`RUN_NOT_ACTIVE`/`SEQUENCE_CONFLICT`) drop the affected run's events observably (`onDrop(count, 'rejected_by_server')`). Spool hardening: `recover()` uses peek → send → ack (crash mid-recovery duplicates, never loses; `EventSpool.drain` replaced by `peek` in the interface), `maxSpoolEntries` cap with `'spool_overflow'` drops, buffer-overflow drops now also remove the events from the spool, opt-in `FileSpool` `fsync`. Guards: constructor `TypeError`s for invalid numeric options, `recordEvent` throws after a terminal event, a throwing custom Transport lands in `FlushResult.errors`. `TransportResponse` now surfaces real server `eventIds` and error `code`s.

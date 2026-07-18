@@ -48,13 +48,14 @@ class MockTransport implements Transport {
         orgId: 'org_demo',
         projectId: 'proj_demo',
         agentId: req.agentId,
-        agentVersionId: req.agentVersionId,
+        // exactOptionalPropertyTypes: only spread optional fields when defined
+        ...(req.agentVersionId !== undefined && { agentVersionId: req.agentVersionId }),
         status: 'running',
         startedAt: Date.now(),
         metadata: req.metadata ?? {},
         tags: req.tags ?? [],
-        triggeredBy: req.triggeredBy,
-        sdkVersion: req.sdkVersion,
+        ...(req.triggeredBy !== undefined && { triggeredBy: req.triggeredBy }),
+        ...(req.sdkVersion !== undefined && { sdkVersion: req.sdkVersion }),
       },
     }
   }

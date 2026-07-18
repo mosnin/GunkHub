@@ -3,6 +3,18 @@
 This runbook covers common operational issues and their resolutions. Each section
 describes a symptom, the likely cause, and the steps to diagnose and fix it.
 
+**Related ops docs:**
+- [`docs/ops/observability.md`](ops/observability.md) — the logging contract, where
+  logs go on Vercel, request-ID correlation, health endpoint semantics, the CSP
+  report sink, and rate-limit classes.
+- [`docs/ops/incident_response.md`](ops/incident_response.md) — triage playbooks for
+  the four most likely incidents: Convex unreachable, ingestion rejections spiking,
+  Clerk webhook/org-sync failures (including the erasure-obligation step), and bad
+  deploys.
+- [`docs/ops/dr_drill.md`](ops/dr_drill.md) — Convex export/restore mechanics, blob-
+  store considerations, the quarterly restore-drill procedure, and recommended
+  RPO/RTO targets.
+
 ---
 
 ## Storage health check
@@ -298,28 +310,65 @@ Both are shared secrets that must match on TWO deployments at once:
   `/api/internal/verify-derivation`) AND on the Convex deployment (sent by the
   `verifyRecentRuns` action).
 
-**Current procedure (coordinated update — brief mismatch window):**
+**Dual-accept format:** both vars support a comma-separated value —
+`current,previous` (entries trimmed, empty entries dropped) — parsed by
+`getAcceptedSecrets()` in `apps/web/src/lib/env.ts`. This lets the Vercel
+side and the Convex side be updated in either order with no window where
+calls fail closed. Convex itself only ever holds ONE value per var (it does
+not parse comma lists) — the dual-accept logic lives entirely in the web
+tier:
+
+- `CONVEX_WEBHOOK_SECRET`: the webhook route
+  (`apps/web/app/api/webhooks/clerk/route.ts`) forwards the FIRST (current)
+  value to Convex on every lifecycle mutation call. If Convex rejects it as
+  `Unauthorized` (because Convex's single stored value is still the old
+  secret), the route retries once with the SECOND (previous) value and logs
+  a structured warning that rotation is in progress.
+- `INTERNAL_VERIFY_SECRET`: `/api/internal/verify-derivation` accepts the
+  incoming `x-internal-secret` header if it matches ANY entry in the list —
+  so it validates whichever single value Convex's `verifyRecentRuns` action
+  currently has configured, old or new.
+
+**Procedure (add new secret as `new,old` → deploy → update Convex → drop old):**
 
 1. Generate a new high-entropy secret: `openssl rand -hex 32`.
-2. Update the value in BOTH places back-to-back, Convex first:
-   - Convex: Dashboard → Deployment → Settings → Environment Variables.
-   - Vercel: Project → Settings → Environment Variables → Production.
-3. Redeploy the Vercel project (Convex env changes apply to new function
-   executions automatically; Vercel requires a redeploy).
+2. On Vercel (Project → Settings → Environment Variables → Production), set
+   the var to `<new>,<old>` — new value first, old value second — for
+   whichever secret you are rotating. Redeploy.
+   - `CONVEX_WEBHOOK_SECRET=<new>,<old>`, or
+   - `INTERNAL_VERIFY_SECRET=<new>,<old>`.
+   At this point Convex still has the OLD single value configured, but
+   nothing fails closed:
+   - Webhook calls try `<new>` first, get rejected, retry with `<old>`
+     (which Convex still recognizes) — check the Vercel function logs for
+     the `"secret rotation appears in progress"` warning to confirm this is
+     happening rather than silently failing.
+   - Verify-derivation accepts Convex's `<old>` value because it's the
+     second entry in the accepted list.
+3. Update the SAME var on the Convex deployment to the single new value
+   (Dashboard → Deployment → Settings → Environment Variables):
+   `npx convex env set CONVEX_WEBHOOK_SECRET <new>` or
+   `npx convex env set INTERNAL_VERIFY_SECRET <new>`.
+   Convex env changes apply to new function executions automatically — no
+   Convex redeploy needed.
 4. Verify:
    - `CONVEX_WEBHOOK_SECRET`: create a throwaway Clerk org (or use Clerk's
-     webhook "Resend") and confirm the org record appears in Convex.
+     webhook "Resend") and confirm the org record appears in Convex, and
+     that the Vercel logs show no more rotation-retry warnings (the first,
+     current value is now succeeding directly).
    - `INTERNAL_VERIFY_SECRET`: wait for (or manually trigger) the next
      `verifyRecentRuns` cycle and confirm runs get verification results, not
      401s, in the Vercel function logs for `/api/internal/verify-derivation`.
-5. During the window between steps 2 and 3, calls fail closed (401 /
-   rejected mutation). Both paths are retryable — Clerk webhooks can be
-   resent, and verification falls back to sequence-only checks — so a short
-   window is acceptable. Rotate during low-traffic hours.
+5. Once step 4 confirms the new value works end-to-end, drop the old value:
+   set the Vercel var back to a single value (`<new>`, no comma) and
+   redeploy. Leaving the old value in the list longer than necessary widens
+   the window in which a leaked old secret remains accepted.
 
-**Future work — dual-accept window:** teach the validating side to accept
-`SECRET` OR `SECRET_PREVIOUS` for a bounded overlap period, so rotation never
-fails closed. Tracked as an ops improvement; not implemented yet.
+**Why this is safe to leave mid-rotation:** both accepted values are
+high-entropy secrets known only to the operator performing the rotation —
+holding two valid values briefly is materially the same risk as holding one,
+and is strictly safer than the old fail-closed window where webhooks/verify
+calls were rejected outright.
 
 ---
 

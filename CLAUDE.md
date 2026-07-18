@@ -43,9 +43,12 @@ packages/sdk/**         → sdk boundary
 convex/**               → convex boundary
 scripts/**              → shared tooling (any team may edit)
 docs/**                 → shared documentation (any team may edit)
-tests/**                → shared tests (any team may edit)
+tests/**                → shared tests (any team may edit; includes tests/e2e)
 root config files        → infrastructure (Team A owns, others may propose changes)
 ```
+
+`.github/CODEOWNERS` mirrors this table (with real review-routing handles substituted
+in later); keep the two in sync when the map changes.
 
 ---
 
@@ -66,6 +69,9 @@ Organization
 - **Comments** hang off **Runs** and **Events** — human annotations on recorded data
 - An `AgentVersion` is immutable once created; a new version must be created for any
   change to the agent's configuration, system prompt, or tool list
+- An append-only **audit log** (org-scoped) and an opt-in per-org **retention** window
+  sit alongside this hierarchy — see Event Log Rules and `docs/architecture.md` for
+  how they interact with runs and events
 
 ---
 
@@ -89,6 +95,13 @@ These rules are non-negotiable. Do not propose changes to them without a formal 
 
 5. **`RUN_STARTED` is always the first event; `RUN_COMPLETED` or `RUN_FAILED` is always
    the last.** A run without a terminal event is considered in-progress.
+
+6. **Privileged mutations are audited, not erased.** An append-only admin audit log
+   records every privileged mutation (role changes, key revocation, retention policy
+   changes, purges). Retention/erasure (data deletion for offboarding or an org's opt-in
+   retention window) is governed by ADR-001 (`docs/adr/001-data-retention-and-erasure.md`)
+   and is the sole exception to "events are never deleted" — it is operator-invoked, not
+   an ad-hoc mutation.
 
 ---
 
@@ -178,6 +191,21 @@ Every UI decision must reflect this.
 - Do not change a type in `packages/contracts` without bumping the package version.
 - After bumping, update all consumers (`apps/web`, `packages/sdk`) in the same PR.
 - Breaking changes to contracts require a migration plan for existing Convex data.
+
+### Documentation
+
+- `docs/architecture.md` is the up-to-date system architecture reference (diagram,
+  entity hierarchy, event-log invariants, tenancy model, ingest paths, durability story)
+  — keep it current when the code paths it cites change.
+- `CONTRIBUTING.md` is the practical dev workflow doc (setup, verification gates, boundary
+  map, and how-tos for adding an event type / Convex function / UI surface / package).
+  It defers to this file as authoritative on rules; update both if a rule changes.
+- Non-negotiable decisions (event log rules, tenancy rules, retention/erasure) are
+  formalized as ADRs. Two ADR directories currently exist — `docs/adrs/` (the original
+  numbered sequence, `0001`–`0026`) and `docs/adr/` (a newer sequence, starting with
+  `001-data-retention-and-erasure.md`). Check both when researching or proposing a
+  decision; do not silently merge or renumber them without an explicit instruction to
+  do so.
 
 ---
 

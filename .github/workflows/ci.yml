@@ -222,6 +222,86 @@ jobs:
       - name: Build all packages
         run: pnpm build
 
+  e2e:
+    name: E2E Smoke (Playwright)
+    runs-on: ubuntu-latest
+    # Needs a successful build first, same reasoning as `test`: no point
+    # driving a browser against a build we already know is broken.
+    needs: [build]
+    # Weekly schedule run is an advisory dependency-audit sweep only — see the
+    # `if` comment on `typecheck` above. Excluded here for the same reason.
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 9
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Cache Turbo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .turbo
+          key: ${{ runner.os }}-turbo-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # /opt/pw-browsers (used by local sandbox sessions) does not exist on
+      # hosted GitHub runners — install Playwright's own Chromium here.
+      # --with-deps also installs the OS-level shared libraries Chromium
+      # needs on a bare Ubuntu runner.
+      - name: Install Playwright Chromium
+        run: pnpm --filter @agent-flight-recorder/tests exec playwright install --with-deps chromium
+
+      # Unauthenticated tier only (see tests/e2e/auth.spec.ts for why the
+      # authenticated tier is skipped rather than run here). No live Convex
+      # deployment or real Clerk credentials are used or required — dummy
+      # values matching playwright.config.ts's DUMMY_ENV, passed here too so
+      # the webServer's `next build && next start` step has them without
+      # duplicating a separate build.
+      - name: Run e2e smoke suite
+        env:
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_Y2xlcmsuZTJlLmludmFsaWQk
+          CLERK_SECRET_KEY: sk_test_dummy00000000000000000000000000000000000000000
+          NEXT_PUBLIC_CONVEX_URL: https://example-e2e-placeholder.convex.cloud
+        run: pnpm e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-report
+          # playwright.config.ts lives at the repo root, so Playwright writes
+          # its report/trace/screenshot output there too, not under tests/.
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
   test:
     name: Test
     runs-on: ubuntu-latest

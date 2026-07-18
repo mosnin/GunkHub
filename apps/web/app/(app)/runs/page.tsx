@@ -1,6 +1,6 @@
 import Link from 'next/link'
 
-import type { Agent, Run } from '@agent-flight-recorder/contracts'
+import type { Agent } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
@@ -39,19 +39,34 @@ function rangeToStartedAfter(range: string | undefined): number | undefined {
   return undefined
 }
 
-/** Returns true if the run matches the verification filter. */
-function matchesVerifyFilter(
-  run: Run,
+/**
+ * Map the UI's finer-grained verify filter to the server-side
+ * `listRunsByVerification` filter (convex/runs.ts). "verified" and "partial"
+ * both mean "latest verification passed" at the server (`passed`) — the split
+ * between full-derivation-passed vs sequence-only-passed is a client-side
+ * refinement of that already-correct, org-wide-scoped page (see
+ * `matchesFineGrainedVerify` below), not a stand-in for real filtering.
+ */
+function toServerVerifyFilter(verify: VerifyFilter): 'failed' | 'passed' | 'unverified' | undefined {
+  if (verify === 'all') return undefined
+  if (verify === 'failed') return 'failed'
+  if (verify === 'unverified') return 'unverified'
+  return 'passed' // 'verified' | 'partial'
+}
+
+/**
+ * Refines the server-filtered "passed" page into "verified" (full derivation
+ * check passed) vs "partial" (sequence-only check passed). "failed",
+ * "unverified", and "all" are already exactly right from the server, so this
+ * is a no-op for them.
+ */
+function matchesFineGrainedVerify(
   status: VerificationStatus | undefined,
   verify: VerifyFilter,
 ): boolean {
-  if (verify === 'all') return true
-  if (!status || !status.verified) return verify === 'unverified'
-  if (verify === 'unverified') return false
-  if (verify === 'failed') return !status.isValid
-  if (verify === 'verified') return status.isValid === true && status.checksRan.includes('replay')
-  if (verify === 'partial') return status.isValid === true && !status.checksRan.includes('replay')
-  return true
+  if (verify !== 'verified' && verify !== 'partial') return true
+  if (!status || !status.verified || status.isValid !== true) return false
+  return verify === 'verified' ? status.checksRan.includes('replay') : !status.checksRan.includes('replay')
 }
 
 /** Build href for a filter pill, preserving all other active searchParams. */
@@ -90,6 +105,8 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
     verify: verifyFilter === 'all' ? undefined : verifyFilter,
   }
 
+  const serverVerifyFilter = toServerVerifyFilter(verifyFilter)
+
   try {
     runs = await listRuns({
       status: searchParams.status as 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'timed_out' | undefined,
@@ -97,6 +114,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
       projectId: searchParams.projectId,
       agentId: searchParams.agentId,
       cursor: searchParams.cursor,
+      verifyFilter: serverVerifyFilter,
       limit: 50,
     })
   } catch (err) {
@@ -137,10 +155,13 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
     )
   }
 
-  // Apply verification filter post-fetch
+  // "failed"/"passed"/"unverified" are already exactly right from
+  // listRunsByVerification; this only refines "passed" into "verified" vs
+  // "partial" within the already server-filtered page (see
+  // matchesFineGrainedVerify above).
   const filteredRuns = runs?.runs
     ? runs.runs.filter((run) =>
-        matchesVerifyFilter(run, verificationStatuses[run.id], verifyFilter),
+        matchesFineGrainedVerify(verificationStatuses[run.id], verifyFilter),
       )
     : undefined
 
@@ -267,15 +288,6 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
           </div>
         )}
       </div>
-
-      {/* Integrity-filter honesty note — verification filtering happens after
-          fetching this page of runs, so it only narrows the current page.
-          Server-side filtering is future work. */}
-      {verifyFilter !== 'all' && !error && (
-        <p className="mt-3 text-xs text-pewter font-mono">
-          Integrity filter “{verifyFilter}” is applied within this page of results only.
-        </p>
-      )}
 
       <div className="mt-4">
         {error ? (

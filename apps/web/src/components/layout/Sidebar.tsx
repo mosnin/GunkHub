@@ -57,6 +57,15 @@ function ColumnsIcon() {
   )
 }
 
+function ShieldIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M8 1.5l5 2v3.7c0 3.2-2.1 5.7-5 6.8-2.9-1.1-5-3.6-5-6.8V3.5l5-2z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+      <path d="M5.5 8l1.7 1.7L10.5 6.2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 function GearIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -72,14 +81,32 @@ const navItems: NavItem[] = [
   { label: 'Agents', href: '/agents', icon: <CpuIcon /> },
   { label: 'Runs', href: '/runs', icon: <PlayIcon /> },
   { label: 'Compare', href: '/diff', icon: <ColumnsIcon /> },
+  { label: 'Audit', href: '/audit', icon: <ShieldIcon /> },
   { label: 'Settings', href: '/settings', icon: <GearIcon /> },
 ]
 
-export function Sidebar() {
+interface SidebarProps {
+  /**
+   * 'rail' — the fixed desktop sidebar (`lg:` and up), unchanged from before.
+   * 'drawer' — rendered inside the mobile off-canvas dialog (MobileNav). Same
+   * content and behavior, slightly narrower and without the rail's border/shrink
+   * constraints since the drawer panel itself defines the edge.
+   */
+  variant?: 'rail' | 'drawer'
+}
+
+export function Sidebar({ variant = 'rail' }: SidebarProps) {
   const pathname = usePathname()
 
   return (
-    <aside className="w-[220px] border-r border-graphite-light bg-blackout flex flex-col py-4 px-3 shrink-0">
+    <aside
+      className={cn(
+        'flex flex-col py-4 px-3 bg-blackout h-full',
+        variant === 'rail'
+          ? 'w-[220px] border-r border-graphite-light shrink-0'
+          : 'w-[260px] max-w-[85vw] border-r border-graphite-light'
+      )}
+    >
       {/* Logo */}
       <div className="flex items-center gap-2.5 px-2 mb-6">
         <div className="w-7 h-7 rounded-[4px] bg-neon-glow flex items-center justify-center shrink-0">

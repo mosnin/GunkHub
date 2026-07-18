@@ -190,7 +190,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
           client-side tab switcher, so they carry nav/aria-current semantics
           rather than tablist/tab roles. */}
       <div className="border-b border-neutral-800 px-6 mt-3">
-        <nav aria-label="Run sections" className="-mb-px flex gap-6">
+        <nav aria-label="Run sections" className="-mb-px flex gap-6 overflow-x-auto">
           {TABS.map((tab) => {
             const isActive = tab.id === activeTab
             // Replay tab links to the dedicated replay page instead of a tab panel
@@ -219,7 +219,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
 
       {/* Tab content — data is already fetched above, so these render
           synchronously (no Suspense boundary needed). */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 min-w-0 overflow-y-auto">
         {activeTab === 'timeline' && (
           <Timeline runId={runId} events={events} initialNextCursor={initialNextCursor} isLive={run.status === 'running'} />
         )}

@@ -6,6 +6,13 @@ import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts
 
 import { EmptyState } from '@/components/ui/EmptyState'
 import { LoadingState } from '@/components/ui/LoadingState'
+import {
+  isNavDownKey,
+  isNavFirstKey,
+  isNavLastKey,
+  isNavUpKey,
+  isPrimaryActionKey,
+} from '@/lib/hooks/useKeyScope'
 
 const WINDOW_SIZE = 100
 
@@ -213,9 +220,13 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
   const windowEnd = Math.min(allEvents.length, windowStart + WINDOW_SIZE)
   const visibleEvents = allEvents.slice(windowStart, windowEnd)
 
+  // Unified list-navigation model (shared with EventInspector/ReplayViewer):
+  // Arrow keys and j/k both move the roving focus, g/Home and G/End jump to
+  // the ends of the list, and Enter runs the row's primary action (here,
+  // expand/collapse the payload). See src/lib/hooks/useKeyScope.ts.
   function handleKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
     if (allEvents.length === 0) return
-    if (e.key === 'ArrowDown') {
+    if (isNavDownKey(e)) {
       e.preventDefault()
       setFollowTail(false)
       const next = Math.min(allEvents.length - 1, focusedIndex < 0 ? windowStart : focusedIndex + 1)
@@ -223,7 +234,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
       if (next >= windowStart + WINDOW_SIZE) {
         setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, next))
       }
-    } else if (e.key === 'ArrowUp') {
+    } else if (isNavUpKey(e)) {
       e.preventDefault()
       setFollowTail(false)
       const prev = Math.max(0, focusedIndex < 0 ? windowStart : focusedIndex - 1)
@@ -231,7 +242,18 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
       if (prev < windowStart) {
         setWindowStart(Math.max(0, prev))
       }
-    } else if (e.key === 'Enter') {
+    } else if (isNavFirstKey(e)) {
+      e.preventDefault()
+      setFollowTail(false)
+      setFocusedIndex(0)
+      setWindowStart(0)
+    } else if (isNavLastKey(e)) {
+      e.preventDefault()
+      setFollowTail(false)
+      const lastIndex = allEvents.length - 1
+      setFocusedIndex(lastIndex)
+      setWindowStart(Math.max(0, allEvents.length - WINDOW_SIZE))
+    } else if (isPrimaryActionKey(e)) {
       e.preventDefault()
       const focused = allEvents[focusedIndex]
       if (focused) {

@@ -5,7 +5,7 @@ import { type NextRequest, NextResponse } from 'next/server'
 import type { Event, Run } from '@agent-flight-recorder/contracts'
 
 import { withApiHandler } from '@/lib/apiHandler'
-import { env } from '@/lib/env'
+import { getAcceptedSecrets } from '@/lib/env'
 import { logger } from '@/lib/logger'
 import { verifyProjectionIntegrity } from '@/lib/replay/verify'
 
@@ -56,7 +56,13 @@ export const POST = withApiHandler(
     // This var is optional by design — the Convex verifyRecentRuns action falls
     // back to sequence-only verification when this route is unavailable — so we
     // report 503 with the variable name instead of throwing via assertServerEnv.
-    if (!env.INTERNAL_VERIFY_SECRET) {
+    //
+    // Supports dual-accept rotation: INTERNAL_VERIFY_SECRET may hold
+    // `current,previous` (comma-separated) during a rotation window — every
+    // accepted value validates until the old one is dropped. See
+    // docs/operations_runbook.md → "Secret rotation".
+    const acceptedSecrets = getAcceptedSecrets('INTERNAL_VERIFY_SECRET')
+    if (acceptedSecrets.length === 0) {
       logger.warn('Missing env var INTERNAL_VERIFY_SECRET — verify-derivation disabled', {
         requestId,
         route: ROUTE,
@@ -68,7 +74,7 @@ export const POST = withApiHandler(
     }
 
     const secret = req.headers.get('x-internal-secret')
-    if (!secret || !secretsMatch(secret, env.INTERNAL_VERIFY_SECRET)) {
+    if (!secret || !acceptedSecrets.some((accepted) => secretsMatch(secret, accepted))) {
       return NextResponse.json(
         { error: 'Unauthorized', requestId },
         { status: 401 },

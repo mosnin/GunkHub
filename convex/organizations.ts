@@ -431,3 +431,29 @@ export const updateRetentionPolicy = mutation({
     return await ctx.db.get(args.orgId);
   },
 });
+
+/**
+ * Read-only org settings surface for the retention UI (ADR 001): the current
+ * retention window (undefined = retain forever) and whether Clerk has reported
+ * this org as pending deletion. Gated at the default "viewer" membership rank —
+ * any authenticated member of the org may read the current policy; only the
+ * "admin" rank may change it (see updateRetentionPolicy above).
+ */
+export const getOrganizationSettings = query({
+  args: {
+    orgId: v.id("organizations"),
+  },
+  handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+
+    const org = await ctx.db.get(args.orgId);
+    if (!org) {
+      throw afrError("NOT_FOUND", "Organization not found");
+    }
+
+    return {
+      retentionDays: org.retentionDays,
+      pendingDeletionAt: org.pendingDeletionAt,
+    };
+  },
+});

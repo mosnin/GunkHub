@@ -2,8 +2,15 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "lib": ["ES2022", "DOM"],
-    "rootDir": "src",
-    "outDir": "dist"
+    "types": ["node"],
+    "rootDir": ".",
+    "outDir": "dist",
+    "noEmit": true
   },
-  "include": ["src"]
+  // `pnpm --filter @agent-flight-recorder/sdk typecheck` runs `tsc --noEmit`
+  // against THIS config, so examples/**/*.ts must be typechecked here to
+  // catch drift when the public API changes. `tsconfig.build.json` (used by
+  // `tsup` to build dist/) overrides `include` back to `src` only, so the
+  // shipped package is unaffected.
+  "include": ["src", "examples"]
 }

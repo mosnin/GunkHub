@@ -149,6 +149,121 @@ describe('Tenancy isolation (CLAUDE.md Tenancy Rules)', () => {
   })
 })
 
+describe('listRunsByVerification (server-side integrity filter)', () => {
+  // Seeds org A with 5 runs: 2 with a failed verification, 2 with a passed
+  // verification, 1 with none ("unverified"). Org B gets its own failed run,
+  // used to prove org B's runs never leak into org A's "failed" results.
+  async function seedVerify(t: ReturnType<typeof convexTest>) {
+    return await t.run(async (ctx) => {
+      const now = Date.now()
+      const orgA = await ctx.db.insert('organizations', {
+        clerkOrgId: 'clerk_org_a', name: 'Org A', slug: 'org-a', plan: 'free', createdAt: now, updatedAt: now,
+      })
+      const orgB = await ctx.db.insert('organizations', {
+        clerkOrgId: 'clerk_org_b', name: 'Org B', slug: 'org-b', plan: 'free', createdAt: now, updatedAt: now,
+      })
+      await ctx.db.insert('user_memberships', { clerkUserId: 'user_a', orgId: orgA, role: 'admin', joinedAt: now })
+      await ctx.db.insert('user_memberships', { clerkUserId: 'user_b', orgId: orgB, role: 'admin', joinedAt: now })
+
+      const projectA = await ctx.db.insert('projects', { orgId: orgA, name: 'P', slug: 'p', createdAt: now, updatedAt: now })
+      const agentA = await ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'A', slug: 'a', createdAt: now, updatedAt: now })
+
+      const makeRun = async (orgId: typeof orgA, projectId: typeof projectA, agentId: typeof agentA) =>
+        await ctx.db.insert('runs', {
+          orgId, projectId, agentId, status: 'completed', startedAt: now, endedAt: now, metadata: {}, tags: [],
+        })
+
+      const failed1 = await makeRun(orgA, projectA, agentA)
+      const failed2 = await makeRun(orgA, projectA, agentA)
+      const passed1 = await makeRun(orgA, projectA, agentA)
+      const passed2 = await makeRun(orgA, projectA, agentA)
+      const unverified = await makeRun(orgA, projectA, agentA)
+
+      const projectB = await ctx.db.insert('projects', { orgId: orgB, name: 'PB', slug: 'pb', createdAt: now, updatedAt: now })
+      const agentB = await ctx.db.insert('agents', { orgId: orgB, projectId: projectB, name: 'AB', slug: 'ab', createdAt: now, updatedAt: now })
+      const orgBFailed = await makeRun(orgB, projectB, agentB)
+
+      const insertResult = async (runId: typeof failed1, orgId: typeof orgA, isValid: boolean) =>
+        await ctx.db.insert('verification_results', {
+          runId, orgId, verifiedAt: now, isValid,
+          summary: isValid ? 'OK' : 'INVALID', sequenceGaps: [], duplicateSeqNums: [],
+        })
+
+      await insertResult(failed1, orgA, false)
+      await insertResult(failed2, orgA, false)
+      await insertResult(passed1, orgA, true)
+      await insertResult(passed2, orgA, true)
+      await insertResult(orgBFailed, orgB, false)
+      // `unverified` intentionally gets no verification_results row.
+
+      return { orgA, orgB, failed1, failed2, passed1, passed2, unverified, orgBFailed }
+    })
+  }
+
+  it('returns exactly the failed runs for the caller\'s org, never another org\'s', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, failed1, failed2, orgBFailed } = await seedVerify(t)
+    const asA = t.withIdentity({ subject: 'user_a', org_id: 'clerk_org_a' })
+
+    const res = await asA.query(api.runs.listRunsByVerification, { orgId: orgA, verifyFilter: 'failed' })
+    const ids = res.runs.map((r: { _id: string }) => r._id).sort()
+    expect(ids).toEqual([failed1, failed2].sort())
+    expect(ids).not.toContain(orgBFailed)
+  })
+
+  it('returns exactly the passed runs for the org', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, passed1, passed2 } = await seedVerify(t)
+    const asA = t.withIdentity({ subject: 'user_a', org_id: 'clerk_org_a' })
+
+    const res = await asA.query(api.runs.listRunsByVerification, { orgId: orgA, verifyFilter: 'passed' })
+    const ids = res.runs.map((r: { _id: string }) => r._id).sort()
+    expect(ids).toEqual([passed1, passed2].sort())
+  })
+
+  it('excludes unverified runs from "failed" and only "unverified" returns them', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, unverified, failed1, failed2 } = await seedVerify(t)
+    const asA = t.withIdentity({ subject: 'user_a', org_id: 'clerk_org_a' })
+
+    const failedRes = await asA.query(api.runs.listRunsByVerification, { orgId: orgA, verifyFilter: 'failed' })
+    expect(failedRes.runs.map((r: { _id: string }) => r._id)).not.toContain(unverified)
+
+    const unverifiedRes = await asA.query(api.runs.listRunsByVerification, { orgId: orgA, verifyFilter: 'unverified' })
+    const unverifiedIds = unverifiedRes.runs.map((r: { _id: string }) => r._id)
+    expect(unverifiedIds).toContain(unverified)
+    expect(unverifiedIds).not.toContain(failed1)
+    expect(unverifiedIds).not.toContain(failed2)
+  })
+
+  it("org B's admin cannot query org A's verification filter", async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedVerify(t)
+    const asB = t.withIdentity({ subject: 'user_b', org_id: 'clerk_org_b' })
+    await expect(
+      asB.query(api.runs.listRunsByVerification, { orgId: orgA, verifyFilter: 'failed' }),
+    ).rejects.toThrow(/Unauthorized|not a member/)
+  })
+
+  it('paginates: a limit of 1 returns one match plus a usable cursor for the next', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, failed1, failed2 } = await seedVerify(t)
+    const asA = t.withIdentity({ subject: 'user_a', org_id: 'clerk_org_a' })
+
+    const page1 = await asA.query(api.runs.listRunsByVerification, { orgId: orgA, verifyFilter: 'failed', limit: 1 })
+    expect(page1.runs.length).toBe(1)
+    expect(page1.nextCursor).toBeTruthy()
+
+    const page2 = await asA.query(api.runs.listRunsByVerification, {
+      orgId: orgA, verifyFilter: 'failed', limit: 1, cursor: page1.nextCursor,
+    })
+    expect(page2.runs.length).toBe(1)
+
+    const combinedIds = [...page1.runs, ...page2.runs].map((r: { _id: string }) => r._id).sort()
+    expect(combinedIds).toEqual([failed1, failed2].sort())
+  })
+})
+
 describe('Event log invariants (Rule 4/5)', () => {
   it('accepts contiguous sequence numbers then rejects a gap', async () => {
     const t = convexTest(schema, modules)

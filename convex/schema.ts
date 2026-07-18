@@ -186,7 +186,17 @@ export default defineSchema({
     failureSummaryPassed: v.optional(v.boolean()),      // true = buildFailureSummary succeeded; absent = not checked
   })
     .index("by_run", ["runId"])
-    .index("by_org_verified", ["orgId", "verifiedAt"]),
+    .index("by_org_verified", ["orgId", "verifiedAt"])
+    // Powers the runs page's server-side integrity filter (`/runs?verify=failed`,
+    // convex/runs.ts `listRunsByVerification`). Each run has at most one row here
+    // (upsertVerificationResult deletes-then-inserts, so a row IS the run's latest
+    // result — no "most recent per run" aggregation needed). Without this index,
+    // finding "runs whose verification failed" requires either a full org scan of
+    // verification_results or filtering client-side over a single page of runs
+    // (the previous, misleading behavior this prompt replaces). Justified now,
+    // not speculative: the query that needs it (`listRunsByVerification`) ships
+    // in this same change.
+    .index("by_org_isvalid", ["orgId", "isValid"]),
 
   // APPEND-ONLY admin audit trail. Like the events table, rows are never updated
   // or deleted (sole exception: ADR 001 org purge, which erases the whole org's

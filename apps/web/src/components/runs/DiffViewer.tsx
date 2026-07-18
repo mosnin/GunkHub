@@ -172,7 +172,7 @@ function RunSelector() {
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="flex flex-col gap-1.5">
           <label htmlFor="diff-left" className="text-xs font-medium text-neutral-500 uppercase tracking-wider">
             Run A (left)
@@ -251,7 +251,7 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
     <div className="flex flex-col gap-4">
       {/* Header — run IDs + summary badges */}
       <div className="flex flex-col gap-3">
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="flex flex-col gap-1">
             <span className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Run A</span>
             <span className="h-9 px-3 flex items-center rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 font-mono truncate">
@@ -357,7 +357,7 @@ export function DiffViewer({ diff, incomparable, incomparableReason, loading }: 
   if (loading) {
     return (
       <div className="flex flex-col gap-4">
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="h-9 rounded-md bg-neutral-900 border border-neutral-800 animate-pulse" />
           <div className="h-9 rounded-md bg-neutral-900 border border-neutral-800 animate-pulse" />
         </div>

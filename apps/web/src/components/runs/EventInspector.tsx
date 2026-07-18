@@ -7,6 +7,13 @@ import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts
 import { CodeBlock } from '@/components/ui/CodeBlock'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { LoadingState } from '@/components/ui/LoadingState'
+import {
+  isNavDownKey,
+  isNavFirstKey,
+  isNavLastKey,
+  isNavUpKey,
+  isPrimaryActionKey,
+} from '@/lib/hooks/useKeyScope'
 
 const WINDOW_SIZE = 100
 
@@ -304,9 +311,13 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
     }
   }
 
+  // Unified list-navigation model (shared with Timeline/ReplayViewer): arrows
+  // and j/k both move the roving focus, g/Home and G/End jump to the ends of
+  // the list, and Enter (or Space) runs the primary action — here, selecting
+  // the focused event into the payload panel. See src/lib/hooks/useKeyScope.ts.
   function handleListKeyDown(e: React.KeyboardEvent<HTMLElement>) {
     if (allEvents.length === 0) return
-    if (e.key === 'ArrowDown') {
+    if (isNavDownKey(e)) {
       e.preventDefault()
       setFollowTail(false)
       const next = Math.min(allEvents.length - 1, focusedIdx < 0 ? windowStart : focusedIdx + 1)
@@ -315,7 +326,7 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       if (next >= windowStart + WINDOW_SIZE) {
         setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, next))
       }
-    } else if (e.key === 'ArrowUp') {
+    } else if (isNavUpKey(e)) {
       e.preventDefault()
       setFollowTail(false)
       const prev = Math.max(0, focusedIdx < 0 ? windowStart : focusedIdx - 1)
@@ -324,7 +335,20 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       if (prev < windowStart) {
         setWindowStart(Math.max(0, prev))
       }
-    } else if (e.key === 'Enter' || e.key === ' ') {
+    } else if (isNavFirstKey(e)) {
+      e.preventDefault()
+      setFollowTail(false)
+      setFocusedIdx(0)
+      setSelectedId(allEvents[0]?.id ?? null)
+      setWindowStart(0)
+    } else if (isNavLastKey(e)) {
+      e.preventDefault()
+      setFollowTail(false)
+      const lastIdx = allEvents.length - 1
+      setFocusedIdx(lastIdx)
+      setSelectedId(allEvents[lastIdx]?.id ?? null)
+      setWindowStart(Math.max(0, allEvents.length - WINDOW_SIZE))
+    } else if (isPrimaryActionKey(e) || e.key === ' ') {
       // Options are not individually focusable (listbox pattern) — activation
       // of the focused option happens here on the container.
       e.preventDefault()

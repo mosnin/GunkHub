@@ -19,12 +19,24 @@ export interface CreateRunResponse {
   run: Run;
 }
 
+/**
+ * Server-side integrity filter for the runs list, backed by the
+ * `verification_results` table (see convex/runs.ts `listRunsByVerification`).
+ * "failed"/"passed" reflect the run's latest verification's `isValid`;
+ * "unverified" means the run has never been verified. When set, this filter
+ * selects the base result set (it wins over pagination source); the other
+ * `ListRunsRequest` filters below still narrow within it.
+ */
+export type VerifyFilter = "failed" | "passed" | "unverified";
+
 export interface ListRunsRequest {
   projectId?: string;
   agentId?: string;
   status?: RunStatus;
   /** Unix ms timestamp. Only runs started at or after this time are returned. */
   startedAfter?: number;
+  /** Server-side integrity filter. Omit for no filtering (all runs). */
+  verifyFilter?: VerifyFilter;
   limit?: number;
   cursor?: string;
 }

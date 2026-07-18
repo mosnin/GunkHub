@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { FailureSummary, ReplayFrame, ReplayProjection } from '@agent-flight-recorder/contracts'
 
 import { EmptyState } from '@/components/ui/EmptyState'
+import { isEditableTarget, isNavFirstKey, isNavLastKey } from '@/lib/hooks/useKeyScope'
 
 interface ReplayViewerProps {
   projection: ReplayProjection
@@ -15,14 +16,6 @@ interface ReplayViewerProps {
 // are mounted at once, with earlier/later expanders. Keeps the DOM bounded for
 // 10k-frame replays.
 const WINDOW_SIZE = 100
-
-/** True when the keydown originated in a text-entry context — the replay
-    stepper must not hijack arrow keys from inputs/textareas/selects. */
-function isEditableTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false
-  const tag = target.tagName
-  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable
-}
 
 // Actor → left border treatment. design.md limits colour to Neon Glow, the red
 // alert, and greys. The actor name is shown in the frame metadata, so hue only
@@ -124,16 +117,26 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
     setCurrentIndex((i) => Math.min(total - 1, i + 1))
   }
 
+  // Unified list-navigation model (shared with Timeline/EventInspector):
+  // ArrowLeft/ArrowRight step frames as before; `k`/`j` are the same "back"/
+  // "forward" aliases the other inspectors use for up/down, and g/Home,
+  // G/End jump to the first/last frame. See src/lib/hooks/useKeyScope.ts.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      // Never hijack arrow keys while the user is typing in a form control.
+      // Never hijack keys while the user is typing in a form control.
       if (isEditableTarget(e.target)) return
-      if (e.key === 'ArrowLeft') {
+      if (e.key === 'ArrowLeft' || e.key === 'k') {
         e.preventDefault()
         setCurrentIndex((i) => Math.max(0, i - 1))
-      } else if (e.key === 'ArrowRight') {
+      } else if (e.key === 'ArrowRight' || e.key === 'j') {
         e.preventDefault()
         setCurrentIndex((i) => Math.min(total - 1, i + 1))
+      } else if (isNavFirstKey(e)) {
+        e.preventDefault()
+        setCurrentIndex(0)
+      } else if (isNavLastKey(e)) {
+        e.preventDefault()
+        setCurrentIndex(total - 1)
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -218,8 +221,8 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
           </span>
         )}
 
-        <span className="ml-auto text-xs text-pewter">
-          ArrowLeft / ArrowRight to step
+        <span className="ml-auto text-xs text-pewter font-mono">
+          ←/→ or k/j to step · g/G first/last · press ? for all shortcuts
         </span>
       </div>
 

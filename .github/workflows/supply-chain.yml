@@ -1,0 +1,118 @@
+name: Supply Chain
+
+# SBOM generation + production-dependency license gate for the pnpm workspace.
+#
+# Runs independently of ci.yml (owned by a different team this batch) so it
+# never blocks or races the main typecheck/build/lint/test pipeline. Triggers:
+#   - push to main: SBOM reflects what's actually shipping
+#   - weekly schedule: catches license/SBOM drift from upstream dependency
+#     releases even when nothing lands on main that week
+#   - workflow_dispatch: on-demand run (e.g. to regenerate the SBOM artifact
+#     for an audit request without waiting for the next scheduled run)
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # Mondays 07:00 UTC — one hour after ci.yml's weekly advisory sweep
+    # (06:00 UTC) so the two scheduled workflows don't contend for the same
+    # runner queue slot.
+    - cron: "0 7 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sbom-and-license-gate:
+    name: SBOM + License Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 9
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare SBOM output directory
+        run: mkdir -p sbom
+
+      - name: Generate pnpm license reports (prod + dev)
+        # Raw `pnpm licenses list` output for both dependency classes. This is
+        # the same data source the license gate step reads from, kept as an
+        # artifact so a reviewer can see exactly what was evaluated without
+        # re-running the gate locally.
+        #
+        # Format note: this is pnpm's own license-report JSON shape — an
+        # object keyed by SPDX license identifier (or SPDX-ish compound
+        # expression, e.g. "(MIT OR CC0-1.0)"), each holding an array of
+        # { name, versions, paths, license, author?, homepage?, description? }
+        # entries. It is NOT a CycloneDX document; see sbom.cdx.json below
+        # for the full CycloneDX 1.5 SBOM covering the same dependency graph.
+        run: |
+          pnpm licenses list --json --prod > sbom/licenses.prod.json
+          pnpm licenses list --json -D > sbom/licenses.dev.json
+
+      - name: Generate CycloneDX SBOM
+        # cdxgen (not cyclonedx-npm) is used because cyclonedx-npm only reads
+        # npm's package-lock.json format and cannot resolve a pnpm workspace's
+        # pnpm-lock.yaml graph. cdxgen has a native pnpm-lock.yaml resolver and
+        # produces a full CycloneDX 1.5 document (components, licenses,
+        # hashes) across every workspace package in one pass.
+        #
+        # Pinned to an exact version (not @latest) for reproducible SBOMs.
+        # `pnpm dlx` fetches straight from the registry — no addition to any
+        # package.json devDependencies.
+        run: |
+          pnpm dlx @cyclonedx/cdxgen@12.7.1 \
+            --type js \
+            --spec-version 1.5 \
+            --output sbom/sbom.cdx.json \
+            .
+
+      - name: License gate (production dependencies)
+        # Allowlist lives in scripts/license-gate.ts (single source of truth —
+        # this comment restates it so the policy is visible without opening
+        # that file):
+        #   MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause, 0BSD, CC0-1.0,
+        #   Unlicense, Python-2.0, BlueOak-1.0.0
+        #
+        # Fails the job if any PRODUCTION dependency carries a license outside
+        # this list (unless covered by a named per-package exception — see
+        # PACKAGE_EXCEPTIONS in scripts/license-gate.ts, e.g. caniuse-lite's
+        # CC-BY-4.0 data license). DevDependency violations are printed as
+        # warnings only and never fail this job.
+        run: pnpm tsx scripts/license-gate.ts
+
+      - name: Upload SBOM + license report artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-and-licenses
+          path: sbom/
+          retention-days: 90

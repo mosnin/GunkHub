@@ -8,6 +8,8 @@ import { getAuthContext, requireOrgMembership } from "./auth.js";
 import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
+import type { Doc } from "./_generated/dataModel.js";
+
 /**
  * List runs scoped to the caller's org, with optional filters.
  */
@@ -112,6 +114,220 @@ export const listRuns = query({
       // Number of runs in THIS page — NOT a grand total across all pages. Renamed
       // from the misleading `total` (which UI read as a full count).
       pageSize: page.page.length,
+    };
+  },
+});
+
+const RUN_STATUS = v.union(
+  v.literal("pending"),
+  v.literal("running"),
+  v.literal("completed"),
+  v.literal("failed"),
+  v.literal("cancelled"),
+  v.literal("timed_out"),
+);
+
+/**
+ * `listRunsByVerification`'s own cursor format (opaque to callers — just a
+ * string they pass back unmodified).
+ *
+ * Why not just `page.continueCursor` from the underlying index query: that
+ * query's page can contain MORE matches (after in-memory secondary filtering)
+ * than `limit`, because of the overfetch multiplier below. If we trimmed to
+ * `limit` and the underlying page happened to be `isDone`, the untrimmed
+ * remainder would be silently dropped — a real, observed bug (a page of 4
+ * overfetched rows containing 2 matches, with `limit: 1`, would return 1 match
+ * and `nextCursor: undefined`, losing the second match forever). `skip` lets
+ * us resume mid-batch by re-reading the same underlying page and skipping the
+ * matches already delivered, instead of only being able to resume at the next
+ * underlying page boundary.
+ */
+interface VerifyCursor {
+  underlyingCursor: string | null;
+  skip: number;
+}
+
+function decodeVerifyCursor(cursor: string | undefined): VerifyCursor {
+  if (!cursor) return { underlyingCursor: null, skip: 0 };
+  try {
+    const parsed: unknown = JSON.parse(cursor);
+    if (
+      parsed && typeof parsed === "object" &&
+      "skip" in parsed && typeof (parsed as { skip: unknown }).skip === "number"
+    ) {
+      const p = parsed as { underlyingCursor: string | null; skip: number };
+      return { underlyingCursor: p.underlyingCursor ?? null, skip: p.skip };
+    }
+  } catch {
+    // fall through to defensive fallback below
+  }
+  // Defensive fallback: treat an unparsable cursor as a raw underlying cursor
+  // (should not happen for cursors this query itself produced).
+  return { underlyingCursor: cursor, skip: 0 };
+}
+
+function encodeVerifyCursor(c: VerifyCursor): string {
+  return JSON.stringify(c);
+}
+
+/**
+ * List runs whose latest integrity verification matches `verifyFilter`, scoped
+ * to the caller's org. This is the real server-side counterpart to the runs
+ * page's "/runs?verify=failed|passed|unverified" filter — previously that
+ * filter was applied client-side over a single page of `listRuns` results,
+ * which silently understated failures beyond page 1. See the `by_org_isvalid`
+ * index comment in schema.ts for why this table (not `runs`) is the query base
+ * for "failed"/"passed".
+ *
+ * Design choice: a dedicated query rather than folding this into `listRuns`.
+ * `listRuns` is driven entirely by indexes ON THE `runs` TABLE (by_org,
+ * by_org_status, by_agent_started, ...); "failed"/"passed" are properties of a
+ * SEPARATE table (`verification_results`), so answering them efficiently means
+ * the base paginated cursor must walk `verification_results`, not `runs` — a
+ * different iteration source with a different cursor space. Bolting that onto
+ * `listRuns` would mean two incompatible pagination strategies live behind one
+ * `cursor` argument (silently wrong if a caller flips `verifyFilter` mid-scroll
+ * while reusing a cursor from the other source). A separate query makes the
+ * cursor's origin unambiguous and keeps `listRuns` simple for the common case.
+ *
+ * Secondary filters (status/agentId/projectId/startedAfter) are checked
+ * in-memory against each candidate run after the indexed base fetch, so a
+ * bounded overfetch multiplier is used to improve the odds of filling a full
+ * page — the same over-fetch-then-filter pattern already used in
+ * projection_verify.ts (`_getRecentTerminalRuns`, `listRecentFailedVerifications`).
+ * Precedence: the verify filter always wins — it selects the base result set;
+ * the other filters only narrow within it, and (like `listRuns`) `pageSize` is
+ * this page's match count, not a global total.
+ */
+export const listRunsByVerification = query({
+  args: {
+    orgId: v.id("organizations"),
+    verifyFilter: v.union(v.literal("failed"), v.literal("passed"), v.literal("unverified")),
+    projectId: v.optional(v.id("projects")),
+    agentId: v.optional(v.id("agents")),
+    status: v.optional(RUN_STATUS),
+    startedAfter: v.optional(v.number()),
+    limit: v.optional(v.number()),
+    cursor: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+
+    const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+    // Bounded overfetch: secondary filters are applied after the indexed base
+    // fetch, so read more than `limit` candidates to improve the chance of
+    // filling a full page. Still bounded (MAX_PAGE_SIZE * 4 at worst).
+    const OVERFETCH = 4;
+
+    // TENANCY: validate cross-org references up front, mirroring listRuns.
+    if (args.agentId !== undefined) {
+      const agent = await ctx.db.get(args.agentId);
+      if (!agent || agent.orgId !== args.orgId) {
+        throw afrError("NOT_FOUND", "Agent not found in this organization");
+      }
+    }
+    if (args.projectId !== undefined) {
+      const project = await ctx.db.get(args.projectId);
+      if (!project || project.orgId !== args.orgId) {
+        throw afrError("NOT_FOUND", "Project not found in this organization");
+      }
+    }
+
+    function matchesSecondaryFilters(run: Doc<"runs">): boolean {
+      // Tenancy safety net — every branch below already scopes by orgId, but
+      // this makes cross-org leakage impossible even if that changes later.
+      if (run.orgId !== args.orgId) return false;
+      if (args.agentId !== undefined && run.agentId !== args.agentId) return false;
+      if (args.projectId !== undefined && run.projectId !== args.projectId) return false;
+      if (args.status !== undefined && run.status !== args.status) return false;
+      if (args.startedAfter !== undefined && run.startedAt < args.startedAfter) return false;
+      return true;
+    }
+
+    const { underlyingCursor, skip } = decodeVerifyCursor(args.cursor);
+
+    if (args.verifyFilter === "unverified") {
+      // Base source: the runs table (there is no row to index on for "absence
+      // of a verification_results record"), reusing listRuns' org-scoped index
+      // selection so status/agent/project stay indexed.
+      let runsQuery;
+      if (args.agentId !== undefined) {
+        runsQuery = ctx.db.query("runs").withIndex("by_agent_started", (q) =>
+          q.eq("agentId", args.agentId!),
+        );
+      } else if (args.projectId !== undefined) {
+        runsQuery = ctx.db.query("runs").withIndex("by_project_started", (q) =>
+          q.eq("projectId", args.projectId!),
+        );
+      } else if (args.status !== undefined) {
+        runsQuery = ctx.db.query("runs").withIndex("by_org_status", (q) =>
+          q.eq("orgId", args.orgId).eq("status", args.status!),
+        );
+      } else {
+        runsQuery = ctx.db.query("runs").withIndex("by_org", (q) => q.eq("orgId", args.orgId));
+      }
+
+      const filtered = runsQuery.filter((q) => q.eq(q.field("orgId"), args.orgId));
+      const page = await filtered.paginate({ numItems: limit * OVERFETCH, cursor: underlyingCursor });
+
+      const matches: Doc<"runs">[] = [];
+      for (const run of page.page) {
+        if (!matchesSecondaryFilters(run)) continue;
+        const existing = await ctx.db
+          .query("verification_results")
+          .withIndex("by_run", (q) => q.eq("runId", run._id))
+          .first();
+        if (existing) continue; // has a result -> not "unverified"
+        matches.push(run);
+      }
+
+      const windowed = matches.slice(skip, skip + limit);
+      let nextCursor: string | undefined;
+      if (matches.length > skip + limit) {
+        // More matches already fetched in THIS underlying batch — resume by
+        // skipping further into it rather than advancing the underlying cursor.
+        nextCursor = encodeVerifyCursor({ underlyingCursor, skip: skip + limit });
+      } else if (!page.isDone) {
+        nextCursor = encodeVerifyCursor({ underlyingCursor: page.continueCursor, skip: 0 });
+      }
+
+      return {
+        runs: windowed,
+        nextCursor,
+        pageSize: windowed.length,
+      };
+    }
+
+    // "failed" | "passed" — base source: verification_results, via the
+    // by_org_isvalid index (see schema.ts for the justification).
+    const isValid = args.verifyFilter === "passed";
+    const vrQuery = ctx.db
+      .query("verification_results")
+      .withIndex("by_org_isvalid", (q) => q.eq("orgId", args.orgId).eq("isValid", isValid));
+    const vrPage = await vrQuery.paginate({ numItems: limit * OVERFETCH, cursor: underlyingCursor });
+
+    const matches: Doc<"runs">[] = [];
+    for (const vr of vrPage.page) {
+      // Tenancy safety net (index already scopes this, belt-and-suspenders).
+      if (vr.orgId !== args.orgId) continue;
+      const run = await ctx.db.get(vr.runId);
+      if (!run) continue; // purged since the verification result was written
+      if (!matchesSecondaryFilters(run)) continue;
+      matches.push(run);
+    }
+
+    const windowed = matches.slice(skip, skip + limit);
+    let nextCursor: string | undefined;
+    if (matches.length > skip + limit) {
+      nextCursor = encodeVerifyCursor({ underlyingCursor, skip: skip + limit });
+    } else if (!vrPage.isDone) {
+      nextCursor = encodeVerifyCursor({ underlyingCursor: vrPage.continueCursor, skip: 0 });
+    }
+
+    return {
+      runs: windowed,
+      nextCursor,
+      pageSize: windowed.length,
     };
   },
 });

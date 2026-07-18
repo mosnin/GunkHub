@@ -36,6 +36,12 @@ out/
 coverage/
 .nyc_output/
 
+# Playwright (playwright.config.ts lives at repo root, so output lands here
+# rather than under tests/)
+/test-results/
+/playwright-report/
+/blob-report/
+
 # Editor directories and files
 .vscode/
 !.vscode/extensions.json

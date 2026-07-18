@@ -28,8 +28,10 @@ export const convex = {
   },
   organizations: {
     getOrganization: makeFunctionReference<Q>('organizations:getOrganization'),
+    getOrganizationSettings: makeFunctionReference<Q>('organizations:getOrganizationSettings'),
     upsertOrganization: makeFunctionReference<M>('organizations:upsertOrganization'),
     upsertMembership: makeFunctionReference<M>('organizations:upsertMembership'),
+    updateRetentionPolicy: makeFunctionReference<M>('organizations:updateRetentionPolicy'),
   },
   api_keys: {
     createApiKey: makeFunctionReference<M>('api_keys:createApiKey'),
@@ -38,6 +40,7 @@ export const convex = {
   },
   runs: {
     listRuns: makeFunctionReference<Q>('runs:listRuns'),
+    listRunsByVerification: makeFunctionReference<Q>('runs:listRunsByVerification'),
     getRun: makeFunctionReference<Q>('runs:getRun'),
     createRun: makeFunctionReference<M>('runs:createRun'),
     updateRunTags: makeFunctionReference<M>('runs:updateRunTags'),
@@ -62,6 +65,9 @@ export const convex = {
     sdkCreateEvents: makeFunctionReference<M>('sdk_ingest:sdkCreateEvents'),
     sdkUpdateRunStatus: makeFunctionReference<M>('sdk_ingest:sdkUpdateRunStatus'),
     sdkCreateArtifact: makeFunctionReference<M>('sdk_ingest:sdkCreateArtifact'),
+  },
+  audit: {
+    listAuditLog: makeFunctionReference<Q>('audit:listAuditLog'),
   },
   projection_verify: {
     getVerificationResult: makeFunctionReference<Q>('projection_verify:getVerificationResult'),

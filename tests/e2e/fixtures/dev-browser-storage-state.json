@@ -1,0 +1,15 @@
+{
+  "cookies": [
+    {
+      "name": "__clerk_db_jwt",
+      "value": "e2e-fixture-dev-browser-token",
+      "domain": "localhost",
+      "path": "/",
+      "expires": 1815883565,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": []
+}
