@@ -65,6 +65,21 @@ export interface Run {
   tags: string[];
   triggeredBy?: string;
   sdkVersion?: string;
+  /** ADR-002: links a sub-run to its parent (same org + project). */
+  parentRunId?: string;
+  /** ADR-002: free-form correlation key grouping multiple runs. */
+  sessionId?: string;
+  /** ADR-002: well-known value or custom string up to 32 chars. */
+  environment?: string;
+  /** ADR-002: triage labels, distinct from `tags` — up to 10, each up to 40 chars. */
+  labels?: string[];
+  /** ADR-002: settable only on failed/timed_out runs via setRunTriage. */
+  triageState?: RunTriageState;
+  /** ADR-002: denormalized running counters, incremented from llm.response events. */
+  tokensIn?: number;
+  tokensOut?: number;
+  /** ADR-002: search-index source field — not itself a canonical fact about the run. */
+  searchText?: string;
 }
 
 export interface Event {
@@ -114,4 +129,4 @@ export interface Comment {
 
 // Forward references resolved by importing from events.ts and status.ts
 import type { EventType, EventPayload } from "./events.js";
-import type { RunStatus } from "./status.js";
+import type { RunStatus, RunTriageState } from "./status.js";

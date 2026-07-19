@@ -6,7 +6,11 @@ import { query, mutation } from "./_generated/server.js";
 import { WEBHOOK_ACTOR, recordAuditEvent } from "./audit.js";
 import { requireOrgMembership } from "./auth.js";
 import { afrError } from "./helpers/errors.js";
-import { MAX_RETENTION_DAYS, MIN_RETENTION_DAYS } from "./helpers/pagination.js";
+import {
+  MAX_PAGE_SIZE,
+  MAX_RETENTION_DAYS,
+  MIN_RETENTION_DAYS,
+} from "./helpers/pagination.js";
 
 /**
  * Shared-secret gate for webhook-only lifecycle mutations.
@@ -455,5 +459,42 @@ export const getOrganizationSettings = query({
       retentionDays: org.retentionDays,
       pendingDeletionAt: org.pendingDeletionAt,
     };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// NEW QUERY (Team E / UI agent, this cycle): listMemberships
+//
+// Read-only org-scoped membership roster for the new /settings/members page.
+// Follows the getOrganizationSettings pattern immediately above exactly:
+// requireOrgMembership() at default "viewer" rank gates the read (any member of
+// the org can see who else is a member — no admin-only data is exposed here),
+// then a single bounded `.take(MAX_PAGE_SIZE)` query against the `by_org` index
+// on `user_memberships`. No new table, no new index, no mutation added.
+//
+// Role CHANGES remain Clerk-authoritative: this file's upsertMembership /
+// removeMembership mutations (webhook-only, gated by assertWebhookSecret) are
+// the only writers of this table. This query adds no new write path.
+// ---------------------------------------------------------------------------
+export const listMemberships = query({
+  args: {
+    orgId: v.id("organizations"),
+  },
+  handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+
+    // Bounded: at most MAX_PAGE_SIZE memberships returned (no unbounded .collect()),
+    // same ceiling used by listApiKeys/listAuditLog.
+    const memberships = await ctx.db
+      .query("user_memberships")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .take(MAX_PAGE_SIZE);
+
+    return memberships.map((m) => ({
+      _id: m._id,
+      clerkUserId: m.clerkUserId,
+      role: m.role,
+      joinedAt: m.joinedAt,
+    }));
   },
 });

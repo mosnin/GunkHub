@@ -29,6 +29,7 @@ Each boundary owns its domain exclusively. Do not blur these lines.
 | `apps/web` | UI, API routes, Clerk auth integration, Next.js configuration |
 | `packages/contracts` | Shared TypeScript types only — zero runtime dependencies |
 | `packages/sdk` | Client recording library — instruments agent code, ships events to Convex |
+| `packages/cli` | `afr` command-line interface — sdk team owns |
 | `convex/` | Backend schema, query functions, mutation functions, Convex auth config |
 
 ### File Ownership Map
@@ -40,6 +41,7 @@ outside the boundary you have been assigned without explicit instruction.
 apps/web/**              → web boundary
 packages/contracts/**   → contracts boundary
 packages/sdk/**         → sdk boundary
+packages/cli/**         → cli boundary — sdk team owns
 convex/**               → convex boundary
 scripts/**              → shared tooling (any team may edit)
 docs/**                 → shared documentation (any team may edit)

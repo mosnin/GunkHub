@@ -7,8 +7,16 @@ import { recordAuditEvent } from "./audit.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
 import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
+import {
+  buildSearchText,
+  validateEnvironment,
+  validateLabels,
+  validateSessionId,
+} from "./helpers/run_fields.js";
+import { incrementUsageCounters } from "./usage.js";
 
-import type { Doc } from "./_generated/dataModel.js";
+import type { Doc, Id } from "./_generated/dataModel.js";
+import type { MutationCtx } from "./_generated/server.js";
 
 /**
  * List runs scoped to the caller's org, with optional filters.
@@ -29,6 +37,11 @@ export const listRuns = query({
       ),
     ),
     startedAfter: v.optional(v.number()),
+    // ADR-002: environment filter. Only applied via the dedicated
+    // by_org_environment_started index when agentId/projectId are NOT also
+    // supplied (those take precedence, as before); otherwise it is applied
+    // as an in-memory secondary filter, same pattern as listRunsByVerification.
+    environment: v.optional(v.string()),
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
   },
@@ -95,6 +108,12 @@ export const listRuns = query({
       runsQuery = ctx.db.query("runs").withIndex("by_org_started", (q) =>
         q.eq("orgId", args.orgId).gte("startedAt", args.startedAfter!),
       );
+    } else if (args.environment !== undefined) {
+      // ADR-002: environment filter only, no agent/project/status — use the
+      // dedicated index instead of a full org scan.
+      runsQuery = ctx.db.query("runs").withIndex("by_org_environment_started", (q) =>
+        q.eq("orgId", args.orgId).eq("environment", args.environment),
+      );
     } else {
       // No filters — all runs for org
       runsQuery = ctx.db.query("runs").withIndex("by_org", (q) =>
@@ -104,7 +123,18 @@ export const listRuns = query({
 
     // Keep orgId safety check only — other conditions are now covered by index selection.
     // This prevents cross-org data leakage in case an invalid agentId or projectId is passed.
-    const filtered = runsQuery.filter((q) => q.eq(q.field("orgId"), args.orgId));
+    // ADR-002: when the environment filter couldn't drive index selection above
+    // (agentId/projectId/status/startedAfter took precedence), apply it here as
+    // an in-memory secondary filter — same overfetch-then-filter tradeoff already
+    // accepted elsewhere (listRunsByVerification) rather than adding yet more
+    // compound indexes for every filter combination.
+    const filtered = runsQuery
+      .filter((q) => q.eq(q.field("orgId"), args.orgId))
+      .filter((q) =>
+        args.environment === undefined
+          ? q.eq(q.field("_id"), q.field("_id"))
+          : q.eq(q.field("environment"), args.environment),
+      );
 
     const page = await filtered.paginate({ numItems: limit, cursor: args.cursor ?? null });
 
@@ -352,6 +382,28 @@ export const getRun = query({
 /**
  * Create a new run record.  Validates org membership before inserting.
  */
+/**
+ * ADR-002: validate that parentRunId (if given) references an existing run in
+ * the SAME org and project as the child. Cycles are structurally impossible
+ * here: the parent must already exist at the moment the child is created, and
+ * parentRunId is never mutated after creation, so no traversal check is needed.
+ */
+async function validateParentRun(
+  ctx: MutationCtx,
+  parentRunId: Id<"runs"> | undefined,
+  orgId: Id<"organizations">,
+  projectId: Id<"projects">,
+): Promise<void> {
+  if (parentRunId === undefined) return;
+  const parent = await ctx.db.get(parentRunId);
+  if (!parent || parent.orgId !== orgId || parent.projectId !== projectId) {
+    throw afrError(
+      "INVALID_ARGUMENT",
+      "parentRunId must reference an existing run in the same organization and project",
+    );
+  }
+}
+
 export const createRun = mutation({
   args: {
     orgId: v.id("organizations"),
@@ -362,6 +414,11 @@ export const createRun = mutation({
     tags: v.optional(v.array(v.string())),
     triggeredBy: v.optional(v.string()),
     sdkVersion: v.optional(v.string()),
+    // ADR-002 additions — all optional/additive.
+    parentRunId: v.optional(v.id("runs")),
+    sessionId: v.optional(v.string()),
+    environment: v.optional(v.string()),
+    labels: v.optional(v.array(v.string())),
   },
   handler: async (ctx, args) => {
     await requireOrgMembership(ctx, args.orgId, { minimumRole: "member" });
@@ -387,7 +444,13 @@ export const createRun = mutation({
       }
     }
 
+    await validateParentRun(ctx, args.parentRunId, args.orgId, args.projectId);
+    validateSessionId(args.sessionId);
+    validateEnvironment(args.environment);
+    validateLabels(args.labels);
+
     const now = Date.now();
+    const searchText = buildSearchText([agent.name, ...(args.tags ?? []), args.triggeredBy]);
     const runId = await ctx.db.insert("runs", {
       orgId: args.orgId,
       projectId: args.projectId,
@@ -400,7 +463,14 @@ export const createRun = mutation({
       tags: args.tags ?? [],
       triggeredBy: args.triggeredBy,
       sdkVersion: args.sdkVersion,
+      parentRunId: args.parentRunId,
+      sessionId: args.sessionId,
+      environment: args.environment,
+      labels: args.labels,
+      searchText,
     });
+
+    await incrementUsageCounters(ctx, args.orgId, { runsStarted: 1 });
 
     const run = await ctx.db.get(runId);
     if (!run) throw new Error("Failed to create run");
@@ -513,5 +583,176 @@ export const updateRunTags = mutation({
     const updated = await ctx.db.get(args.runId);
     if (!updated) throw new Error("Run not found after update");
     return updated;
+  },
+});
+
+// ---------------------------------------------------------------------------
+// ADR-002 — run hierarchy / sessions / environment / triage / search.
+// ---------------------------------------------------------------------------
+
+/**
+ * Set the labels on a run (distinct from `tags` — see ADR-002). Labels are
+ * replaced wholesale — pass the full desired array.
+ */
+export const setRunLabels = mutation({
+  args: {
+    runId: v.id("runs"),
+    labels: v.array(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const run = await ctx.db.get(args.runId);
+    if (!run) throw new Error("Run not found");
+
+    const { userId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, run.orgId, { minimumRole: "member" });
+
+    validateLabels(args.labels);
+    await ctx.db.patch(args.runId, { labels: args.labels });
+
+    await recordAuditEvent(ctx, {
+      orgId: run.orgId,
+      actorClerkUserId: userId,
+      action: "run.labels_updated",
+      targetType: "run",
+      targetId: String(args.runId),
+      metadata: { labels: args.labels },
+    });
+
+    const updated = await ctx.db.get(args.runId);
+    if (!updated) throw new Error("Run not found after update");
+    return updated;
+  },
+});
+
+// Linear triage workflow: open -> investigating -> resolved. `open` is also
+// reachable from ANY state (reopen), per ADR-002.
+const TRIAGE_FORWARD_TRANSITIONS: Record<string, string> = {
+  open: "investigating",
+  investigating: "resolved",
+};
+
+/**
+ * Set a run's triage state. Only settable on failed/timed_out runs. Enforces
+ * the linear state machine open -> investigating -> resolved (+ any -> open).
+ */
+export const setRunTriage = mutation({
+  args: {
+    runId: v.id("runs"),
+    triageState: v.union(
+      v.literal("open"),
+      v.literal("investigating"),
+      v.literal("resolved"),
+    ),
+  },
+  handler: async (ctx, args) => {
+    const run = await ctx.db.get(args.runId);
+    if (!run) throw new Error("Run not found");
+
+    const { userId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, run.orgId, { minimumRole: "member" });
+
+    if (run.status !== "failed" && run.status !== "timed_out") {
+      throw afrError(
+        "INVALID_ARGUMENT",
+        `Triage state can only be set on failed or timed_out runs (current status "${run.status}")`,
+      );
+    }
+
+    const current = run.triageState ?? "open";
+    if (current !== args.triageState) {
+      const allowedNext = args.triageState === "open" ? true : TRIAGE_FORWARD_TRANSITIONS[current] === args.triageState;
+      if (!allowedNext) {
+        throw afrError(
+          "INVALID_ARGUMENT",
+          `Invalid triage transition from "${current}" to "${args.triageState}"`,
+        );
+      }
+    }
+
+    await ctx.db.patch(args.runId, { triageState: args.triageState });
+
+    await recordAuditEvent(ctx, {
+      orgId: run.orgId,
+      actorClerkUserId: userId,
+      action: "run.triage_updated",
+      targetType: "run",
+      targetId: String(args.runId),
+      metadata: { from: current, to: args.triageState },
+    });
+
+    return await ctx.db.get(args.runId);
+  },
+});
+
+/**
+ * Full-text search over runs' searchText, scoped to the caller's org via the
+ * search index's filterFields. Bounded like every other list query.
+ */
+export const searchRuns = query({
+  args: {
+    orgId: v.id("organizations"),
+    searchTerm: v.string(),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+    const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+
+    if (args.searchTerm.trim().length === 0) {
+      return { runs: [] };
+    }
+
+    const results = await ctx.db
+      .query("runs")
+      .withSearchIndex("search_runs", (q) =>
+        q.search("searchText", args.searchTerm).eq("orgId", args.orgId),
+      )
+      .take(limit);
+
+    return { runs: results };
+  },
+});
+
+/** All runs sharing a sessionId, scoped to the caller's org, newest first. */
+export const listSessionRuns = query({
+  args: {
+    orgId: v.id("organizations"),
+    sessionId: v.string(),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    await requireOrgMembership(ctx, args.orgId);
+    const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+
+    const runs = await ctx.db
+      .query("runs")
+      .withIndex("by_org_session", (q) =>
+        q.eq("orgId", args.orgId).eq("sessionId", args.sessionId),
+      )
+      .order("desc")
+      .take(limit);
+
+    return { runs };
+  },
+});
+
+/** Direct children of a run (one level of the parent hierarchy), org-checked via the parent. */
+export const listChildRuns = query({
+  args: {
+    parentRunId: v.id("runs"),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const parent = await ctx.db.get(args.parentRunId);
+    if (!parent) throw new Error("Run not found");
+    await requireOrgMembership(ctx, parent.orgId);
+
+    const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+    const children = await ctx.db
+      .query("runs")
+      .withIndex("by_parent", (q) => q.eq("parentRunId", args.parentRunId))
+      .take(limit);
+
+    return { runs: children };
   },
 });

@@ -24,6 +24,8 @@ export { FlightRecorder, RunRecorder } from './flight-recorder.js'
 // run, so exporting it here keeps the main entry browser/edge-safe.
 export { FileSpool } from './file-spool.js'
 export { SDK_VERSION } from './version.js'
+export { redactPayload } from './redaction.js'
+export { decideSampling, hashString } from './sampling.js'
 
 export type {
   RecorderConfig,
@@ -38,6 +40,8 @@ export type {
   DropReason,
 } from './types.js'
 export type { FileSpoolOptions } from './file-spool.js'
+export type { RedactionConfig, RedactionPattern, RedactedPayload } from './redaction.js'
+export type { SamplingConfig, SamplingContext } from './sampling.js'
 
 export type {
   Transport,

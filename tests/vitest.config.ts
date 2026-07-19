@@ -16,6 +16,7 @@ export default defineConfig({
     alias: {
       '@agent-flight-recorder/contracts': path.resolve(__dirname, '../packages/contracts/src/index.ts'),
       '@agent-flight-recorder/sdk': path.resolve(__dirname, '../packages/sdk/src/index.ts'),
+      '@agent-flight-recorder/cli': path.resolve(__dirname, '../packages/cli/src/index.ts'),
     },
   },
 })

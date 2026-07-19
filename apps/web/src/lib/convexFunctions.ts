@@ -29,6 +29,7 @@ export const convex = {
   organizations: {
     getOrganization: makeFunctionReference<Q>('organizations:getOrganization'),
     getOrganizationSettings: makeFunctionReference<Q>('organizations:getOrganizationSettings'),
+    listMemberships: makeFunctionReference<Q>('organizations:listMemberships'),
     upsertOrganization: makeFunctionReference<M>('organizations:upsertOrganization'),
     upsertMembership: makeFunctionReference<M>('organizations:upsertMembership'),
     updateRetentionPolicy: makeFunctionReference<M>('organizations:updateRetentionPolicy'),

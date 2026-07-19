@@ -1,10 +1,13 @@
 import { PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER } from '@agent-flight-recorder/contracts'
 
 import { externalizePayloadIfLarge, uploadArtifact } from './externalize.js'
+import { redactPayload } from './redaction.js'
 import { warnIfInsecureEndpoint } from './transport.js'
 import { SDK_VERSION } from './version.js'
 
+import type { RedactionConfig } from './redaction.js'
 import type {
+  EventType,
   RunStartedPayload,
   RunCompletedPayload,
   RunFailedPayload,
@@ -44,6 +47,18 @@ export interface FlightRecorderConfig {
    * Default: false.
    */
   allowInsecureEndpoint?: boolean
+  /**
+   * Redact sensitive data out of every recorded event payload BEFORE
+   * externalization measures its size — same redact-then-measure guarantee
+   * as the buffered `Recorder` path. See `RecorderOptions.redact` /
+   * {@link RedactionConfig} for the shared shape.
+   */
+  redact?: RedactionConfig
+  /**
+   * Called when the `redact` pipeline fails (invalid pattern, or
+   * `redact.custom` throwing). Must not throw; exceptions are swallowed.
+   */
+  onRedactionError?: (error: string) => void
 }
 
 /**
@@ -109,6 +124,10 @@ export class FlightRecorder {
   private readonly sdkVersion: string
   /** Bounds concurrent in-flight requests across all RunRecorders. */
   private readonly semaphore: Semaphore
+  /** @internal Read by RunRecorder.recordEvent. */
+  readonly _redact: RedactionConfig | undefined
+  /** @internal Read by RunRecorder.recordEvent. */
+  readonly _onRedactionError: ((error: string) => void) | undefined
 
   /**
    * Create a new FlightRecorder.
@@ -133,6 +152,8 @@ export class FlightRecorder {
     this.agentVersionId = config.agentVersionId
     this.sdkVersion = config.sdkVersion ?? SDK_VERSION
     this.semaphore = new Semaphore(config.maxConcurrentRequests ?? 8)
+    this._redact = config.redact
+    this._onRedactionError = config.onRedactionError
     warnIfInsecureEndpoint(this.baseUrl, config.allowInsecureEndpoint)
   }
 
@@ -277,14 +298,21 @@ export class RunRecorder {
     return this.fr._withRequestSlot(() => this._sendEvent(type, payload, seq, parentEventId))
   }
 
-  /** Perform the externalize + POST for one event. Runs while holding a request slot. */
+  /** Perform the redact + externalize + POST for one event. Runs while holding a request slot. */
   private async _sendEvent(type: string, payload: unknown, seq: number, parentEventId?: string): Promise<string> {
+    // Redact BEFORE externalization measures payload size — same
+    // redact-then-measure guarantee as the buffered Recorder path.
+    const redactConfig = this.fr._redact
+    const redactedPayload = redactConfig
+      ? redactPayload(payload as never, type as EventType, redactConfig, this.fr._onRedactionError)
+      : payload
+
     // Externalize oversized payloads through the shared helper so this path
     // enforces the same >10 KB rule as HttpTransport. Failures propagate.
     const outgoingPayload = await externalizePayloadIfLarge(
       this.runId,
       type,
-      payload,
+      redactedPayload,
       (runId, eventType, serialized) =>
         uploadArtifact((u, i) => fetch(u, i), this.fr.baseUrl, this.fr.apiKey, runId, eventType, serialized),
     )

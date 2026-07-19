@@ -6,10 +6,20 @@ import { v } from "convex/values";
 
 import { mutation, query } from "./_generated/server.js";
 import { afrError } from "./helpers/errors.js";
+import { validateEvalFields } from "./helpers/eval_fields.js";
 import {
   MAX_ARTIFACTS_PER_RUN,
   MAX_EVENTS_PER_RUN,
 } from "./helpers/pagination.js";
+import {
+  buildSearchText,
+  extractErrorMessage,
+  extractTokenUsage,
+  validateEnvironment,
+  validateLabels,
+  validateSessionId,
+} from "./helpers/run_fields.js";
+import { incrementUsageCounters } from "./usage.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
 import type { MutationCtx, QueryCtx } from "./_generated/server.js";
@@ -247,6 +257,11 @@ export const sdkCreateRun = mutation({
     tags: v.optional(v.array(v.string())),
     triggeredBy: v.optional(v.string()),
     sdkVersion: v.optional(v.string()),
+    // ADR-002 additions — all optional/additive.
+    parentRunId: v.optional(v.string()),
+    sessionId: v.optional(v.string()),
+    environment: v.optional(v.string()),
+    labels: v.optional(v.array(v.string())),
   },
   handler: async (ctx, args) => {
     const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
@@ -277,7 +292,29 @@ export const sdkCreateRun = mutation({
       }
     }
 
+    // ADR-002: parentRunId must belong to the SAME org AND project as the
+    // child being created. Cycles are structurally impossible — see
+    // convex/runs.ts validateParentRun for the full rationale.
+    const parentRunId = args.parentRunId ? (args.parentRunId as Id<"runs">) : undefined;
+    if (parentRunId !== undefined) {
+      const parent = await ctx.db.get(parentRunId);
+      if (!parent || parent.orgId !== apiKey.orgId || parent.projectId !== agent.projectId) {
+        throw afrError(
+          "INVALID_ARGUMENT",
+          "parentRunId must reference an existing run in the same organization and project",
+        );
+      }
+    }
+    validateSessionId(args.sessionId);
+    validateEnvironment(args.environment);
+    validateLabels(args.labels);
+
+    // ADR-002: a key's own `environment` stamps every run it creates, unless
+    // the caller explicitly supplies one on this call.
+    const environment = args.environment ?? apiKey.environment;
+
     const now = Date.now();
+    const searchText = buildSearchText([agent.name, ...(args.tags ?? []), args.triggeredBy]);
     const runId = await ctx.db.insert("runs", {
       orgId: apiKey.orgId,
       projectId: agent.projectId,
@@ -290,7 +327,14 @@ export const sdkCreateRun = mutation({
       tags: args.tags ?? [],
       triggeredBy: args.triggeredBy,
       sdkVersion: args.sdkVersion,
+      parentRunId,
+      sessionId: args.sessionId,
+      environment,
+      labels: args.labels,
+      searchText,
     });
+
+    await incrementUsageCounters(ctx, apiKey.orgId, { runsStarted: 1 });
 
     const run = await ctx.db.get(runId);
     if (!run) throw new Error("Failed to create run");
@@ -329,6 +373,10 @@ export const sdkCreateEvents = mutation({
     await enforceRateLimit(ctx, apiKey, args.events.length);
 
     const eventIds: string[] = [];
+    // ADR-002 usage metering: accumulated across the batch and flushed ONCE
+    // after the loop (batch calls always flush exactly — see convex/usage.ts).
+    let insertedCount = 0;
+    let insertedBytes = 0;
 
     // Per-run ingest state, established lazily and advanced as we insert. Lets us
     // validate CLAUDE.md Event Log Rule 4 (contiguous, non-repeating sequence
@@ -493,22 +541,63 @@ export const sdkCreateEvents = mutation({
         }
       }
 
+      // ADR-002: incremental token-usage counters from llm.response payloads,
+      // updated at event-insert time (the log remains the source of truth for
+      // the underlying payloads themselves).
+      if (evt.type === "llm.response") {
+        const { tokensIn, tokensOut } = extractTokenUsage(evt.payload);
+        if (tokensIn > 0 || tokensOut > 0) {
+          // Re-fetch: a prior iteration in THIS batch may have already patched
+          // tokensIn/tokensOut for the same run (read-your-writes within a
+          // single Convex mutation execution makes this safe).
+          const current = await ctx.db.get(runId);
+          await ctx.db.patch(runId, {
+            tokensIn: (current?.tokensIn ?? 0) + tokensIn,
+            tokensOut: (current?.tokensOut ?? 0) + tokensOut,
+          });
+        }
+      }
+
       // Reconcile run.status with the terminal event so the event log (source of
       // truth) and the run's status never disagree. A run.completed/run.failed
       // event immediately transitions the run to the matching terminal status;
       // the SDK's separate updateRunStatus call is then an idempotent no-op.
       if (TERMINAL_EVENT_TYPES.has(evt.type)) {
-        await ctx.db.patch(runId, {
+        const patch: {
+          status: "failed" | "completed";
+          endedAt: number;
+          searchText?: string;
+        } = {
           status: evt.type === "run.failed" ? "failed" : "completed",
           endedAt: evt.timestamp,
-        });
+        };
+        // ADR-002: terminal reconcile — append the extracted error message to
+        // runs.searchText so a failed run's error text is searchable.
+        if (evt.type === "run.failed") {
+          const errorMessage = extractErrorMessage(evt.payload);
+          if (errorMessage) {
+            const current = await ctx.db.get(runId);
+            patch.searchText = buildSearchText([current?.searchText, errorMessage]);
+          }
+        }
+        await ctx.db.patch(runId, patch);
       }
 
       // Advance in-memory state so the next event in the batch validates against it.
       state.maxSeq = evt.sequenceNumber;
       state.hasTerminal = TERMINAL_EVENT_TYPES.has(evt.type);
 
+      insertedCount++;
+      insertedBytes += new TextEncoder().encode(JSON.stringify(evt.payload ?? null)).length;
+
       eventIds.push(eventId);
+    }
+
+    if (insertedCount > 0) {
+      await incrementUsageCounters(ctx, apiKey.orgId, {
+        eventsIngested: insertedCount,
+        bytesIngested: insertedBytes,
+      });
     }
 
     return { eventIds };
@@ -647,8 +736,69 @@ export const sdkCreateArtifact = mutation({
       createdAt: Date.now(),
     });
 
+    await incrementUsageCounters(ctx, apiKey.orgId, { artifactBytes: args.size });
+
     const artifact = await ctx.db.get(artifactId);
     if (!artifact) throw new Error("Failed to create artifact");
     return artifact;
+  },
+});
+
+/**
+ * Record an eval against a run from an API-key-authenticated caller (e.g. an
+ * automated eval pipeline). Requires ingest:write, same as the other ingest
+ * mutations. See convex/evals.ts recordEval for the Clerk-authenticated path.
+ */
+export const sdkRecordEval = mutation({
+  args: {
+    apiKeyHash: v.string(),
+    runId: v.string(),
+    agentVersionId: v.optional(v.string()),
+    name: v.string(),
+    kind: v.union(v.literal("rule"), v.literal("llm_judge"), v.literal("manual")),
+    passed: v.boolean(),
+    score: v.optional(v.number()),
+    details: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
+
+    const runId = args.runId as Id<"runs">;
+    const run = await ctx.db.get(runId);
+    if (!run) {
+      throw new Error("Run not found");
+    }
+    if (run.orgId !== apiKey.orgId) {
+      throw new Error("Unauthorized");
+    }
+
+    validateEvalFields(args);
+
+    const agentVersionId = args.agentVersionId
+      ? (args.agentVersionId as Id<"agent_versions">)
+      : undefined;
+    if (agentVersionId !== undefined) {
+      const version = await ctx.db.get(agentVersionId);
+      if (!version || version.orgId !== apiKey.orgId) {
+        throw new Error("Agent version not found for this organization");
+      }
+    }
+
+    const evalId = await ctx.db.insert("evals", {
+      orgId: apiKey.orgId,
+      runId,
+      agentVersionId,
+      name: args.name,
+      kind: args.kind,
+      passed: args.passed,
+      score: args.score,
+      details: args.details,
+      createdAt: Date.now(),
+      createdBy: "system",
+    });
+
+    const created = await ctx.db.get(evalId);
+    if (!created) throw new Error("Failed to record eval");
+    return created;
   },
 });

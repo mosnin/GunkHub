@@ -39,4 +39,15 @@ crons.daily(
   makeFunctionReference<"action">("retention:enforceRetention"),
 );
 
+// Daily rollup computation (ADR-002). Runs at 05:00 UTC, after the other
+// daily jobs, so it sees the day's post-retention/post-GC state. Computes
+// yesterday's per-agent terminal-run counts, duration percentiles, and token
+// totals into daily_rollups.
+crons.daily(
+  "compute-daily-rollups",
+  { hourUTC: 5, minuteUTC: 0 },
+  makeFunctionReference<"action">("rollups:computeDailyRollups"),
+  {},
+);
+
 export default crons;

@@ -1,5 +1,7 @@
 import { NON_RETRYABLE_RUN_ERROR_CODES } from './api-errors.js'
 import { Events, buildEvent } from './events.js'
+import { redactPayload } from './redaction.js'
+import { decideSampling } from './sampling.js'
 import { HttpTransport, createRetryStrategy, type Transport } from './transport.js'
 import { SDK_VERSION } from './version.js'
 
@@ -108,6 +110,19 @@ export class Recorder {
    */
   private spoolEntryCount = 0
 
+  /**
+   * True for the CURRENT run when `RecorderOptions.sampling` decided NOT to
+   * sample it in. While true, `recordEvent` diverts events away from the
+   * real buffer/spool: either discarded immediately, or (when
+   * `sampling.alwaysKeepFailures` is set) held in `shadowBuffer` in case the
+   * run ends in `failRun()`. Reset by `startRun`.
+   */
+  private sampledOut = false
+  /** Shadow buffer for an unsampled run's events, used only when `alwaysKeepFailures` is set. */
+  private shadowBuffer: ReturnType<typeof buildEvent>[] = []
+  /** Count of events discarded outright for the current unsampled run (no `alwaysKeepFailures`). */
+  private sampledOutEventCount = 0
+
   // Serializes spool I/O so append/clear operations apply in program order even
   // though they are launched fire-and-forget. Without this, a recordEvent
   // append racing a post-flush resync could duplicate or lose spool entries.
@@ -170,6 +185,31 @@ export class Recorder {
       throw new Error('A run is already active. Call endRun() before starting a new one.')
     }
 
+    this.shadowBuffer = []
+    this.sampledOutEventCount = 0
+
+    const samplingConfig = this.config.options?.sampling
+    const runName = typeof runConfig['name'] === 'string' ? runConfig['name'] : undefined
+    const sampled = decideSampling(samplingConfig, { agentId: this.config.agentId, tags: [] }, runName)
+    this.sampledOut = !sampled
+
+    if (!sampled) {
+      // Unsampled: record NOTHING to the server. No transport.createRun call —
+      // this run has zero server-side footprint unless alwaysKeepFailures
+      // later materializes it. The RunContext shape is identical either way,
+      // and every Recorder method remains callable the same way.
+      this.runContext = {
+        runId: `sampled_out_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
+        agentId: this.config.agentId,
+        status: 'running',
+        startedAt: Date.now(),
+      }
+      this.sequenceCounter = 0
+      this.terminalBuffered = false
+      this.recordEvent('run.started', Events.runStarted(this.runContext.runId, input, runConfig).payload)
+      return this.runContext
+    }
+
     const runResponse = await this.transport.createRun(
       {
         agentId: this.config.agentId,
@@ -228,18 +268,41 @@ export class Recorder {
       ...(options?.timestamp !== undefined && { timestamp: options.timestamp }),
     }
 
+    // Redaction runs BEFORE buffering/spooling/externalization measurement,
+    // for both the sampled and unsampled paths.
+    const redactConfig = this.config.options?.redact
+    const effectivePayload = redactConfig
+      ? redactPayload(payload, type, redactConfig, (err) => this.notifyRedactionError(err))
+      : payload
+
+    if (TERMINAL_EVENT_TYPES.has(type)) {
+      this.terminalBuffered = true
+    }
+
+    if (this.sampledOut) {
+      const event = buildEvent(this.runContext.runId, '', type, effectivePayload, seq, eventOptions)
+      const samplingConfig = this.config.options?.sampling
+      if (samplingConfig?.alwaysKeepFailures) {
+        this.shadowBuffer.push(event)
+        const max = this.config.options?.maxBufferSize ?? 10_000
+        const { kept, droppedCount } = this.enforceCap(this.shadowBuffer, max)
+        this.shadowBuffer = kept
+        if (droppedCount > 0) this.notifyDrop(droppedCount, 'sampled_out')
+      } else {
+        this.sampledOutEventCount++
+      }
+      return
+    }
+
     const event = buildEvent(
       this.runContext.runId,
       '', // orgId resolved server-side from API key
       type,
-      payload,
+      effectivePayload,
       seq,
       eventOptions
     )
     this.eventBuffer.push(event)
-    if (TERMINAL_EVENT_TYPES.has(type)) {
-      this.terminalBuffered = true
-    }
 
     // Write-ahead: persist to the spool (if configured) before delivery is
     // attempted. Best-effort and non-blocking — spool failure never breaks
@@ -257,6 +320,30 @@ export class Recorder {
   }
 
   /**
+   * Enforce a cap on `buffer`, dropping the OLDEST non-protected (non
+   * lifecycle) events until it fits within `max`. Shared by the real
+   * in-memory buffer (`enforceBufferLimit`) and the sampling shadow buffer.
+   */
+  private enforceCap(
+    buffer: ReturnType<typeof buildEvent>[],
+    max: number
+  ): { kept: ReturnType<typeof buildEvent>[]; droppedCount: number } {
+    if (buffer.length <= max) return { kept: buffer, droppedCount: 0 }
+    let toDrop = buffer.length - max
+    let droppedCount = 0
+    const kept: ReturnType<typeof buildEvent>[] = []
+    for (const ev of buffer) {
+      if (toDrop > 0 && !PROTECTED_EVENT_TYPES.has(ev.type)) {
+        toDrop--
+        droppedCount++
+        continue
+      }
+      kept.push(ev)
+    }
+    return { kept, droppedCount }
+  }
+
+  /**
    * Enforce the configured `maxBufferSize`. When the buffer exceeds the cap,
    * drop the OLDEST non-protected events (protected = run.started and the
    * terminal events) until the buffer is back within bounds. Terminal telemetry
@@ -266,19 +353,7 @@ export class Recorder {
    */
   private enforceBufferLimit(): void {
     const max = this.config.options?.maxBufferSize ?? 10_000
-    if (this.eventBuffer.length <= max) return
-
-    let toDrop = this.eventBuffer.length - max
-    let droppedNow = 0
-    const kept: ReturnType<typeof buildEvent>[] = []
-    for (const ev of this.eventBuffer) {
-      if (toDrop > 0 && !PROTECTED_EVENT_TYPES.has(ev.type)) {
-        toDrop--
-        droppedNow++
-        continue
-      }
-      kept.push(ev)
-    }
+    const { kept, droppedCount: droppedNow } = this.enforceCap(this.eventBuffer, max)
     this.eventBuffer = kept
 
     if (droppedNow > 0) {
@@ -299,6 +374,7 @@ export class Recorder {
       'run.completed',
       Events.runCompleted(this.runContext.runId, output, Date.now() - this.runContext.startedAt).payload
     )
+    if (this.sampledOut) return this.finalizeSampledOutRun('completed')
     return this.finalizeRun('completed')
   }
 
@@ -319,7 +395,70 @@ export class Recorder {
       'run.failed',
       Events.runFailed(this.runContext.runId, errPayload, Date.now() - this.runContext.startedAt).payload
     )
+    if (this.sampledOut) return this.finalizeSampledOutRun('failed')
     return this.finalizeRun('failed')
+  }
+
+  /**
+   * Finalize an unsampled run. On `'failed'` with `sampling.alwaysKeepFailures`
+   * set and a non-empty shadow buffer, this is the tail-bias round-trip:
+   * materialize the run for real (`transport.createRun`), re-point the
+   * shadow-buffered events (including `run.started`) at the real run ID, and
+   * fall through to the normal `finalizeRun` delivery path. Otherwise the
+   * shadow-buffered / discarded events are dropped and reported via
+   * `onDrop(count, 'sampled_out')`.
+   */
+  private async finalizeSampledOutRun(status: RunStatus): Promise<FlushResult> {
+    const samplingConfig = this.config.options?.sampling
+    const alwaysKeep = samplingConfig?.alwaysKeepFailures ?? false
+
+    if (status === 'failed' && alwaysKeep && this.shadowBuffer.length > 0) {
+      try {
+        const runResponse = await this.transport.createRun(
+          {
+            agentId: this.config.agentId,
+            ...(this.config.agentVersionId !== undefined && { agentVersionId: this.config.agentVersionId }),
+            metadata: {},
+            tags: [],
+            sdkVersion: SDK_VERSION,
+          },
+          { apiKey: this.config.apiKey }
+        )
+        const realRunId = runResponse.run.id
+        const rebuilt = this.shadowBuffer.map((ev) => ({ ...ev, runId: realRunId }))
+        this.shadowBuffer = []
+        this.sampledOut = false
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        this.runContext = { ...this.runContext!, runId: realRunId }
+        this.eventBuffer.push(...rebuilt)
+        return this.finalizeRun(status)
+      } catch (err) {
+        this.notifyDrop(this.shadowBuffer.length, 'sampled_out')
+        this.shadowBuffer = []
+        this.sampledOut = false
+        this.runContext = null
+        return {
+          success: false,
+          eventsSubmitted: 0,
+          errors: [
+            {
+              eventIndex: -1,
+              error: `Sampled-out run materialization on failure failed: ${err instanceof Error ? err.message : String(err)}`,
+              retryable: false,
+            },
+          ],
+          droppedEvents: this.droppedEventCount,
+        }
+      }
+    }
+
+    const discarded = this.shadowBuffer.length + this.sampledOutEventCount
+    if (discarded > 0) this.notifyDrop(discarded, 'sampled_out')
+    this.shadowBuffer = []
+    this.sampledOutEventCount = 0
+    this.sampledOut = false
+    this.runContext = null
+    return { success: true, eventsSubmitted: 0, errors: [], droppedEvents: this.droppedEventCount }
   }
 
   /**
@@ -760,6 +899,15 @@ export class Recorder {
     this.debugLog(`background flush failed: ${error}`)
     try {
       this.config.options?.onFlushError?.(error)
+    } catch {
+      // Consumer callback must never crash the recorder.
+    }
+  }
+
+  private notifyRedactionError(error: string): void {
+    this.debugLog(`redaction error: ${error}`)
+    try {
+      this.config.options?.onRedactionError?.(error)
     } catch {
       // Consumer callback must never crash the recorder.
     }

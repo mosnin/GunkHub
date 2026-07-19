@@ -54,3 +54,19 @@ export function truncateId(id: string, length = 8): string {
   if (id.length <= length) return id
   return id.slice(0, length)
 }
+
+/**
+ * Format a byte count as a human-readable size string.
+ * Examples: 512B | 3.4KB | 12.1MB | 2.0GB
+ */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value.toFixed(1)}${units[unitIndex]}`
+}

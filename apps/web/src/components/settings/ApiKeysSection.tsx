@@ -7,11 +7,18 @@ import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
 import { useFocusTrap } from '@/lib/hooks/useFocusTrap'
 
+// Warning thresholds for the lifecycle UX (task spec): a key is flagged when it
+// expires within 14 days, or has gone unused (or never been used) for 30+ days.
+const EXPIRING_SOON_MS = 14 * 24 * 60 * 60 * 1000
+const STALE_UNUSED_MS = 30 * 24 * 60 * 60 * 1000
+
 interface ApiKey {
   id: string
   name: string
   createdAt: number
   lastUsedAt: number | null
+  expiresAt: number | null
+  scopes: string[] | null
 }
 
 interface GenerateResult {
@@ -19,6 +26,8 @@ interface GenerateResult {
   name: string
   key: string
   createdAt: number
+  expiresAt?: number
+  scopes?: string[]
 }
 
 function formatDate(ts: number): string {
@@ -30,7 +39,52 @@ function formatDate(ts: number): string {
   })
 }
 
-function NewKeyModal({ result, onClose }: { result: GenerateResult; onClose: () => void }) {
+/** Human-readable rotated-key name suffix: `-rotated-YYYYMMDD`. */
+function rotatedName(name: string): string {
+  const now = new Date()
+  const yyyy = now.getFullYear()
+  const mm = String(now.getMonth() + 1).padStart(2, '0')
+  const dd = String(now.getDate()).padStart(2, '0')
+  return `${name}-rotated-${String(yyyy)}${mm}${dd}`
+}
+
+interface KeyWarning {
+  level: 'expired' | 'expiring' | 'stale' | null
+  message: string | null
+}
+
+/** Computes the lifecycle warning (if any) for a single key, per the task's
+ * 14-day-expiring / 30-day-unused thresholds. Destructive-toned dot + pewter
+ * note is the sanctioned treatment (design.md: no new colors, warn dot only). */
+function getKeyWarning(key: ApiKey, now: number): KeyWarning {
+  if (key.expiresAt !== null && key.expiresAt <= now) {
+    return { level: 'expired', message: 'Expired — this key is rejected by ingest.' }
+  }
+  if (key.expiresAt !== null && key.expiresAt - now <= EXPIRING_SOON_MS) {
+    const days = Math.max(0, Math.ceil((key.expiresAt - now) / (24 * 60 * 60 * 1000)))
+    return { level: 'expiring', message: `Expires in ${String(days)} day${days === 1 ? '' : 's'}.` }
+  }
+  const lastActivity = key.lastUsedAt ?? key.createdAt
+  if (now - lastActivity >= STALE_UNUSED_MS) {
+    return {
+      level: 'stale',
+      message: key.lastUsedAt === null ? 'Never used since creation.' : 'Unused for 30+ days.',
+    }
+  }
+  return { level: null, message: null }
+}
+
+function NewKeyModal({
+  result,
+  isRotation,
+  oldKeyName,
+  onClose,
+}: {
+  result: GenerateResult
+  isRotation: boolean
+  oldKeyName: string | null
+  onClose: () => void
+}) {
   const [copied, setCopied] = useState(false)
   const dialogRef = useFocusTrap<HTMLDivElement>(true)
 
@@ -61,7 +115,9 @@ function NewKeyModal({ result, onClose }: { result: GenerateResult; onClose: () 
         className="bg-graphite-deep border border-graphite-light rounded-[4px] shadow-lg w-full max-w-md mx-4 outline-none"
       >
         <div className="px-5 py-4 border-b border-neutral-800 flex items-center justify-between">
-          <h3 id="new-key-title" className="text-sm font-semibold text-neutral-100">API Key Created</h3>
+          <h3 id="new-key-title" className="text-sm font-semibold text-neutral-100">
+            {isRotation ? 'Replacement Key Created' : 'API Key Created'}
+          </h3>
           <button
             onClick={onClose}
             aria-label="Close"
@@ -85,9 +141,23 @@ function NewKeyModal({ result, onClose }: { result: GenerateResult; onClose: () 
           </div>
 
           <div>
-            <p className="text-xs font-medium text-neutral-400 mb-1.5 uppercase tracking-wider">Your API Key</p>
+            <p className="text-xs font-medium text-neutral-400 mb-1.5 uppercase tracking-wider">
+              {isRotation ? 'Replacement API Key' : 'Your API Key'}
+            </p>
             <CodeBlock content={result.key} maxHeight="60px" />
           </div>
+
+          {isRotation && (
+            <div className="rounded-[4px] border border-graphite-light bg-graphite px-3 py-2.5">
+              <p className="text-xs text-cloud leading-relaxed">
+                Update the consumers using{' '}
+                <span className="font-mono text-neutral-300">{oldKeyName}</span> to this new key
+                first. Once traffic has moved over, come back and{' '}
+                <strong className="text-whiteout">revoke the old key</strong> below — rotation
+                does not revoke it automatically, so both keys work until you do.
+              </p>
+            </div>
+          )}
 
           <Button
             variant={copied ? 'ghost' : 'primary'}
@@ -194,25 +264,43 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
   const [generating, setGenerating] = useState(false)
   const [generateError, setGenerateError] = useState<string | null>(null)
   const [newKey, setNewKey] = useState<GenerateResult | null>(null)
+  const [rotatingId, setRotatingId] = useState<string | null>(null)
+  const [rotateError, setRotateError] = useState<string | null>(null)
+  const [isRotationResult, setIsRotationResult] = useState(false)
+  const [rotationSourceName, setRotationSourceName] = useState<string | null>(null)
   const fetchError = loadError
+  const now = Date.now()
+
+  async function createKey(body: Record<string, unknown>): Promise<GenerateResult> {
+    const res = await fetch('/api/api-keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({})) as { message?: string }
+      throw new Error(errBody.message ?? `Server error ${res.status}`)
+    }
+    return (await res.json()) as GenerateResult
+  }
 
   async function handleGenerate() {
     setGenerating(true)
     setGenerateError(null)
     try {
-      const res = await fetch('/api/api-keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: keyName.trim() }),
-      })
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({})) as { message?: string }
-        throw new Error(body.message ?? `Server error ${res.status}`)
-      }
-      const data = await res.json() as GenerateResult
+      const data = await createKey({ name: keyName.trim() })
+      setIsRotationResult(false)
+      setRotationSourceName(null)
       setNewKey(data)
       setKeys((prev) => [
-        { id: data.id, name: data.name, createdAt: data.createdAt, lastUsedAt: null },
+        {
+          id: data.id,
+          name: data.name,
+          createdAt: data.createdAt,
+          lastUsedAt: null,
+          expiresAt: data.expiresAt ?? null,
+          scopes: data.scopes ?? null,
+        },
         ...prev,
       ])
       setKeyName('')
@@ -223,6 +311,41 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
     }
   }
 
+  /**
+   * Rotate = create a replacement key with the same name (suffixed
+   * `-rotated-YYYYMMDD`) and the same scopes as the source key, shown once via
+   * the same NewKeyModal. No silent auto-revoke of the source key — a human
+   * must click Revoke on the old row after moving consumers over.
+   */
+  async function handleRotate(key: ApiKey) {
+    setRotatingId(key.id)
+    setRotateError(null)
+    try {
+      const data = await createKey({
+        name: rotatedName(key.name),
+        ...(key.scopes !== null && { scopes: key.scopes }),
+      })
+      setIsRotationResult(true)
+      setRotationSourceName(key.name)
+      setNewKey(data)
+      setKeys((prev) => [
+        {
+          id: data.id,
+          name: data.name,
+          createdAt: data.createdAt,
+          lastUsedAt: null,
+          expiresAt: data.expiresAt ?? null,
+          scopes: data.scopes ?? null,
+        },
+        ...prev,
+      ])
+    } catch (err) {
+      setRotateError(err instanceof Error ? err.message : 'Failed to rotate key')
+    } finally {
+      setRotatingId(null)
+    }
+  }
+
   function handleRevoked(id: string) {
     setKeys((prev) => prev.filter((k) => k.id !== id))
   }
@@ -230,7 +353,12 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
   return (
     <>
       {newKey && (
-        <NewKeyModal result={newKey} onClose={() => setNewKey(null)} />
+        <NewKeyModal
+          result={newKey}
+          isRotation={isRotationResult}
+          oldKeyName={rotationSourceName}
+          onClose={() => setNewKey(null)}
+        />
       )}
 
       <Card>
@@ -269,6 +397,9 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
           {generateError && (
             <p className="text-destructive-400 text-sm">{generateError}</p>
           )}
+          {rotateError && (
+            <p className="text-destructive-400 text-sm">{rotateError}</p>
+          )}
 
           {/* Key list */}
           {fetchError ? (
@@ -279,38 +410,74 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
             </p>
           ) : (
             <div className="overflow-x-auto rounded-md border border-neutral-800">
-              <table className="w-full text-sm">
+              <table className="w-full text-sm table-fixed">
                 <thead>
                   <tr className="border-b border-neutral-800 bg-neutral-900">
-                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/3">
+                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/4">
                       Name
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/4">
+                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/6">
                       Created
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/4">
+                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/6">
+                      Expires
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/6">
                       Last used
                     </th>
-                    <th className="px-4 py-3 text-right text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/6">
-                      {/* Revoke column */}
+                    <th className="px-4 py-3 text-right text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/4">
+                      {/* Actions column */}
                     </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-neutral-800 bg-neutral-950">
-                  {keys.map((k) => (
-                    <tr key={k.id}>
-                      <td className="px-4 py-3 text-sm text-neutral-300">{k.name}</td>
-                      <td className="px-4 py-3 font-mono text-xs text-neutral-400">
-                        {formatDate(k.createdAt)}
-                      </td>
-                      <td className="px-4 py-3 font-mono text-xs text-neutral-400">
-                        {k.lastUsedAt ? formatDate(k.lastUsedAt) : 'Never'}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <RevokeButton keyId={k.id} onRevoked={handleRevoked} />
-                      </td>
-                    </tr>
-                  ))}
+                  {keys.map((k) => {
+                    const warning = getKeyWarning(k, now)
+                    return (
+                      <tr key={k.id}>
+                        <td className="px-4 py-3 text-sm text-neutral-300 align-top">
+                          <div className="truncate" title={k.name}>{k.name}</div>
+                          {warning.message && (
+                            <div className="mt-1 flex items-center gap-1.5">
+                              <span
+                                className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                                  warning.level === 'expired'
+                                    ? 'bg-destructive-500 shadow-[var(--shadow-glow-warn)]'
+                                    : warning.level === 'expiring'
+                                      ? 'bg-destructive-500'
+                                      : 'bg-pewter'
+                                }`}
+                                aria-hidden="true"
+                              />
+                              <span className="text-xs text-pewter">{warning.message}</span>
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-xs text-neutral-400 align-top">
+                          {formatDate(k.createdAt)}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-xs text-neutral-400 align-top">
+                          {k.expiresAt ? formatDate(k.expiresAt) : 'Never'}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-xs text-neutral-400 align-top">
+                          {k.lastUsedAt ? formatDate(k.lastUsedAt) : 'Never'}
+                        </td>
+                        <td className="px-4 py-3 text-right align-top">
+                          <div className="flex items-center justify-end gap-3">
+                            <button
+                              onClick={() => { void handleRotate(k) }}
+                              disabled={rotatingId === k.id}
+                              className="text-xs text-neutral-400 hover:text-neutral-300 disabled:opacity-40 disabled:pointer-events-none transition-colors duration-100"
+                              title="Create a replacement key with the same scopes"
+                            >
+                              {rotatingId === k.id ? 'Rotating…' : 'Rotate'}
+                            </button>
+                            <RevokeButton keyId={k.id} onRevoked={handleRevoked} />
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>

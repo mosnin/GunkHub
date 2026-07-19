@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "@agent-flight-recorder/contracts": "workspace:*",
-    "@agent-flight-recorder/sdk": "workspace:*"
+    "@agent-flight-recorder/sdk": "workspace:*",
+    "@agent-flight-recorder/cli": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.4.0",

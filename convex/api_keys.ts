@@ -9,8 +9,20 @@ import { getAuthContext, requireOrgMembership } from "./auth.js";
 import { afrError } from "./helpers/errors.js";
 import {
   DEFAULT_RATE_LIMIT_PER_MIN,
+  MAX_ENVIRONMENT_LENGTH,
   MAX_PAGE_SIZE,
 } from "./helpers/pagination.js";
+
+/**
+ * Closed set of recognized API-key scopes (ADR-002). Additive/backward
+ * compatible: a key created with `scopes` omitted (or empty) still has full
+ * ingest access, per resolveApiKey in sdk_ingest.ts. "ingest:read" matches the
+ * value already validated by the web layer's own ALLOWED_SCOPES
+ * (apps/web/app/api/api-keys/route.ts); "read" is new — see ADR-002 — for a
+ * future read-only, API-key-authenticated surface (no such surface is wired
+ * up yet).
+ */
+export const API_KEY_SCOPES = ["ingest:write", "ingest:read", "read"] as const;
 
 /**
  * Create a new API key record for an organization.
@@ -27,6 +39,9 @@ export const createApiKey = mutation({
     expiresAt: v.optional(v.number()),
     scopes: v.optional(v.array(v.string())),
     rateLimitPerMin: v.optional(v.number()),
+    // ADR-002: stamped onto every run this key creates (unless the caller
+    // supplies its own `environment` on the ingest call).
+    environment: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const { userId } = await getAuthContext(ctx);
@@ -39,6 +54,26 @@ export const createApiKey = mutation({
       throw afrError(
         "INVALID_ARGUMENT",
         "rateLimitPerMin must be a positive number",
+      );
+    }
+    if (args.scopes !== undefined) {
+      const invalid = args.scopes.filter(
+        (s) => !(API_KEY_SCOPES as readonly string[]).includes(s),
+      );
+      if (invalid.length > 0) {
+        throw afrError(
+          "INVALID_ARGUMENT",
+          `Unknown API key scope(s): ${invalid.join(", ")}`,
+        );
+      }
+    }
+    if (
+      args.environment !== undefined &&
+      (args.environment.length === 0 || args.environment.length > MAX_ENVIRONMENT_LENGTH)
+    ) {
+      throw afrError(
+        "INVALID_ARGUMENT",
+        `environment must be 1-${MAX_ENVIRONMENT_LENGTH} characters`,
       );
     }
 
@@ -60,6 +95,7 @@ export const createApiKey = mutation({
       rateLimitPerMin,
       rateWindowStart: undefined,
       rateWindowCount: undefined,
+      environment: args.environment,
     });
 
     const key = await ctx.db.get(keyId);
@@ -118,6 +154,7 @@ export const listApiKeys = query({
         expiresAt: k.expiresAt,
         scopes: k.scopes,
         rateLimitPerMin: k.rateLimitPerMin,
+        environment: k.environment,
       }));
   },
 });

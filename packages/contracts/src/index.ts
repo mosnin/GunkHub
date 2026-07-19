@@ -8,3 +8,7 @@ export * from "./artifacts.js";
 export * from "./replay.js";
 export * from "./diff.js";
 export * from "./protocol.js";
+export * from "./evals.js";
+export * from "./alerts.js";
+export * from "./webhooks.js";
+export * from "./usage.js";

@@ -1,0 +1,96 @@
+import type { UsageData } from '@/lib/services/usage'
+
+import { Card } from '@/components/ui/Card'
+import { EmptyState } from '@/components/ui/EmptyState'
+import { formatBytes } from '@/lib/utils'
+
+interface UsageSectionProps {
+  data: UsageData
+}
+
+interface StatTileProps {
+  label: string
+  value: string
+}
+
+function StatTile({ label, value }: StatTileProps) {
+  return (
+    <div className="flex-1 min-w-[120px] rounded-[4px] border border-graphite bg-graphite-deep px-4 py-3">
+      <dt className="text-xs font-medium text-pewter uppercase tracking-wider">{label}</dt>
+      <dd className="mt-1 font-mono text-xl text-whiteout tabular-nums">{value}</dd>
+    </div>
+  )
+}
+
+/**
+ * CSS-only sparkline — a row of bars, one per day, height proportional to the
+ * max of the series. No chart library (design.md: no external UI deps; Neon
+ * accent for the data itself, not decoration).
+ */
+function DailyBars({
+  dailyCounts,
+}: {
+  dailyCounts: Array<{ date: string; events: number; runs: number }>
+}) {
+  const max = Math.max(1, ...dailyCounts.map((d) => d.events))
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-xs font-medium text-pewter uppercase tracking-wider">
+        Events per day
+      </p>
+      <div
+        className="flex items-end gap-[3px] h-16 border-b border-graphite"
+        role="img"
+        aria-label={`Event counts for the last ${String(dailyCounts.length)} days`}
+      >
+        {dailyCounts.map((d) => {
+          const heightPct = Math.max(2, Math.round((d.events / max) * 100))
+          return (
+            <div
+              key={d.date}
+              className="flex-1 min-w-[3px] bg-neon-muted hover:bg-neon-glow transition-colors duration-100 rounded-t-[2px]"
+              style={{ height: `${String(heightPct)}%` }}
+              title={`${d.date}: ${String(d.events)} events, ${String(d.runs)} runs`}
+            />
+          )
+        })}
+      </div>
+      <div className="flex justify-between text-[10px] font-mono text-pewter">
+        <span>{dailyCounts[0]?.date}</span>
+        <span>{dailyCounts[dailyCounts.length - 1]?.date}</span>
+      </div>
+    </div>
+  )
+}
+
+export function UsageSection({ data }: UsageSectionProps) {
+  return (
+    <Card>
+      <div className="px-5 py-4 border-b border-neutral-800">
+        <h2 className="text-sm font-semibold text-neutral-200">Usage</h2>
+        <p className="mt-0.5 text-xs text-neutral-400">
+          Event and run volume, and an estimate of stored data, for this organization.
+        </p>
+      </div>
+
+      <div className="px-5 py-4">
+        {!data.available ? (
+          <EmptyState
+            title="Usage metering is not yet available"
+            description="Usage metering activates with the next data-platform update, which introduces per-org event and run counters. This page is wired and ready — it will start showing real numbers as soon as that data lands, with no further UI changes needed."
+          />
+        ) : (
+          <div className="flex flex-col gap-5">
+            <dl className="flex flex-wrap gap-3">
+              <StatTile label={`Events (${String(data.rangeDays)}d)`} value={data.eventCount.toLocaleString('en-US')} />
+              <StatTile label={`Runs (${String(data.rangeDays)}d)`} value={data.runCount.toLocaleString('en-US')} />
+              <StatTile label="Storage (est.)" value={formatBytes(data.storageEstimateBytes)} />
+            </dl>
+
+            {data.dailyCounts.length > 0 && <DailyBars dailyCounts={data.dailyCounts} />}
+          </div>
+        )}
+      </div>
+    </Card>
+  )
+}

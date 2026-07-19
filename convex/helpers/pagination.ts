@@ -86,3 +86,56 @@ export const GC_MAX_EVENTS_PER_INVOCATION = 100_000;
  */
 export const MIN_RETENTION_DAYS = 1;
 export const MAX_RETENTION_DAYS = 3_650;
+
+// ---------------------------------------------------------------------------
+// ADR-002 — data model expansion. See docs/adr/002-data-model-expansion.md.
+// ---------------------------------------------------------------------------
+
+/** Write ceilings for runs.labels (distinct from tags — see ADR-002). */
+export const MAX_LABELS_PER_RUN = 10;
+export const MAX_LABEL_LENGTH = 40;
+
+/**
+ * runs.environment: well-known values (see below) or any custom string up to
+ * this length. Not a closed set — see helpers/run_fields.ts.
+ */
+export const MAX_ENVIRONMENT_LENGTH = 32;
+export const KNOWN_ENVIRONMENTS = [
+  "production",
+  "staging",
+  "development",
+  "preview",
+] as const;
+
+/** runs.sessionId — opaque correlation key, bounded to prevent abuse. */
+export const MAX_SESSION_ID_LENGTH = 200;
+
+/** runs.searchText byte budget (UTF-8), enforced by helpers/run_fields.ts. */
+export const MAX_SEARCH_TEXT_BYTES = 2 * 1024;
+
+/** Write ceilings for the evals table. */
+export const MAX_EVAL_NAME_LENGTH = 80;
+export const MAX_EVAL_DETAILS_BYTES = 4 * 1024;
+
+/** Write ceilings for alert_rules.channels. */
+export const MAX_ALERT_CHANNELS = 5;
+
+/** Closed set size for webhook_targets.events (run.completed/run.failed/eval.failed/alert.fired). */
+export const MAX_WEBHOOK_EVENTS = 4;
+
+/**
+ * computeDailyRollups cron bounds: orgs examined per sweep, agents examined
+ * per org, and the bounded runs-per-agent-per-day sample used to compute
+ * counts and (approximate, for oversized samples) duration percentiles.
+ */
+export const ROLLUP_MAX_ORGS_PER_SWEEP = 1_000;
+export const ROLLUP_MAX_AGENTS_PER_ORG = 200;
+export const ROLLUP_MAX_RUNS_SAMPLE = 5_000;
+
+/**
+ * Approximate usage-counter flush stride (usage_counters), mirroring
+ * sdk_ingest.ts's RATE_FLUSH_STRIDE: single-unit ingest calls flush the
+ * counter only ~1-in-STRIDE times (scaled up by STRIDE when flushed); batch
+ * calls always flush exactly.
+ */
+export const USAGE_FLUSH_STRIDE = 10;

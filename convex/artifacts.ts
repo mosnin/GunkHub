@@ -10,6 +10,7 @@ import {
   MAX_ARTIFACTS_PER_RUN,
   MAX_PAGE_SIZE,
 } from "./helpers/pagination.js";
+import { incrementUsageCounters } from "./usage.js";
 
 /**
  * List artifacts associated with a run, bounded by `limit` (default
@@ -113,6 +114,8 @@ export const createArtifact = mutation({
       checksum: args.checksum,
       createdAt: Date.now(),
     });
+
+    await incrementUsageCounters(ctx, run.orgId, { artifactBytes: args.size });
 
     const artifact = await ctx.db.get(artifactId);
     if (!artifact) throw new Error("Failed to create artifact");

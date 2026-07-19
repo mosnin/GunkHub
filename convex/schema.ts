@@ -76,6 +76,47 @@ export default defineSchema({
     tags: v.array(v.string()),
     triggeredBy: v.optional(v.string()),
     sdkVersion: v.optional(v.string()),
+    // ADR-002 — run hierarchy / sessions / environment / triage / search.
+    // All additive+optional: existing rows remain valid with no migration.
+    //
+    // Links a sub-run to its parent (e.g. a sub-agent invocation). Validated
+    // at write time only (same org AND same project as the child); arbitrary
+    // depth is allowed. Cycles are structurally impossible: a parent must
+    // already exist when the child references it, and parentRunId is never
+    // mutated after creation — see ADR-002 for why no traversal check is
+    // needed.
+    parentRunId: v.optional(v.id("runs")),
+    // Free-form correlation key an SDK caller sets to group multiple runs
+    // (e.g. a multi-turn conversation). Opaque to the backend beyond a
+    // length bound.
+    sessionId: v.optional(v.string()),
+    // Well-known values (production/staging/development/preview) or any
+    // custom string up to 32 chars. Stamped from the API key's own
+    // `environment` field when the caller doesn't supply one explicitly.
+    environment: v.optional(v.string()),
+    // Triage labels, distinct from `tags` — up to 10, each up to 40 chars.
+    labels: v.optional(v.array(v.string())),
+    // Settable only on failed/timed_out runs via setRunTriage, which
+    // enforces open -> investigating -> resolved (+ any -> open).
+    triageState: v.optional(
+      v.union(
+        v.literal("open"),
+        v.literal("investigating"),
+        v.literal("resolved"),
+      ),
+    ),
+    // Denormalized running counters, incremented at event-insert time from
+    // llm.response payloads. The one narrow, documented exception to "do not
+    // denormalize event data into runs" — see ADR-002: monotonic add-only
+    // counters, never a recomputed aggregate, so they cannot silently
+    // disagree with the log the way a cached "last error" could.
+    tokensIn: v.optional(v.number()),
+    tokensOut: v.optional(v.number()),
+    // Feeds the search_runs search index below. Populated at create (agent
+    // name + tags + triggeredBy) and appended to on a terminal run.failed
+    // event (extracted error message). Bounded to 2 KB. Not itself a
+    // canonical fact about the run — purely a search-index source field.
+    searchText: v.optional(v.string()),
   })
     .index("by_org", ["orgId"])
     .index("by_org_status", ["orgId", "status"])
@@ -85,7 +126,17 @@ export default defineSchema({
     .index("by_org_status_started", ["orgId", "status", "startedAt"])
     // Cross-org index for the stale-run sweep: find "running" runs older than a
     // cutoff without scanning the whole (unbounded) runs table.
-    .index("by_status_started", ["status", "startedAt"]),
+    .index("by_status_started", ["status", "startedAt"])
+    // ADR-002: session correlation, run hierarchy, environment filtering.
+    .index("by_org_session", ["orgId", "sessionId"])
+    .index("by_parent", ["parentRunId"])
+    .index("by_org_environment_started", ["orgId", "environment", "startedAt"])
+    // ADR-002: full-text search over runs, scoped to the caller's org via
+    // filterFields. searchField must be a stored field (searchText).
+    .searchIndex("search_runs", {
+      searchField: "searchText",
+      filterFields: ["orgId"],
+    }),
 
   // IMMUTABILITY: Events must never be updated or deleted. This table is append-only.
   events: defineTable({
@@ -167,6 +218,9 @@ export default defineSchema({
     rateLimitPerMin: v.optional(v.number()),
     rateWindowStart: v.optional(v.number()),    // minute bucket = floor(now/60000)
     rateWindowCount: v.optional(v.number()),    // events counted in the current bucket
+    // ADR-002: when set, stamped onto every run this key creates (unless the
+    // caller explicitly supplies its own `environment`).
+    environment: v.optional(v.string()),
   })
     .index("by_org", ["orgId"])
     .index("by_key_hash", ["keyHash"]),
@@ -215,4 +269,143 @@ export default defineSchema({
     // v.any() is justified: the shape varies per action and is display-only.
     metadata: v.optional(v.any()),
   }).index("by_org", ["orgId", "timestamp"]),
+
+  // ---------------------------------------------------------------------------
+  // ADR-002 — data model expansion (docs/adr/002-data-model-expansion.md).
+  // ---------------------------------------------------------------------------
+
+  // APPEND-ONLY, like events/audit_log — an eval is a recorded observation
+  // about a run and must not be quietly edited after the fact. Written via
+  // recordEval (member) or sdkRecordEval (API key, ingest:write scope).
+  evals: defineTable({
+    orgId: v.id("organizations"),
+    runId: v.id("runs"),
+    agentVersionId: v.optional(v.id("agent_versions")),
+    name: v.string(),
+    kind: v.union(v.literal("rule"), v.literal("llm_judge"), v.literal("manual")),
+    passed: v.boolean(),
+    score: v.optional(v.number()),
+    details: v.optional(v.string()),
+    createdAt: v.number(),
+    createdBy: v.string(), // Clerk user ID, or "system" for the API-key path
+  })
+    .index("by_run", ["runId"])
+    .index("by_org_name", ["orgId", "name", "createdAt"])
+    .index("by_org_version", ["orgId", "agentVersionId"]),
+
+  // Ordinary admin-gated config, audited like api_keys/projects.
+  alert_rules: defineTable({
+    orgId: v.id("organizations"),
+    projectId: v.optional(v.id("projects")),
+    name: v.string(),
+    kind: v.union(
+      v.literal("run_failed"),
+      v.literal("failure_rate"),
+      v.literal("eval_failed"),
+    ),
+    thresholdPct: v.optional(v.number()),
+    windowMinutes: v.optional(v.number()),
+    channels: v.array(
+      v.object({
+        type: v.union(v.literal("webhook"), v.literal("email")),
+        target: v.string(),
+      }),
+    ),
+    enabled: v.boolean(),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_org", ["orgId"]),
+
+  // APPEND-ONLY record of a rule firing. deliveryStatus/deliveredAt are the
+  // ONE sanctioned patch — delivery bookkeeping about an already-immutable
+  // fact (ruleId/runId/firedAt/summary), never touched after insert. See
+  // ADR-002 for why this is not a violation of append-only semantics.
+  alert_events: defineTable({
+    orgId: v.id("organizations"),
+    ruleId: v.id("alert_rules"),
+    runId: v.optional(v.id("runs")),
+    firedAt: v.number(),
+    summary: v.string(),
+    deliveryStatus: v.union(
+      v.literal("pending"),
+      v.literal("delivered"),
+      v.literal("failed"),
+    ),
+    deliveredAt: v.optional(v.number()),
+  })
+    .index("by_org_fired", ["orgId", "firedAt"])
+    .index("by_rule", ["ruleId"]),
+
+  // Signing secret is generated server-side and returned exactly once (in the
+  // createWebhook response) — listWebhooks always strips it. Stored in
+  // plaintext (not hashed) because HMAC-signing outbound deliveries requires
+  // the original value at delivery time; see ADR-002 for the tradeoff vs.
+  // API-key hashing.
+  webhook_targets: defineTable({
+    orgId: v.id("organizations"),
+    url: v.string(), // https:// only, validated at write time
+    secret: v.string(),
+    events: v.array(v.string()), // subset of run.completed/run.failed/eval.failed/alert.fired
+    enabled: v.boolean(),
+    createdAt: v.number(),
+  }).index("by_org", ["orgId"]),
+
+  // APPEND-ONLY, status-patchable exactly like alert_events (same rationale).
+  webhook_deliveries: defineTable({
+    orgId: v.id("organizations"),
+    webhookId: v.id("webhook_targets"),
+    event: v.string(),
+    runId: v.optional(v.id("runs")),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("delivered"),
+      v.literal("failed"),
+    ),
+    attempts: v.number(),
+    lastAttemptAt: v.optional(v.number()),
+    responseCode: v.optional(v.number()),
+    // ADR-003 constraint 3 ("payload hash ... or error"): a hash of the
+    // delivered payload (for audit/dedup, without storing the payload body
+    // itself again) and a human-readable error when the attempt failed
+    // before/without receiving an HTTP status.
+    payloadHash: v.optional(v.string()),
+    error: v.optional(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_webhook", ["webhookId", "createdAt"])
+    .index("by_org", ["orgId", "createdAt"]),
+
+  // Approximate usage metering, incremented from every ingest path using the
+  // same stride-counting contention mitigation as the per-key rate limiter in
+  // sdk_ingest.ts. Observability/billing groundwork, not an exact audit trail
+  // (events/audit_log remain authoritative for anything exact).
+  usage_counters: defineTable({
+    orgId: v.id("organizations"),
+    day: v.string(), // "YYYY-MM-DD", UTC
+    runsStarted: v.number(),
+    eventsIngested: v.number(),
+    bytesIngested: v.number(),
+    artifactBytes: v.number(),
+  }).index("by_org_day", ["orgId", "day"]),
+
+  // Written ONLY by the internal daily cron computeDailyRollups — never by a
+  // public mutation. A derived projection over yesterday's terminal runs,
+  // computed from a bounded sample (<= 5,000 runs/agent/day); percentiles are
+  // therefore approximate for any agent/day exceeding the sample size.
+  daily_rollups: defineTable({
+    orgId: v.id("organizations"),
+    agentId: v.id("agents"),
+    date: v.string(), // "YYYY-MM-DD", UTC
+    runsTotal: v.number(),
+    runsFailed: v.number(),
+    runsCompleted: v.number(),
+    runsCancelled: v.number(),
+    runsTimedOut: v.number(),
+    durationMsP50: v.optional(v.number()),
+    durationMsP95: v.optional(v.number()),
+    tokensIn: v.number(),
+    tokensOut: v.number(),
+  })
+    .index("by_org_date", ["orgId", "date"])
+    .index("by_agent_date", ["agentId", "date"]),
 });

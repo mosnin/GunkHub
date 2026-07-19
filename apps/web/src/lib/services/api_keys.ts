@@ -8,6 +8,8 @@ export interface ApiKeySummary {
   name: string
   createdAt: number
   lastUsedAt: number | null
+  expiresAt: number | null
+  scopes: string[] | null
 }
 
 interface ApiKeyDoc {
@@ -15,6 +17,8 @@ interface ApiKeyDoc {
   name: string
   createdAt: number
   lastUsedAt?: number
+  expiresAt?: number
+  scopes?: string[]
 }
 
 /**
@@ -39,5 +43,7 @@ export async function listApiKeys(): Promise<ApiKeySummary[]> {
     name: k.name,
     createdAt: k.createdAt,
     lastUsedAt: k.lastUsedAt ?? null,
+    expiresAt: k.expiresAt ?? null,
+    scopes: k.scopes ?? null,
   }))
 }

@@ -231,6 +231,56 @@ Delivery becomes at-least-once: re-sends are deduplicated server-side by run + `
 
 ---
 
+## Redaction
+
+`RecorderOptions.redact` strips sensitive data out of every recorded event payload BEFORE it is buffered, spooled, or sent — and before externalization measures its size, so a redacted (smaller) payload decides whether it gets shipped inline or externalized. Both recorder paths (`Recorder` and `FlightRecorder`/`RunRecorder`) apply it identically.
+
+```typescript
+import { Recorder } from '@agent-flight-recorder/sdk'
+
+const recorder = new Recorder({
+  endpoint, apiKey, agentId,
+  options: {
+    redact: {
+      paths: ['messages.*.content'],       // dot-paths with `*` wildcards
+      patterns: ['email', 'api_key', 'jwt', 'credit_card', 'ssn', 'phone', /internal-[a-z]+/],
+      replacement: '[REDACTED]',            // default
+      custom: (payload, eventType) => payload, // last transform applied, see below
+    },
+    onRedactionError: (error) => console.error('[redaction]', error),
+  },
+})
+```
+
+**Shared responsibility.** This pipeline is best-effort defense in depth, not a compliance guarantee — it catches common shapes (well-known secret prefixes, common PII formats) but cannot know your application's own sensitive fields. Use `paths` for anything you know by name (e.g. `input.password`, `messages.*.content`); use `patterns` as a safety net for what leaks despite that. Read `redaction.ts`'s JSDoc for each built-in pattern's documented false-positive/false-negative tradeoffs (e.g. `credit_card` runs a Luhn check to avoid flagging arbitrary 16-digit numbers; `api_key` only matches known vendor prefixes, so a bespoke unprefixed secret needs a `paths` entry or a custom `RegExp`).
+
+**Order of operations & failure handling:** `paths` → `patterns` → `custom`. `paths`/`patterns` always run (this is what guarantees the payload is never sent unredacted). If `custom` throws, the already-`paths`/`patterns`-redacted payload is used as-is, `onRedactionError` fires, and the payload carries `_redactionDegraded: true` so you can detect (and alert on) a broken custom transform in production instead of silently losing its coverage.
+
+**Safety:** the pipeline deep-clones before mutating (never touches your original objects), refuses to traverse through `__proto__`/`constructor`/`prototype` (proto-pollution safe), and bounds traversal depth (32) and node count (10 000) so a pathological payload can't hang the recorder.
+
+## Sampling
+
+`RecorderOptions.sampling` head-samples which runs actually ship telemetry — useful at high volume where recording every run is unaffordable, while still keeping full traces of the runs that matter most: the ones that fail.
+
+```typescript
+options: {
+  sampling: {
+    rate: 0.1,                 // sample in 10% of runs (decided once, at startRun())
+    alwaysKeepFailures: true,   // tail bias: an unsampled run that fails ships anyway
+    seedFromRunName: true,      // deterministic decision from runConfig.name, for reproducibility
+    decider: (ctx) => ctx.tags.includes('debug'), // full override; wins over `rate`
+  },
+}
+```
+
+An unsampled run records NOTHING by default: `startRun()` never calls the transport, `recordEvent()` is a no-op, and `endRun()`/`failRun()` discard silently (observable via `onDrop(count, 'sampled_out')`). There is no separate "sampled-out handle" type — you call the exact same `Recorder` methods either way; only the internal behavior (send vs. discard) differs, so instrumented agent code never has to branch on whether this particular run happened to be sampled in.
+
+With `alwaysKeepFailures: true`, an unsampled run's events are held in a bounded shadow buffer (capped at `maxBufferSize`, same as normal buffering) instead of discarded immediately. If the run ends via `failRun()`, the recorder materializes it for real — calling `transport.createRun()` for the first time — and ships the whole shadow buffer (including the original `run.started`) with contiguous sequence numbers, so the failure's full trace is never lost to sampling. A run that ends via `endRun()` (success) still discards the shadow buffer.
+
+`decider` fully overrides `rate` when provided, and fails open (samples the run IN) if it throws — a broken decider must not silently blackhole telemetry. `seedFromRunName` derives the decision from a stable hash of `runConfig.name` (the `name` field you pass as the second argument to `startRun`) instead of `Math.random()`, so re-running the same named run reproduces the same sampling decision; it falls back to `Math.random()` when no run name is provided.
+
+---
+
 ## Security
 
 - **Transport security is TLS via the platform's `fetch`.** The SDK uses the runtime's default certificate validation (Node's bundled CA store, or the platform trust store). There is no certificate pinning and no custom TLS configuration; if you need either, inject a custom `Transport`.
@@ -484,6 +534,8 @@ this pattern (including the tool-error path).
 ---
 
 ## Version
+
+v0.4.0 — Redaction pipeline (`RecorderOptions.redact`): dot-path + wildcard targeting, built-in named patterns (`email`/`api_key`/`jwt`/`credit_card`/`ssn`/`phone`) with documented false-positive tradeoffs, caller `custom` transform with guaranteed-redacted fallback on throw (`_redactionDegraded: true`), applied identically in both recorder paths before externalization measures payload size. Sampling (`RecorderOptions.sampling`): head sampling by `rate`, `decider` override (fails open), `seedFromRunName` for reproducible decisions, `alwaysKeepFailures` tail-bias shadow buffering so a sampled-out run that fails still ships its full trace. New `onDrop` reason `'sampled_out'`.
 
 v0.3.1 — Stranded-run fix: the run-status transition is deferred (never patched) while the terminal event is undelivered, so retried events can no longer be poisoned into `RUN_NOT_ACTIVE`; flush and `recover()` batch events per run so one stranded run cannot block others; permanent server rejections (`RUN_NOT_ACTIVE`/`SEQUENCE_CONFLICT`) drop the affected run's events observably (`onDrop(count, 'rejected_by_server')`). Spool hardening: `recover()` uses peek → send → ack (crash mid-recovery duplicates, never loses; `EventSpool.drain` replaced by `peek` in the interface), `maxSpoolEntries` cap with `'spool_overflow'` drops, buffer-overflow drops now also remove the events from the spool, opt-in `FileSpool` `fsync`. Guards: constructor `TypeError`s for invalid numeric options, `recordEvent` throws after a terminal event, a throwing custom Transport lands in `FlushResult.errors`. `TransportResponse` now surfaces real server `eventIds` and error `code`s.
 

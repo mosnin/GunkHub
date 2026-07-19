@@ -32,6 +32,14 @@ export const AUDIT_ACTIONS = [
   "membership.removed",
   "org.deletion_requested",
   "org.retention_updated",
+  // ADR-002 — data model expansion.
+  "run.triage_updated",
+  "run.labels_updated",
+  "alert_rule.created",
+  "alert_rule.updated",
+  "alert_rule.deleted",
+  "webhook.created",
+  "webhook.deleted",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

@@ -10,6 +10,12 @@ import {
   MAX_EVENTS_PER_RUN,
   MAX_PAGE_SIZE,
 } from "./helpers/pagination.js";
+import {
+  buildSearchText,
+  extractErrorMessage,
+  extractTokenUsage,
+} from "./helpers/run_fields.js";
+import { incrementUsageCounters } from "./usage.js";
 
 // Event types that must be the last event in a run (CLAUDE.md Event Log Rule 5).
 const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
@@ -239,6 +245,33 @@ export const createEvent = mutation({
       payload: args.payload,
       parentEventId: args.parentEventId,
     });
+
+    // ADR-002: incremental token-usage counters, updated at event-insert time
+    // rather than recomputed from a full replay (the log itself remains the
+    // source of truth for the underlying llm.response payloads).
+    if (args.type === "llm.response") {
+      const { tokensIn, tokensOut } = extractTokenUsage(args.payload);
+      if (tokensIn > 0 || tokensOut > 0) {
+        await ctx.db.patch(args.runId, {
+          tokensIn: (run.tokensIn ?? 0) + tokensIn,
+          tokensOut: (run.tokensOut ?? 0) + tokensOut,
+        });
+      }
+    }
+
+    // ADR-002: terminal reconcile — append the extracted error message to
+    // runs.searchText so a failed run's error text is searchable.
+    if (args.type === "run.failed") {
+      const errorMessage = extractErrorMessage(args.payload);
+      if (errorMessage) {
+        const searchText = buildSearchText([run.searchText, errorMessage]);
+        await ctx.db.patch(args.runId, { searchText });
+      }
+    }
+
+    // ADR-002: approximate usage metering (see convex/usage.ts).
+    const bytes = new TextEncoder().encode(JSON.stringify(args.payload ?? null)).length;
+    await incrementUsageCounters(ctx, run.orgId, { eventsIngested: 1, bytesIngested: bytes });
 
     const event = await ctx.db.get(eventId);
     if (!event) throw new Error("Failed to create event");

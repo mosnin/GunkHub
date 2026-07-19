@@ -1,3 +1,5 @@
+import type { RedactionConfig } from './redaction.js'
+import type { SamplingConfig } from './sampling.js'
 import type { EventType, EventPayload, RunStatus, CreateEventRequest } from '@agent-flight-recorder/contracts'
 
 // ---------------------------------------------------------------------------
@@ -74,8 +76,10 @@ export interface RecorderConfig {
  * - `'spool_overflow'` — the persistent spool exceeded `maxSpoolEntries`.
  * - `'rejected_by_server'` — the server permanently rejected a run's batch
  *   (`RUN_NOT_ACTIVE` / `SEQUENCE_CONFLICT`); retrying can never succeed.
+ * - `'sampled_out'` — the run was not sampled in (`RecorderOptions.sampling`);
+ *   fires once per unsampled run, with `count` = events discarded for it.
  */
-export type DropReason = 'buffer_overflow' | 'spool_overflow' | 'rejected_by_server'
+export type DropReason = 'buffer_overflow' | 'spool_overflow' | 'rejected_by_server' | 'sampled_out'
 
 export interface RecorderOptions {
   /** Flush events after this many ms of inactivity. Must be >= 1. Default: 1000 */
@@ -158,6 +162,25 @@ export interface RecorderOptions {
    * unavailable. Default: false (opt-in, since it registers global handlers).
    */
   captureProcessExit?: boolean
+  /**
+   * Redact sensitive data out of every recorded event payload BEFORE it is
+   * buffered, spooled, or sent — and before externalization measures its
+   * size, so a redacted payload's (smaller) size decides whether it gets
+   * externalized. See {@link RedactionConfig}.
+   */
+  redact?: RedactionConfig
+  /**
+   * Called when the `redact` pipeline fails: an invalid `patterns` entry, or
+   * `redact.custom` throwing (in which case built-in `paths`/`patterns`
+   * redaction still applied, and the payload carries `_redactionDegraded:
+   * true`). Must not throw; exceptions are swallowed.
+   */
+  onRedactionError?: (error: string) => void
+  /**
+   * Head-sample which runs actually ship telemetry. See {@link SamplingConfig}.
+   * Unset (the default) samples every run.
+   */
+  sampling?: SamplingConfig
 }
 
 export interface RunContext {
