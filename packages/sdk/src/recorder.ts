@@ -388,7 +388,7 @@ export class Recorder {
     const errPayload: { message: string; code?: string; stack?: string } = {
       message: error.message,
       ...(error instanceof Error && error.stack !== undefined && { stack: error.stack }),
-      ...(!('stack' in error) && 'code' in error && error.code !== undefined && { code: error.code }),
+      ...('code' in error && error.code !== undefined && { code: error.code }),
     }
 
     this.recordEvent(

@@ -88,3 +88,95 @@ export async function createAgentVersion(input: {
 
   return mapAgentVersion(doc as Record<string, unknown>)
 }
+
+/**
+ * A version's configured eval-auto-run rule set (schema.ts `agent_versions.evalRules`,
+ * validated at write time by convex/helpers/agent_version_fields.ts against the
+ * `EvalRule` discriminated union in convex/helpers/evals.ts). Not part of the
+ * shared `AgentVersion` contract type — read here as a loosely-typed array of
+ * records for read-only display (this cycle's requirement); each rule's
+ * `kind` field plus its remaining fields are rendered generically rather than
+ * importing the convex-internal union type into apps/web.
+ */
+export async function getAgentVersionEvalRules(versionId: string): Promise<Record<string, unknown>[]> {
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await client.query(convex.agent_versions.getAgentVersion, { versionId })
+  if (!doc) return []
+  const rules = (doc as Record<string, unknown>).evalRules
+  return Array.isArray(rules) ? (rules as Record<string, unknown>[]) : []
+}
+
+// ---------------------------------------------------------------------------
+// Version comparison (cohort A/B) — Team B's convex/insights.ts `compareVersions`.
+// ---------------------------------------------------------------------------
+//
+// Real request:  { orgId, agentVersionIdA, agentVersionIdB }
+// Real response: {
+//   agentId,
+//   versionA: { id, version, sampleSize, scanned, truncated, countsByStatus },
+//   versionB: { id, version, sampleSize, scanned, truncated, countsByStatus },
+//   comparison: CohortComparison,  // includes the significance verdict
+// }
+//
+// `comparison.verdict` is one of likely_regression / likely_improvement /
+// inconclusive / insufficient_data. `truncated: true` on either cohort means
+// the underlying scan was capped — surfaced in the UI as "sampled" rather
+// than a full-population comparison.
+
+export interface VersionCohortStats {
+  id: string
+  version: string
+  sampleSize: number
+  scanned: number
+  truncated: boolean
+  countsByStatus: Record<string, number>
+}
+
+export type VersionCompareVerdict =
+  | 'likely_regression'
+  | 'likely_improvement'
+  | 'inconclusive'
+  | 'insufficient_data'
+
+export interface CohortComparison {
+  verdict: VersionCompareVerdict
+  /** Remaining fields (failure-rate deltas, statistical detail, etc.) — shape
+      is owned by insights.ts and rendered generically where not explicitly typed. */
+  [key: string]: unknown
+}
+
+export interface VersionCompareResultAvailable {
+  available: true
+  agentId: string
+  versionA: VersionCohortStats
+  versionB: VersionCohortStats
+  comparison: CohortComparison
+}
+
+export interface VersionCompareResultUnavailable {
+  available: false
+}
+
+export type VersionCompareResult = VersionCompareResultAvailable | VersionCompareResultUnavailable
+
+export async function compareVersions(
+  orgId: string,
+  agentVersionIdA: string,
+  agentVersionIdB: string,
+): Promise<VersionCompareResult> {
+  try {
+    const client = await getAuthedClient()
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const result = await client.query(convex.insights.compareVersions, {
+      orgId,
+      agentVersionIdA,
+      agentVersionIdB,
+    })
+    if (!result) return { available: false }
+    const r = result as Omit<VersionCompareResultAvailable, 'available'>
+    return { available: true, ...r }
+  } catch {
+    return { available: false }
+  }
+}

@@ -6,22 +6,26 @@ import type { Metadata } from 'next'
 
 import { ArtifactList } from '@/components/runs/ArtifactList'
 import { CommentThread } from '@/components/runs/CommentThread'
+import { EvalsPanel } from '@/components/runs/EvalsPanel'
 import { EventInspector } from '@/components/runs/EventInspector'
 import { FailureSummary as FailureSummaryPanel } from '@/components/runs/FailureSummary'
 import { RunBreadcrumb } from '@/components/runs/RunBreadcrumb'
 import { RunHeader } from '@/components/runs/RunHeader'
+import { RunHierarchyPanel } from '@/components/runs/RunHierarchyPanel'
 import { Timeline } from '@/components/runs/Timeline'
+import { TriageControl } from '@/components/runs/TriageControl'
 import { VerificationPanel } from '@/components/runs/VerificationPanel'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { InlineError } from '@/components/ui/InlineError'
 import { getAgent } from '@/lib/services/agents'
 import { listArtifacts } from '@/lib/services/artifacts'
 import { listComments } from '@/lib/services/comments'
+import { listEvalsForRun } from '@/lib/services/evals'
 import { listEvents } from '@/lib/services/events'
 import { getRunVerificationStatus, type VerificationStatus } from '@/lib/services/projection_verify'
 import { getProject } from '@/lib/services/projects'
 import { getReplayProjection } from '@/lib/services/replay'
-import { getRun } from '@/lib/services/runs'
+import { getRun, listChildRuns } from '@/lib/services/runs'
 
 export const metadata: Metadata = { title: 'Run Detail' }
 
@@ -29,6 +33,7 @@ const TABS = [
   { id: 'timeline', label: 'Timeline' },
   { id: 'events', label: 'Events' },
   { id: 'artifacts', label: 'Artifacts' },
+  { id: 'evals', label: 'Evals' },
   { id: 'comments', label: 'Comments' },
   { id: 'replay', label: 'Replay' },
 ] as const
@@ -59,22 +64,29 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   let failureSummary: FailureSummary | null = null
   let artifactsData: { artifacts: Artifact[] } = { artifacts: [] }
   let commentsData: Comment[] = []
+  let childRuns: Awaited<ReturnType<typeof listChildRuns>> = []
+  let evalsData: Awaited<ReturnType<typeof listEvalsForRun>> = []
 
   // Phase 1 — fetch everything that only depends on runId in parallel instead of
   // serially. run + events are the fatal group (drive notFound / ErrorState);
-  // replay, artifacts and comments are additive (non-fatal). allSettled lets one
-  // failure not reject the others.
-  const [runSettled, eventsSettled, replaySettled, artifactsSettled, commentsSettled] =
+  // replay, artifacts, comments, child runs and evals are additive (non-fatal).
+  // allSettled lets one failure not reject the others.
+  const [runSettled, eventsSettled, replaySettled, artifactsSettled, commentsSettled, childRunsSettled, evalsSettled] =
     await Promise.allSettled([
       getRun(runId),
       listEvents({ runId, limit: 200 }),
       getReplayProjection(runId),
       listArtifacts(runId),
       listComments(runId, 'run'),
+      listChildRuns(runId),
+      listEvalsForRun(runId),
     ])
 
   if (runSettled.status === 'fulfilled') runData = runSettled.value
   if (eventsSettled.status === 'fulfilled') eventsData = eventsSettled.value
+  if (childRunsSettled.status === 'fulfilled') childRuns = childRunsSettled.value
+  if (evalsSettled.status === 'fulfilled') evalsData = evalsSettled.value
+  const evalsFailed = evalsSettled.status === 'rejected'
 
   // Fatal group error handling — preserve notFound() on "not found", else surface.
   const fatalRejection: unknown =
@@ -166,7 +178,32 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         metadata={run.metadata}
         isLive={run.status === 'running'}
         verificationStatus={verificationStatus}
+        environment={run.environment}
       />
+
+      {/* Triage + labels — only rendered when there's something to show:
+          eligible (failed/timed_out) runs always get the control; any run
+          that already has a triage state or labels shows them read-only. */}
+      {(run.status === 'failed' || run.status === 'timed_out' || run.triageState !== undefined || (run.labels?.length ?? 0) > 0) && (
+        <div className="px-6 py-3 border-b border-neutral-800">
+          <TriageControl
+            runId={runId}
+            triageState={run.triageState ?? 'open'}
+            labels={run.labels ?? []}
+            eligible={run.status === 'failed' || run.status === 'timed_out'}
+          />
+        </div>
+      )}
+
+      {/* Trace hierarchy — parent link, child runs, session link. Hidden
+          entirely when the run has none of the three. */}
+      {(run.parentRunId !== undefined || run.sessionId !== undefined || childRuns.length > 0) && (
+        <RunHierarchyPanel
+          parentRunId={run.parentRunId}
+          sessionId={run.sessionId}
+          children={childRuns}
+        />
+      )}
 
       {/* Failure summary panel — additive, shown only when there is a failure or incomplete run */}
       {replayFailed ? (
@@ -233,6 +270,15 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
             </div>
           ) : (
             <ArtifactList artifacts={artifactsData.artifacts} />
+          )
+        )}
+        {activeTab === 'evals' && (
+          evalsFailed ? (
+            <div className="p-6">
+              <InlineError message="Couldn't load evals — refresh to retry." />
+            </div>
+          ) : (
+            <EvalsPanel evals={evalsData} />
           )
         )}
         {activeTab === 'comments' && (

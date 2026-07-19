@@ -139,3 +139,30 @@ export const ROLLUP_MAX_RUNS_SAMPLE = 5_000;
  * calls always flush exactly.
  */
 export const USAGE_FLUSH_STRIDE = 10;
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — action layer (docs/design/action_layer.md): alert evaluation,
+// webhook delivery, the key-authed read API, and eval auto-run.
+// ---------------------------------------------------------------------------
+
+/**
+ * Bounded sample of recent runs examined by the `failure_rate` alert-rule
+ * condition (convex/alert_engine.ts). Mirrors ROLLUP_MAX_RUNS_SAMPLE's
+ * rationale: an approximate rate computed from a bounded window is
+ * sufficient for an alert threshold, and avoids an unbounded scan of a busy
+ * org's run history.
+ */
+export const ALERT_FAILURE_RATE_SAMPLE_SIZE = 1_000;
+
+/** Batch size for one deliverPendingWebhooks cron invocation (convex/webhook_engine.ts). */
+export const WEBHOOK_DELIVERY_BATCH_SIZE = 50;
+
+/**
+ * Maximum delivery attempts before a webhook_deliveries row is marked
+ * terminally "failed" (no further retries scheduled). Attempt 1 is the
+ * initial send; attempts 2-6 are retries with computeBackoff delay.
+ */
+export const WEBHOOK_MAX_ATTEMPTS = 6;
+
+/** Write ceiling for agent_versions.evalRules (ADR-002 follow-up / Cycle 2). */
+export const MAX_EVAL_RULES_PER_VERSION = 20;

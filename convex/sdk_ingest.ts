@@ -2,6 +2,7 @@
 // Authentication here is via pre-hashed API key only. Do NOT call getAuthContext
 // or requireOrgMembership in this file — those require a Clerk JWT.
 
+import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
 import { mutation, query } from "./_generated/server.js";
@@ -37,7 +38,7 @@ const LAST_USED_THROTTLE_MS = 60_000;
  * that every ingest mutation must perform: existence, revocation, expiration, and
  * scope. Throws "Unauthorized"/"Forbidden" on any failure. Also stamps lastUsedAt.
  */
-async function resolveApiKey(
+export async function resolveApiKey(
   ctx: MutationCtx,
   apiKeyHash: string,
   requiredScope: string,
@@ -100,7 +101,7 @@ const RATE_EXACT_THRESHOLD = 4 * RATE_FLUSH_STRIDE; // ≤100/min: exact countin
  * it. Throws a stable RATE_LIMITED error when the limit would be exceeded. The
  * whole mutation is transactional, so on rejection nothing is committed.
  */
-async function enforceRateLimit(
+export async function enforceRateLimit(
   ctx: MutationCtx,
   apiKey: Doc<"api_keys">,
   units: number,
@@ -187,6 +188,14 @@ const VALID_EVENT_TYPES = new Set<string>([
 // storage; the event stores only a pointer. Enforced server-side (defense in
 // depth) so a direct Convex call or an SDK bug cannot bloat the document store.
 const MAX_INLINE_PAYLOAD_BYTES = 10 * 1024;
+
+// Cycle 2 (docs/design/action_layer.md) — see convex/events.ts for the full
+// rationale on makeFunctionReference-by-name here and the
+// _runEvalsForRunRef coordination note (Team B's convex/insights.ts has not
+// landed as of this change; this typechecks regardless and resolves at
+// runtime once it does).
+const _evaluateAlertsForRunRef = makeFunctionReference<"mutation">("alert_engine:evaluateAlertsForRun");
+const _runEvalsForRunRef = makeFunctionReference<"mutation">("insights:runEvalsForRun");
 
 /**
  * Throws if a payload exceeds the 10 KB inline limit (UTF-8 bytes). Applied to
@@ -581,6 +590,15 @@ export const sdkCreateEvents = mutation({
           }
         }
         await ctx.db.patch(runId, patch);
+
+        // Cycle 2 (docs/design/action_layer.md): schedule alert evaluation +
+        // eval auto-run on the terminal event, NON-BLOCKING. See
+        // convex/events.ts createEvent for the identical Clerk-authenticated
+        // path and the coordination note above on _runEvalsForRunRef
+        // (Team B's function — typechecks now, resolves at runtime once
+        // convex/insights.ts lands).
+        await ctx.scheduler.runAfter(0, _evaluateAlertsForRunRef, { runId });
+        await ctx.scheduler.runAfter(0, _runEvalsForRunRef, { runId });
       }
 
       // Advance in-memory state so the next event in the batch validates against it.

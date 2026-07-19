@@ -45,6 +45,13 @@ export const convex = {
     getRun: makeFunctionReference<Q>('runs:getRun'),
     createRun: makeFunctionReference<M>('runs:createRun'),
     updateRunTags: makeFunctionReference<M>('runs:updateRunTags'),
+    // ADR-002 — run hierarchy / sessions / environment / triage / search
+    // (Team A, convex/runs.ts, landed this cycle — see adr002.test.ts).
+    setRunLabels: makeFunctionReference<M>('runs:setRunLabels'),
+    setRunTriage: makeFunctionReference<M>('runs:setRunTriage'),
+    searchRuns: makeFunctionReference<Q>('runs:searchRuns'),
+    listSessionRuns: makeFunctionReference<Q>('runs:listSessionRuns'),
+    listChildRuns: makeFunctionReference<Q>('runs:listChildRuns'),
   },
   events: {
     listEvents: makeFunctionReference<Q>('events:listEvents'),
@@ -75,5 +82,60 @@ export const convex = {
     batchGetVerificationResults: makeFunctionReference<Q>('projection_verify:batchGetVerificationResults'),
     listRecentFailedVerifications: makeFunctionReference<Q>('projection_verify:listRecentFailedVerifications'),
     reverifyRun: makeFunctionReference<A>('projection_verify:reverifyRun'),
+  },
+  // --- Team C (action layer), Cycle 2 ---------------------------------------
+  // convex/read_api.ts (Team A) landed as `mutation`s, not `query`s — the
+  // per-key rate-limit/lastUsedAt bookkeeping they share with sdk_ingest.ts
+  // requires write access to the api_keys document (see that file's header
+  // comment). Refs stay string-based (makeFunctionReference) rather than
+  // imports from convex/_generated/api per this repo's convention.
+  read_api: {
+    apiListRuns: makeFunctionReference<M>('read_api:apiListRuns'),
+    apiGetRun: makeFunctionReference<M>('read_api:apiGetRun'),
+    apiGetRunEvents: makeFunctionReference<M>('read_api:apiGetRunEvents'),
+    apiGetReplay: makeFunctionReference<M>('read_api:apiGetReplay'),
+  },
+  // convex/alerts.ts already exists (data agent, ADR-002/003) — the management
+  // API routes wrap these directly.
+  alerts: {
+    listAlertRules: makeFunctionReference<Q>('alerts:listAlertRules'),
+    createAlertRule: makeFunctionReference<M>('alerts:createAlertRule'),
+    updateAlertRule: makeFunctionReference<M>('alerts:updateAlertRule'),
+    deleteAlertRule: makeFunctionReference<M>('alerts:deleteAlertRule'),
+    listAlertEvents: makeFunctionReference<Q>('alerts:listAlertEvents'),
+    listAlertEventsForRule: makeFunctionReference<Q>('alerts:listAlertEventsForRule'),
+  },
+  // convex/webhooks.ts already exists (data agent, ADR-002/003) — the
+  // management API routes wrap these directly. Named to match the convex
+  // file (`webhooks:*`); the HTTP surface lives under /api/webhooks-config to
+  // avoid colliding with the existing /api/webhooks/clerk receiver route.
+  webhooks: {
+    listWebhooks: makeFunctionReference<Q>('webhooks:listWebhooks'),
+    createWebhook: makeFunctionReference<M>('webhooks:createWebhook'),
+    deleteWebhook: makeFunctionReference<M>('webhooks:deleteWebhook'),
+    listWebhookDeliveries: makeFunctionReference<Q>('webhooks:listWebhookDeliveries'),
+  },
+  // convex/evals.ts already exists (data agent, ADR-002) — append-only eval
+  // records + rollups.
+  evals: {
+    recordEval: makeFunctionReference<M>('evals:recordEval'),
+    listEvalsForRun: makeFunctionReference<Q>('evals:listEvalsForRun'),
+    listEvalsByName: makeFunctionReference<Q>('evals:listEvalsByName'),
+    listEvalsByAgentVersion: makeFunctionReference<Q>('evals:listEvalsByAgentVersion'),
+  },
+  // convex/usage.ts already exists (data agent, ADR-002) — approximate usage
+  // counters (usage_counters table).
+  usage: {
+    getUsageForDay: makeFunctionReference<Q>('usage:getUsageForDay'),
+    listRecentUsage: makeFunctionReference<Q>('usage:listRecentUsage'),
+  },
+  // Team B's analytics/insights surface (convex/insights.ts) — dashboard
+  // stats, per-agent cost estimates, version-comparison cohorts, and the
+  // per-version eval pass-rate rollup. Landed this cycle.
+  insights: {
+    getDashboardStats: makeFunctionReference<Q>('insights:getDashboardStats'),
+    getAgentCostStats: makeFunctionReference<Q>('insights:getAgentCostStats'),
+    compareVersions: makeFunctionReference<Q>('insights:compareVersions'),
+    listEvalsForVersion: makeFunctionReference<Q>('insights:listEvalsForVersion'),
   },
 } as const

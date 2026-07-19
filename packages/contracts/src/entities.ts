@@ -50,6 +50,15 @@ export interface AgentVersion {
   changelog?: string;
   configSnapshot?: Record<string, unknown>;
   createdAt: number;
+  /**
+   * Cycle 2 (docs/design/action_layer.md) — optional eval auto-run rule set,
+   * evaluated against every terminal run created against this version. Typed
+   * loosely here (matches Convex's `v.array(v.any())` storage — the
+   * `EvalRule` discriminated union lives in convex/helpers/evals.ts, a
+   * Convex-only pure module, not currently re-exported through contracts).
+   * Bounded to <= 20 entries at write time (createAgentVersion).
+   */
+  evalRules?: Record<string, unknown>[];
 }
 
 export interface Run {

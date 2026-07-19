@@ -5,16 +5,18 @@
  * against a deployment via `AFR_API_KEY` / `AFR_BASE_URL` env vars (see
  * `src/env.ts`).
  *
- * Command dispatch is structured so cycle 2 (the read API — `GET /api/runs`,
- * `GET /api/runs/:id`, replay/tail/export) only has to replace the
- * `scaffoldedCommand(...)` calls below with real handlers; the arg parsing,
- * dispatch tree, and exit-code conventions are already in place.
+ * `record demo` / `config check` / `version` talk to the SDK / `/api/health`
+ * directly. `runs list|get`, `replay`, `tail`, and `export` talk to the
+ * public v1 read API (`GET /api/v1/runs...`, see `src/apiClient.ts`) via
+ * `x-api-key` auth.
  */
-import { parseArgs } from 'node:util'
-
 import { printConfigCheck, runConfigCheck } from './commands/config-check.js'
+import { EXPORT_HELP, parseExportArgs, printExport, runExport } from './commands/export.js'
 import { printRecordDemo, runRecordDemo } from './commands/record-demo.js'
-import { printScaffolded, scaffoldedCommand } from './commands/scaffolded.js'
+import { REPLAY_HELP, parseReplayArgs, printReplay, runReplay } from './commands/replay.js'
+import { RUNS_GET_HELP, parseRunsGetArgs, printRunsGet, runRunsGet } from './commands/runs-get.js'
+import { RUNS_LIST_HELP, parseRunsListArgs, printRunsList, runRunsList } from './commands/runs-list.js'
+import { TAIL_HELP, parseTailArgs, printTailSummary, runTail } from './commands/tail.js'
 import { runVersion } from './commands/version.js'
 
 export { readEnv } from './env.js'
@@ -25,8 +27,18 @@ export { runConfigCheck, printConfigCheck } from './commands/config-check.js'
 export type { ConfigCheck, ConfigCheckResult, FetchLike } from './commands/config-check.js'
 export { runRecordDemo, printRecordDemo } from './commands/record-demo.js'
 export type { RecordDemoResult } from './commands/record-demo.js'
-export { scaffoldedCommand, printScaffolded } from './commands/scaffolded.js'
-export type { ScaffoldedResult } from './commands/scaffolded.js'
+export * from './apiClient.js'
+export { parseRunsListArgs, runRunsList, printRunsList } from './commands/runs-list.js'
+export type { RunsListArgs, RunsListResult } from './commands/runs-list.js'
+export { parseRunsGetArgs, runRunsGet, printRunsGet } from './commands/runs-get.js'
+export type { RunsGetArgs, RunsGetResult } from './commands/runs-get.js'
+export { parseReplayArgs, runReplay, printReplay } from './commands/replay.js'
+export type { ReplayArgs, ReplayResult } from './commands/replay.js'
+export { parseTailArgs, runTail, printTailSummary } from './commands/tail.js'
+export type { TailArgs, TailOptions, TailResult, TailStopReason } from './commands/tail.js'
+export { parseExportArgs, runExport, printExport } from './commands/export.js'
+export type { ExportArgs, ExportResult, ExportBundle, WriteFileLike } from './commands/export.js'
+export type { CommandFailure } from './commands/shared.js'
 
 function printHelp(log: (line: string) => void = console.log): void {
   log(`afr — Agent Flight Recorder CLI
@@ -35,16 +47,16 @@ Usage:
   afr <command> [subcommand] [args]
 
 Commands:
-  afr record demo            Run a small demo agent end-to-end against your configured backend
-  afr config check           Validate AFR_API_KEY / AFR_BASE_URL and ping /api/health
-  afr version                Print CLI and SDK version
+  afr record demo              Run a small demo agent end-to-end against your configured backend
+  afr config check             Validate AFR_API_KEY / AFR_BASE_URL and ping /api/health
+  afr version                  Print CLI and SDK version
+  afr runs list [options]       List runs
+  afr runs get <runId>          Get a single run
+  afr replay <runId>            Replay a run's event sequence as a transcript
+  afr tail <runId>               Tail a run's events live
+  afr export <runId>             Export a run's run/events/replay bundle
 
-Coming in cycle 2 (requires the read API):
-  afr runs list               List runs
-  afr runs get <runId>         Get a single run
-  afr replay <runId>           Replay a run
-  afr tail <runId>             Tail a run's events live
-  afr export <runId>           Export a run
+Run 'afr <command> --help' for command-specific options.
 
 Environment variables:
   AFR_API_KEY                 Organization API key
@@ -58,35 +70,31 @@ Environment variables:
  * in-process instead of spawning a subprocess.
  *
  * @param argv - argv WITHOUT the `node`/script prefix (i.e. `process.argv.slice(2)`)
- * @returns process exit code
+ * @returns process exit code (0 ok, 1 usage, 2 auth, 3 not-found, 4 network/server)
  */
 export async function main(argv: string[], log: (line: string) => void = console.log): Promise<number> {
-  const { positionals, values } = parseArgs({
-    args: argv,
-    allowPositionals: true,
-    strict: false,
-    options: {
-      help: { type: 'boolean', short: 'h' },
-    },
-  })
+  if (argv.length === 0) {
+    printHelp(log)
+    return 1
+  }
 
-  if (values['help']) {
+  const [command, ...afterCommand] = argv
+
+  // `--help`/`-h`/`help` are only special-cased as the FIRST token (bare
+  // `afr --help`). Anything after a real command is left in `afterCommand`
+  // untouched, so e.g. `afr runs get --help` reaches parseRunsGetArgs and
+  // prints THAT command's help — not the global one.
+  if (command === '--help' || command === '-h' || command === 'help') {
     printHelp(log)
     return 0
   }
 
-  const [command, subcommand, ...rest] = positionals
-
   switch (command) {
-    case undefined:
-    case 'help':
-      printHelp(log)
-      return command === undefined ? 1 : 0
-
     case 'version':
       return runVersion(log)
 
     case 'config': {
+      const [subcommand] = afterCommand
       if (subcommand === 'check') {
         const result = await runConfigCheck()
         printConfigCheck(result, log)
@@ -97,6 +105,7 @@ export async function main(argv: string[], log: (line: string) => void = console
     }
 
     case 'record': {
+      const [subcommand] = afterCommand
       if (subcommand === 'demo') {
         const result = await runRecordDemo()
         printRecordDemo(result, log)
@@ -106,24 +115,99 @@ export async function main(argv: string[], log: (line: string) => void = console
       return 1
     }
 
-    // Scaffolded for cycle 2 — see file header.
     case 'runs': {
-      if (subcommand === 'list' || subcommand === 'get') {
-        printScaffolded(scaffoldedCommand(`runs ${subcommand}${rest.length > 0 ? ` ${rest.join(' ')}` : ''}`), log)
-        return 1
+      const [subcommand, ...rest] = afterCommand
+      if (subcommand === 'list') {
+        const args = parseRunsListArgs(rest)
+        if (args.help) {
+          log(RUNS_LIST_HELP)
+          return 0
+        }
+        const result = await runRunsList(args)
+        printRunsList(args, result, log)
+        return result.ok ? 0 : result.exitCode
+      }
+      if (subcommand === 'get') {
+        const args = parseRunsGetArgs(rest)
+        if (args.help) {
+          log(RUNS_GET_HELP)
+          return 0
+        }
+        if (!args.runId) {
+          log("Usage: afr runs get <runId>. Run 'afr runs get --help' for details.")
+          return 1
+        }
+        const result = await runRunsGet(args.runId)
+        printRunsGet(args, result, log)
+        return result.ok ? 0 : result.exitCode
       }
       log(`Unknown 'runs' subcommand: ${subcommand ?? '(none)'}. Try 'afr runs list' or 'afr runs get <runId>'.`)
       return 1
     }
-    case 'replay':
-      printScaffolded(scaffoldedCommand(`replay${subcommand ? ` ${subcommand}` : ''}`), log)
-      return 1
-    case 'tail':
-      printScaffolded(scaffoldedCommand(`tail${subcommand ? ` ${subcommand}` : ''}`), log)
-      return 1
-    case 'export':
-      printScaffolded(scaffoldedCommand(`export${subcommand ? ` ${subcommand}` : ''}`), log)
-      return 1
+
+    case 'replay': {
+      const args = parseReplayArgs(afterCommand)
+      if (args.help) {
+        log(REPLAY_HELP)
+        return 0
+      }
+      if (!args.runId) {
+        log("Usage: afr replay <runId>. Run 'afr replay --help' for details.")
+        return 1
+      }
+      const result = await runReplay(args.runId)
+      printReplay(args, result, log)
+      return result.ok ? 0 : result.exitCode
+    }
+
+    case 'tail': {
+      const args = parseTailArgs(afterCommand)
+      if (args.help) {
+        log(TAIL_HELP)
+        return 0
+      }
+      if (!args.runId) {
+        log("Usage: afr tail <runId>. Run 'afr tail --help' for details.")
+        return 1
+      }
+
+      // Wire Ctrl-C to a graceful stop rather than an abrupt process kill, so
+      // the loop's own exit-code / summary printing still runs.
+      let interrupted = false
+      const onSigint = (): void => {
+        interrupted = true
+      }
+      const proc = (globalThis as { process?: { on(event: string, listener: () => void): unknown; off(event: string, listener: () => void): unknown } }).process
+      proc?.on('SIGINT', onSigint)
+      try {
+        const result = await runTail(
+          args.runId,
+          undefined,
+          undefined,
+          { ...(args.interval !== undefined && { intervalMs: args.interval }), shouldStop: () => interrupted },
+          log
+        )
+        printTailSummary(result, log)
+        return result.ok ? 0 : result.exitCode
+      } finally {
+        proc?.off('SIGINT', onSigint)
+      }
+    }
+
+    case 'export': {
+      const args = parseExportArgs(afterCommand)
+      if (args.help) {
+        log(EXPORT_HELP)
+        return 0
+      }
+      if (!args.runId) {
+        log("Usage: afr export <runId>. Run 'afr export --help' for details.")
+        return 1
+      }
+      const result = await runExport(args.runId, args)
+      printExport(result, log)
+      return result.ok ? 0 : result.exitCode
+    }
 
     default:
       log(`Unknown command: ${command}. Run 'afr help' for usage.`)

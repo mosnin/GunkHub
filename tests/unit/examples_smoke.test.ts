@@ -81,6 +81,15 @@ describe('SDK examples (smoke)', () => {
     expect(stdout).toContain('checksum (sha256)')
   })
 
+  it('read_back.ts records a run then reads it back through the simulated v1 API', () => {
+    const { stdout, status } = runExample('read_back.ts')
+    expect(status).toBe(0)
+    expect(stdout).toContain('Run started:')
+    expect(stdout).toContain('using a simulated v1 API response')
+    expect(stdout).toContain('apiVersion: v1')
+    expect(stdout).toContain('Read-back round trip completed successfully.')
+  })
+
   it('unbuffered_quickstart.ts prints guidance and exits cleanly without --live', () => {
     const { stdout, status } = runExample('unbuffered_quickstart.ts')
     expect(status).toBe(0)

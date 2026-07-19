@@ -32,6 +32,7 @@ const COMMANDS: Command[] = [
   { id: 'nav-projects', label: 'Go to Projects', run: ({ router }) => router.push('/projects') },
   { id: 'nav-agents', label: 'Go to Agents', run: ({ router }) => router.push('/agents') },
   { id: 'nav-runs', label: 'Go to Runs', run: ({ router }) => router.push('/runs') },
+  { id: 'nav-search', label: 'Go to Search', run: ({ router }) => router.push('/search') },
   { id: 'nav-compare', label: 'Go to Compare', run: ({ router }) => router.push('/diff') },
   { id: 'nav-settings', label: 'Go to Settings', run: ({ router }) => router.push('/settings') },
   {

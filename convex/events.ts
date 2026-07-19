@@ -1,5 +1,6 @@
 // IMMUTABILITY: No updateEvent or deleteEvent. These operations must never exist.
 
+import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
@@ -49,6 +50,19 @@ const VALID_EVENT_TYPES = new Set<string>([
 // CLAUDE.md Event Log Rule 3: payloads over 10 KB must be externalized to blob
 // storage. Enforced server-side so a direct Convex call cannot bloat the store.
 const MAX_INLINE_PAYLOAD_BYTES = 10 * 1024;
+
+// Cycle 2 (docs/design/action_layer.md) — internal function references,
+// addressed by name (matches the makeFunctionReference pattern already used
+// by convex/rollups.ts, convex/artifact_gc.ts, convex/projection_verify.ts,
+// since convex/_generated/api.ts is not a live codegen output). `_runEvalsForRunRef`
+// is Team B's (insight_engine) internalMutation in convex/insights.ts, which
+// has NOT landed as of this change — see the coordination note at the call
+// site below. This reference typechecks regardless (makeFunctionReference
+// resolves by string name at runtime, not by import), but will throw at
+// RUNTIME when the scheduled call actually fires until convex/insights.ts
+// exists and exports `runEvalsForRun`.
+const _evaluateAlertsForRunRef = makeFunctionReference<"mutation">("alert_engine:evaluateAlertsForRun");
+const _runEvalsForRunRef = makeFunctionReference<"mutation">("insights:runEvalsForRun");
 
 // Applied to EVERY payload with no type-based exemption: a genuine externalized
 // pointer is tiny and passes, while a client-spoofed `type: "_externalized"` field
@@ -272,6 +286,21 @@ export const createEvent = mutation({
     // ADR-002: approximate usage metering (see convex/usage.ts).
     const bytes = new TextEncoder().encode(JSON.stringify(args.payload ?? null)).length;
     await incrementUsageCounters(ctx, run.orgId, { eventsIngested: 1, bytesIngested: bytes });
+
+    // Cycle 2 (docs/design/action_layer.md): on the terminal event, schedule
+    // alert evaluation and eval auto-run, NON-BLOCKING (runAfter(0, ...)) so
+    // neither ever adds latency or failure risk to the ingest path itself.
+    // Idempotent / replay-safe on the receiving end (evaluateAlertsForRun
+    // checks alert_events before firing; runEvalsForRun is Team B's).
+    if (TERMINAL_EVENT_TYPES.has(args.type)) {
+      await ctx.scheduler.runAfter(0, _evaluateAlertsForRunRef, { runId: args.runId });
+      // COORDINATION NOTE: convex/insights.ts (Team B) owns runEvalsForRun.
+      // Do not remove this call — it is the wiring Team B's function needs
+      // to ever be invoked; see the module-level comment on
+      // _runEvalsForRunRef for why this typechecks today but will only
+      // succeed at runtime once convex/insights.ts lands.
+      await ctx.scheduler.runAfter(0, _runEvalsForRunRef, { runId: args.runId });
+    }
 
     const event = await ctx.db.get(eventId);
     if (!event) throw new Error("Failed to create event");

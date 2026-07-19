@@ -6,6 +6,7 @@ import type { VerificationStatus } from '@/lib/services/projection_verify'
 import type { RunStatus, GetRunResponse } from '@agent-flight-recorder/contracts'
 
 import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
+import { EnvironmentChip } from '@/components/runs/RunMetaChips'
 import { Badge } from '@/components/ui/Badge'
 import { updateRunTagsAction } from '@/lib/actions/runs'
 import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
@@ -22,6 +23,7 @@ interface RunHeaderProps {
   metadata?: Record<string, unknown>
   isLive?: boolean
   verificationStatus?: VerificationStatus | null
+  environment?: string
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -57,7 +59,7 @@ function CopyButton({ value }: { value: string }) {
   )
 }
 
-export function RunHeader({ runId, status, agentName, agentVersionLabel, startedAt, endedAt, triggeredBy, tags, metadata, isLive = false, verificationStatus }: RunHeaderProps) {
+export function RunHeader({ runId, status, agentName, agentVersionLabel, startedAt, endedAt, triggeredBy, tags, metadata, isLive = false, verificationStatus, environment }: RunHeaderProps) {
   const [liveStatus, setLiveStatus] = useState<RunStatus>(status)
   const [liveEndedAt, setLiveEndedAt] = useState<number | undefined>(endedAt)
 
@@ -158,6 +160,8 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
         )}
 
         <span className="text-xs text-neutral-500 font-mono">{truncateId(agentName, 20)}</span>
+
+        {environment && <EnvironmentChip environment={environment} />}
 
         {agentVersionLabel && (
           <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-mono text-neutral-500 bg-neutral-900 border border-neutral-800">

@@ -7,6 +7,7 @@ import type { VerificationStatus } from '@/lib/services/projection_verify'
 import type { Run } from '@agent-flight-recorder/contracts'
 
 import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
+import { EnvironmentChip, TriageChip } from '@/components/runs/RunMetaChips'
 import { Badge } from '@/components/ui/Badge'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { bulkReverifyAction, type BulkReverifyResult } from '@/lib/actions/verification'
@@ -252,8 +253,9 @@ export function SelectableRunList({
                     </span>
                   </td>
                   <td className="px-4 py-3">
-                    <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
+                    <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden className="flex items-center gap-1.5 flex-wrap">
                       <Badge status={run.status} />
+                      {run.triageState && <TriageChip triageState={run.triageState} />}
                     </Link>
                   </td>
                   <td className="px-4 py-3">
@@ -275,7 +277,8 @@ export function SelectableRunList({
                     </Link>
                   </td>
                   <td className="px-4 py-3">
-                    <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
+                    <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden className="flex items-center gap-1.5 flex-wrap">
+                      {run.environment && <EnvironmentChip environment={run.environment} />}
                       {run.agentVersionId && agentVersionLabels[run.agentVersionId] ? (
                         <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-mono text-neutral-400 bg-neutral-900 border border-neutral-800">
                           {agentVersionLabels[run.agentVersionId]}

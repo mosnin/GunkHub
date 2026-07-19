@@ -131,6 +131,25 @@ describe('Recorder', () => {
     )
   })
 
+  it('preserves error.code on failRun even when the error has a stack (regression)', async () => {
+    // Regression for a bug where failRun's errPayload only copied `.code` when
+    // the error had NO `.stack` — but every `Error` instance has a stack, so a
+    // Node-style error (e.g. a fetch/fs error with `.code = 'ECONNRESET'`) had
+    // its code silently dropped from the recorded run.failed event.
+    await recorder.startRun('input')
+    const err = new Error('boom') as Error & { code?: string }
+    err.code = 'ECONNRESET'
+    await recorder.failRun(err)
+
+    const sendEventsMock = transport.sendEvents as unknown as { mock: { calls: [CreateEventRequest[], TransportAuth][] } }
+    const allEvents = sendEventsMock.mock.calls.flatMap((call) => call[0])
+    const runFailedEvent = allEvents.find((e) => e.type === 'run.failed')
+    expect(runFailedEvent).toBeDefined()
+    const payload = runFailedEvent!.payload as { error: { code?: string; stack?: string } }
+    expect(payload.error.code).toBe('ECONNRESET')
+    expect(payload.error.stack).toBeDefined()
+  })
+
   it('calls transport.updateRunStatus with failed on failRun', async () => {
     await recorder.startRun('input')
     await recorder.failRun(new Error('something broke'))

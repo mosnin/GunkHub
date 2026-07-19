@@ -4,9 +4,15 @@ import { notFound } from 'next/navigation'
 import type { Agent, AgentVersion } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
+import { CostStats } from '@/components/agents/CostStats'
+import { EvalVersionPanel } from '@/components/agents/EvalVersionPanel'
+import { VersionCompare } from '@/components/agents/VersionCompare'
 import { VersionSection } from '@/components/agents/VersionSection'
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
+import { getAgentVersionEvalRules } from '@/lib/services/agent_versions'
+import { getAgentCostStats } from '@/lib/services/cost'
+import { getEvalRollupForVersion } from '@/lib/services/evals'
 import { getProject } from '@/lib/services/projects'
 
 export const metadata: Metadata = { title: 'Agent' }
@@ -88,6 +94,24 @@ export default async function AgentPage({ params }: Props) {
 
   const sdkSnippet = buildSdkSnippet(agent.id, versions[0]?.id)
 
+  // Cost + eval-rollup panels are additive — a failure here must not blank
+  // the whole agent page, so both use the honest `available: false` shape
+  // rather than throwing.
+  const costStats = await getAgentCostStats(agent.id, '7d')
+
+  const latestVersion = versions[0]
+  let evalRules: Record<string, unknown>[] = []
+  const evalRollup = latestVersion
+    ? await getEvalRollupForVersion(latestVersion.id, '7d')
+    : { available: false as const }
+  if (latestVersion) {
+    try {
+      evalRules = await getAgentVersionEvalRules(latestVersion.id)
+    } catch {
+      // Non-fatal: eval rules list stays empty
+    }
+  }
+
   return (
     <div className="p-6 max-w-4xl mx-auto">
       {/* Breadcrumb */}
@@ -136,6 +160,23 @@ export default async function AgentPage({ params }: Props) {
       {/* Versions section */}
       <section className="mb-8">
         <VersionSection agentId={agent.id} versions={versions} nextCursor={versionsNextCursor} />
+      </section>
+
+      {/* Cost — estimated token cost by model */}
+      <section className="mb-8">
+        <CostStats stats={costStats} />
+      </section>
+
+      {/* Evals — configured rules + pass-rate rollup for the latest version */}
+      {latestVersion && (
+        <section className="mb-8">
+          <EvalVersionPanel version={latestVersion.version} evalRules={evalRules} rollup={evalRollup} />
+        </section>
+      )}
+
+      {/* Version comparison — pick two versions, see the cohort comparison */}
+      <section className="mb-8">
+        <VersionCompare versions={versions} />
       </section>
 
       {/* SDK Setup */}

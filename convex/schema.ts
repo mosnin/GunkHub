@@ -55,6 +55,15 @@ export default defineSchema({
     changelog: v.optional(v.string()),
     createdAt: v.number(),
     configSnapshot: v.optional(v.any()),
+    // Cycle 2 (docs/design/action_layer.md, ADR-002 follow-up): optional
+    // eval-auto-run rule set for this version, evaluated against every
+    // terminal run created against it. Stored as `v.array(v.any())` — same
+    // justified exception as `events.payload` — because the `EvalRule`
+    // discriminated union (convex/helpers/evals.ts) cannot be expressed in
+    // the validator DSL. Runtime shape validation happens in
+    // createAgentVersion (helpers/agent_version_fields.ts), not here. Bounded
+    // to <= 20 rules at write time.
+    evalRules: v.optional(v.array(v.any())),
   }).index("by_agent", ["agentId"]),
 
   runs: defineTable({
@@ -371,9 +380,31 @@ export default defineSchema({
     payloadHash: v.optional(v.string()),
     error: v.optional(v.string()),
     createdAt: v.number(),
+    // Cycle 2 (docs/design/action_layer.md): when this delivery was enqueued
+    // by the alert engine (as opposed to the standalone outbound-webhooks
+    // feature), links back to the alert_events row it is delivering, so
+    // webhook_engine.deliverPendingWebhooks can roll the delivery outcome up
+    // into alert_events.deliveryStatus once every sibling delivery resolves.
+    // Optional/additive — deliveries created by the plain webhook_targets
+    // CRUD path (not alert-triggered) leave this unset.
+    alertEventId: v.optional(v.id("alert_events")),
+    // Retry scheduling: the next attempt is not due before this timestamp.
+    // Set on enqueue (now) and advanced on each retryable failure via
+    // computeBackoff. Optional/additive; absent = due immediately (legacy
+    // rows inserted before this field existed, or rows from the Cycle-1
+    // internal-only recordWebhookDelivery entry point).
+    nextAttemptAt: v.optional(v.number()),
   })
     .index("by_webhook", ["webhookId", "createdAt"])
-    .index("by_org", ["orgId", "createdAt"]),
+    .index("by_org", ["orgId", "createdAt"])
+    // Cycle 2: cross-org bounded batch scan for the delivery cron — same
+    // shape as runs.by_status_started (stale-run sweep). Needed because
+    // deliverPendingWebhooks must find pending rows across ALL orgs without
+    // an unindexed table scan.
+    .index("by_status_created", ["status", "createdAt"])
+    // Cycle 2: find every delivery belonging to one fired alert, to decide
+    // when alert_events.deliveryStatus can be rolled up to delivered/failed.
+    .index("by_alert_event", ["alertEventId"]),
 
   // Approximate usage metering, incremented from every ingest path using the
   // same stride-counting contention mitigation as the per-key rate limiter in

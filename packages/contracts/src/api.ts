@@ -122,3 +122,48 @@ export interface ApiError {
   message: string;
   details?: unknown;
 }
+
+// ---------------------------------------------------------------------------
+// Cycle 2 (docs/design/action_layer.md) — key-authed read API. The response
+// shapes for convex/read_api.ts's apiListRuns/apiGetRun/apiGetRunEvents/
+// apiGetReplay, consumed by the CLI and other external, API-key-authenticated
+// callers (as opposed to the Clerk-authenticated web UI's ListRunsResponse/
+// GetRunResponse/ListEventsResponse/GetReplayResponse above, which these
+// deliberately mirror the shape of).
+// ---------------------------------------------------------------------------
+
+export interface ApiListRunsRequest {
+  status?: RunStatus;
+  agentId?: string;
+  environment?: string;
+  sessionId?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface ApiListRunsResponse {
+  runs: Run[];
+  nextCursor?: string;
+  pageSize: number;
+}
+
+export interface ApiGetRunResponse {
+  run: Run;
+  eventCount: number;
+  artifactCount: number;
+}
+
+export interface ApiGetRunEventsRequest {
+  runId: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface ApiGetRunEventsResponse {
+  events: Event[];
+  nextCursor?: string;
+}
+
+export interface ApiGetReplayResponse {
+  projection: import("./replay.js").ReplayProjection;
+}

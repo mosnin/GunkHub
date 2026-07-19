@@ -57,24 +57,125 @@ Prints the CLI and SDK versions.
 ```bash
 $ afr version
 afr (Agent Flight Recorder CLI) v0.1.0
-sdk: v0.4.0
+sdk: v0.4.1
 ```
 
 ### `afr --help` / `afr help`
 
-Prints the command tree and environment variable reference.
+Prints the command tree and environment variable reference. Every subcommand also
+accepts its own `--help` (e.g. `afr runs list --help`), printed instead of running
+the command.
 
-## Coming in cycle 2
+## Read-API commands (DONE)
 
-The following commands are scaffolded (they parse correctly and exit `1` with a clear message) but not yet implemented — they depend on the read API (`GET /api/runs`, `GET /api/runs/:id`, and the replay/tail/export endpoints), which lands in cycle 2 after coordination with the data/ui teams:
+The commands below talk to the public v1 read API (`GET /api/v1/runs`,
+`/api/v1/runs/:id`, `/api/v1/runs/:id/events`, `/api/v1/runs/:id/replay`) —
+`x-api-key` auth with `read` scope, `{ apiVersion, data }` JSON envelopes on
+success and `{ apiVersion, error: { code, message } }` on failure. See
+`src/apiClient.ts` for the client and its error mapping.
+
+Exit codes are consistent across all commands: `0` ok, `1` usage (e.g. missing
+`AFR_API_KEY`/`AFR_BASE_URL`, missing required argument), `2` auth (401/403 —
+bad key or missing `read` scope), `3` not found (404), `4` network/rate-limit/
+server error (429/5xx/connection failure/malformed response).
+
+### `afr runs list`
 
 ```bash
-afr runs list               # List runs
-afr runs get <runId>        # Get a single run
-afr replay <runId>          # Replay a run
-afr tail <runId>            # Tail a run's events live
-afr export <runId>          # Export a run
+$ afr runs list --status failed --limit 5
+ID            STATUS  AGENT           STARTED                   ENDED
+run_a1b2c3d…  failed  agent_support   2026-07-18T09:12:03.000Z  2026-07-18T09:12:05.500Z
+run_e4f5a6b…  failed  agent_support   2026-07-18T08:55:41.000Z  2026-07-18T08:55:44.200Z
+
+$ afr runs list --agent agent_support --json
+{ "runs": [ ... ], "total": 2 }
 ```
+
+Options: `--status`, `--agent`, `--env`, `--session`, `--limit`, `--json`. Prints
+`No runs found.` for an empty result set instead of an empty table.
+
+### `afr runs get <runId>`
+
+```bash
+$ afr runs get run_a1b2c3d4e5f6
+Run:          run_a1b2c3d4e5f6
+Status:       failed
+Agent:        agent_support (version ver_1_2_0)
+Project:      proj_demo
+Started:      2026-07-18T09:12:03.000Z
+Ended:        2026-07-18T09:12:05.500Z
+Duration:     2.5s
+Events:       14
+Artifacts:    1
+```
+
+Options: `--json`.
+
+### `afr replay <runId>`
+
+Fetches the replay projection and renders it as a readable transcript —
+`RUN_STARTED -> ... -> terminal` — the way the landing page's terminal mock
+advertises, plus a failure summary when the run failed.
+
+```bash
+$ afr replay run_a1b2c3d4e5f6
+Run run_a1b2c3d4e5f6 — 14 event(s), 2500ms
+
++0ms       run.started      (agent)  input: "Help me track my order #98765"
++120ms     llm.request      (llm)    model=gpt-4o
++980ms     llm.response     (llm)    "I'll look up order #98765..."
+  +1010ms  tool.call        (tool)   lookup_order({"order_id":"98765"})
+  +1120ms  tool.result      (tool)   {"status":"shipped"}
++2500ms    run.failed       (agent)  Timeout waiting for upstream [ERROR] [DONE]
+
+Failure summary:
+  Primary failure: seq=8 type=run.failed reason=run_failed — Timeout waiting for upstream
+```
+
+Options: `--json` (prints the raw `{ projection, failureSummary }`).
+
+### `afr tail <runId>`
+
+Polls `GET /api/v1/runs/:id/events` and prints new events as they arrive.
+Stops automatically on a terminal event (`run.completed`/`run.failed`/
+`run.cancelled`), after a 10-minute max duration, or on Ctrl-C.
+
+```bash
+$ afr tail run_a1b2c3d4e5f6
+seq=1 type=run.started t=2026-07-18T09:12:03.000Z
+seq=2 type=llm.request t=2026-07-18T09:12:03.120Z
+seq=3 type=llm.response t=2026-07-18T09:12:03.980Z
+seq=4 type=run.completed t=2026-07-18T09:12:05.500Z
+
+(run reached a terminal state — 4 event(s) seen)
+```
+
+Options: `--interval <ms>` (poll interval, default 2000).
+
+### `afr export <runId>`
+
+Assembles a run's run record, full event log, and replay projection as an
+ndjson (default) or json bundle.
+
+**Auth note:** the web app's bundle endpoint (`GET /api/export/runs/:runId`)
+is Clerk-session-authed, not key-authed — a key-authed CLI cannot call it
+directly. `afr export` instead assembles the same kind of bundle
+client-side from the v1 read API (`/api/v1/runs/:id`, `/events`, `/replay`),
+so the CLI stays key-authed end to end. This means a CLI export is a
+**subset** of the web app's: it does NOT include artifacts or comments,
+since the v1 read API does not expose those (as of this cycle). Use the web
+app's export for a complete bundle.
+
+```bash
+$ afr export run_a1b2c3d4e5f6 --out run.ndjson
+Wrote 14 event(s) to run.ndjson
+
+$ afr export run_a1b2c3d4e5f6 --format json | jq .run.status
+"failed"
+```
+
+Options: `--out <file>` (default: print to stdout), `--format ndjson|json`
+(default: `ndjson`).
 
 ## Development
 

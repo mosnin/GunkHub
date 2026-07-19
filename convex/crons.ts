@@ -50,4 +50,14 @@ crons.daily(
   {},
 );
 
+// Cycle 2 (docs/design/action_layer.md): drain due "pending" webhook
+// deliveries (both alert-triggered and the standalone outbound-webhooks
+// feature) every minute, in bounded batches (WEBHOOK_DELIVERY_BATCH_SIZE).
+crons.interval(
+  "deliver-pending-webhooks",
+  { minutes: 1 },
+  makeFunctionReference<"action">("webhook_engine:deliverPendingWebhooks"),
+  {},
+);
+
 export default crons;

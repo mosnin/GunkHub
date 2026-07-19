@@ -1,5 +1,5 @@
 import { CLI_VERSION, main, printConfigCheck, runConfigCheck, runRecordDemo } from '@agent-flight-recorder/cli'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { FetchLike } from '@agent-flight-recorder/cli'
 import type { CreateEventRequest, CreateRunRequest, CreateRunResponse, Run } from '@agent-flight-recorder/contracts'
@@ -70,12 +70,43 @@ describe('afr CLI — arg parsing / dispatch', () => {
     expect(code).toBe(1)
   })
 
-  for (const cmd of [['runs', 'list'], ['runs', 'get', 'run_1'], ['replay', 'run_1'], ['tail', 'run_1'], ['export', 'run_1']]) {
-    it(`'afr ${cmd.join(' ')}' is scaffolded (exits 1, mentions cycle 2)`, async () => {
+  describe('v1-read-API commands without AFR_API_KEY / AFR_BASE_URL configured', () => {
+    const originalEnv = { ...process.env }
+
+    beforeEach(() => {
+      delete process.env['AFR_API_KEY']
+      delete process.env['AFR_BASE_URL']
+    })
+
+    afterEach(() => {
+      process.env = { ...originalEnv }
+    })
+
+    for (const cmd of [['runs', 'list'], ['runs', 'get', 'run_1'], ['replay', 'run_1'], ['tail', 'run_1'], ['export', 'run_1']]) {
+      it(`'afr ${cmd.join(' ')}' exits 1 and points at 'afr config check'`, async () => {
+        const log = vi.fn()
+        const code = await main(cmd, log)
+        expect(code).toBe(1)
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('afr config check'))
+      })
+    }
+  })
+
+  for (const cmd of [['runs', 'list'], ['runs', 'get'], ['replay'], ['tail'], ['export']]) {
+    it(`'afr ${cmd.join(' ')} --help' prints usage and exits 0`, async () => {
+      const log = vi.fn()
+      const code = await main([...cmd, '--help'], log)
+      expect(code).toBe(0)
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('Usage:'))
+    })
+  }
+
+  for (const cmd of [['runs', 'get'], ['replay'], ['tail'], ['export']]) {
+    it(`'afr ${cmd.join(' ')}' without a runId exits 1 with a usage message`, async () => {
       const log = vi.fn()
       const code = await main(cmd, log)
       expect(code).toBe(1)
-      expect(log).toHaveBeenCalledWith(expect.stringContaining('cycle 2'))
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('Usage:'))
     })
   }
 })

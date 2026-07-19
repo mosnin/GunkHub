@@ -3,6 +3,7 @@ import { v } from "convex/values";
 import { query, mutation } from "./_generated/server.js";
 import { recordAuditEvent } from "./audit.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { validateEvalRules } from "./helpers/agent_version_fields.js";
 import { MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 /**
@@ -15,6 +16,12 @@ export const createAgentVersion = mutation({
     version: v.string(),
     changelog: v.optional(v.string()),
     configSnapshot: v.optional(v.any()),
+    // Cycle 2 (docs/design/action_layer.md): optional eval auto-run rule set,
+    // evaluated by Team B's insights.runEvalsForRun against every terminal
+    // run created against this version. Bounded to
+    // MAX_EVAL_RULES_PER_VERSION and shape-validated by validateEvalRules —
+    // see convex/schema.ts for why this is stored as v.array(v.any()).
+    evalRules: v.optional(v.array(v.any())),
   },
   handler: async (ctx, args) => {
     const agent = await ctx.db.get(args.agentId);
@@ -28,6 +35,7 @@ export const createAgentVersion = mutation({
     if (trimmedVersion.length > 64) {
       throw new Error("version must be 64 characters or fewer");
     }
+    validateEvalRules(args.evalRules);
 
     // Uniqueness check within the agent
     const existing = await ctx.db
@@ -49,6 +57,7 @@ export const createAgentVersion = mutation({
       ...(args.configSnapshot !== undefined && {
         configSnapshot: args.configSnapshot,
       }),
+      ...(args.evalRules !== undefined && { evalRules: args.evalRules }),
     });
 
     const doc = await ctx.db.get(id);

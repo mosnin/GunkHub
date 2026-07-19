@@ -1,8 +1,27 @@
 'use server'
 
+import { auth } from '@clerk/nextjs/server'
+
 import type { AgentVersion } from '@agent-flight-recorder/contracts'
 
-import { createAgentVersion } from '@/lib/services/agent_versions'
+import { resolveConvexOrgId } from '@/lib/convexServer'
+import { compareVersions, createAgentVersion, type VersionCompareResult } from '@/lib/services/agent_versions'
+
+/** Server action backing VersionCompare.tsx's picker — resolves the caller's
+    Convex orgId then delegates to services/agent_versions.ts `compareVersions`. */
+export async function compareVersionsAction(
+  versionAId: string,
+  versionBId: string,
+): Promise<VersionCompareResult> {
+  const { orgId: clerkOrgId } = auth()
+  if (!clerkOrgId) return { available: false }
+  try {
+    const convexOrgId = await resolveConvexOrgId(clerkOrgId)
+    return await compareVersions(convexOrgId, versionAId, versionBId)
+  } catch {
+    return { available: false }
+  }
+}
 
 export async function createAgentVersionAction(
   agentId: string,

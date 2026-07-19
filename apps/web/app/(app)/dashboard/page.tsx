@@ -4,6 +4,7 @@ import type { FailedVerification } from '@/lib/services/projection_verify'
 import type { Run } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
+import { DashboardStats } from '@/components/dashboard/DashboardStats'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
 import { RunList } from '@/components/runs/RunList'
@@ -11,6 +12,7 @@ import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { Reveal, RevealGroup, RevealItem } from '@/components/ui/Motion'
+import { getDashboardStats, getPerAgentDashboardStats, type DashboardRange } from '@/lib/services/dashboard'
 import { getRecentFailedVerifications } from '@/lib/services/projection_verify'
 import { listRuns } from '@/lib/services/runs'
 import { truncateId, formatRelativeTime } from '@/lib/utils'
@@ -65,7 +67,13 @@ function failedVerificationBadgeStatus(fv: FailedVerification) {
 
 const SDK_INSTALL = `npm install @agent-flight-recorder/sdk`
 
-export default async function DashboardPage() {
+interface DashboardPageProps {
+  searchParams: { range?: string }
+}
+
+export default async function DashboardPage({ searchParams }: DashboardPageProps) {
+  const range: DashboardRange = searchParams.range === '30d' ? '30d' : '7d'
+
   let runs: Run[] = []
   let error: string | null = null
   let failedVerifications: FailedVerification[] = []
@@ -89,9 +97,22 @@ export default async function DashboardPage() {
     // Non-fatal
   }
 
+  // Analytics — Team B's insights rollup. Independent of the recent-runs
+  // fetch above (and its own error state), so a failure here never blanks
+  // the rest of the page.
+  const [dashboardStats, perAgentStats] = await Promise.all([
+    getDashboardStats(range),
+    getPerAgentDashboardStats(range),
+  ])
+
   return (
     <div className="p-6 max-w-6xl mx-auto">
       <PageHeader title="Dashboard" />
+
+      {/* Analytics — failure-rate trend, token volume, per-agent breakdown. */}
+      <div className="mt-6">
+        <DashboardStats stats={dashboardStats} perAgent={perAgentStats} range={range} />
+      </div>
 
       {error ? (
         <div className="mt-6">

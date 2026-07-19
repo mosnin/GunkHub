@@ -4,6 +4,7 @@ import type { Agent } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
+import { RunSearchBar } from '@/components/runs/RunSearchBar'
 import { SelectableRunList } from '@/components/runs/SelectableRunList'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { listAgentsByOrg } from '@/lib/services/agents'
@@ -19,6 +20,15 @@ export const metadata: Metadata = { title: 'Runs' }
 const VERIFY_VALUES = ['all', 'verified', 'partial', 'failed', 'unverified'] as const
 type VerifyFilter = (typeof VERIFY_VALUES)[number]
 
+/** Well-known environment presets (ADR-002 allows any custom string up to 32
+    chars too — a run whose environment isn't one of these still displays its
+    chip everywhere, it's just not one of the quick-filter pills below). */
+const ENV_VALUES = ['all', 'production', 'staging', 'development', 'preview'] as const
+type EnvFilter = (typeof ENV_VALUES)[number]
+
+const TRIAGE_VALUES = ['all', 'open', 'investigating', 'resolved'] as const
+type TriageFilter = (typeof TRIAGE_VALUES)[number]
+
 interface RunsPageProps {
   searchParams: {
     status?: string
@@ -27,6 +37,8 @@ interface RunsPageProps {
     agentId?: string
     cursor?: string
     verify?: string  // VerifyFilter
+    environment?: string
+    triage?: string  // TriageFilter
   }
 }
 
@@ -94,6 +106,19 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
       ? (searchParams.verify as VerifyFilter)
       : 'all'
 
+  const envFilter: EnvFilter = ENV_VALUES.includes(searchParams.environment as EnvFilter)
+    ? (searchParams.environment as EnvFilter)
+    : 'all' // unset, or a custom (non-preset) value — see customEnvironment below
+  const customEnvironment =
+    searchParams.environment && !ENV_VALUES.includes(searchParams.environment as EnvFilter)
+      ? searchParams.environment
+      : undefined
+
+  const triageFilter: TriageFilter =
+    TRIAGE_VALUES.includes(searchParams.triage as TriageFilter)
+      ? (searchParams.triage as TriageFilter)
+      : 'all'
+
   // Base searchParams dict for href builders. Excludes cursor (reset on filter
   // change) but preserves projectId so clicking a status/range/verify/agent pill
   // while scoped to a project does not silently drop the project filter.
@@ -103,9 +128,12 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
     agentId: searchParams.agentId,
     projectId: searchParams.projectId,
     verify: verifyFilter === 'all' ? undefined : verifyFilter,
+    environment: envFilter === 'all' ? customEnvironment : envFilter,
+    triage: triageFilter === 'all' ? undefined : triageFilter,
   }
 
   const serverVerifyFilter = toServerVerifyFilter(verifyFilter)
+  const effectiveEnvironment = envFilter === 'all' ? customEnvironment : envFilter
 
   try {
     runs = await listRuns({
@@ -115,10 +143,27 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
       agentId: searchParams.agentId,
       cursor: searchParams.cursor,
       verifyFilter: serverVerifyFilter,
+      environment: effectiveEnvironment,
       limit: 50,
     })
   } catch (err) {
     error = err instanceof Error ? err.message : 'Failed to load runs'
+  }
+
+  // Triage has no server-side filter (ADR-002 has no by_org_triage index) —
+  // narrow the already-fetched page client-side, same overfetch-then-filter
+  // tradeoff the fine-grained verify split already accepts above. Only
+  // failed/timed_out runs are triage-eligible; an untriaged eligible run
+  // defaults to "open" (matching setRunTriage's own default), a non-eligible
+  // run has no triage state and is excluded from every triage filter value.
+  if (runs?.runs && triageFilter !== 'all') {
+    const TRIAGE_ELIGIBLE = new Set(['failed', 'timed_out'])
+    runs = {
+      ...runs,
+      runs: runs.runs.filter(
+        (r) => TRIAGE_ELIGIBLE.has(r.status) && (r.triageState ?? 'open') === triageFilter,
+      ),
+    }
   }
 
   // Build version label lookup map for runs that have agentVersionId
@@ -171,6 +216,12 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
         title="Runs"
         subtitle="All agent runs across your organization."
       />
+
+      {/* Search — debounced, navigates to the dedicated /search results page.
+          Press / anywhere on this page to focus it. */}
+      <div className="mt-4">
+        <RunSearchBar />
+      </div>
 
       {/* Filter bar — URL-based, no JS required */}
       <div className="mt-4 flex flex-wrap items-center gap-3">
@@ -287,6 +338,62 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
             </div>
           </div>
         )}
+
+        {/* Environment filter — ADR-002. Custom (non-preset) environment
+            values still work via the URL but don't get a quick pill. */}
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-pewter font-medium uppercase tracking-wider">Env</span>
+          <div className="flex gap-1">
+            {ENV_VALUES.map((e) => {
+              const active = e === 'all' ? envFilter === 'all' && !customEnvironment : envFilter === e
+              const href = buildHref(baseParams, { environment: e === 'all' ? undefined : e })
+              return (
+                <Link
+                  key={e}
+                  href={href}
+                  className={[
+                    'px-2 py-1 rounded text-xs font-mono font-medium border transition-colors duration-100',
+                    active
+                      ? 'bg-primary-900 text-primary-300 border-primary-700'
+                      : 'bg-transparent text-neutral-500 border-neutral-800 hover:text-neutral-300 hover:border-neutral-700',
+                  ].join(' ')}
+                >
+                  {e}
+                </Link>
+              )
+            })}
+            {customEnvironment && (
+              <span className="px-2 py-1 rounded text-xs font-mono font-medium border bg-primary-900 text-primary-300 border-primary-700">
+                {customEnvironment}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Triage filter — ADR-002, applies only to failed/timed_out runs. */}
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-pewter font-medium uppercase tracking-wider">Triage</span>
+          <div className="flex gap-1">
+            {TRIAGE_VALUES.map((t) => {
+              const active = triageFilter === t
+              const href = buildHref(baseParams, { triage: t === 'all' ? undefined : t })
+              return (
+                <Link
+                  key={t}
+                  href={href}
+                  className={[
+                    'px-2 py-1 rounded text-xs font-mono font-medium border transition-colors duration-100',
+                    active
+                      ? 'bg-primary-900 text-primary-300 border-primary-700'
+                      : 'bg-transparent text-neutral-500 border-neutral-800 hover:text-neutral-300 hover:border-neutral-700',
+                  ].join(' ')}
+                >
+                  {t}
+                </Link>
+              )
+            })}
+          </div>
+        </div>
       </div>
 
       <div className="mt-4">

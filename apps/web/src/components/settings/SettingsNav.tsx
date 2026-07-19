@@ -14,6 +14,8 @@ const NAV_ITEMS: SettingsNavItem[] = [
   { label: 'General', href: '/settings' },
   { label: 'Members', href: '/settings/members' },
   { label: 'Usage', href: '/settings/usage' },
+  { label: 'Alerts', href: '/settings/alerts' },
+  { label: 'Webhooks', href: '/settings/webhooks' },
 ]
 
 /**

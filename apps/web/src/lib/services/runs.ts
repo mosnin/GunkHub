@@ -26,14 +26,35 @@ function mapRun(doc: Record<string, unknown>): Run {
     ...(doc.endedAt !== undefined && { endedAt: doc.endedAt as number }),
     ...(doc.triggeredBy !== undefined && { triggeredBy: doc.triggeredBy as string }),
     ...(doc.sdkVersion !== undefined && { sdkVersion: doc.sdkVersion as string }),
+    // ADR-002 — run hierarchy / sessions / environment / triage / search.
+    ...(doc.parentRunId !== undefined && { parentRunId: doc.parentRunId as string }),
+    ...(doc.sessionId !== undefined && { sessionId: doc.sessionId as string }),
+    ...(doc.environment !== undefined && { environment: doc.environment as string }),
+    ...(doc.labels !== undefined && { labels: doc.labels as string[] }),
+    ...(doc.triageState !== undefined && { triageState: doc.triageState as Run['triageState'] }),
+    ...(doc.tokensIn !== undefined && { tokensIn: doc.tokensIn as number }),
+    ...(doc.tokensOut !== undefined && { tokensOut: doc.tokensOut as number }),
   }
+}
+
+/**
+ * ListRunsRequest + the ADR-002 `environment` filter. `environment` is not
+ * yet part of the shared `ListRunsRequest` contract (contracts are owned by
+ * the data team) even though convex/runs.ts `listRuns` already accepts it —
+ * kept as a local extension here rather than editing packages/contracts
+ * unilaterally. Only applied when `verifyFilter` is unset (listRunsByVerification
+ * does not accept it); the /runs page combines the two client-side same as
+ * it already does for the fine-grained verify split.
+ */
+export interface ListRunsParams extends ListRunsRequest {
+  environment?: string
 }
 
 /**
  * List runs for the authenticated organization.
  * Requires an active Clerk session with an org context.
  */
-export async function listRuns(params: ListRunsRequest): Promise<ListRunsResponse> {
+export async function listRuns(params: ListRunsParams): Promise<ListRunsResponse> {
   const { orgId: clerkOrgId } = auth()
   if (!clerkOrgId) throw new Error('Not authenticated — no org context')
 
@@ -59,6 +80,8 @@ export async function listRuns(params: ListRunsRequest): Promise<ListRunsRespons
     ...(params.agentId !== undefined && { agentId: params.agentId }),
     ...(params.status !== undefined && { status: params.status }),
     ...(params.startedAfter !== undefined && { startedAfter: params.startedAfter }),
+    ...(params.verifyFilter === undefined &&
+      params.environment !== undefined && { environment: params.environment }),
     ...(params.limit !== undefined && { limit: params.limit }),
     ...(params.cursor !== undefined && { cursor: params.cursor }),
   })
@@ -138,4 +161,88 @@ export async function createRun(req: CreateRunRequest): Promise<CreateRunRespons
 export async function updateRunTags(runId: string, tags: string[]): Promise<void> {
   const client = await getAuthedClient()
   await client.mutation(convex.runs.updateRunTags, { runId, tags })
+}
+
+// ---------------------------------------------------------------------------
+// ADR-002 — hierarchy / sessions / triage / labels / search
+// ---------------------------------------------------------------------------
+
+/** Direct children of a run (one level), newest-first as returned by Convex. */
+export async function listChildRuns(parentRunId: string): Promise<Run[]> {
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await client.query(convex.runs.listChildRuns, { parentRunId })
+  const res = result as { runs: Record<string, unknown>[] }
+  return (res.runs ?? []).map(mapRun)
+}
+
+/** All runs sharing a sessionId, scoped to the caller's org, newest first. */
+export async function listSessionRuns(sessionId: string): Promise<Run[]> {
+  const { orgId: clerkOrgId } = auth()
+  if (!clerkOrgId) throw new Error('Not authenticated — no org context')
+
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
+  if (!org) throw new Error('Organization not found — run onboarding first')
+  const orgDoc = org as Record<string, unknown>
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await client.query(convex.runs.listSessionRuns, {
+    orgId: orgDoc._id,
+    sessionId,
+  })
+  const res = result as { runs: Record<string, unknown>[] }
+  return (res.runs ?? []).map(mapRun)
+}
+
+/**
+ * Full-text search over runs (name/tags/error text), org-scoped via the
+ * search index's filterFields (see convex/runs.ts `searchRuns`).
+ */
+export async function searchRuns(searchTerm: string, limit = 25): Promise<Run[]> {
+  const { orgId: clerkOrgId } = auth()
+  if (!clerkOrgId) throw new Error('Not authenticated — no org context')
+
+  const trimmed = searchTerm.trim()
+  if (trimmed.length === 0) return []
+
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
+  if (!org) throw new Error('Organization not found — run onboarding first')
+  const orgDoc = org as Record<string, unknown>
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await client.query(convex.runs.searchRuns, {
+    orgId: orgDoc._id,
+    searchTerm: trimmed,
+    limit,
+  })
+  const res = result as { runs: Record<string, unknown>[] }
+  return (res.runs ?? []).map(mapRun)
+}
+
+/**
+ * Set a run's triage state (open/investigating/resolved). Only valid on
+ * failed/timed_out runs — the Convex mutation enforces the linear state
+ * machine and throws INVALID_ARGUMENT on an illegal transition or wrong
+ * status; this function surfaces that message rather than swallowing it.
+ */
+export async function setRunTriage(
+  runId: string,
+  triageState: 'open' | 'investigating' | 'resolved',
+): Promise<Run> {
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await client.mutation(convex.runs.setRunTriage, { runId, triageState })
+  return mapRun(doc as Record<string, unknown>)
+}
+
+/** Replace a run's labels wholesale (distinct from `tags` — ADR-002). */
+export async function setRunLabels(runId: string, labels: string[]): Promise<Run> {
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await client.mutation(convex.runs.setRunLabels, { runId, labels })
+  return mapRun(doc as Record<string, unknown>)
 }
