@@ -287,6 +287,84 @@ describe('webhook_engine.deliverPendingWebhooks', () => {
     const result = await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
     expect(result.failed).toBe(1)
   })
+
+  // AUDIT FIX (cycle 4): deliverWebhook (helpers/delivery.ts) calls
+  // assertSafeWebhookUrl BEFORE its own try/catch, so it THROWS (rather than
+  // returning a normal {ok:false} result) for a target that fails the SSRF
+  // guard. The per-delivery catch block used to only log-and-continue,
+  // never patching the row — so a delivery whose target failed the SSRF
+  // check stayed "pending" with `nextAttemptAt` already due, and the cron
+  // retried it identically forever. This row is seeded by directly inserting
+  // into webhook_targets (bypassing createWebhook/createAlertRule's
+  // creation-time validation, which is now also SSRF-checked) to simulate a
+  // legacy/tampered row and isolate the ENGINE's own defensive behavior.
+  it('a delivery whose target fails the SSRF check at delivery time converges to failed, not an infinite retry', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    const webhookId = await t.run(async (ctx) =>
+      ctx.db.insert('webhook_targets', {
+        orgId: orgA, url: 'https://169.254.169.254/hook', secret: 's', events: ['run.failed'], enabled: true, createdAt: Date.now(),
+      }),
+    )
+    const deliveryId = await t.run((ctx) =>
+      ctx.db.insert('webhook_deliveries', {
+        orgId: orgA, webhookId, event: 'run.failed', status: 'pending', attempts: 0, createdAt: Date.now(), nextAttemptAt: Date.now(),
+      }),
+    )
+
+    // First drain: the SSRF guard throws inside deliverWebhook; the row must
+    // be patched (retried), not silently left "pending" forever.
+    const first = await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+    expect(first.retried).toBe(1)
+    let delivery = await t.run((ctx) => ctx.db.get(deliveryId))
+    expect(delivery!.status).toBe('pending')
+    expect(delivery!.attempts).toBe(1)
+    expect(delivery!.nextAttemptAt).toBeGreaterThan(Date.now() - 1)
+    expect(delivery!.error).toMatch(/unsafe|private|reserved/i)
+
+    // Force due repeatedly — it must terminally converge to "failed" within
+    // WEBHOOK_MAX_ATTEMPTS, exactly like any other retryable failure, rather
+    // than retrying without bound.
+    for (let i = 0; i < 10; i++) {
+      const current = await t.run((ctx) => ctx.db.get(deliveryId))
+      if (current!.status === 'failed') break
+      await t.run((ctx) => ctx.db.patch(deliveryId, { nextAttemptAt: Date.now() - 1 }))
+      await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+    }
+    delivery = await t.run((ctx) => ctx.db.get(deliveryId))
+    expect(delivery!.status).toBe('failed')
+    expect(delivery!.attempts).toBe(6) // WEBHOOK_MAX_ATTEMPTS
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SSRF guard now also enforced at CREATION time (defense in depth) — see the
+// fix in convex/alerts.ts validateChannels and convex/webhooks.ts
+// validateWebhookArgs. Previously both only checked `startsWith("https://")`.
+// ---------------------------------------------------------------------------
+describe('SSRF guard enforced at webhook/alert-rule creation time', () => {
+  it('createWebhook rejects a private-IP https:// target', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    await expect(
+      asAdmin.mutation(api.webhooks.createWebhook, {
+        orgId: orgA, url: 'https://169.254.169.254/hook', events: ['run.failed'],
+      }),
+    ).rejects.toThrow(/unsafe/i)
+  })
+
+  it('createAlertRule rejects a webhook channel targeting a private IP', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    await expect(
+      asAdmin.mutation(api.alerts.createAlertRule, {
+        orgId: orgA, name: 'bad', kind: 'run_failed',
+        channels: [{ type: 'webhook', target: 'https://169.254.169.254/hook' }],
+      }),
+    ).rejects.toThrow(/unsafe/i)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -439,6 +517,32 @@ describe('read_api — key scope enforcement and cross-org rejection', () => {
     expect(replay.frames[0].actor).toBe('system')
   })
 
+  // AUDIT FIX (cycle 4): when `agentId` was supplied, apiListRuns selected
+  // `by_agent_started` and silently dropped `status` (and `environment`)
+  // entirely — `agentId=X&status=failed` used to return ALL of agent X's
+  // runs, completed ones included, with no error.
+  it('combined agentId + status narrows correctly (previously status was silently dropped)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'agent_status_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] })
+    })
+    const failedRun = await seedFailedRun(t, orgA, projectA, agentA)
+    const completedRun = await t.run(async (ctx) => {
+      const now = Date.now()
+      return await ctx.db.insert('runs', {
+        orgId: orgA, projectId: projectA, agentId: agentA, status: 'completed', startedAt: now, endedAt: now, metadata: {}, tags: [],
+      })
+    })
+
+    const list = await t.mutation(api.read_api.apiListRuns, {
+      apiKeyHash: 'agent_status_key', agentId: String(agentA), status: 'failed',
+    })
+    const ids = list.runs.map((r: any) => r._id)
+    expect(ids).toContain(failedRun)
+    expect(ids).not.toContain(completedRun)
+  })
+
   it("a key from org B cannot read org A's run (cross-org rejected)", async () => {
     const t = convexTest(schema, modules)
     const { orgA, orgB, projectA, agentA } = await seedTwoOrgs(t)
@@ -531,6 +635,71 @@ describe('eval auto-run — scheduler wiring end to end', () => {
 
     // The alert engine was also scheduled (no alert_rules configured here, so
     // it evaluates zero rules but must not throw).
+  })
+
+  // AUDIT FIX (cycle 4): createEvent/sdkCreateEvents used to schedule
+  // alert_engine.evaluateAlertsForRun AND insights.runEvalsForRun as two
+  // independent runAfter(0, ...) calls off the same terminal event. Convex
+  // does not guarantee execution order between two independently-scheduled
+  // functions, so an "eval_failed" alert rule could observe zero `evals`
+  // rows for the very run whose auto-run eval just failed — silently missing
+  // the alert forever (evaluateAlertsForRun only ever runs once per terminal
+  // event). The fix makes runEvalsForRun schedule evaluateAlertsForRun
+  // itself, after its own eval inserts commit. This test exercises the real,
+  // end-to-end ingest path (not a direct call to evaluateAlertsForRun with
+  // pre-seeded evals, which the older eval_failed test above used and which
+  // would never have caught this race).
+  it('an eval_failed alert rule fires off the REAL ingest path, via an auto-run eval that fails', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, agentA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+
+    // An eval rule that will FAIL for a run ending "completed" (it expects "failed").
+    const version = await asAdmin.mutation(api.agent_versions.createAgentVersion, {
+      agentId: agentA,
+      version: 'v1',
+      evalRules: [{ kind: 'terminal_status', expect: ['failed'] }],
+    })
+    await asAdmin.mutation(api.alerts.createAlertRule, {
+      orgId: orgA, name: 'eval-gate', kind: 'eval_failed',
+      channels: [{ type: 'webhook', target: 'https://example.com/hook' }],
+    })
+    await t.run((ctx) =>
+      ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'eval_race_key', name: 'k', createdBy: 'u', createdAt: Date.now() }),
+    )
+
+    // Drives the REAL API-key ingest path (sdk_ingest.ts), which — unlike
+    // the Clerk-authenticated events.ts createEvent path (see the deferred
+    // finding this test surfaced) — reconciles run.status to "completed" on
+    // the terminal event itself, so the terminal_status rule evaluates
+    // against the run's true final status.
+    const created = await t.mutation(api.sdk_ingest.sdkCreateRun, {
+      apiKeyHash: 'eval_race_key', agentId: String(agentA), agentVersionId: String(version._id),
+    })
+    const runId = created.id
+
+    vi.useFakeTimers()
+    try {
+      await t.mutation(api.sdk_ingest.sdkCreateEvents, {
+        apiKeyHash: 'eval_race_key',
+        events: [
+          { runId: String(runId), type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} },
+          // Run ends "completed" -> the terminal_status rule (expects "failed") fails.
+          { runId: String(runId), type: 'run.completed', sequenceNumber: 2, timestamp: Date.now(), payload: {} },
+        ],
+      })
+      await t.finishAllScheduledFunctions(vi.runAllTimers)
+    } finally {
+      vi.useRealTimers()
+    }
+
+    const evals = await t.run((ctx) => ctx.db.query('evals').withIndex('by_run', (q) => q.eq('runId', runId)).collect())
+    expect(evals.some((e) => e.name === 'eval_summary' && e.passed === false)).toBe(true)
+
+    // The critical assertion: the eval_failed alert rule must have seen the
+    // just-inserted failing eval and fired for THIS run.
+    const alertEvents = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(alertEvents.some((ae) => ae.runId === runId)).toBe(true)
   })
 
   it('rejects more than MAX_EVAL_RULES_PER_VERSION rules on createAgentVersion', async () => {

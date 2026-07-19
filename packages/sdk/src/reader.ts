@@ -19,7 +19,8 @@
  * Uses only the native `fetch` — no HTTP framework dependency, consistent
  * with the rest of the SDK.
  */
-import { fetchV1 } from './v1-client.js'
+import { warnIfInsecureEndpoint } from './transport.js'
+import { fetchV1, V1ApiError } from './v1-client.js'
 
 import type { V1ApiConfig, V1FetchLike } from './v1-client.js'
 import type { Event, FailureSummary, ReplayProjection, Run, RunStatus } from '@agent-flight-recorder/contracts'
@@ -72,6 +73,14 @@ export interface FlightReaderConfig {
   baseUrl: string
   /** An API key carrying the `read` scope (see `docs/api_reference.md` — a write-only `ingest:write` key is rejected with 403). */
   apiKey: string
+  /**
+   * Suppress the one-time console warning emitted when `baseUrl` uses plain
+   * HTTP to a non-localhost host (the read-scoped API key would transit in
+   * cleartext) — same warning, and same opt-out, as `RecorderConfig.options.
+   * allowInsecureEndpoint` / `FlightRecorderConfig.allowInsecureEndpoint`.
+   * Default: false.
+   */
+  allowInsecureEndpoint?: boolean
 }
 
 /**
@@ -98,6 +107,10 @@ export class FlightReader {
   constructor(config: FlightReaderConfig, fetchImpl?: V1FetchLike) {
     this.config = { baseUrl: config.baseUrl, apiKey: config.apiKey }
     this.fetchImpl = fetchImpl
+    // Same cleartext-transit warning as the write paths (HttpTransport /
+    // FlightRecorder) — a read-scoped key sent over plain HTTP to a
+    // non-localhost host is just as exposed as a write-scoped one.
+    warnIfInsecureEndpoint(config.baseUrl, config.allowInsecureEndpoint)
   }
 
   /**
@@ -155,18 +168,48 @@ export class FlightReader {
    * {@link getRunEvents} — a consumer that `break`s out of the loop early
    * simply stops paging.
    *
+   * Guards against a misbehaving (or hostile) server hanging the caller
+   * forever: if `nextCursor` is ever identical to the cursor just requested
+   * (no pagination progress) or the loop exceeds `maxPages`, the generator
+   * throws a {@link V1ApiError} with `kind: 'invalid_response'` instead of
+   * looping without end.
+   *
    * @param runId - the run's id.
-   * @param options - `pageSize` controls the `limit` sent on each underlying request (server-capped).
+   * @param options - `pageSize` controls the `limit` sent on each underlying
+   *   request (server-capped). `maxPages` bounds total pages fetched
+   *   (default: 100 000 — effectively unbounded for any real run, but finite).
+   * @throws {@link V1ApiError} on a request failure, a non-advancing cursor, or `maxPages` exceeded.
    */
-  async *iterateEvents(runId: string, options: { pageSize?: number } = {}): AsyncGenerator<Event, void, void> {
+  async *iterateEvents(
+    runId: string,
+    options: { pageSize?: number; maxPages?: number } = {}
+  ): AsyncGenerator<Event, void, void> {
+    const maxPages = options.maxPages ?? 100_000
     let cursor: string | undefined
+    let pages = 0
     do {
+      if (pages >= maxPages) {
+        throw new V1ApiError(
+          'invalid_response',
+          `iterateEvents(${runId}) aborted after ${maxPages} pages without reaching the end of the event log.`
+        )
+      }
+      pages++
       const page = await this.getRunEvents(runId, {
         ...(options.pageSize !== undefined && { limit: options.pageSize }),
         ...(cursor !== undefined && { cursor }),
       })
       for (const event of page.events) {
         yield event
+      }
+      if (page.nextCursor !== undefined && page.nextCursor === cursor) {
+        // The server returned the same cursor it was just given — pagination
+        // is not advancing. Looping forever on a stalled cursor is worse than
+        // failing loudly: it would hang the caller's process indefinitely.
+        throw new V1ApiError(
+          'invalid_response',
+          `iterateEvents(${runId}): server returned a non-advancing cursor ("${page.nextCursor}") — refusing to loop forever.`
+        )
       }
       cursor = page.nextCursor
     } while (cursor !== undefined)

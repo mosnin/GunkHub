@@ -14,6 +14,7 @@ import { v } from "convex/values";
 import { internalMutation, query, mutation } from "./_generated/server.js";
 import { recordAuditEvent } from "./audit.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from "./helpers/delivery.js";
 import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_WEBHOOK_EVENTS } from "./helpers/pagination.js";
 
@@ -30,6 +31,19 @@ const WEBHOOK_EVENT_TYPES = new Set<string>([
 function validateWebhookArgs(args: { url: string; events: string[] }): void {
   if (!args.url.startsWith("https://")) {
     throw afrError("INVALID_ARGUMENT", "Webhook url must be an https:// URL");
+  }
+  // AUDIT FIX (cycle 4): `startsWith("https://")` alone lets a private/
+  // reserved-IP or blocked-internal-hostname target through (e.g.
+  // "https://169.254.169.254/"), which would only fail later, at DELIVERY
+  // time, inside deliverWebhook's assertSafeWebhookUrl call — see the fix in
+  // convex/webhook_engine.ts for why that used to wedge the delivery
+  // forever. Run the real SSRF guard here too, as defense in depth, so an
+  // unsafe target is rejected at creation time with a clear error.
+  try {
+    assertSafeWebhookUrl(args.url);
+  } catch (err) {
+    const reason = err instanceof UnsafeWebhookUrlError ? err.message : "invalid webhook URL";
+    throw afrError("INVALID_ARGUMENT", `Webhook url is unsafe: ${reason}`);
   }
   if (args.events.length === 0 || args.events.length > MAX_WEBHOOK_EVENTS) {
     throw afrError(

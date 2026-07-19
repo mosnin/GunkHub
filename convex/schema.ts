@@ -468,7 +468,14 @@ export default defineSchema({
     nextAttemptAt: v.optional(v.number()),
   })
     .index("by_status_created", ["status", "createdAt"])
-    .index("by_alert_event", ["alertEventId"]),
+    .index("by_alert_event", ["alertEventId"])
+    // AUDIT FIX (cycle 4): ADR 001's org purge (convex/retention.ts) must be
+    // able to enumerate and delete every row belonging to a purged org — see
+    // that file's purgeOrganizationBatch. email_deliveries had no org-scoped
+    // index (only by_status_created / by_alert_event), which made it
+    // impossible to find this table's rows for an org without an unbounded,
+    // cross-org table scan. Mirrors webhook_deliveries.by_org.
+    .index("by_org", ["orgId", "createdAt"]),
 
   daily_rollups: defineTable({
     orgId: v.id("organizations"),

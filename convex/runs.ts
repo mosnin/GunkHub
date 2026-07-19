@@ -128,8 +128,22 @@ export const listRuns = query({
     // an in-memory secondary filter — same overfetch-then-filter tradeoff already
     // accepted elsewhere (listRunsByVerification) rather than adding yet more
     // compound indexes for every filter combination.
+    //
+    // AUDIT FIX (cycle 4): `status` needs the exact same secondary-filter
+    // treatment. When `agentId` (or `projectId`) is supplied, the branches
+    // above select `by_agent_started`/`by_project_started`, which does NOT
+    // encode `status` — so `status` was silently dropped whenever it was
+    // combined with `agentId`/`projectId` (e.g. `?agentId=X&status=failed`
+    // used to return ALL of agent X's runs, not just its failed ones, with
+    // no error). Re-applying it here is redundant-but-harmless in the
+    // branches where the index already encoded it (by_org_status /
+    // by_org_status_started) and load-bearing in the agentId/projectId
+    // branches where it didn't.
     const filtered = runsQuery
       .filter((q) => q.eq(q.field("orgId"), args.orgId))
+      .filter((q) =>
+        args.status === undefined ? q.eq(q.field("_id"), q.field("_id")) : q.eq(q.field("status"), args.status),
+      )
       .filter((q) =>
         args.environment === undefined
           ? q.eq(q.field("_id"), q.field("_id"))

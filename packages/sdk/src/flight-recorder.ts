@@ -393,11 +393,17 @@ export class RunRecorder {
    */
   async fail(error: Error | string): Promise<void> {
     const originalError = error instanceof Error ? error : new Error(error)
+    // Preserve `.code` (e.g. a Node-style ECONNRESET/ENOENT on a fetch/fs
+    // error) the same way the buffered Recorder's failRun() does — dropping it
+    // here would silently discard diagnostic information the caller attached
+    // to the error, undermining "make failures explainable" (CLAUDE.md).
+    const code = 'code' in originalError ? (originalError as { code?: unknown }).code : undefined
     const payload: RunFailedPayload = {
       type: 'run.failed',
       error: {
         message: originalError.message,
         ...(originalError.stack !== undefined && { stack: originalError.stack }),
+        ...(typeof code === 'string' && { code }),
       },
       duration_ms: Date.now() - this.startedAt,
     }

@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER } from '@agent-flight-recorder/contracts'
-import { Recorder, HttpTransport, FlightRecorder, SDK_VERSION } from '@agent-flight-recorder/sdk'
+import { Recorder, HttpTransport, FlightRecorder, FlightReader, SDK_VERSION } from '@agent-flight-recorder/sdk'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 import type {
@@ -295,6 +295,23 @@ describe('insecure endpoint warning', () => {
       agentId: 'a',
       allowInsecureEndpoint: true,
     })
+    expect(warnSpy).not.toHaveBeenCalled()
+  })
+
+  it('warns for a plain-HTTP non-localhost baseUrl (FlightReader) — parity with the write paths', () => {
+    new FlightReader({ apiKey: 'k', baseUrl: 'http://insecure-e.example.com' })
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(String(warnSpy.mock.calls[0][0])).toContain('plain HTTP')
+  })
+
+  it('FlightReader insecure warning is suppressed by allowInsecureEndpoint: true', () => {
+    new FlightReader({ apiKey: 'k', baseUrl: 'http://insecure-f.example.com', allowInsecureEndpoint: true })
+    expect(warnSpy).not.toHaveBeenCalled()
+  })
+
+  it('does not warn for a FlightReader over https or localhost', () => {
+    new FlightReader({ apiKey: 'k', baseUrl: 'https://afr.example.com' })
+    new FlightReader({ apiKey: 'k', baseUrl: 'http://localhost:3000' })
     expect(warnSpy).not.toHaveBeenCalled()
   })
 })

@@ -192,12 +192,16 @@ const VALID_EVENT_TYPES = new Set<string>([
 const MAX_INLINE_PAYLOAD_BYTES = 10 * 1024;
 
 // Cycle 2 (docs/design/action_layer.md) — see convex/events.ts for the full
-// rationale on makeFunctionReference-by-name here and the
-// _runEvalsForRunRef coordination note (Team B's convex/insights.ts has not
-// landed as of this change; this typechecks regardless and resolves at
-// runtime once it does).
-const _evaluateAlertsForRunRef = makeFunctionReference<"mutation">("alert_engine:evaluateAlertsForRun");
-const _runEvalsForRunRef = makeFunctionReference<"mutation">("insights:runEvalsForRun");
+// rationale on makeFunctionReference-by-name here. AUDIT FIX (cycle 4): a
+// single action (alert_engine.runEvalsThenEvaluateAlerts) is scheduled now,
+// instead of independently scheduling alert_engine.evaluateAlertsForRun and
+// insights.runEvalsForRun — the former used to be able to race the latter's
+// auto-run eval inserts, causing an "eval_failed" alert rule to silently
+// never fire for the run whose eval had just failed. See that action's doc
+// comment in convex/alert_engine.ts for the full rationale.
+const _runEvalsThenEvaluateAlertsRef = makeFunctionReference<"action">(
+  "alert_engine:runEvalsThenEvaluateAlerts",
+);
 
 /**
  * Throws if a payload exceeds the 10 KB inline limit (UTF-8 bytes). Applied to
@@ -609,14 +613,13 @@ export const sdkCreateEvents = mutation({
         }
         await ctx.db.patch(runId, patch);
 
-        // Cycle 2 (docs/design/action_layer.md): schedule alert evaluation +
-        // eval auto-run on the terminal event, NON-BLOCKING. See
+        // Cycle 2 (docs/design/action_layer.md): schedule eval auto-run +
+        // alert evaluation on the terminal event, NON-BLOCKING. See
         // convex/events.ts createEvent for the identical Clerk-authenticated
-        // path and the coordination note above on _runEvalsForRunRef
-        // (Team B's function — typechecks now, resolves at runtime once
-        // convex/insights.ts lands).
-        await ctx.scheduler.runAfter(0, _evaluateAlertsForRunRef, { runId });
-        await ctx.scheduler.runAfter(0, _runEvalsForRunRef, { runId });
+        // path. AUDIT FIX (cycle 4): scheduled as ONE action that sequences
+        // the two mutations with a real ordering guarantee (see the
+        // module-level comment above).
+        await ctx.scheduler.runAfter(0, _runEvalsThenEvaluateAlertsRef, { runId });
       }
 
       // Advance in-memory state so the next event in the batch validates against it.

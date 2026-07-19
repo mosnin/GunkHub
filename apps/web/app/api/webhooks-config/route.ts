@@ -6,6 +6,7 @@ import type { ApiError, WebhookEventType } from '@agent-flight-recorder/contract
 import { hasOrgAuthContext } from '@/lib/apiAuthGuard'
 import { mapApiError } from '@/lib/apiErrorMapping'
 import { withApiHandler } from '@/lib/apiHandler'
+import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from '@/lib/delivery'
 import { createWebhook, listWebhooks } from '@/lib/services/webhooks_config'
 
 const VALID_EVENTS = new Set<string>(['run.completed', 'run.failed', 'eval.failed', 'alert.fired'])
@@ -71,6 +72,23 @@ export const POST = withApiHandler(
         { code: 'VALIDATION_ERROR', message: 'url is required and must be an https:// URL' },
         { status: 422 }
       )
+    }
+    // Defense in depth: reject SSRF-unsafe targets (private/reserved IPs,
+    // localhost, .internal/.local suffixes) at registration time too, not
+    // only at delivery time. deliverWebhook (lib/delivery.ts) already refuses
+    // to send to these — validating here means an admin gets an immediate,
+    // actionable 422 instead of a webhook target that will silently never
+    // deliver once the delivery worker is wired (docs/design/action_layer.md).
+    try {
+      assertSafeWebhookUrl(url)
+    } catch (err) {
+      if (err instanceof UnsafeWebhookUrlError) {
+        return NextResponse.json<ApiError>(
+          { code: 'VALIDATION_ERROR', message: err.message },
+          { status: 422 }
+        )
+      }
+      throw err
     }
     const events = body['events']
     if (

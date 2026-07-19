@@ -219,6 +219,9 @@ export function WebhooksSection({ initialWebhooks, isAdmin, loadError }: Webhook
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               placeholder="https://your-endpoint.example.com/webhook"
+              aria-label="Webhook URL"
+              aria-invalid={createError ? true : undefined}
+              aria-describedby={createError ? 'webhook-create-error' : undefined}
               className="h-8 px-2 rounded-[4px] bg-graphite border border-graphite-light text-sm text-whiteout placeholder-pewter font-mono outline-none focus:ring-1 focus:ring-neon-glow"
             />
             <div className="flex flex-wrap gap-3">
@@ -243,7 +246,7 @@ export function WebhooksSection({ initialWebhooks, isAdmin, loadError }: Webhook
             >
               {creating ? 'Creating…' : 'Add webhook'}
             </Button>
-            {createError && <p className="text-xs text-destructive-400">{createError}</p>}
+            {createError && <p id="webhook-create-error" role="alert" className="text-xs text-destructive-400">{createError}</p>}
           </div>
 
           {loadError ? (

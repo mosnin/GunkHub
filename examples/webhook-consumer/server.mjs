@@ -32,6 +32,14 @@ import { createServer } from 'node:http'
 // matching the 300s (5 minute) tolerance documented in docs/api_reference.md.
 const DEFAULT_TOLERANCE_SECONDS = 300
 
+// Hard cap on request body size. AFR webhook payloads are small JSON event
+// envelopes (never large blobs — those stay externalized as artifact
+// pointers per the event-log rules), so this is generous headroom, not a
+// tight fit. Without a cap, a slow/hostile sender (or a bug on either side)
+// could stream an unbounded body and exhaust this process's memory before
+// signature verification ever runs.
+const MAX_BODY_BYTES = 5 * 1024 * 1024 // 5 MiB
+
 /**
  * Parse an `x-afr-signature` header of the form `t=<seconds>,v1=<hex>` into
  * its parts. Returns null if the header is missing or malformed.
@@ -104,11 +112,37 @@ function rememberDelivery(deliveryId) {
   return alreadySeen
 }
 
-function readRawBody(req) {
+class PayloadTooLargeError extends Error {}
+
+/**
+ * Read the full request body, bounded to `maxBytes`. Once the running total
+ * crosses the cap, further chunks are dropped (not buffered — this is what
+ * bounds memory) but the stream keeps draining until `end` rather than
+ * destroying the socket outright: cutting the connection mid-upload can race
+ * the client's own write and surface as a confusing connection-reset error
+ * instead of the intended 413 response. Draining to completion lets the
+ * handler respond normally once the client finishes sending.
+ */
+function readRawBody(req, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = []
-    req.on('data', (chunk) => chunks.push(chunk))
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    let total = 0
+    let exceeded = false
+    req.on('data', (chunk) => {
+      total += chunk.length
+      if (total > maxBytes) {
+        exceeded = true
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      if (exceeded) {
+        reject(new PayloadTooLargeError(`body exceeds ${String(maxBytes)} bytes`))
+        return
+      }
+      resolve(Buffer.concat(chunks).toString('utf8'))
+    })
     req.on('error', reject)
   })
 }
@@ -124,7 +158,21 @@ export function createHandler(secret, { log = console.log } = {}) {
       return
     }
 
-    const rawBody = await readRawBody(req)
+    let rawBody
+    try {
+      rawBody = await readRawBody(req)
+    } catch (err) {
+      if (err instanceof PayloadTooLargeError) {
+        log(`[webhook-consumer] rejected oversized request body: ${err.message}`)
+        if (!res.headersSent) {
+          res.writeHead(413, { 'content-type': 'application/json' }).end(
+            JSON.stringify({ error: 'payload too large' }),
+          )
+        }
+        return
+      }
+      throw err
+    }
     const signatureHeader = req.headers['x-afr-signature']
     const eventType = req.headers['x-afr-event'] ?? 'unknown'
     const deliveryId = req.headers['x-afr-delivery-id'] ?? null

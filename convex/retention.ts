@@ -63,8 +63,8 @@ interface BatchResult {
 
 /**
  * Delete up to `budget` documents belonging to one RUN, in dependency order:
- * run-targeted comments → verification_results → artifacts → events (plus any
- * event-targeted comments) → finally the run document itself.
+ * run-targeted comments → verification_results → evals → artifacts → events
+ * (plus any event-targeted comments) → finally the run document itself.
  * Returns done=true once the run document has been deleted.
  */
 async function purgeRunSlice(
@@ -98,6 +98,23 @@ async function purgeRunSlice(
       .take(remaining());
     for (const r of results) {
       await ctx.db.delete(r._id);
+      deleted++;
+    }
+  }
+
+  // 2b. AUDIT FIX (cycle 4): evals recorded against this run (ADR-002 —
+  // append-only, same erasure obligation as comments/verification_results).
+  // This was missing entirely: a retention-window run deletion, and every
+  // per-run slice inside an org purge, left `evals` rows referencing a
+  // deleted runId behind forever — a real erasure gap (an eval's `details`
+  // field can carry arbitrary, possibly-sensitive text quoted from the run).
+  if (remaining() > 0) {
+    const evalRows = await ctx.db
+      .query("evals")
+      .withIndex("by_run", (q) => q.eq("runId", runId))
+      .take(remaining());
+    for (const ev of evalRows) {
+      await ctx.db.delete(ev._id);
       deleted++;
     }
   }
@@ -207,6 +224,89 @@ export const purgeOrganizationBatch = internalMutation({
       .take(remaining());
     for (const m of memberships) {
       await ctx.db.delete(m._id);
+      deleted++;
+    }
+    if (remaining() <= 0) return { deleted, storageKeys, done: false };
+
+    // 0c. AUDIT FIX (cycle 4): webhook_targets — deleted alongside api_keys
+    // above, before any other org data. Like an API key, a webhook target
+    // carries a live credential (its plaintext signing secret, per ADR-002's
+    // documented tradeoff) that must not outlive the org it authenticates
+    // for. This entire ADR-002/ADR-003 table set (alert_rules, alert_events,
+    // webhook_targets, webhook_deliveries, email_deliveries, usage_counters,
+    // daily_rollups) landed AFTER ADR 001's purge was written and was never
+    // wired into it — every one of these tables was previously left behind,
+    // permanently, by an org purge, which is a genuine erasure-obligation gap
+    // (ADR 001 requires "cascades deletion of ALL data belonging to a single
+    // organization"). Order among these seven is not load-bearing (none of
+    // them gate write authorization the way api_keys/memberships do), so they
+    // are grouped here as one step, each org-indexed and bounded.
+    const webhookTargets = await ctx.db
+      .query("webhook_targets")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .take(remaining());
+    for (const w of webhookTargets) {
+      await ctx.db.delete(w._id);
+      deleted++;
+    }
+    if (remaining() <= 0) return { deleted, storageKeys, done: false };
+
+    const webhookDeliveries = await ctx.db
+      .query("webhook_deliveries")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .take(remaining());
+    for (const w of webhookDeliveries) {
+      await ctx.db.delete(w._id);
+      deleted++;
+    }
+    if (remaining() <= 0) return { deleted, storageKeys, done: false };
+
+    const emailDeliveries = await ctx.db
+      .query("email_deliveries")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .take(remaining());
+    for (const e of emailDeliveries) {
+      await ctx.db.delete(e._id);
+      deleted++;
+    }
+    if (remaining() <= 0) return { deleted, storageKeys, done: false };
+
+    const alertEvents = await ctx.db
+      .query("alert_events")
+      .withIndex("by_org_fired", (q) => q.eq("orgId", args.orgId))
+      .take(remaining());
+    for (const ae of alertEvents) {
+      await ctx.db.delete(ae._id);
+      deleted++;
+    }
+    if (remaining() <= 0) return { deleted, storageKeys, done: false };
+
+    const alertRules = await ctx.db
+      .query("alert_rules")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .take(remaining());
+    for (const ar of alertRules) {
+      await ctx.db.delete(ar._id);
+      deleted++;
+    }
+    if (remaining() <= 0) return { deleted, storageKeys, done: false };
+
+    const usageCounters = await ctx.db
+      .query("usage_counters")
+      .withIndex("by_org_day", (q) => q.eq("orgId", args.orgId))
+      .take(remaining());
+    for (const u of usageCounters) {
+      await ctx.db.delete(u._id);
+      deleted++;
+    }
+    if (remaining() <= 0) return { deleted, storageKeys, done: false };
+
+    const dailyRollups = await ctx.db
+      .query("daily_rollups")
+      .withIndex("by_org_date", (q) => q.eq("orgId", args.orgId))
+      .take(remaining());
+    for (const d of dailyRollups) {
+      await ctx.db.delete(d._id);
       deleted++;
     }
     if (remaining() <= 0) return { deleted, storageKeys, done: false };

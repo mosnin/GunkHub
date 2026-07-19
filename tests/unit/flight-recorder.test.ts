@@ -449,6 +449,24 @@ describe('RunRecorder', () => {
     await expect(run.fail('plain string error')).rejects.toThrow('plain string error')
   })
 
+  it('fail preserves error.code on the recorded run.failed payload (parity with Recorder.failRun)', async () => {
+    const run = await fr.startRun()
+    const err = new Error('connection reset') as Error & { code?: string }
+    err.code = 'ECONNRESET'
+    await expect(run.fail(err)).rejects.toThrow('connection reset')
+
+    const eventCalls = mockFetch.mock.calls.filter(
+      ([url, init]: FetchArgs) =>
+        (url as string).endsWith('/api/events') && init?.method === 'POST'
+    )
+    // The last /api/events POST is the run.failed terminal event.
+    const evtCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
+    const body = JSON.parse((evtCall[1] as RequestInit).body as string) as {
+      payload: { error: { code?: string } }
+    }
+    expect(body.payload.error.code).toBe('ECONNRESET')
+  })
+
   it('fail swallows status-update failure and still re-throws original error', async () => {
     // Route by URL so auto-emitted lifecycle events (run.started/run.failed) don't
     // shift a positional mock chain: runs+events succeed, the PATCH status fails.

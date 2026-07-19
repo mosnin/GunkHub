@@ -145,6 +145,39 @@ describe('FlightReader', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1) // never fetched page 2
   })
 
+  it('iterateEvents() throws instead of looping forever when the server returns a non-advancing cursor', async () => {
+    const fetchImpl: V1FetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { events: [makeEvent()], nextCursor: 'stuck' } })
+    )
+    const reader = new FlightReader(config, fetchImpl)
+    const seen: Event[] = []
+    await expect(async () => {
+      for await (const event of reader.iterateEvents('run_1')) {
+        seen.push(event)
+        if (seen.length > 3) break // safety valve in case the guard regresses
+      }
+    }).rejects.toMatchObject({ kind: 'invalid_response' })
+    // Only the first request should have happened before the second page came
+    // back with the SAME cursor it was given, tripping the guard.
+    expect((fetchImpl as ReturnType<typeof vi.fn>).mock.calls.length).toBeLessThanOrEqual(2)
+  })
+
+  it('iterateEvents() respects an explicit maxPages bound', async () => {
+    let calls = 0
+    const fetchImpl: V1FetchLike = vi.fn(async () => {
+      calls++
+      return jsonResponse(200, { apiVersion: 'v1', data: { events: [makeEvent()], nextCursor: `cur-${calls}` } })
+    })
+    const reader = new FlightReader(config, fetchImpl)
+    const seen: Event[] = []
+    await expect(async () => {
+      for await (const event of reader.iterateEvents('run_1', { maxPages: 3 })) {
+        seen.push(event)
+      }
+    }).rejects.toMatchObject({ kind: 'invalid_response' })
+    expect(calls).toBe(3)
+  })
+
   it('getReplay() hits GET /api/v1/runs/:id/replay', async () => {
     const replay = {
       projection: { runId: 'run_1', frames: [], totalEvents: 0, duration_ms: 0, isComplete: true, isFailed: false },

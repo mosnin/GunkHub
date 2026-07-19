@@ -11,6 +11,7 @@ import { v } from "convex/values";
 import { internalMutation, query, mutation } from "./_generated/server.js";
 import { recordAuditEvent } from "./audit.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from "./helpers/delivery.js";
 import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_ALERT_CHANNELS, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
@@ -33,8 +34,23 @@ function validateChannels(channels: Array<{ type: "webhook" | "email"; target: s
     );
   }
   for (const c of channels) {
-    if (c.type === "webhook" && !c.target.startsWith("https://")) {
-      throw afrError("INVALID_ARGUMENT", "A webhook channel's target must be an https:// URL");
+    if (c.type === "webhook") {
+      // AUDIT FIX (cycle 4): the old `startsWith("https://")` check let an
+      // otherwise-https URL through even when it points at a private/
+      // reserved IP or a blocked internal hostname (e.g.
+      // "https://169.254.169.254/") — a target that would then throw at
+      // DELIVERY time from assertSafeWebhookUrl inside deliverWebhook,
+      // wedging that delivery forever if the catch site didn't handle it
+      // (see the fix in convex/webhook_engine.ts). Run the real SSRF guard
+      // HERE too, as defense in depth, so an unsafe target is rejected at
+      // rule-creation time with a clear error instead of silently queuing
+      // deliveries that can never succeed.
+      try {
+        assertSafeWebhookUrl(c.target);
+      } catch (err) {
+        const reason = err instanceof UnsafeWebhookUrlError ? err.message : "invalid webhook URL";
+        throw afrError("INVALID_ARGUMENT", `A webhook channel's target is unsafe: ${reason}`);
+      }
     }
     if (c.type === "email" && !c.target.includes("@")) {
       throw afrError("INVALID_ARGUMENT", "An email channel's target must look like an email address");

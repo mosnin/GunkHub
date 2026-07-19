@@ -151,7 +151,7 @@ export const markRetry = internalMutation({
  * sibling first resolves. Called from both convex/webhook_engine.ts and
  * convex/email_engine.ts's delivery drains (by name, via
  * makeFunctionReference — same cross-file pattern already used for
- * _evaluateAlertsForRunRef/_runEvalsForRunRef).
+ * alert_engine.ts's own cross-file references, e.g. runEvalsThenEvaluateAlerts).
  */
 export const rollupAlertEventStatus = internalMutation({
   args: { alertEventId: v.id("alert_events") },
@@ -267,10 +267,49 @@ export const deliverPendingWebhooks = internalAction({
           failed++;
         }
       } catch (err) {
+        // AUDIT FIX (cycle 4): this used to log-and-continue WITHOUT ever
+        // patching the delivery row. `deliverWebhook` (helpers/delivery.ts)
+        // calls `assertSafeWebhookUrl` BEFORE its own try/catch, so a target
+        // that passed the (weaker, pre-fix) creation-time check but fails
+        // the SSRF guard at delivery time — or any other unexpected
+        // exception from the query/mutation calls above — left the row
+        // "pending" with `nextAttemptAt` already due, so the once-a-minute
+        // cron re-picked it up and repeated the same failure FOREVER: an
+        // infinite retry wedge, not a bounded one. Fix: treat an exception
+        // here exactly like a retryable delivery failure, bounded by
+        // WEBHOOK_MAX_ATTEMPTS, so it always converges to terminally
+        // "failed". Wrapped in its OWN try/catch — even a failure to patch
+        // the row must not crash the batch (matches this action's "never
+        // throws out of the batch" contract).
         console.error(
           `Webhook delivery: unexpected error delivering ${String(delivery._id)}: ${String(err)}`,
         );
-        skipped++;
+        try {
+          const attemptNumber = delivery.attempts + 1;
+          const message = err instanceof Error ? err.message : String(err);
+          if (attemptNumber < WEBHOOK_MAX_ATTEMPTS) {
+            const delayMs = computeBackoff(attemptNumber - 1);
+            await ctx.runMutation(_markRetry, {
+              deliveryId: delivery._id,
+              attempts: attemptNumber,
+              error: message,
+              nextAttemptAt: Date.now() + delayMs,
+            });
+            retried++;
+          } else {
+            await ctx.runMutation(_markFailed, {
+              deliveryId: delivery._id,
+              attempts: attemptNumber,
+              error: message,
+            });
+            failed++;
+          }
+        } catch (patchErr) {
+          console.error(
+            `Webhook delivery: failed to record the above error for ${String(delivery._id)}: ${String(patchErr)}`,
+          );
+          skipped++;
+        }
         continue;
       }
 

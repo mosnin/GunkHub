@@ -111,10 +111,18 @@ function resolveApiError(err: unknown): ResolvedApiError | null {
   }
 
   // 3. Pre-afrError-convention throws that only carry prose, not a CODE: prefix.
+  // Bounded to 500 chars, first line only — same discipline as the CODE-prefix
+  // paths above. These messages are expected to be short, server-authored
+  // strings (e.g. "Run not found", "Webhook not found"), but this is a
+  // catch-all string-matching fallback, not a closed set of known throws, so
+  // it must not become a way for an unexpectedly-long or multi-line error
+  // (stack trace, internal path) to reach the client unbounded.
+  const boundedFirstLine = (s: string): string => (s.split('\n')[0] ?? s).slice(0, 500)
   const lower = message.toLowerCase()
-  if (lower.startsWith('forbidden')) return { code: 'FORBIDDEN', status: 403, message }
-  if (lower.startsWith('unauthorized')) return { code: 'UNAUTHORIZED', status: 401, message }
-  if (lower.includes('not found')) return { code: 'NOT_FOUND', status: 404, message }
+  if (lower.startsWith('forbidden')) return { code: 'FORBIDDEN', status: 403, message: boundedFirstLine(message) }
+  if (lower.startsWith('unauthorized'))
+    return { code: 'UNAUTHORIZED', status: 401, message: boundedFirstLine(message) }
+  if (lower.includes('not found')) return { code: 'NOT_FOUND', status: 404, message: boundedFirstLine(message) }
 
   return null
 }

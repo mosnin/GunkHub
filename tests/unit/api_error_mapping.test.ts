@@ -150,6 +150,20 @@ describe('mapApiError — HTTP status table', () => {
     expect(res!.headers.get('x-request-id')).toBe(REQUEST_ID)
   })
 
+  it('bounds an oversized/multi-line "not found" prose message to 500 chars, first line only', async () => {
+    // Defense in depth: this fallback matches on a substring ("not found")
+    // over an open-ended set of throws, not a closed list — it must not pass
+    // an arbitrarily long or multi-line message straight through to the
+    // client the way an internal stack trace or path dump could be.
+    const longSuffix = 'x'.repeat(1000)
+    const res = mapApiError(new Error(`Run not found in this org: ${longSuffix}\nsecond line`), REQUEST_ID)
+    const { status, code, message } = await statusAndCode(res)
+    expect(status).toBe(404)
+    expect(code).toBe('NOT_FOUND')
+    expect(message.length).toBeLessThanOrEqual(500)
+    expect(message).not.toContain('second line')
+  })
+
   it('does not misfire on ordinary prose containing a colon (e.g. api_keys expiry message)', () => {
     // "Unauthorized: API key has expired" — the token before the first colon
     // is "Unauthorized" (mixed case), not an ALL_CAPS code, so this must be

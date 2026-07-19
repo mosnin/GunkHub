@@ -82,11 +82,13 @@ function RuleBuilder({ onCreated }: { onCreated: (rule: AlertRule) => void }) {
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="Rule name"
+          aria-label="Rule name"
           className="flex-1 min-w-[140px] h-8 px-2 rounded-[4px] bg-graphite border border-graphite-light text-sm text-whiteout placeholder-pewter outline-none focus:ring-1 focus:ring-neon-glow"
         />
         <select
           value={kind}
           onChange={(e) => setKind(e.target.value as AlertRuleKind)}
+          aria-label="Alert rule kind"
           className="h-8 px-2 rounded-[4px] bg-graphite border border-graphite-light text-sm text-whiteout font-mono outline-none focus:ring-1 focus:ring-neon-glow"
         >
           {(Object.keys(KIND_LABEL) as AlertRuleKind[]).map((k) => (
@@ -126,6 +128,7 @@ function RuleBuilder({ onCreated }: { onCreated: (rule: AlertRule) => void }) {
         <select
           value={channelType}
           onChange={(e) => setChannelType(e.target.value as 'webhook' | 'email')}
+          aria-label="Channel type"
           className="h-8 px-2 rounded-[4px] bg-graphite border border-graphite-light text-sm text-whiteout font-mono outline-none focus:ring-1 focus:ring-neon-glow"
         >
           <option value="webhook">Webhook</option>
@@ -136,6 +139,7 @@ function RuleBuilder({ onCreated }: { onCreated: (rule: AlertRule) => void }) {
           value={channelTarget}
           onChange={(e) => setChannelTarget(e.target.value)}
           placeholder={channelType === 'webhook' ? 'https://…' : 'you@example.com'}
+          aria-label="Channel target"
           className="flex-1 min-w-[160px] h-8 px-2 rounded-[4px] bg-graphite border border-graphite-light text-sm text-whiteout placeholder-pewter font-mono outline-none focus:ring-1 focus:ring-neon-glow"
         />
         <Button variant="primary" size="sm" onClick={() => { void handleCreate() }} disabled={submitting}>

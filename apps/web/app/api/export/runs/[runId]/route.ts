@@ -124,4 +124,10 @@ export const GET = withApiHandler(
       },
     })
   },
+  // Same heavy-export rate class as GET /api/export/runs — this route also
+  // does an unbounded-ish amount of paginated Convex work per request (full
+  // event log + artifacts + comments for one run), streamed but not cheap.
+  // Without this override it fell back to the default GET class (300/min),
+  // which does not reflect the actual cost of this endpoint.
+  { rateLimit: { key: 'org', limitPerMin: 10 } },
 )

@@ -4,6 +4,7 @@ import type { Metadata } from 'next'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { RunList } from '@/components/runs/RunList'
 import { Badge } from '@/components/ui/Badge'
+import { EmptyState } from '@/components/ui/EmptyState'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { listSessionRuns } from '@/lib/services/runs'
 import { formatRelativeTime, truncateId } from '@/lib/utils'
@@ -74,9 +75,9 @@ export default async function SessionPage({ params }: SessionPageProps) {
         </div>
       ) : runs.length === 0 ? (
         <div className="mt-6">
-          <ErrorState
+          <EmptyState
             title="No runs found for this session"
-            message="Either the session ID is wrong, or no runs have been recorded against it yet."
+            description="Either the session ID is wrong, or no runs have been recorded against it yet — runs are correlated into a session via the SDK's sessionId option."
           />
         </div>
       ) : (

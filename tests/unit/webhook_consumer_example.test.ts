@@ -196,4 +196,26 @@ describe('createHandler — end-to-end HTTP behavior', () => {
     const res = await fetch(baseUrl, { method: 'GET' })
     expect(res.status).toBe(405)
   })
+
+  it('rejects an oversized body with 413 instead of buffering it unbounded', async () => {
+    const logs: string[] = []
+    await startServer(logs)
+
+    // One byte over the 5 MiB cap — big enough to prove the cap is enforced
+    // without making the test itself slow.
+    const oversized = 'a'.repeat(5 * 1024 * 1024 + 1)
+    const res = await fetch(baseUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-afr-signature': 't=9999999999,v1=deadbeef',
+        'x-afr-event': 'run.completed',
+        'x-afr-delivery-id': 'delivery_huge',
+      },
+      body: oversized,
+    })
+
+    expect(res.status).toBe(413)
+    expect(logs.some((l) => l.includes('rejected oversized request body'))).toBe(true)
+  })
 })

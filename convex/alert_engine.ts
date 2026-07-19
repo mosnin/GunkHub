@@ -13,14 +13,56 @@
 // scheduler call (or a defensive re-run) is safe. Never mutates a run or
 // event — only ever inserts new alert_events/webhook_deliveries rows.
 
+import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
-import { internalMutation } from "./_generated/server.js";
+import { internalAction, internalMutation } from "./_generated/server.js";
 import { renderAlertEmailText } from "./helpers/notifier.js";
 import { ALERT_FAILURE_RATE_SAMPLE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
 import type { MutationCtx } from "./_generated/server.js";
+
+// AUDIT FIX (cycle 4): createEvent (convex/events.ts) and sdkCreateEvents
+// (convex/sdk_ingest.ts) used to schedule THIS file's evaluateAlertsForRun
+// and insights.ts's runEvalsForRun as two independent
+// `ctx.scheduler.runAfter(0, ...)` calls off the same terminal event. Convex
+// does not guarantee execution order between two independently-scheduled
+// functions, so an "eval_failed" alert rule could run BEFORE
+// runEvalsForRun's auto-run eval insert committed — observing zero `evals`
+// rows for the very run that just failed its eval, and silently never
+// firing for it (evaluateAlertsForRun only ever runs once per terminal
+// event; a "did not fire" verdict leaves nothing to retry from).
+//
+// Fix, without touching convex/insights.ts (owned by another team this
+// cycle): `runEvalsThenEvaluateAlerts` below is a new internalAction, owned
+// here, that awaits insights.ts's runEvalsForRun mutation to fully commit
+// BEFORE invoking this file's evaluateAlertsForRun mutation. Actions may
+// `ctx.runMutation` sequentially with real ordering guarantees (each
+// `runMutation` is its own committed transaction, and the second call is not
+// issued until the `await` on the first resolves) — unlike two independent
+// `ctx.scheduler.runAfter(0, ...)` calls, which carry no such guarantee.
+// convex/events.ts and convex/sdk_ingest.ts now schedule ONLY this action on
+// a terminal event, instead of scheduling the two mutations directly.
+const _runEvalsForRunRef = makeFunctionReference<"mutation">("insights:runEvalsForRun");
+const _evaluateAlertsForRunMutationRef = makeFunctionReference<"mutation">(
+  "alert_engine:evaluateAlertsForRun",
+);
+
+/**
+ * Ordering wrapper for the terminal-event action layer: run eval auto-run to
+ * completion, THEN evaluate alert rules — so an "eval_failed" rule always
+ * sees this run's just-inserted eval rows. Scheduled (not called inline) by
+ * convex/events.ts / convex/sdk_ingest.ts on a terminal event, exactly like
+ * the two mutations it now sequences used to be scheduled independently.
+ */
+export const runEvalsThenEvaluateAlerts = internalAction({
+  args: { runId: v.id("runs") },
+  handler: async (ctx, args) => {
+    await ctx.runMutation(_runEvalsForRunRef, { runId: args.runId });
+    await ctx.runMutation(_evaluateAlertsForRunMutationRef, { runId: args.runId });
+  },
+});
 
 /** Terminal statuses that count as a "failure" for run_failed / failure_rate. */
 const FAILURE_STATUSES = new Set(["failed", "timed_out"]);
@@ -75,16 +117,26 @@ async function evaluateFailureRate(
   }
   const windowStart = Date.now() - rule.windowMinutes * 60_000;
 
+  // AUDIT FIX (cycle 4): without `.order("desc")`, `.take(N)` on an
+  // ascending index scan returns the OLDEST N runs at-or-after windowStart,
+  // not the most recent — so a project/org with more than
+  // ALERT_FAILURE_RATE_SAMPLE_SIZE runs in the window silently evaluated the
+  // rate over its stalest slice of the window and never saw anything close
+  // to "now" (a real recency bias, not just an approximation). `.order("desc")`
+  // takes the most-recent N instead, matching every other bounded-recency
+  // sample in this codebase (e.g. convex/insights.ts's collectRunSummariesForVersion).
   const sample = rule.projectId !== undefined
     ? await ctx.db
         .query("runs")
         .withIndex("by_project_started", (q) =>
           q.eq("projectId", rule.projectId!).gte("startedAt", windowStart),
         )
+        .order("desc")
         .take(ALERT_FAILURE_RATE_SAMPLE_SIZE)
     : await ctx.db
         .query("runs")
         .withIndex("by_org_started", (q) => q.eq("orgId", run.orgId).gte("startedAt", windowStart))
+        .order("desc")
         .take(ALERT_FAILURE_RATE_SAMPLE_SIZE);
 
   // Only terminal runs count toward the rate — an in-flight run is neither a

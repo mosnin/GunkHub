@@ -104,7 +104,26 @@ export const apiListRuns = mutation({
     }
 
     // Tenancy safety net, mirroring runs.ts listRuns.
-    const filtered = runsQuery.filter((q) => q.eq(q.field("orgId"), apiKey.orgId));
+    //
+    // AUDIT FIX (cycle 4): when `agentId` is supplied, the branch above
+    // selects `by_agent_started`, which encodes neither `status` nor
+    // `environment` — both used to be silently dropped whenever combined
+    // with `agentId` (e.g. `agentId=X&status=failed` returned ALL of agent
+    // X's runs, not just its failed ones, with no error). Re-applied here as
+    // in-memory secondary filters, same overfetch-then-filter pattern
+    // already used by runs.ts listRuns/listRunsByVerification — redundant
+    // but harmless in the branches where the index already encoded the
+    // condition (by_org_status / by_org_environment_started).
+    const filtered = runsQuery
+      .filter((q) => q.eq(q.field("orgId"), apiKey.orgId))
+      .filter((q) =>
+        args.status === undefined ? q.eq(q.field("_id"), q.field("_id")) : q.eq(q.field("status"), args.status),
+      )
+      .filter((q) =>
+        args.environment === undefined
+          ? q.eq(q.field("_id"), q.field("_id"))
+          : q.eq(q.field("environment"), args.environment),
+      );
     const page = await filtered.paginate({ numItems: limit, cursor: args.cursor ?? null });
 
     return {

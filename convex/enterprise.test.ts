@@ -149,13 +149,51 @@ async function seedFullOrg(t: ReturnType<typeof convexTest>, tag: string, opts?:
     await ctx.db.insert('audit_log', {
       orgId: org, actorClerkUserId: 'u', action: 'project.created', targetType: 'project', targetId: String(project), timestamp: now,
     })
+    // AUDIT FIX (cycle 4): ADR-002/ADR-003 tables (evals, alert_rules,
+    // alert_events, webhook_targets, webhook_deliveries, email_deliveries,
+    // usage_counters, daily_rollups) landed after ADR 001's purge cascade was
+    // written and were never wired into it — every one of these rows used to
+    // survive purgeOrganization forever. Seed one row per table here so the
+    // 'purges every record of org A' test below actually exercises them.
+    await ctx.db.insert('evals', {
+      orgId: org, runId: run, name: 'eval1', kind: 'manual', passed: true, createdAt: now, createdBy: 'u',
+    })
+    const rule = await ctx.db.insert('alert_rules', {
+      orgId: org, name: 'r', kind: 'run_failed', channels: [{ type: 'webhook', target: 'https://example.com/hook' }],
+      enabled: true, createdAt: now, updatedAt: now,
+    })
+    const alertEvent = await ctx.db.insert('alert_events', {
+      orgId: org, ruleId: rule, runId: run, firedAt: now, summary: 's', deliveryStatus: 'pending',
+    })
+    const webhook = await ctx.db.insert('webhook_targets', {
+      orgId: org, url: 'https://example.com/hook', secret: 'sec', events: ['run.failed'], enabled: true, createdAt: now,
+    })
+    await ctx.db.insert('webhook_deliveries', {
+      orgId: org, webhookId: webhook, event: 'run.failed', runId: run, status: 'pending', attempts: 0, createdAt: now, alertEventId: alertEvent,
+    })
+    await ctx.db.insert('email_deliveries', {
+      orgId: org, alertEventId: alertEvent, to: 'a@example.com', subject: 's', body: 'b', status: 'pending', attempts: 0, createdAt: now,
+    })
+    await ctx.db.insert('usage_counters', {
+      orgId: org, day: '2026-07-19', runsStarted: 1, eventsIngested: 1, bytesIngested: 1, artifactBytes: 1,
+    })
+    await ctx.db.insert('daily_rollups', {
+      orgId: org, agentId: agent, date: '2026-07-19', runsTotal: 1, runsFailed: 0, runsCompleted: 1, runsCancelled: 0, runsTimedOut: 0, tokensIn: 0, tokensOut: 0,
+    })
     return { org, project, agent, run }
   })
 }
 
 async function countOrgDocs(t: ReturnType<typeof convexTest>, org: unknown) {
   return await t.run(async (ctx) => {
-    const tables = ['projects', 'agents', 'agent_versions', 'runs', 'events', 'artifacts', 'comments', 'verification_results', 'api_keys', 'user_memberships', 'audit_log'] as const
+    const tables = [
+      'projects', 'agents', 'agent_versions', 'runs', 'events', 'artifacts', 'comments', 'verification_results',
+      'api_keys', 'user_memberships', 'audit_log',
+      // AUDIT FIX (cycle 4): previously missing from this list, which let the
+      // purge-cascade gap for these tables go undetected.
+      'evals', 'alert_rules', 'alert_events', 'webhook_targets', 'webhook_deliveries', 'email_deliveries',
+      'usage_counters', 'daily_rollups',
+    ] as const
     let total = 0
     for (const table of tables) {
       const docs = await ctx.db.query(table as any).collect()
@@ -237,6 +275,36 @@ describe('ADR 001 — retention window enforcement', () => {
     await t.action(internal.retention.enforceRetention, {})
     const still = await t.run((ctx) => ctx.db.get(run))
     expect(still).not.toBeNull()
+  })
+
+  // AUDIT FIX (cycle 4): evals were not deleted by purgeRunSlice, so a
+  // retention-expired run's eval rows survived forever, referencing a
+  // deleted runId — an erasure gap for a table that can carry arbitrary,
+  // possibly-sensitive `details` text quoted from the run.
+  it('deletes evals recorded against a retention-expired run', async () => {
+    const t = convexTest(schema, modules)
+    const now = Date.now()
+    const { org, oldTerminal } = await t.run(async (ctx) => {
+      const org = await ctx.db.insert('organizations', {
+        clerkOrgId: 'clerk_ret_evals', name: 'R', slug: 'r', plan: 'free', createdAt: now, updatedAt: now, retentionDays: 30,
+      })
+      const project = await ctx.db.insert('projects', { orgId: org, name: 'P', slug: 'p', createdAt: now, updatedAt: now })
+      const agent = await ctx.db.insert('agents', { orgId: org, projectId: project, name: 'A', slug: 'a', createdAt: now, updatedAt: now })
+      const oldTerminal = await ctx.db.insert('runs', {
+        orgId: org, projectId: project, agentId: agent, status: 'completed', startedAt: now - 40 * DAY, metadata: {}, tags: [],
+      })
+      await ctx.db.insert('evals', {
+        orgId: org, runId: oldTerminal, name: 'e', kind: 'manual', passed: true, createdAt: now, createdBy: 'u',
+      })
+      return { org, oldTerminal }
+    })
+
+    await t.action(internal.retention.enforceRetention, {})
+
+    const evals = await t.run((ctx) => ctx.db.query('evals').withIndex('by_run', (q) => q.eq('runId', oldTerminal)).collect())
+    expect(evals.length).toBe(0)
+    expect(await t.run((ctx) => ctx.db.get(oldTerminal))).toBeNull()
+    expect(await t.run((ctx) => ctx.db.get(org))).not.toBeNull() // retention never deletes the org
   })
 })
 
@@ -360,6 +428,27 @@ describe('listRuns cross-org filter validation (P2)', () => {
     await expect(
       asA.query(api.runs.listRuns, { orgId: orgA, projectId: projectB }),
     ).rejects.toThrow(/not found in this organization/i)
+  })
+
+  // AUDIT FIX (cycle 4): when `agentId` was supplied, listRuns selected
+  // by_agent_started and silently dropped `status` entirely —
+  // `agentId=X&status=failed` used to return ALL of agent X's runs, not
+  // just its failed ones, with no error.
+  it('combined agentId + status narrows correctly (previously status was silently dropped)', async () => {
+    const t = convexTest(schema, modules)
+    const { org, project, agent, run: completedRun } = await seedFullOrg(t, 'lr_status')
+    const failedRun = await t.run(async (ctx) => {
+      const now = Date.now()
+      return await ctx.db.insert('runs', {
+        orgId: org, projectId: project, agentId: agent, status: 'failed', startedAt: now, endedAt: now, metadata: {}, tags: [],
+      })
+    })
+    const asAdmin = t.withIdentity({ subject: 'admin_lr_status', org_id: 'clerk_lr_status' })
+
+    const page = await asAdmin.query(api.runs.listRuns, { orgId: org, agentId: agent, status: 'failed' })
+    const ids = page.runs.map((r) => r._id)
+    expect(ids).toContain(failedRun)
+    expect(ids).not.toContain(completedRun)
   })
 })
 
