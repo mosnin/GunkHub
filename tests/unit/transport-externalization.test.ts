@@ -1,7 +1,7 @@
-import { HttpTransport } from '@agent-flight-recorder/sdk'
+import { HttpTransport, Recorder } from '@agent-flight-recorder/sdk'
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest'
 
-import type { CreateEventRequest } from '@agent-flight-recorder/contracts'
+import type { CreateEventRequest, CreateRunResponse } from '@agent-flight-recorder/contracts'
 
 // ---------------------------------------------------------------------------
 // Fetch mock helpers (mirror pattern from flight-recorder.test.ts)
@@ -790,5 +790,132 @@ describe('HttpTransport.sendEvents — upload cache deduplication', () => {
     expect(body.events[0]!.payload._artifact.artifactId).not.toBe(
       body.events[1]!.payload._artifact.artifactId
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Group 4: M4 — errorSummary survives externalization for run.failed
+// ---------------------------------------------------------------------------
+
+describe('HttpTransport.sendEvents — run.failed errorSummary survives externalization (M4)', () => {
+  let transport: HttpTransport
+
+  beforeEach(() => {
+    transport = new HttpTransport(ENDPOINT)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  /** A run.failed event whose payload (message + huge stack) exceeds 10 KB. */
+  function makeLargeFailurePayloadEvent(runId: string, errorSummary: string): CreateEventRequest {
+    const hugeStack =
+      'Error: something went badly wrong\n' +
+      Array.from({ length: 400 }, (_, i) => `    at frame${i} (/app/src/module${i}.ts:${i}:1)`).join('\n')
+    // `errorSummary` is an SDK-side extra field on the run.failed payload (see
+    // error-summary.ts / externalize.ts) — NOT (yet) part of the contracts
+    // `RunFailedPayload` type, so it's built via an intersection type here
+    // rather than directly as a `CreateEventRequest` literal (which would
+    // trip excess-property checking against `EventPayload`).
+    const payload: import('@agent-flight-recorder/contracts').RunFailedPayload & { errorSummary: string } = {
+      type: 'run.failed',
+      error: { message: 'something went badly wrong', stack: hugeStack },
+      duration_ms: 1234,
+      errorSummary,
+    }
+    return {
+      runId,
+      type: 'run.failed',
+      sequenceNumber: 2,
+      timestamp: Date.now(),
+      payload,
+    }
+  }
+
+  it('externalizes an oversized run.failed payload but ships errorSummary inline on the envelope', async () => {
+    const errorSummary = 'something went badly wrong | at frame0 (/app/src/module0.ts:0:1)'
+    const event = makeLargeFailurePayloadEvent(RUN_ID, errorSummary)
+    assertLargePayloadIsActuallyLarge(event)
+
+    const mockFetch = vi.fn<FetchArgs, FetchRet>(async (url) => {
+      if (url.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
+      return jsonResponse(mockEventsResponse, 201)
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    const result = await transport.sendEvents([event], auth)
+    expect(result.success).toBe(true)
+
+    const eventsCall = mockFetch.mock.calls.find(([url]: FetchArgs) => (url as string).endsWith('/api/events'))!
+    const init = eventsCall[1] as RequestInit
+    const body = JSON.parse(init.body as string) as {
+      events: Array<{ payload: { type: string; errorSummary?: string; _artifact: { artifactId: string } } }>
+    }
+    const sentPayload = body.events[0]!.payload
+    // The payload was too big to ship inline...
+    expect(sentPayload.type).toBe('_externalized')
+    // ...but errorSummary is still present, unchanged, as a sibling field on
+    // the externalized envelope — the server can read it without ever
+    // fetching the artifact.
+    expect(sentPayload.errorSummary).toBe(errorSummary)
+  })
+
+  it('a run recorded end-to-end through Recorder redacts errorSummary AND keeps it inline after externalization', async () => {
+    const runResponse: CreateRunResponse = {
+      run: {
+        id: 'run_m4_001',
+        orgId: 'org_test',
+        projectId: 'proj_test',
+        agentId: 'agent_test',
+        status: 'running',
+        startedAt: Date.now(),
+        metadata: {},
+        tags: [],
+      },
+    }
+
+    const mockFetch = vi.fn<FetchArgs, FetchRet>(async (url, init) => {
+      const u = url as string
+      if (u.endsWith('/api/runs')) return jsonResponse(runResponse, 201)
+      if (u.includes('artifacts/upload')) return jsonResponse(mockUploadResponse)
+      if (u.endsWith('/api/events')) return jsonResponse(mockEventsResponse, 201)
+      if (u.includes('/status')) return jsonResponse({ ok: true }, 200)
+      throw new Error(`unexpected fetch: ${u} ${JSON.stringify(init)}`)
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    const recorder = new Recorder(
+      { endpoint: ENDPOINT, apiKey: API_KEY, agentId: 'agent_test', options: { redact: { patterns: ['email'] } } },
+      new HttpTransport(ENDPOINT)
+    )
+
+    await recorder.startRun('input')
+
+    const hugeStack =
+      'Error: contact support at leak@example.com for help\n' +
+      Array.from({ length: 400 }, (_, i) => `    at frame${i} (/app/src/module${i}.ts:${i}:1)`).join('\n')
+    const err = new Error('contact support at leak@example.com for help')
+    err.stack = hugeStack
+
+    await recorder.failRun(err)
+
+    const eventsCalls = mockFetch.mock.calls.filter(([url]: FetchArgs) => (url as string).endsWith('/api/events'))
+    const runFailedBody = eventsCalls
+      .map(([, init]: FetchArgs) => JSON.parse((init!.body as string)) as { events: Array<{ type: string; payload: Record<string, unknown> }> })
+      .flatMap((b) => b.events)
+      .find((e) => e.type === 'run.failed')
+
+    expect(runFailedBody).toBeDefined()
+    const payload = runFailedBody!.payload
+    // The huge stack pushed the payload over 10 KB, so it externalized...
+    expect(payload['type']).toBe('_externalized')
+    // ...but errorSummary is still present inline, and it went through the
+    // SAME redaction pass as the rest of the payload (patterns: ['email']),
+    // so the email address never reaches the wire.
+    expect(typeof payload['errorSummary']).toBe('string')
+    const summary = payload['errorSummary'] as string
+    expect(summary).toContain('[REDACTED]')
+    expect(summary).not.toContain('leak@example.com')
   })
 })

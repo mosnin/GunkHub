@@ -123,6 +123,29 @@ export interface DashboardStats {
     tokensOut: number;
   };
   series: DashboardDailyPoint[];
+  /**
+   * Top-level, easy-to-check mirror of `series[series.length - 1].source`
+   * (today's date is always the last entry in `series`). Exists so a caller
+   * doesn't have to know that convention or grovel through the series array
+   * just to answer "is today's number finalized or still moving?" — see
+   * `partialToday` for the boolean shorthand of the same fact. `"no_data"`
+   * covers the (should-never-normally-happen, but possible for a request
+   * whose `range` window somehow excludes today) case where the series has
+   * no entry for today at all.
+   */
+  todaySource: "rollup" | "fallback" | "no_data";
+  /**
+   * True iff today's totals were computed via the bounded live fallback scan
+   * (see getDashboardStats's doc comment) rather than the finalized
+   * daily_rollups cron output. When true, `totals` and today's series point
+   * reflect only the runs that existed AT READ TIME today — more runs may
+   * start or finish later today and will not retroactively appear until the
+   * next cron tick recomputes and stores today's rollup (early tomorrow,
+   * UTC). This is the per-view "honest bound" flag the dashboard UI should
+   * use to render something like "today's numbers are live/partial" instead
+   * of presenting them with the same confidence as a finalized day.
+   */
+  partialToday: boolean;
 }
 
 interface RollupAgg {
@@ -173,6 +196,47 @@ function failureRateOf(agg: RollupAgg): number | null {
  * `computeRunStats` engine the cron itself uses. A day with PARTIAL rollup
  * coverage (some but not all agents rolled up) is treated as fully rolled
  * up — a documented simplification; see docs/design/insight_engine.md.
+ *
+ * PER-VIEW COST OF THE LIVE FALLBACK (M5, documented precisely rather than
+ * hand-waved, since this is the one part of this query that scales with
+ * traffic, not with range):
+ *
+ *   - The `computeDailyRollups` cron (Team A, convex/rollups.ts) runs once
+ *     daily at 05:00 UTC and only ever rolls up the PRECEDING UTC calendar
+ *     day. That means "today" has zero daily_rollups coverage for the
+ *     entire current UTC day, by construction — every single call to this
+ *     query, from every viewer, for every org, takes the live-fallback
+ *     branch for exactly one date: today. Already-rolled-up days (yesterday
+ *     and earlier) are NEVER re-scanned live — the loop above only takes
+ *     the fallback branch when `rollupsByDate.get(date)` is empty, and that
+ *     is true only for today (or, for a brand-new org, a short backlog
+ *     before its first cron tick — see note above).
+ *   - That one live query IS already bounded and indexed: it takes at most
+ *     `DASHBOARD_FALLBACK_MAX_RUNS` (5,000) rows via `by_org_started`
+ *     (org-wide) or `by_agent_started` (agent-scoped), i.e. it can never
+ *     scan more than 5,000 run documents no matter how large the org or how
+ *     many runs started today, and reads no other table (no per-run event
+ *     reads, unlike getAgentCostStats's fallback path).
+ *   - The real cost this doc-comment is calling out is not "this one call is
+ *     unbounded" (it isn't) but "this bounded, indexed scan reruns on EVERY
+ *     dashboard view with zero caching," because a Convex `query` cannot
+ *     memoize across calls. At N concurrent viewers of the same org's
+ *     dashboard, that is N independent up-to-5,000-row scans of today's
+ *     runs, all reading the same underlying rows, once per page view/poll.
+ *     For a single large org (hundreds+ agents, thousands of runs/day) with
+ *     several people watching the dashboard, that is the multiplier worth
+ *     watching, not per-call cost.
+ *   - Nothing here can fix that within this file: a query has no cache to
+ *     write to, and a per-day incremental rollup for "today" (updated as
+ *     runs land, so this call could read a same-day daily_rollups-like row
+ *     instead of re-scanning `runs`) needs either a schema addition (a
+ *     `today`/intraday rollup table or a mutable row Team A would own) or a
+ *     much higher-frequency cron — both out of scope for this cycle (Team A
+ *     owns schema/crons). See docs/design/insight_engine.md, "Future work:
+ *     same-day incremental rollup," for the concrete recommendation.
+ *   - The `todaySource`/`partialToday` fields on the return value make this
+ *     bound visible to callers: `partialToday: true` means today's numbers
+ *     came from this live, capped scan and are not yet finalized.
  */
 export const getDashboardStats = query({
   args: {
@@ -278,11 +342,22 @@ export const getDashboardStats = query({
 
     const totals = series.reduce(addAgg, EMPTY_AGG);
 
+    // "Today" is always dates[dates.length - 1] (the loop above pushes dates
+    // oldest-first), and therefore always series[series.length - 1] too,
+    // since series is built in the same order. Surfaced as a top-level flag
+    // so callers don't need to know/rely on that ordering convention
+    // themselves — see the DashboardStats field docs and the PER-VIEW COST
+    // note on this function above.
+    const todayPoint = series[series.length - 1];
+    const todaySource: DashboardStats["todaySource"] = todayPoint ? todayPoint.source : "no_data";
+
     return {
       range: args.range,
       agentId: args.agentId ?? null,
       totals: { ...totals, failureRate: failureRateOf(totals) },
       series,
+      todaySource,
+      partialToday: todaySource === "fallback",
     };
   },
 });

@@ -360,7 +360,16 @@ export default defineSchema({
     deliveredAt: v.optional(v.number()),
   })
     .index("by_org_fired", ["orgId", "firedAt"])
-    .index("by_rule", ["ruleId"]),
+    .index("by_rule", ["ruleId"])
+    // AUDIT FIX (cycle 5, H4): retention.ts's per-run deletion (enforceRetention)
+    // needs to find alert_events tied to ONE specific run so it can scrub
+    // them (and their dependent email_deliveries) the same way the org purge
+    // already does org-wide. Without this index the only options were an
+    // unindexed table scan or piggybacking on by_org_fired and filtering in
+    // memory across the whole org's fired alerts — this is a real, narrow
+    // query pattern (used immediately in convex/retention.ts), not
+    // speculative.
+    .index("by_run", ["runId"]),
 
   // Signing secret is generated server-side and returned exactly once (in the
   // createWebhook response) — listWebhooks always strips it. Stored in
@@ -419,9 +428,24 @@ export default defineSchema({
     // deliverPendingWebhooks must find pending rows across ALL orgs without
     // an unindexed table scan.
     .index("by_status_created", ["status", "createdAt"])
+    // AUDIT FIX (cycle 5, perf M1): getPendingDeliveries used to scan
+    // by_status_created (all "pending" rows across every org, oldest first)
+    // and post-filter in memory for nextAttemptAt <= now — under a large
+    // pending backlog with staggered backoff retry times, most of that scan
+    // is wasted reading rows that are not yet due. This index lets the query
+    // range directly on (status, nextAttemptAt) so only due (or never-set)
+    // rows are read off the index, not scanned-then-discarded.
+    .index("by_status_nextAttempt", ["status", "nextAttemptAt"])
     // Cycle 2: find every delivery belonging to one fired alert, to decide
     // when alert_events.deliveryStatus can be rolled up to delivered/failed.
-    .index("by_alert_event", ["alertEventId"]),
+    .index("by_alert_event", ["alertEventId"])
+    // AUDIT FIX (cycle 5, H4): retention.ts's per-run deletion needs to find
+    // webhook_deliveries tied to ONE run (both the alert-triggered path,
+    // convex/alert_engine.ts, and the standalone webhook_targets CRUD path,
+    // convex/webhooks.ts, stamp `runId` directly on creation), the same way
+    // the org purge already deletes them org-wide via by_org. Real query
+    // pattern, used immediately in convex/retention.ts.
+    .index("by_run", ["runId"]),
 
   // Approximate usage metering, incremented from every ingest path using the
   // same stride-counting contention mitigation as the per-key rate limiter in

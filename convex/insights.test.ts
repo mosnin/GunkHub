@@ -108,6 +108,36 @@ describe('getDashboardStats', () => {
     // failureRate = (failed + timedOut) / terminal across all seeded days.
     const terminal = stats.totals.runsFailed + stats.totals.runsCompleted + stats.totals.runsCancelled + stats.totals.runsTimedOut
     expect(stats.totals.failureRate).toBeCloseTo((2 + 0 + 1) / terminal)
+
+    // M5 (cycle 5): today has no rollup coverage (the cron only ever rolls up
+    // yesterday), so the top-level honesty flags must report the live
+    // fallback, mirroring series[today].source rather than requiring callers
+    // to know the series-ordering convention themselves.
+    expect(stats.todaySource).toBe('fallback')
+    expect(stats.partialToday).toBe(true)
+  })
+
+  it('reports todaySource "rollup" and partialToday false when today itself has rollup coverage', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, agentA } = await seedTwoOrgs(t)
+    const today = dateNDaysAgoUtc(0)
+
+    await t.run(async (ctx) => {
+      // Simulate a day where today's row already exists (e.g. a future
+      // same-day incremental rollup, or a backfill) -- getDashboardStats
+      // doesn't care WHY the row exists, only whether rollupsByDate has it.
+      await ctx.db.insert('daily_rollups', {
+        orgId: orgA, agentId: agentA, date: today,
+        runsTotal: 3, runsFailed: 0, runsCompleted: 3, runsCancelled: 0, runsTimedOut: 0,
+        tokensIn: 30, tokensOut: 15,
+      })
+    })
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const stats = await asAdmin.query(api.insights.getDashboardStats, { orgId: orgA, range: '7d' })
+
+    expect(stats.todaySource).toBe('rollup')
+    expect(stats.partialToday).toBe(false)
   })
 
   it('rejects a caller who is not a member of the org', async () => {

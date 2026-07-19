@@ -416,6 +416,7 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
                 value={keyName}
                 onChange={(e) => setKeyName(e.target.value)}
                 placeholder="Key name (e.g. production)"
+                aria-label="Key name"
                 className="flex-1 max-w-xs bg-neutral-900 border border-neutral-700 text-neutral-200 text-sm px-3 py-1.5 rounded focus:outline-none focus:ring-1 focus:ring-neon-glow placeholder-neutral-500"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && keyName.trim() && !generating) {

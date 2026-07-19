@@ -119,6 +119,66 @@ async function purgeRunSlice(
     }
   }
 
+  // 2c. AUDIT FIX (cycle 5, H4): alert_events fired for this run, and their
+  // dependent email_deliveries/webhook_deliveries rows (ADR-002/003 tables).
+  // The org purge (purgeOrganizationBatch) already sweeps these tables
+  // org-wide; this per-run retention-window deletion did not touch them at
+  // all, so a retention-deleted run could leave behind alert_events rows
+  // (whose `summary` can quote run details) plus their webhook/email
+  // delivery bookkeeping, forever — the same class of erasure gap the
+  // cycle-4 fix closed for `evals` above. See docs/adr/001 for the
+  // decision note recording this as part of ADR 001's scope.
+  //
+  // alert_events and webhook_deliveries both carry `runId` directly (the
+  // latter is stamped on creation by both the alert-triggered path,
+  // convex/alert_engine.ts, and the standalone webhook_targets CRUD path,
+  // convex/webhooks.ts), so both are found via their own `by_run` index.
+  // email_deliveries has no `runId` field — it is only reachable via its
+  // `alertEventId` (by_alert_event index) — so alert_events must be looked
+  // up (not yet deleted) before its email_deliveries can be found.
+  let alertEventIds: Id<"alert_events">[] = [];
+  if (remaining() > 0) {
+    const alertEvents = await ctx.db
+      .query("alert_events")
+      .withIndex("by_run", (q) => q.eq("runId", runId))
+      .take(remaining());
+    alertEventIds = alertEvents.map((ae) => ae._id);
+  }
+
+  for (const alertEventId of alertEventIds) {
+    if (remaining() <= 0) break;
+    const emails = await ctx.db
+      .query("email_deliveries")
+      .withIndex("by_alert_event", (q) => q.eq("alertEventId", alertEventId))
+      .take(remaining());
+    for (const e of emails) {
+      await ctx.db.delete(e._id);
+      deleted++;
+    }
+  }
+
+  if (remaining() > 0) {
+    const webhookDeliveries = await ctx.db
+      .query("webhook_deliveries")
+      .withIndex("by_run", (q) => q.eq("runId", runId))
+      .take(remaining());
+    for (const w of webhookDeliveries) {
+      await ctx.db.delete(w._id);
+      deleted++;
+    }
+  }
+
+  // Delete the alert_events rows themselves last (after their dependent
+  // email_deliveries have been removed above).
+  for (const alertEventId of alertEventIds) {
+    if (remaining() <= 0) break;
+    const ae = await ctx.db.get(alertEventId);
+    if (ae) {
+      await ctx.db.delete(alertEventId);
+      deleted++;
+    }
+  }
+
   // 3. Artifacts (collect storage keys for best-effort blob deletion upstream).
   if (remaining() > 0) {
     const artifacts = await ctx.db

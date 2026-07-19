@@ -234,6 +234,18 @@ describe('webhook_engine.deliverPendingWebhooks', () => {
     expect(alertEvent!.deliveredAt).toBeDefined()
   })
 
+  // AUDIT FIX (cycle 5, de-flake): this test used to read `Date.now()`
+  // independently in the action call and in its own assertions/forcing
+  // logic. `computeBackoff` (helpers/delivery.ts) returns a RANDOM delay in
+  // `[0, cap)`, so a draw near 0 combined with real wall-clock drift between
+  // those independent `Date.now()` reads (worse under parallel-suite CPU
+  // contention) could make a fixed `nextAttemptAt` fail to exceed a LATER
+  // wall-clock reading taken a few ms afterward — a genuine, if rare, flake.
+  // Fix: pin one `now` per action call (deliverPendingWebhooks now accepts
+  // an optional injectable `now`, defaulting to Date.now() in production)
+  // and compare/force against that SAME pinned value, never a fresh
+  // Date.now() read. Coverage is unchanged: still asserts convergence to
+  // "failed" at WEBHOOK_MAX_ATTEMPTS.
   it('retries a 5xx with backoff, then marks terminally failed after WEBHOOK_MAX_ATTEMPTS', async () => {
     const t = convexTest(schema, modules)
     const { orgA, projectA, agentA } = await seedTwoOrgs(t)
@@ -247,24 +259,37 @@ describe('webhook_engine.deliverPendingWebhooks', () => {
 
     vi.spyOn(global, 'fetch').mockResolvedValue(new Response('boom', { status: 503 }))
 
+    // Captured ONCE — every subsequent comparison/advance in this test reuses
+    // this same value (or a deterministic offset of it) instead of taking a
+    // fresh Date.now() reading, which is what made the old version of this
+    // test flaky (see the fix note above). Must start from the real current
+    // time (not an arbitrary fixed epoch) since the delivery row itself is
+    // created via evaluateAlertsForRun/alert_engine.ts using a genuine
+    // Date.now() at insert time.
+    let now = Date.now()
+
     // First attempt: retryable failure, stays "pending" with a future nextAttemptAt.
-    const first = await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+    const first = await t.action(internal.webhook_engine.deliverPendingWebhooks, { now })
     expect(first.retried).toBe(1)
     let delivery = await t.run((ctx) => ctx.db.query('webhook_deliveries').withIndex('by_org', (q) => q.eq('orgId', orgA)).first())
     expect(delivery!.status).toBe('pending')
     expect(delivery!.attempts).toBe(1)
-    expect(delivery!.nextAttemptAt).toBeGreaterThan(Date.now() - 1)
+    // nextAttemptAt = now + delayMs, delayMs >= 0 — always >= the SAME now.
+    expect(delivery!.nextAttemptAt).toBeGreaterThanOrEqual(now)
 
-    // Not yet due — a second drain right away finds nothing to do.
-    const tooSoon = await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+    // Not yet due — a second drain at the SAME pinned `now` finds nothing to do.
+    const tooSoon = await t.action(internal.webhook_engine.deliverPendingWebhooks, { now })
     expect(tooSoon.batch).toBe(0)
 
     // Force it due and drain repeatedly until it exhausts WEBHOOK_MAX_ATTEMPTS.
+    // Each iteration advances the pinned clock well past the previous
+    // attempt's nextAttemptAt (backoff caps at 30s) instead of touching the
+    // real wall clock at all.
     for (let i = 0; i < 10; i++) {
       const current = await t.run((ctx) => ctx.db.get(delivery!._id))
       if (current!.status === 'failed') break
-      await t.run((ctx) => ctx.db.patch(delivery!._id, { nextAttemptAt: Date.now() - 1 }))
-      await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+      now += 60_000
+      await t.action(internal.webhook_engine.deliverPendingWebhooks, { now })
     }
 
     delivery = await t.run((ctx) => ctx.db.get(delivery!._id))
@@ -298,38 +323,52 @@ describe('webhook_engine.deliverPendingWebhooks', () => {
   // into webhook_targets (bypassing createWebhook/createAlertRule's
   // creation-time validation, which is now also SSRF-checked) to simulate a
   // legacy/tampered row and isolate the ENGINE's own defensive behavior.
+  // AUDIT FIX (cycle 5, de-flake): same fix as the 5xx-backoff test above —
+  // pin one `now` per deliverPendingWebhooks call instead of reading the real
+  // wall clock, so a near-zero `computeBackoff` draw can never make a fixed
+  // `nextAttemptAt` race a later independent `Date.now()` read. Coverage is
+  // unchanged: still asserts convergence to "failed" at WEBHOOK_MAX_ATTEMPTS.
   it('a delivery whose target fails the SSRF check at delivery time converges to failed, not an infinite retry', async () => {
     const t = convexTest(schema, modules)
     const { orgA } = await seedTwoOrgs(t)
+    // Captured ONCE — every subsequent comparison/advance in this test reuses
+    // this same value (or a deterministic offset of it) instead of taking a
+    // fresh Date.now() reading, which is what made the old version of this
+    // test flaky (see the fix note above). Must start from the real current
+    // time (not an arbitrary fixed epoch) since the delivery row itself is
+    // created via evaluateAlertsForRun/alert_engine.ts using a genuine
+    // Date.now() at insert time.
+    let now = Date.now()
     const webhookId = await t.run(async (ctx) =>
       ctx.db.insert('webhook_targets', {
-        orgId: orgA, url: 'https://169.254.169.254/hook', secret: 's', events: ['run.failed'], enabled: true, createdAt: Date.now(),
+        orgId: orgA, url: 'https://169.254.169.254/hook', secret: 's', events: ['run.failed'], enabled: true, createdAt: now,
       }),
     )
     const deliveryId = await t.run((ctx) =>
       ctx.db.insert('webhook_deliveries', {
-        orgId: orgA, webhookId, event: 'run.failed', status: 'pending', attempts: 0, createdAt: Date.now(), nextAttemptAt: Date.now(),
+        orgId: orgA, webhookId, event: 'run.failed', status: 'pending', attempts: 0, createdAt: now, nextAttemptAt: now,
       }),
     )
 
     // First drain: the SSRF guard throws inside deliverWebhook; the row must
     // be patched (retried), not silently left "pending" forever.
-    const first = await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+    const first = await t.action(internal.webhook_engine.deliverPendingWebhooks, { now })
     expect(first.retried).toBe(1)
     let delivery = await t.run((ctx) => ctx.db.get(deliveryId))
     expect(delivery!.status).toBe('pending')
     expect(delivery!.attempts).toBe(1)
-    expect(delivery!.nextAttemptAt).toBeGreaterThan(Date.now() - 1)
+    // nextAttemptAt = now + delayMs, delayMs >= 0 — always >= the SAME now.
+    expect(delivery!.nextAttemptAt).toBeGreaterThanOrEqual(now)
     expect(delivery!.error).toMatch(/unsafe|private|reserved/i)
 
-    // Force due repeatedly — it must terminally converge to "failed" within
-    // WEBHOOK_MAX_ATTEMPTS, exactly like any other retryable failure, rather
-    // than retrying without bound.
+    // Force due repeatedly by advancing the pinned clock — it must terminally
+    // converge to "failed" within WEBHOOK_MAX_ATTEMPTS, exactly like any
+    // other retryable failure, rather than retrying without bound.
     for (let i = 0; i < 10; i++) {
       const current = await t.run((ctx) => ctx.db.get(deliveryId))
       if (current!.status === 'failed') break
-      await t.run((ctx) => ctx.db.patch(deliveryId, { nextAttemptAt: Date.now() - 1 }))
-      await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+      now += 60_000
+      await t.action(internal.webhook_engine.deliverPendingWebhooks, { now })
     }
     delivery = await t.run((ctx) => ctx.db.get(deliveryId))
     expect(delivery!.status).toBe('failed')

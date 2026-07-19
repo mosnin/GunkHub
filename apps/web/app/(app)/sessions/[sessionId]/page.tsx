@@ -1,9 +1,12 @@
+import Link from 'next/link'
+
 import type { Run } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
 import { RunList } from '@/components/runs/RunList'
 import { Badge } from '@/components/ui/Badge'
+import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { listSessionRuns } from '@/lib/services/runs'
@@ -64,9 +67,19 @@ export default async function SessionPage({ params }: SessionPageProps) {
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
+      <nav aria-label="breadcrumb" className="flex items-center gap-1.5 text-xs text-neutral-500 pb-1 flex-wrap">
+        <Link href="/runs" className="hover:text-neutral-300 transition-colors duration-75">
+          Runs
+        </Link>
+        <span className="text-pewter" aria-hidden>/</span>
+        <span className="font-mono text-neutral-400" aria-current="page">
+          session {truncateId(sessionId, 12)}
+        </span>
+      </nav>
       <PageHeader
         title="Session"
         subtitle={`Runs correlated under session ${sessionId}`}
+        actions={<CopyToClipboardButton value={sessionId} label="Copy session ID" />}
       />
 
       {error ? (

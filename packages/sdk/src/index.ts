@@ -25,6 +25,7 @@ export { FlightRecorder, RunRecorder } from './flight-recorder.js'
 export { FileSpool } from './file-spool.js'
 export { SDK_VERSION } from './version.js'
 export { redactPayload } from './redaction.js'
+export { buildErrorSummary, ERROR_SUMMARY_MAX_LENGTH } from './error-summary.js'
 export { decideSampling, hashString } from './sampling.js'
 export { FlightReader } from './reader.js'
 export { V1ApiError, fetchV1, tryParseV1Json, messageFromV1Body } from './v1-client.js'
@@ -43,6 +44,7 @@ export type {
 } from './types.js'
 export type { FileSpoolOptions } from './file-spool.js'
 export type { RedactionConfig, RedactionPattern, RedactedPayload } from './redaction.js'
+export type { ErrorSummaryInput } from './error-summary.js'
 export type { SamplingConfig, SamplingContext } from './sampling.js'
 
 export type {

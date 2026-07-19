@@ -100,6 +100,8 @@ buffering/retry/spool behavior, and payload-externalization details.
 
 The following are implemented and enforced today, not aspirational:
 
+### Core event log and platform
+
 - **Event log invariants** — append-only `events` table (no update/delete mutations),
   server-enforced contiguous `sequenceNumber`s starting at 1, `run.started` required as
   the first event, `run.completed`/`run.failed` required as the last (`convex/events.ts`,
@@ -111,7 +113,8 @@ The following are implemented and enforced today, not aspirational:
   (`convex/audit.ts`)
 - **Retention / erasure (ADR 001)** — per-org opt-in `retentionDays`; a daily cron
   (`convex/retention.ts`) deletes terminal runs and their events/artifacts/comments past
-  the window; org deletion is tracked via `pendingDeletionAt` with operator-invoked purge
+  the window; org deletion is tracked via `pendingDeletionAt` with operator-invoked purge;
+  configured from the web UI (`apps/web/src/components/settings/RetentionSection.tsx`)
 - **API-key SDK ingest with rate limits** — `x-api-key`-authenticated mutations in
   `convex/sdk_ingest.ts` (`sdkCreateRun`, `sdkCreateEvents`, `sdkCreateArtifact`,
   `sdkUpdateRunStatus`) enforce key revocation/expiry/scope and a fixed one-minute-window
@@ -122,8 +125,63 @@ The following are implemented and enforced today, not aspirational:
 - **Payload externalization** — payloads over 10 KB are rejected inline and must be
   uploaded as artifacts (blob storage pointer + SHA-256 checksum), enforced both in the
   SDK and, defense-in-depth, in Convex (`sdk_ingest.ts` `assertPayloadWithinInlineLimit`)
-- **Scheduled jobs** — daily crons for artifact GC, stale-run expiry, retention
-  enforcement, and projection-integrity verification (`convex/crons.ts`)
+- **Sampling** — client-side head sampling with tail-bias for failures
+  (`packages/sdk/src/sampling.ts`), decided once per run, optionally deterministic
+  (`seedFromRunName`) or caller-overridden (`decider`); see `docs/architecture.md` §9 for
+  its effect on server-side rollups/usage/alerts
+- **Redaction** — SDK-side payload redaction before events leave the process
+  (`packages/sdk/src/redaction.ts`)
+- **Member management** — org member listing and role changes in the web UI
+  (`apps/web/app/(app)/settings/members/page.tsx`)
+
+### Run organization and investigation
+
+- **Full-text search over runs** — a Convex search index (`search_runs`) over an
+  extracted `searchText` field, queried via `searchRuns` and surfaced in the web UI
+  (`apps/web/app/(app)/search/page.tsx`) and `GET /api/v1/runs`
+- **Run hierarchy and sessions** — parent/child sub-runs (`parentRunId`) and free-form
+  session grouping (`sessionId`) for multi-turn/multi-agent flows
+  (`apps/web/src/components/runs/RunHierarchyPanel.tsx`,
+  `apps/web/app/(app)/sessions/[sessionId]/page.tsx`)
+- **Environments** — per-run `environment` field (well-known values or a custom string),
+  filterable in the run list and the v1 read API
+- **Triage** — a linear `open → investigating → resolved` state machine for failed/
+  timed-out runs (`apps/web/app/api/runs/[id]/triage/route.ts`,
+  `apps/web/src/components/runs/TriageControl.tsx`)
+- **Evals** — pass/fail/score checks recorded against a run, written via a member-gated
+  mutation or an API-key ingest path for automated eval pipelines
+  (`convex/evals.ts`, `apps/web/src/components/runs/EvalsPanel.tsx`)
+
+### Analytics, alerting, and delivery (ADR-002 / ADR-003)
+
+- **Analytics, cost, and version comparison** — daily per-agent rollups (`daily_rollups`)
+  and per-org usage counters (`usage_counters`), surfaced in a usage settings page
+  (`apps/web/app/(app)/settings/usage/page.tsx`) and an agent-version comparison view
+  (`apps/web/src/components/agents/VersionCompare.tsx`); see `docs/architecture.md` §9
+  for how client-side sampling affects these numbers
+- **Alerting** — org-configured, admin-managed alert rules (`run_failed` /
+  `failure_rate` / `eval_failed`) evaluated automatically on every run's terminal event,
+  configured via `/api/alerts/**` and the web UI (`apps/web/app/(app)/settings/alerts/page.tsx`)
+- **Outbound webhooks** — HTTPS-only, SSRF-guarded, HMAC-signed webhook delivery to
+  org-configured targets, with an append-only delivery log
+  (`convex/webhook_engine.ts`, `apps/web/app/(app)/settings/webhooks/page.tsx`)
+- **Email delivery** — the alert-rule email channel counterpart to webhooks, pluggable
+  via an `EmailNotifier` abstraction (console logger by default, Resend when
+  `AFR_EMAIL_PROVIDER=resend`) (`convex/email_engine.ts`, `convex/helpers/notifier.ts`)
+- **Data export** — bulk (`GET /api/export/runs`) and single-run
+  (`GET /api/export/runs/{runId}`) extraction of already-authorized data in
+  JSON/CSV/ndjson, rate-limited and streamed rather than materialized in memory
+- **Read-only public API surface** — the key-authenticated `/api/v1/**` read API
+  (`convex/read_api.ts`), the SDK-side `FlightReader` client (`packages/sdk/src/reader.ts`),
+  and the `afr` CLI (`packages/cli`, read-only: `runs list`, `runs get`, `tail`, `replay`,
+  `export`) — see `docs/api_reference.md` for the full contract
+
+### Scheduled jobs
+
+- Five daily crons (artifact GC, stale-run expiry, retention enforcement,
+  projection-integrity verification, daily rollup computation) and two per-minute crons
+  (webhook delivery, email delivery) — all defined in `convex/crons.ts`, detailed in
+  `docs/architecture.md` §8
 
 ---
 

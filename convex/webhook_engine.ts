@@ -57,21 +57,55 @@ function toEnvelopeRun(run: Doc<"runs">): EnvelopeRun {
   };
 }
 
-/** Bounded batch of due deliveries: status "pending" AND (nextAttemptAt unset OR <= now). */
+/**
+ * Bounded batch of due deliveries: status "pending" AND (nextAttemptAt unset
+ * OR <= now).
+ *
+ * AUDIT FIX (cycle 5, perf M1): this used to scan the whole `by_status_created`
+ * index (every "pending" row across every org, oldest-created first) and
+ * post-filter in memory for the due condition — under a large pending
+ * backlog with staggered backoff retry times, most of that scan reads rows
+ * that turn out not to be due yet. `by_status_nextAttempt` (status,
+ * nextAttemptAt) lets this read due rows directly off the index. Two
+ * indexed queries (rather than one open-ended range) because Convex's
+ * comparable-value ordering for an optional field is not something this
+ * code should depend on for correctness: querying `eq(undefined)` and
+ * `lte(now)` separately is unambiguous regardless of how undefined sorts,
+ * and the de-dup guards against double-counting if a row happens to satisfy
+ * both.
+ *
+ * `now` is optional and injectable (default Date.now()) so callers/tests can
+ * pin a single timestamp for an entire drain instead of taking a fresh
+ * wall-clock reading — see deliverPendingWebhooks below.
+ */
 export const getPendingDeliveries = internalQuery({
-  args: {},
-  handler: async (ctx) => {
-    const now = Date.now();
-    return await ctx.db
+  args: { now: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const now = args.now ?? Date.now();
+
+    const due = await ctx.db
       .query("webhook_deliveries")
-      .withIndex("by_status_created", (q) => q.eq("status", "pending"))
-      .filter((q) =>
-        q.or(
-          q.eq(q.field("nextAttemptAt"), undefined),
-          q.lte(q.field("nextAttemptAt"), now),
-        ),
+      .withIndex("by_status_nextAttempt", (q) =>
+        q.eq("status", "pending").lte("nextAttemptAt", now),
       )
       .take(WEBHOOK_DELIVERY_BATCH_SIZE);
+
+    const remaining = WEBHOOK_DELIVERY_BATCH_SIZE - due.length;
+    if (remaining <= 0) {
+      return due;
+    }
+
+    const seen = new Set(due.map((d) => d._id));
+    const unset = (
+      await ctx.db
+        .query("webhook_deliveries")
+        .withIndex("by_status_nextAttempt", (q) =>
+          q.eq("status", "pending").eq("nextAttemptAt", undefined),
+        )
+        .take(remaining)
+    ).filter((d) => !seen.has(d._id));
+
+    return [...due, ...unset];
   },
 });
 
@@ -192,11 +226,29 @@ export const rollupAlertEventStatus = internalMutation({
  * patch the result. Retryable failures reschedule via computeBackoff up to
  * WEBHOOK_MAX_ATTEMPTS, after which the delivery is marked terminally
  * "failed". Never throws out of the batch — a bad row is logged and skipped.
+ *
+ * AUDIT FIX (cycle 5, de-flake): `now` is an optional injectable clock
+ * (defaults to Date.now()), threaded through to getPendingDeliveries and
+ * used for every timestamp computed in this invocation (envelope `firedAt`,
+ * `nextAttemptAt = now + delayMs`). Previously every timestamp in this
+ * handler was its own independent `Date.now()` call, and a test asserting
+ * `nextAttemptAt > (a separately-read Date.now() - 1)` could flake: since
+ * `computeBackoff` returns a RANDOM delay in `[0, cap)` (helpers/delivery.ts),
+ * a draw near 0 combined with real wall-clock drift between the action's
+ * internal Date.now() and the test's own Date.now() read (worse under
+ * parallel-suite CPU contention) could make `nextAttemptAt` (fixed at an
+ * earlier instant) fail to exceed a *later* wall-clock reading. Pinning one
+ * `now` per invocation removes that drift entirely: nextAttemptAt = now +
+ * delayMs >= now is always true relative to the SAME now a test compares
+ * against, independent of scheduling jitter or how small the random delay
+ * is. Coverage is unchanged — this still asserts convergence to "failed" at
+ * WEBHOOK_MAX_ATTEMPTS; see convex/action_layer.test.ts.
  */
 export const deliverPendingWebhooks = internalAction({
-  args: {},
-  handler: async (ctx) => {
-    const pending: Doc<"webhook_deliveries">[] = await ctx.runQuery(_getPendingDeliveries, {});
+  args: { now: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const now = args.now ?? Date.now();
+    const pending: Doc<"webhook_deliveries">[] = await ctx.runQuery(_getPendingDeliveries, { now });
 
     let delivered = 0;
     let failed = 0;
@@ -229,7 +281,7 @@ export const deliverPendingWebhooks = internalAction({
           event: delivery.event,
           orgId: String(delivery.orgId),
           run: run ? toEnvelopeRun(run) : null,
-          firedAt: Date.now(),
+          firedAt: now,
         };
 
         const result = await deliverWebhook({
@@ -254,7 +306,7 @@ export const deliverPendingWebhooks = internalAction({
             attempts: attemptNumber,
             responseCode: result.status ?? undefined,
             error: result.error,
-            nextAttemptAt: Date.now() + delayMs,
+            nextAttemptAt: now + delayMs,
           });
           retried++;
         } else {
@@ -293,7 +345,7 @@ export const deliverPendingWebhooks = internalAction({
               deliveryId: delivery._id,
               attempts: attemptNumber,
               error: message,
-              nextAttemptAt: Date.now() + delayMs,
+              nextAttemptAt: now + delayMs,
             });
             retried++;
           } else {

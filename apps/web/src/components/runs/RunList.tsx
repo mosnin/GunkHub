@@ -5,6 +5,7 @@ import type { Run } from '@agent-flight-recorder/contracts'
 
 import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
 import { Badge } from '@/components/ui/Badge'
+import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { LoadingState } from '@/components/ui/LoadingState'
 import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
@@ -72,12 +73,19 @@ export function RunList({ runs, loading, agentVersionLabels = {}, verificationSt
             return (
               <tr key={run.id} className="hover:bg-neutral-900 transition-colors duration-100 group">
                 <td className="px-4 py-3">
-                  <Link
-                    href={`/runs/${run.id}`}
-                    className="font-mono text-xs text-neutral-300 group-hover:text-neutral-100 transition-colors duration-100"
-                  >
-                    {truncateId(run.id, 12)}
-                  </Link>
+                  <div className="flex items-center gap-1">
+                    <Link
+                      href={`/runs/${run.id}`}
+                      className="font-mono text-xs text-neutral-300 group-hover:text-neutral-100 transition-colors duration-100"
+                    >
+                      {truncateId(run.id, 12)}
+                    </Link>
+                    <CopyToClipboardButton
+                      value={run.id}
+                      label="Copy run ID"
+                      className="opacity-0 group-hover:opacity-100 focus:opacity-100"
+                    />
+                  </div>
                 </td>
                 <td className="px-4 py-3">
                   <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>

@@ -164,10 +164,29 @@ export function addModelSeen(
  * Tolerant extraction of a human-readable error message from a run.failed
  * event payload, for appending to runs.searchText at terminal reconcile.
  * Never throws.
+ *
+ * M4 (searchable error text for externalized failures): `errorSummary` is
+ * checked FIRST, before the older `message`/`errorMessage`/`error.message`
+ * fields. The SDK attaches this redacted, <=512-char string as a sibling
+ * field on BOTH run.failed payload shapes (packages/contracts/src/events.ts
+ * RunFailedPayload.errorSummary and ExternalizedPayload.errorSummary):
+ *   - inline: { type: "run.failed", error, duration_ms, errorSummary }
+ *   - externalized: { type: "_externalized", originalType: "run.failed",
+ *     _artifact, errorSummary }
+ * For an externalized run.failed, the full `error` object lives only in the
+ * blob artifact — it is never read at ingest time — so `errorSummary` is the
+ * ONLY way any error text reaches runs.searchText for a large failure
+ * payload. Checking it first (rather than only as a fallback) also means a
+ * caller-supplied `errorSummary` takes precedence over a possibly-truncated
+ * or differently-formatted `message`/`error.message` on the inline shape,
+ * matching the SDK's redaction/sizing guarantees.
  */
 export function extractErrorMessage(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const p = payload as Record<string, unknown>;
+  if (typeof p["errorSummary"] === "string" && p["errorSummary"].length > 0) {
+    return p["errorSummary"];
+  }
   if (typeof p["message"] === "string") return p["message"];
   if (typeof p["errorMessage"] === "string") return p["errorMessage"];
   if (p["error"] && typeof p["error"] === "object") {

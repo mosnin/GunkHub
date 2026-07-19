@@ -252,11 +252,28 @@ When starting a new Claude session on this repository:
 The following are explicitly out of scope for the initial release. Do not implement
 or design for them until v1 ships and the decision is revisited.
 
+> **Amendment (2026-07-19, final cycle of the action-layer work):** ADR-002
+> (`docs/adr/002-data-model-expansion.md`) and ADR-003
+> (`docs/adr/003-alerting-webhooks-export.md`) each lifted part of this
+> freeze and committed to amending this section once their work shipped.
+> Both are now fully implemented and wired (not just data-model/engine-only —
+> see `docs/architecture.md` §8 and §9 for the crons and terminal-event
+> scheduling that make delivery live). The two lifted items are removed below
+> and replaced with pointers to the ADRs that govern them.
+
 - Real-time collaboration or live streaming of events to multiple viewers
-- Analytics dashboards, aggregate metrics, or usage statistics
+- ~~Analytics dashboards, aggregate metrics, or usage statistics~~ — lifted by
+  ADR-002: usage counters, daily rollups, and the analytics/cost/version-
+  comparison UI surfaces are shipped, subject to ADR-002's constraints
+  (additive schema only, org-scoped, approximate/observability-grade
+  counters — never a substitute for the event log as source of truth).
 - Agent marketplace or agent registry
 - Policy engine, compliance features, or audit log export
 - Multi-region or distributed ingestion infrastructure
 - Billing, usage metering, or subscription management
-- Webhooks or external integrations (Slack, PagerDuty, etc.)
+- ~~Webhooks or external integrations (Slack, PagerDuty, etc.)~~ — lifted by
+  ADR-003: alerting and outbound webhook delivery are shipped, subject to
+  ADR-003's constraints (org-scoped, admin-managed mutations, append-only
+  delivery/firing logs, HTTPS-only + SSRF-guarded outbound targets,
+  HMAC-signed payloads).
 - Mobile application

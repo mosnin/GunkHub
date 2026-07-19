@@ -293,14 +293,33 @@ export const createEvent = mutation({
       }
     }
 
-    // ADR-002: terminal reconcile — append the extracted error message to
-    // runs.searchText so a failed run's error text is searchable.
-    if (args.type === "run.failed") {
-      const errorMessage = extractErrorMessage(args.payload);
-      if (errorMessage) {
-        const searchText = buildSearchText([run.searchText, errorMessage]);
-        await ctx.db.patch(args.runId, { searchText });
+    // AUDIT FIX (cycle 5): terminal reconcile — mirrors sdkCreateEvents
+    // (convex/sdk_ingest.ts): a run.completed/run.failed event appended via
+    // this Clerk-authenticated write path must transition run.status to the
+    // matching terminal status, exactly like the SDK ingest path already
+    // does. Before this fix, createEvent only appended the error message to
+    // runs.searchText on run.failed and never patched run.status/endedAt, so
+    // a UI/dashboard-driven terminal event left the run stuck "running"
+    // forever (RUN_NOT_ACTIVE would then block any further appends, but
+    // nothing ever closed the run itself). The subsequent updateRunStatus
+    // mutation (convex/runs.ts) is an idempotent no-op when it later
+    // transitions to the same terminal status, same as the SDK path.
+    if (TERMINAL_EVENT_TYPES.has(args.type)) {
+      const patch: {
+        status: "failed" | "completed";
+        endedAt: number;
+        searchText?: string;
+      } = {
+        status: args.type === "run.failed" ? "failed" : "completed",
+        endedAt: args.timestamp,
+      };
+      if (args.type === "run.failed") {
+        const errorMessage = extractErrorMessage(args.payload);
+        if (errorMessage) {
+          patch.searchText = buildSearchText([run.searchText, errorMessage]);
+        }
       }
+      await ctx.db.patch(args.runId, patch);
     }
 
     // ADR-002: approximate usage metering (see convex/usage.ts).

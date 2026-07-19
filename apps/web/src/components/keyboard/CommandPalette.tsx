@@ -34,7 +34,12 @@ const COMMANDS: Command[] = [
   { id: 'nav-runs', label: 'Go to Runs', run: ({ router }) => router.push('/runs') },
   { id: 'nav-search', label: 'Go to Search', run: ({ router }) => router.push('/search') },
   { id: 'nav-compare', label: 'Go to Compare', run: ({ router }) => router.push('/diff') },
+  { id: 'nav-audit', label: 'Go to Audit log', run: ({ router }) => router.push('/audit') },
   { id: 'nav-settings', label: 'Go to Settings', run: ({ router }) => router.push('/settings') },
+  { id: 'nav-members', label: 'Go to Members', run: ({ router }) => router.push('/settings/members') },
+  { id: 'nav-usage', label: 'Go to Usage', run: ({ router }) => router.push('/settings/usage') },
+  { id: 'nav-alerts', label: 'Go to Alerts', run: ({ router }) => router.push('/settings/alerts') },
+  { id: 'nav-webhooks', label: 'Go to Webhooks', run: ({ router }) => router.push('/settings/webhooks') },
   {
     id: 'copy-url',
     label: 'Copy current URL',

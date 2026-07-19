@@ -306,6 +306,57 @@ describe('ADR 001 — retention window enforcement', () => {
     expect(await t.run((ctx) => ctx.db.get(oldTerminal))).toBeNull()
     expect(await t.run((ctx) => ctx.db.get(org))).not.toBeNull() // retention never deletes the org
   })
+
+  // AUDIT FIX (cycle 5, H4): retention-window deletion of a terminal run must
+  // also scrub its alert_events, email_deliveries, and webhook_deliveries —
+  // the org purge already covers these tables org-wide, but the per-run
+  // window sweep previously left them behind entirely (docs/adr/001,
+  // "Addendum (Cycle 5)").
+  it('deletes evals, alert_events, webhook_deliveries, and email_deliveries for a retention-expired run', async () => {
+    const t = convexTest(schema, modules)
+    const now = Date.now()
+    const { org, oldTerminal, alertEventId, webhookId } = await t.run(async (ctx) => {
+      const org = await ctx.db.insert('organizations', {
+        clerkOrgId: 'clerk_ret_deliveries', name: 'R2', slug: 'r2', plan: 'free', createdAt: now, updatedAt: now, retentionDays: 30,
+      })
+      const project = await ctx.db.insert('projects', { orgId: org, name: 'P', slug: 'p', createdAt: now, updatedAt: now })
+      const agent = await ctx.db.insert('agents', { orgId: org, projectId: project, name: 'A', slug: 'a', createdAt: now, updatedAt: now })
+      const oldTerminal = await ctx.db.insert('runs', {
+        orgId: org, projectId: project, agentId: agent, status: 'failed', startedAt: now - 40 * DAY, endedAt: now - 40 * DAY, metadata: {}, tags: [],
+      })
+      await ctx.db.insert('evals', {
+        orgId: org, runId: oldTerminal, name: 'e', kind: 'manual', passed: true, createdAt: now, createdBy: 'u',
+      })
+      const ruleId = await ctx.db.insert('alert_rules', {
+        orgId: org, name: 'rule', kind: 'run_failed', channels: [{ type: 'webhook', target: 'https://example.com/hook' }], enabled: true, createdAt: now, updatedAt: now,
+      })
+      const alertEventId = await ctx.db.insert('alert_events', {
+        orgId: org, ruleId, runId: oldTerminal, firedAt: now, summary: 'run failed', deliveryStatus: 'failed',
+      })
+      await ctx.db.insert('email_deliveries', {
+        orgId: org, alertEventId, to: 'a@example.com', subject: 's', body: 'b', status: 'failed', attempts: 6, createdAt: now,
+      })
+      const webhookId = await ctx.db.insert('webhook_targets', {
+        orgId: org, url: 'https://example.com/hook', secret: 's', events: ['run.failed'], enabled: true, createdAt: now,
+      })
+      await ctx.db.insert('webhook_deliveries', {
+        orgId: org, webhookId, event: 'run.failed', runId: oldTerminal, status: 'failed', attempts: 6, createdAt: now, alertEventId,
+      })
+      return { org, oldTerminal, alertEventId, webhookId }
+    })
+
+    await t.action(internal.retention.enforceRetention, {})
+
+    expect(await t.run((ctx) => ctx.db.get(oldTerminal))).toBeNull()
+    expect(await t.run((ctx) => ctx.db.query('evals').withIndex('by_run', (q) => q.eq('runId', oldTerminal)).collect())).toHaveLength(0)
+    expect(await t.run((ctx) => ctx.db.get(alertEventId))).toBeNull()
+    expect(await t.run((ctx) => ctx.db.query('email_deliveries').withIndex('by_alert_event', (q) => q.eq('alertEventId', alertEventId)).collect())).toHaveLength(0)
+    expect(await t.run((ctx) => ctx.db.query('webhook_deliveries').withIndex('by_run', (q) => q.eq('runId', oldTerminal)).collect())).toHaveLength(0)
+    // The webhook target itself and the org are untouched — retention deletes
+    // only the run and its dependents, never the org's standing config.
+    expect(await t.run((ctx) => ctx.db.get(webhookId))).not.toBeNull()
+    expect(await t.run((ctx) => ctx.db.get(org))).not.toBeNull()
+  })
 })
 
 describe('Artifact GC — reworked orphan semantics', () => {
@@ -413,6 +464,23 @@ describe('Write ceilings', () => {
       orgId: org, name: 'e', keyHash: 'he', rateLimitPerMin: 42,
     })
     expect(explicit.rateLimitPerMin).toBe(42)
+  })
+
+  it('AUDIT FIX (cycle 5): createApiKey rejects an empty scopes array', async () => {
+    const t = convexTest(schema, modules)
+    const { org } = await seedOrg(t, 'esc')
+    const asAdmin = t.withIdentity(identity('admin', 'esc'))
+    // Mirrors the web layer's resolveRequestedScopes (apps/web/src/lib/
+    // apiKeyScopes.ts), which rejects `scopes: []` for the same reason: a
+    // direct-mutation caller (bypassing the Next.js route) must not be able
+    // to mint a scopeless key just because it skipped that layer's check.
+    await expect(
+      asAdmin.mutation(api.api_keys.createApiKey, { orgId: org, name: 'empty', keyHash: 'he2', scopes: [] }),
+    ).rejects.toThrow(/scopes must not be empty/i)
+
+    // Omitting scopes entirely is still the documented "full access" default.
+    const defaulted = await asAdmin.mutation(api.api_keys.createApiKey, { orgId: org, name: 'ok', keyHash: 'he3' })
+    expect(defaulted.scopes).toBeUndefined()
   })
 })
 

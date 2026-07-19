@@ -57,6 +57,23 @@ export const createApiKey = mutation({
       );
     }
     if (args.scopes !== undefined) {
+      // AUDIT FIX (cycle 5, LOW): an empty `scopes` array is explicitly
+      // rejected, not treated as "no scopes" or silently coerced into
+      // unrestricted access. `scopes: undefined` means "full/back-compat
+      // access" (see resolveApiKey in sdk_ingest.ts) and `scopes: [...]`
+      // means "restricted to exactly these" — `scopes: []` is neither of
+      // those and is ambiguous at best, a scopeless-but-still-usable key at
+      // worst. The web layer's resolveRequestedScopes (apps/web/src/lib/
+      // apiKeyScopes.ts) already rejects `[]` for the same reason; this
+      // mirrors that behavior at the actual enforcement point so a caller
+      // that mutates Convex directly (bypassing the Next.js route) cannot
+      // mint a scopeless key by omitting the web layer's check.
+      if (args.scopes.length === 0) {
+        throw afrError(
+          "INVALID_ARGUMENT",
+          "scopes must not be empty (omit the field entirely for the default, full-access behavior)",
+        );
+      }
       const invalid = args.scopes.filter(
         (s) => !(API_KEY_SCOPES as readonly string[]).includes(s),
       );

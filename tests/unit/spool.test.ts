@@ -392,4 +392,38 @@ describe('FileSpool', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  it('warns once when a second FileSpool targets an already-open path in this process', async () => {
+    const { dir, path } = await makeTmpPath()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      new FileSpool(path) // eslint-disable-line no-new -- claims the path
+      expect(warnSpy).not.toHaveBeenCalled()
+
+      new FileSpool(path) // eslint-disable-line no-new -- same path, second instance: should warn
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      expect(warnSpy.mock.calls[0]![0]).toContain(path)
+
+      new FileSpool(path) // eslint-disable-line no-new -- a third instance must NOT spam a second warning
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      warnSpy.mockRestore()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not warn for two FileSpools at distinct paths', async () => {
+    const { dir: dir1, path: path1 } = await makeTmpPath()
+    const { dir: dir2, path: path2 } = await makeTmpPath()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      new FileSpool(path1) // eslint-disable-line no-new
+      new FileSpool(path2) // eslint-disable-line no-new
+      expect(warnSpy).not.toHaveBeenCalled()
+    } finally {
+      warnSpy.mockRestore()
+      await rm(dir1, { recursive: true, force: true })
+      await rm(dir2, { recursive: true, force: true })
+    }
+  })
 })

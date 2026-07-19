@@ -1,4 +1,5 @@
 import { NON_RETRYABLE_RUN_ERROR_CODES } from './api-errors.js'
+import { buildErrorSummary } from './error-summary.js'
 import { Events, buildEvent } from './events.js'
 import { redactPayload } from './redaction.js'
 import { decideSampling } from './sampling.js'
@@ -390,10 +391,23 @@ export class Recorder {
       ...(error instanceof Error && error.stack !== undefined && { stack: error.stack }),
       ...('code' in error && error.code !== undefined && { code: error.code }),
     }
+    // M4: short, bounded, searchable error summary — see error-summary.ts.
+    // Computed here (not just at externalization time) so it flows through
+    // redactPayload below like any other payload field before it ever gets
+    // buffered/spooled/externalized.
+    const errorSummary = buildErrorSummary({
+      message: error.message,
+      ...(errPayload.stack !== undefined && { stack: errPayload.stack }),
+    })
 
     this.recordEvent(
       'run.failed',
-      Events.runFailed(this.runContext.runId, errPayload, Date.now() - this.runContext.startedAt).payload
+      Events.runFailed(
+        this.runContext.runId,
+        errPayload,
+        Date.now() - this.runContext.startedAt,
+        errorSummary
+      ).payload
     )
     if (this.sampledOut) return this.finalizeSampledOutRun('failed')
     return this.finalizeRun('failed')
@@ -707,9 +721,16 @@ export class Recorder {
     try {
       if (this.runContext) {
         const message = err instanceof Error ? err.message : String(err)
+        const stack = err instanceof Error ? err.stack : undefined
+        const errorSummary = buildErrorSummary({ message, ...(stack !== undefined && { stack }) })
         this.recordEvent(
           'run.failed',
-          Events.runFailed(this.runContext.runId, { message }, Date.now() - this.runContext.startedAt).payload
+          Events.runFailed(
+            this.runContext.runId,
+            { message },
+            Date.now() - this.runContext.startedAt,
+            errorSummary
+          ).payload
         )
         await this.finalizeRun('failed')
       } else {

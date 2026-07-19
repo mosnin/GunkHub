@@ -45,26 +45,33 @@ function validateChannelsBody(raw: unknown): AlertChannel[] | NextResponse {
 // GET /api/alerts — list alert rules for the authenticated org (Clerk auth,
 // admin-only — convex/alerts.ts listAlertRules enforces the role check).
 // ---------------------------------------------------------------------------
-export const GET = withApiHandler('/api/alerts', async (_req: NextRequest, ctx) => {
-  const authResult = auth()
-  if (!hasOrgAuthContext(authResult)) {
-    return NextResponse.json<ApiError>(
-      { code: 'UNAUTHORIZED', message: 'Authentication required' },
-      { status: 401 }
-    )
-  }
-  const { orgId } = authResult
-  ctx.setOrgId(orgId)
+export const GET = withApiHandler(
+  '/api/alerts',
+  async (_req: NextRequest, ctx) => {
+    const authResult = auth()
+    if (!hasOrgAuthContext(authResult)) {
+      return NextResponse.json<ApiError>(
+        { code: 'UNAUTHORIZED', message: 'Authentication required' },
+        { status: 401 }
+      )
+    }
+    const { orgId } = authResult
+    ctx.setOrgId(orgId)
 
-  try {
-    const rules = await listAlertRules()
-    return NextResponse.json({ rules })
-  } catch (err) {
-    const mapped = mapApiError(err, ctx.requestId)
-    if (mapped) return mapped
-    throw err
-  }
-})
+    try {
+      const rules = await listAlertRules()
+      return NextResponse.json({ rules })
+    } catch (err) {
+      const mapped = mapApiError(err, ctx.requestId)
+      if (mapped) return mapped
+      throw err
+    }
+  },
+  // Clerk-read rate class: higher than the sibling 60/min write limit,
+  // explicit rather than falling back to the global 300/min default, for
+  // consistency with this route family's other explicit limits.
+  { rateLimit: { key: 'org', limitPerMin: 180 } }
+)
 
 // ---------------------------------------------------------------------------
 // POST /api/alerts — create an alert rule (Clerk auth, admin-only).

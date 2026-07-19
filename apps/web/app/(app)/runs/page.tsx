@@ -393,6 +393,14 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
         </div>
       </div>
 
+      {triageFilter !== 'all' && (
+        <p className="mt-2 text-xs text-pewter">
+          Triage has no server-side index yet — this filter is applied within this page of
+          results, not across your whole history. Some matching runs on later pages won&#39;t
+          appear until you page through them.
+        </p>
+      )}
+
       <div className="mt-4">
         {error ? (
           <ErrorState

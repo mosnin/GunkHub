@@ -228,6 +228,51 @@ describe("evaluateRules — payload_match", () => {
     expect(result.overallPassed).toBe(false);
   });
 
+  it("AUDIT FIX (cycle 5): rejects a known ReDoS (nested-quantifier) pattern without hanging", () => {
+    // Classic catastrophic-backtracking shape: (a+)+ against a string with no
+    // trailing match forces the backtracking engine through exponentially
+    // many ways to partition the "a" run. This must be rejected statically
+    // (never even reach re.test()), not merely "eventually return false".
+    const result = evaluateRules(
+      [{ kind: "payload_match", eventType: "llm.error", path: "error.message", op: "regex", value: "^(a+)+$" }],
+      baseRun(),
+      events,
+    );
+    expect(result.overallPassed).toBe(false);
+    expect(result.results[0].explanation).toMatch(/unsafe|ReDoS/i);
+  });
+
+  it("AUDIT FIX (cycle 5): rejects other known nested/overlapping-quantifier shapes", () => {
+    for (const pattern of ["(a*)*", "(a+)*b", "(a{2,})+"]) {
+      const result = evaluateRules(
+        [{ kind: "payload_match", eventType: "llm.error", path: "error.message", op: "regex", value: pattern }],
+        baseRun(),
+        events,
+      );
+      expect(result.overallPassed).toBe(false);
+      expect(result.results[0].explanation).toMatch(/unsafe|ReDoS/i);
+    }
+  });
+
+  it("AUDIT FIX (cycle 5): normal, non-dangerous regex patterns still work", () => {
+    // A quantifier inside a group that is NOT itself repeated is fine (no
+    // nested repetition ambiguity) — must not be caught by the new guard.
+    const result = evaluateRules(
+      [{ kind: "payload_match", eventType: "llm.error", path: "error.code", op: "regex", value: "^(4\\d{2})$" }],
+      baseRun(),
+      events,
+    );
+    expect(result.overallPassed).toBe(true);
+
+    // Alternation with a trailing quantifier but no inner quantifier is safe.
+    const result2 = evaluateRules(
+      [{ kind: "payload_match", eventType: "llm.error", path: "error.message", op: "regex", value: "(rate|timeout)+" }],
+      baseRun(),
+      events,
+    );
+    expect(result2.overallPassed).toBe(true);
+  });
+
   it("fails cleanly when no events of the given type exist", () => {
     const result = evaluateRules(
       [{ kind: "payload_match", eventType: "no.such.type", path: "x", op: "contains", value: "y" }],

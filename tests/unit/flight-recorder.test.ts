@@ -467,6 +467,23 @@ describe('RunRecorder', () => {
     expect(body.payload.error.code).toBe('ECONNRESET')
   })
 
+  it('fail attaches a bounded errorSummary as a sibling field on the run.failed payload', async () => {
+    const run = await fr.startRun()
+    const err = new Error('connection reset')
+    err.stack = 'Error: connection reset\n    at doThing (/app/src/index.ts:12:5)'
+    await expect(run.fail(err)).rejects.toThrow('connection reset')
+
+    const eventCalls = mockFetch.mock.calls.filter(
+      ([url, init]: FetchArgs) =>
+        (url as string).endsWith('/api/events') && init?.method === 'POST'
+    )
+    const evtCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
+    const body = JSON.parse((evtCall[1] as RequestInit).body as string) as {
+      payload: { errorSummary?: string }
+    }
+    expect(body.payload.errorSummary).toBe('connection reset | at doThing (/app/src/index.ts:12:5)')
+  })
+
   it('fail swallows status-update failure and still re-throws original error', async () => {
     // Route by URL so auto-emitted lifecycle events (run.started/run.failed) don't
     // shift a positional mock chain: runs+events succeed, the PATCH status fails.
@@ -569,5 +586,41 @@ describe('RunRecorder — payload externalization', () => {
       ([url]: FetchArgs) => (url as string).includes('/api/artifacts/upload'),
     )
     expect(uploadCalls).toHaveLength(0)
+  })
+
+  it('a >10KB run.failed payload externalizes but keeps errorSummary inline (M4)', async () => {
+    mockFetch = makeMockFetch(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/runs') && init?.method === 'POST') {
+        return jsonResponse({ run: { id: 'run_fail_big' } })
+      }
+      if (url.includes('/api/artifacts/upload')) {
+        return jsonResponse({
+          artifactId: 'art-fail-1',
+          storageKey: 'key/fail-big',
+          storageBucket: 'default',
+          checksum: 'deadbeef',
+          size: 12010,
+        })
+      }
+      return jsonResponse({ eventId: 'evt_fail_big' })
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    const run = await fr.startRun()
+    const hugeStack = 'Error: boom\n' + 'x'.repeat(12_000)
+    const err = new Error('boom')
+    err.stack = hugeStack
+    await expect(run.fail(err)).rejects.toThrow('boom')
+
+    const eventCalls = mockFetch.mock.calls.filter(
+      ([url, init]: FetchArgs) =>
+        (url as string).endsWith('/api/events') && init?.method === 'POST',
+    )
+    const evtCall = eventCalls[eventCalls.length - 1] as [string, RequestInit]
+    const body = JSON.parse((evtCall[1] as RequestInit).body as string) as {
+      payload: { type: string; errorSummary?: string }
+    }
+    expect(body.payload.type).toBe('_externalized')
+    expect(body.payload.errorSummary).toBe('boom')
   })
 })

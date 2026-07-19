@@ -249,9 +249,71 @@ function evaluateEventCount(rule: EventCountRule, events: EvalEventLike[]): Rule
   };
 }
 
-/** Compile a rule-supplied regex source safely. Never throws — returns undefined on any failure. */
+/**
+ * AUDIT FIX (cycle 5): reject regex patterns with a nested/overlapping
+ * quantifier ("evil regex") shape — the classic ReDoS construction where a
+ * quantified group's body can match the same substring in more than one way
+ * and the group is itself repeated, e.g. `(a+)+`, `(a*)*`, `(a|a)+`,
+ * `(a+)*b`. MAX_REGEX_LENGTH bounds pattern SOURCE length but says nothing
+ * about evaluation COST: a 6-char pattern like `(a+)+$` run against a
+ * crafted non-matching string (e.g. "aaaaaaaaaaaaaaaaaaaaaaaaaaaa!") is
+ * exponential in the input length, so the length cap alone does not bound
+ * the work `re.test()` can do.
+ *
+ * GUARANTEE (what this function actually provides): a conservative static
+ * scan of the pattern source that flags any parenthesized group whose body
+ * contains a quantifier metacharacter (`+`, `*`, or `{m,n}`) AND which is
+ * itself immediately followed by another quantifier. This is the necessary
+ * shape for catastrophic backtracking in a backtracking regex engine (which
+ * is what JS `RegExp` is). It is intentionally over-inclusive — some
+ * patterns matching this shape are in fact safe (e.g. quantifiers over
+ * mutually-exclusive character classes) — because false rejections of an
+ * admin-authored rule are cheap (the rule just fails safely with an
+ * explanation) whereas a false negative is a live availability incident.
+ * It is NOT a full regex parser/analyzer and does not prove linear-time
+ * evaluation for everything it allows through (e.g. it does not reason
+ * about backreferences or cross-group ambiguity), so it is defense-in-depth
+ * layered on top of the length cap and the bounded MAX_COMPARISON_LENGTH
+ * input, not a formal safety proof. Combined, the three bounds are: pattern
+ * source length (compile-time cost), rejected nested-quantifier shape
+ * (catastrophic-backtracking shape), and input string length (per-match
+ * work for any pattern that does get through).
+ */
+function hasDangerousQuantifierNesting(source: string): boolean {
+  const groupStarts: number[] = [];
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "\\") {
+      i++; // skip the escaped character (e.g. "\(" is not a group boundary)
+      continue;
+    }
+    if (ch === "(") {
+      groupStarts.push(i + 1);
+    } else if (ch === ")") {
+      const start = groupStarts.pop();
+      if (start === undefined) continue; // unbalanced — let RegExp compilation reject it
+      const body = source.slice(start, i);
+      const bodyHasQuantifier = /[+*]|\{\d*,?\d*\}/.test(body);
+      const after = source.slice(i + 1);
+      const followedByQuantifier = /^([+*]|\{\d*,?\d*\})/.test(after);
+      if (bodyHasQuantifier && followedByQuantifier) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Compile a rule-supplied regex source safely. Never throws — returns
+ * undefined on any failure, including a rejected nested-quantifier shape
+ * (see hasDangerousQuantifierNesting above).
+ */
 function safeCompileRegex(source: string): RegExp | undefined {
   if (typeof source !== "string" || source.length === 0 || source.length > MAX_REGEX_LENGTH) {
+    return undefined;
+  }
+  if (hasDangerousQuantifierNesting(source)) {
     return undefined;
   }
   try {
@@ -281,7 +343,7 @@ function evaluatePayloadMatch(rule: PayloadMatchRule, events: EvalEventLike[]): 
         passed: false,
         actual: "n/a",
         expected: `valid regex "${rule.value}"`,
-        explanation: `Rule regex "${rule.value}" is invalid or exceeds the ${MAX_REGEX_LENGTH}-char cap; rule fails safely rather than throwing.`,
+        explanation: `Rule regex "${rule.value}" is invalid, exceeds the ${MAX_REGEX_LENGTH}-char cap, or has an unsafe nested-quantifier (ReDoS) shape; rule fails safely rather than throwing or hanging.`,
       };
     }
 

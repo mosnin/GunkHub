@@ -91,16 +91,35 @@ sense as the Event Log Rules and Tenancy Rules elsewhere in CLAUDE.md:
 
 ## Consequences
 
-- CLAUDE.md's "Not in v1" section will be amended in the final cycle of this
+- **Superseding note (final cycle, 2026-07-19):** CLAUDE.md's "Not in v1"
+  section has now been amended per the commitment below — analytics/usage
+  metering (ADR-002) and webhooks/alerting (this ADR) are removed from the
+  freeze list, each replaced with a pointer to its governing ADR and
+  constraints. Delivery is also no longer "engine only" — see the superseding
+  bullet further down; the two points immediately below describe this ADR's
+  original as-shipped state at Cycle 2 and are retained for history.
+- ~~CLAUDE.md's "Not in v1" section will be amended in the final cycle of this
   work to remove webhooks/external-integrations from the freeze list (and to
   reflect ADR-002's analytics decision), replacing the blanket prohibition
-  with a pointer to this ADR and the constraints above.
-- The delivery engine shipped this cycle (`apps/web/src/lib/delivery.ts`) is
+  with a pointer to this ADR and the constraints above.~~ Done — see above.
+- ~~The delivery engine shipped this cycle (`apps/web/src/lib/delivery.ts`) is
   pure and transport-level: it does not yet read from or write to any Convex
   table. It is not reachable from any route or scheduled function yet. No
   alert rule or webhook target can be configured until the data agent lands
   the corresponding schema and the wiring cycle lands the Convex
-  action/scheduler described in `docs/design/action_layer.md`.
+  action/scheduler described in `docs/design/action_layer.md`.~~
+  **Superseded:** this was accurate at Cycle 2 only. As of this cycle, the
+  schema (`convex/schema.ts` `alert_rules`/`alert_events`/`webhook_targets`/
+  `webhook_deliveries`/`email_deliveries`, per ADR-002) exists, alert rules
+  and webhook targets are fully configurable via `/api/alerts/**` and
+  `/api/webhooks-config/**` (`docs/api_reference.md` §2), and the
+  action/scheduler is live: a run's terminal event schedules
+  `alert_engine.runEvalsThenEvaluateAlerts` (`convex/events.ts`,
+  `convex/sdk_ingest.ts`), which evaluates rules and enqueues delivery rows
+  drained by the per-minute `deliver-pending-webhooks` and
+  `deliver-pending-emails` crons (`convex/crons.ts`). Delivery is live end to
+  end, not merely a pure transport-level engine. See `docs/architecture.md`
+  §8 for the full picture.
 - **Known limitation, flagged for the audit cycle:** the SSRF guard
   (`assertSafeWebhookUrl`) is a syntactic check against the hostname/URL at
   call time. It does not resolve DNS and pin the resolved IP for the actual

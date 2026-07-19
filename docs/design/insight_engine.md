@@ -149,3 +149,98 @@ query listEvalResults({ orgId, agentVersionId, limit?, cursor? }) -> paginated e
   approximation, explicitly not a rigorous statistical test (documented in
   the source). If this becomes customer-facing beyond an internal hint, it
   may be worth revisiting with a proper hypothesis-testing library.
+
+## 5. `getDashboardStats` same-day live fallback — cost, bound, and future work (cycle 5 / M5)
+
+**The situation.** `computeDailyRollups` (Team A's cron, `convex/rollups.ts`)
+runs once daily at 05:00 UTC and rolls up only the PRECEDING UTC calendar day.
+That means "today" has zero `daily_rollups` coverage for the entire current
+UTC day, always, for every org. `getDashboardStats` falls back to a live query
+over `runs` for any date with zero rollup rows — in steady state that is
+exactly one date per call: today. Already-rolled-up days are never re-scanned
+live; the fallback is keyed off "this date has zero rows in the rollup map,"
+not off "this date is recent."
+
+**Why it's already about as cheap as it can be within this cycle's
+boundaries.** The live fallback:
+- Only ever fires for one date (today) in steady state — not a re-scan of
+  the whole range.
+- Is bounded: `.take(DASHBOARD_FALLBACK_MAX_RUNS)` (5,000), so a single call
+  can never read more than 5,000 `runs` documents regardless of org size.
+- Is indexed: `by_org_started` (org-wide) or `by_agent_started`
+  (agent-scoped) — no table scan.
+- Reads only the `runs` table (unlike `getAgentCostStats`'s fallback, which
+  also reads events) — no N+1 read pattern.
+
+**The actual cost being called out.** A Convex `query` has no cache to write
+to across calls — every dashboard view (and every poll, if the UI polls)
+independently re-runs this bounded scan. At high dashboard traffic on a large
+org (hundreds of agents, many concurrent viewers), that is many independent
+up-to-5,000-row scans of the same underlying "today" rows, once per view. The
+per-call cost is bounded and cheap; the aggregate cost across a busy org's
+viewers is the real concern, and it scales with viewer traffic, not with the
+`range` parameter or org size directly.
+
+**What this cycle did about it:**
+1. Confirmed and documented (in `getDashboardStats`'s own doc comment) that
+   the fallback already only touches today (or, for a brand-new org, a short
+   pre-first-cron-tick backlog), never a re-scan of rolled-up history.
+2. Added `todaySource: "rollup" | "fallback" | "no_data"` and
+   `partialToday: boolean` to `DashboardStats` (top-level, not just on the
+   per-day `series` point that already had `source`/`truncated`) so a caller
+   can cheaply and honestly render "today's numbers are still live" without
+   knowing the series-ordering convention.
+
+**Recommendation for a future cycle (needs Team A — schema/cron owner):**
+A real fix requires eliminating the live scan entirely for "today," which
+means an incremental same-day rollup. Two concrete options, in order of
+preference:
+1. **Incremental upsert on terminal event.** When a run reaches a terminal
+   status (`completed`/`failed`/`cancelled`/`timed_out`), have the same
+   terminal-event path that already schedules `runEvalsForRun` also schedule
+   an internal mutation that upserts (increments) TODAY's `daily_rollups` row
+   for that `(orgId, agentId, date)` — turning `daily_rollups` from a
+   once-daily batch write into an append/increment-friendly running total.
+   `getDashboardStats` would then find a (continuously updating, but always
+   present) rollup row for today and never take the live-scan branch at all.
+   Requires: relaxing/re-purposing `daily_rollups` from "written once by the
+   nightly cron" to "written once nightly AND incrementally intraday" (a
+   behavior change to a table Team A owns, plus care that the nightly cron's
+   overwrite-or-merge semantics don't clobber the day's incremental counts),
+   and durability/ordering discipline on the incremented counters (e.g. an
+   idempotency key so a scheduler retry doesn't double-count — same class of
+   problem `runEvalsForRun` already solved for evals via its
+   `createdBy === EVAL_SOURCE` idempotency check).
+2. **Higher-frequency intraday cron** (e.g. hourly instead of once daily),
+   rolling up "today so far" into a row keyed the same way, overwritten each
+   tick. Simpler to reason about (still batch, not incremental-on-write) but
+   less fresh (up to an hour of live-scan exposure right after each tick),
+   and multiplies the existing cron's read cost by ~24x/day.
+Both require a schema/cron change outside this file's ownership — this cycle
+does not implement either, per the instruction that Team A owns schema. The
+`todaySource`/`partialToday` fields added this cycle are forward-compatible
+with option 1 or 2: once either lands, `todaySource` simply reports `"rollup"`
+for today too, and `partialToday` becomes `false` in steady state, with no
+API shape change needed on the caller side.
+
+## 6. Pricing snapshot — cycle 5 review
+
+`PRICING_LAST_UPDATED` is `"2026-01-15"`, roughly six months stale as of this
+review — a reminder that this is a snapshot, not a live feed, and operators
+should override it per the module's own top-of-file warning (env-configured
+JSON blob merged over `PRICING_TABLE`, or a fork). The unmatched-model path
+was re-verified to never fabricate: `resolveModelPricing` returns `undefined`
+on no match (exact, then longest-key substring, then give up — no
+nearest-neighbor guessing), and `estimateCostUsd` returns `{ costUsd: 0,
+matched: false }` for that case rather than inventing a number.
+
+Deliberately **not** added this cycle: newer-generation model ids (e.g. the
+Claude generation this very session is running on, `claude-opus-4-6` /
+`claude-sonnet-5`-style ids, and any GPT/Gemini ids released after
+`PRICING_LAST_UPDATED`). This file's own rule is "never guess a price, mark
+uncertain ones as unmatched" — without an operator-supplied, verified price
+list for those ids, adding entries would mean fabricating numbers, which is
+exactly what this module exists to avoid. Those model strings will correctly
+surface as `unmatched`/`$0` with `matched: false` until an operator supplies
+real pricing (via the documented override mechanism) or a future cycle adds
+verified entries from a primary source.

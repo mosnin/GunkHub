@@ -87,6 +87,20 @@ export interface FileSpoolOptions {
  * await recorder.recover() // re-send anything a previous process left behind
  * ```
  */
+/**
+ * Process-level registry of spool paths currently claimed by a `FileSpool`
+ * instance (module-scoped, so it survives across `Recorder`s and is shared by
+ * every `FileSpool` in this process). Two `FileSpool`s writing the same path
+ * race their appends/truncates against each other (no `flock`, by design —
+ * see the SINGLE-PROCESS ASSUMPTION note below) and can silently corrupt or
+ * duplicate entries. This registry can't prevent that (there is no portable
+ * way to lock a path), so it only warns — once per path, not once per
+ * instance, so constructing many short-lived spools at the same path doesn't
+ * spam the console.
+ */
+const openSpoolPaths = new Set<string>()
+const warnedDuplicateSpoolPaths = new Set<string>()
+
 export class FileSpool implements EventSpool {
   private readonly path: string
   private readonly fsync: boolean
@@ -102,6 +116,20 @@ export class FileSpool implements EventSpool {
   constructor(path: string, options?: FileSpoolOptions) {
     this.path = path
     this.fsync = options?.fsync ?? false
+
+    if (openSpoolPaths.has(path)) {
+      if (!warnedDuplicateSpoolPaths.has(path)) {
+        warnedDuplicateSpoolPaths.add(path)
+        console.warn(
+          `[afr-sdk] FileSpool: another FileSpool instance in this process already targets path "${path}". ` +
+            'Two FileSpool instances writing the same path race their appends/truncates and can silently ' +
+            'corrupt or duplicate entries (see the SINGLE-PROCESS ASSUMPTION in file-spool.ts). Use a distinct ' +
+            'path per instance (e.g. include a worker ID in the path).'
+        )
+      }
+    } else {
+      openSpoolPaths.add(path)
+    }
   }
 
   /** Run `op` after all previously enqueued file operations complete. */

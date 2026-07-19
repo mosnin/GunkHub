@@ -1,4 +1,4 @@
-import { Recorder, Events, buildEvent } from '@agent-flight-recorder/sdk'
+import { Recorder, Events, buildEvent, buildErrorSummary, ERROR_SUMMARY_MAX_LENGTH } from '@agent-flight-recorder/sdk'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 import type {
@@ -148,6 +148,20 @@ describe('Recorder', () => {
     const payload = runFailedEvent!.payload as { error: { code?: string; stack?: string } }
     expect(payload.error.code).toBe('ECONNRESET')
     expect(payload.error.stack).toBeDefined()
+  })
+
+  it('failRun attaches a bounded errorSummary as a sibling field on the run.failed payload', async () => {
+    await recorder.startRun('input')
+    const err = new Error('something broke')
+    err.stack = 'Error: something broke\n    at doThing (/app/src/index.ts:12:5)'
+    await recorder.failRun(err)
+
+    const sendEventsMock = transport.sendEvents as unknown as { mock: { calls: [CreateEventRequest[], TransportAuth][] } }
+    const allEvents = sendEventsMock.mock.calls.flatMap((call) => call[0])
+    const runFailedEvent = allEvents.find((e) => e.type === 'run.failed')
+    expect(runFailedEvent).toBeDefined()
+    const payload = runFailedEvent!.payload as { errorSummary?: string }
+    expect(payload.errorSummary).toBe('something broke | at doThing (/app/src/index.ts:12:5)')
   })
 
   it('calls transport.updateRunStatus with failed on failRun', async () => {
@@ -463,6 +477,49 @@ describe('Events builders', () => {
   it('runFailed includes duration_ms', () => {
     const e = Events.runFailed('run_1', { message: 'oops', code: 'ERR_503' }, 2500)
     expect(e.payload.duration_ms).toBe(2500)
+  })
+
+  it('runFailed omits errorSummary when not passed', () => {
+    const e = Events.runFailed('run_1', { message: 'oops' }, 2500)
+    expect('errorSummary' in e.payload).toBe(false)
+  })
+
+  it('runFailed includes errorSummary as a sibling field (not nested under error) when passed', () => {
+    const e = Events.runFailed('run_1', { message: 'oops' }, 2500, 'oops | at foo (file.ts:1:1)')
+    expect(e.payload.errorSummary).toBe('oops | at foo (file.ts:1:1)')
+    expect('errorSummary' in e.payload.error).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildErrorSummary (M4 — searchable error text for externalized failures)
+// ---------------------------------------------------------------------------
+
+describe('buildErrorSummary', () => {
+  it('returns just the message when there is no stack', () => {
+    expect(buildErrorSummary({ message: 'boom' })).toBe('boom')
+  })
+
+  it('appends the first "at " stack frame when present', () => {
+    const stack = 'Error: boom\n    at doThing (/app/src/index.ts:12:5)\n    at main (/app/src/index.ts:20:3)'
+    expect(buildErrorSummary({ message: 'boom', stack })).toBe('boom | at doThing (/app/src/index.ts:12:5)')
+  })
+
+  it('skips a stack header line that does not start with "at "', () => {
+    const stack = 'TypeError: boom\n    at frame1 (/x.ts:1:1)'
+    const summary = buildErrorSummary({ message: 'boom', stack })
+    expect(summary).toBe('boom | at frame1 (/x.ts:1:1)')
+  })
+
+  it('truncates to ERROR_SUMMARY_MAX_LENGTH characters', () => {
+    const longMessage = 'x'.repeat(1000)
+    const summary = buildErrorSummary({ message: longMessage })
+    expect(summary.length).toBe(ERROR_SUMMARY_MAX_LENGTH)
+  })
+
+  it('never throws on an empty message and no stack', () => {
+    expect(() => buildErrorSummary({ message: '' })).not.toThrow()
+    expect(buildErrorSummary({ message: '' })).toBe('')
   })
 
   it('runCompleted includes output and duration_ms', () => {

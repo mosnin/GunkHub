@@ -16,26 +16,33 @@ const VALID_EVENTS = new Set<string>(['run.completed', 'run.failed', 'eval.faile
 // (Clerk auth, admin-only — convex/webhooks.ts listWebhooks strips the
 // signing secret from every entry).
 // ---------------------------------------------------------------------------
-export const GET = withApiHandler('/api/webhooks-config', async (_req: NextRequest, ctx) => {
-  const authResult = auth()
-  if (!hasOrgAuthContext(authResult)) {
-    return NextResponse.json<ApiError>(
-      { code: 'UNAUTHORIZED', message: 'Authentication required' },
-      { status: 401 }
-    )
-  }
-  const { orgId } = authResult
-  ctx.setOrgId(orgId)
+export const GET = withApiHandler(
+  '/api/webhooks-config',
+  async (_req: NextRequest, ctx) => {
+    const authResult = auth()
+    if (!hasOrgAuthContext(authResult)) {
+      return NextResponse.json<ApiError>(
+        { code: 'UNAUTHORIZED', message: 'Authentication required' },
+        { status: 401 }
+      )
+    }
+    const { orgId } = authResult
+    ctx.setOrgId(orgId)
 
-  try {
-    const webhooks = await listWebhooks()
-    return NextResponse.json({ webhooks })
-  } catch (err) {
-    const mapped = mapApiError(err, ctx.requestId)
-    if (mapped) return mapped
-    throw err
-  }
-})
+    try {
+      const webhooks = await listWebhooks()
+      return NextResponse.json({ webhooks })
+    } catch (err) {
+      const mapped = mapApiError(err, ctx.requestId)
+      if (mapped) return mapped
+      throw err
+    }
+  },
+  // Clerk-read rate class: higher than the sibling 60/min write limit,
+  // explicit rather than falling back to the global 300/min default, for
+  // consistency with this route family's other explicit limits.
+  { rateLimit: { key: 'org', limitPerMin: 180 } }
+)
 
 // ---------------------------------------------------------------------------
 // POST /api/webhooks-config — create an outbound webhook target

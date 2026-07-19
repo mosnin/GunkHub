@@ -229,24 +229,130 @@ event immediately instead, trading durability for simplicity):
 
 ## 8. Scheduled Jobs
 
-All defined in `convex/crons.ts`, running daily in UTC:
+All defined in `convex/crons.ts`. Four run daily in UTC; two run every minute
+(interval jobs, not time-of-day):
 
-| Time (UTC) | Job | Action |
+| Schedule (UTC) | Job | Action |
 |------------|-----|--------|
-| 01:00 | `enforce-retention` | `retention:enforceRetention` — deletes terminal runs (and their events/artifacts/comments/verification results) past an org's opt-in `retentionDays` window (ADR 001) |
-| 02:00 | `artifact-gc` | `artifact_gc:cleanOrphanedArtifacts` — deletes artifacts older than 24h with no referencing event, from both blob storage and Convex |
-| 03:00 | `expire-stale-runs` | `stale_runs:expireStaleRuns` — transitions runs stuck in `"running"` for >24h to `"timed_out"` |
-| 04:30 | `verify-projection-integrity` | `projection_verify:verifyRecentRuns` — checks sequence contiguity for up to 50 recent terminal runs, recording a `verification_results` row |
+| 01:00 daily | `enforce-retention` | `retention:enforceRetention` — deletes terminal runs (and their events/artifacts/comments/verification results) past an org's opt-in `retentionDays` window (ADR 001) |
+| 02:00 daily | `artifact-gc` | `artifact_gc:cleanOrphanedArtifacts` — deletes artifacts older than 24h with no referencing event, from both blob storage and Convex |
+| 03:00 daily | `expire-stale-runs` | `stale_runs:expireStaleRuns` — transitions runs stuck in `"running"` for >24h to `"timed_out"` |
+| 04:30 daily | `verify-projection-integrity` | `projection_verify:verifyRecentRuns` — checks sequence contiguity for up to 50 recent terminal runs, recording a `verification_results` row |
+| 05:00 daily | `compute-daily-rollups` | `rollups:computeDailyRollups` (ADR-002) — computes yesterday's per-agent terminal-run counts, duration percentiles, and token totals into `daily_rollups`, after the other daily jobs so it sees post-retention/post-GC state |
+| every 1 min | `deliver-pending-webhooks` | `webhook_engine:deliverPendingWebhooks` (ADR-003) — drains due `"pending"` rows in `webhook_deliveries`, in bounded batches (`WEBHOOK_DELIVERY_BATCH_SIZE`) |
+| every 1 min | `deliver-pending-emails` | `email_engine:deliverPendingEmails` (ADR-003) — drains due `"pending"` rows in `email_deliveries` (alert-rule email channels) through whichever `EmailNotifier` `convex/helpers/notifier.ts`'s `getConfiguredEmailNotifier()` resolves to (console logger by default; `AFR_EMAIL_PROVIDER=resend` opts into a real send) |
 
 Retention runs before artifact GC deliberately, so GC sees the post-retention state.
 
+**Terminal-event alert/eval scheduling (not a cron — an inline scheduler
+call):** the moment a run's terminal event (`run.completed`/`run.failed`) is
+stored — in both the Clerk-session path (`convex/events.ts`) and the SDK
+ingest path (`convex/sdk_ingest.ts`) — the mutation calls
+`ctx.scheduler.runAfter(0, ...)` against a single Convex action,
+`alert_engine.runEvalsThenEvaluateAlerts`, that sequences auto-run evals and
+then alert-rule evaluation for that run. This runs non-blocking relative to
+the event-insert mutation, and is scheduled as **one** action (not two
+independent `runAfter(0, ...)` calls) specifically so eval results are
+guaranteed to exist before alert evaluation reads them — two independent
+scheduler calls would race and could let alert evaluation run before an eval
+insert lands, permanently missing the alert for that run. This is what makes
+alerting and webhook/email delivery actually live end to end: terminal event
+→ scheduled alert evaluation → `alert_events`/`webhook_deliveries`/
+`email_deliveries` row → drained by the per-minute crons above. See
+`docs/api_reference.md` §3 for the outbound delivery contract this produces.
+
 ---
 
-## 9. Where This Document Can Go Stale
+## 9. Sampling and Its Effect on Rollups, Alerts, and Usage Counters
+
+The SDK supports client-side head sampling with tail-bias for failures
+(`packages/sdk/src/sampling.ts`, `SamplingConfig`/`decideSampling`): a
+sampling decision is made once at `startRun()`, optionally seeded
+deterministically from the run name (`seedFromRunName`) or overridden by a
+caller-supplied `decider`. An unsampled run's events are never transmitted to
+the server at all — unless `alwaysKeepFailures` is set, in which case an
+unsampled run that ends via `failRun()` retroactively ships its
+shadow-buffered events.
+
+This has a consequence every consumer of server-side aggregates must
+understand: **sampling is a client-side, per-SDK-integration configuration
+decision that is completely invisible to the server.** Convex has no
+knowledge that a run was sampled out — it simply never receives it. This
+means:
+
+- **`usage_counters` undercount** actual agent activity whenever any caller
+  samples below `rate: 1`. The counters are already documented as
+  approximate/observability-grade (ADR-002), but sampling is an additional,
+  separate source of undercount on top of the counters' own
+  contention-mitigation approximation.
+- **`daily_rollups` undercount** the true population of runs for any
+  agent/day where a sampled SDK integration is in use — the rollup's
+  percentiles and totals are computed only over what actually reached
+  Convex, which is a biased-by-tail-inclusion subset when
+  `alwaysKeepFailures` is set (failures are over-represented relative to
+  their true rate, successes under-represented).
+- **`failure_rate` alerts (`convex/alert_engine.ts`) evaluate only over
+  sampled-in traffic.** If an org's agents sample at `rate: 0.1`, a
+  `failure_rate` alert's computed percentage is over that 10% window, not
+  the agent's true failure rate — and with `alwaysKeepFailures` enabled, the
+  sampled-in population is deliberately failure-biased, which can make a
+  `failure_rate` alert fire more eagerly than the true failure rate
+  warrants (or, without `alwaysKeepFailures`, under-fire because failures
+  are sampled out at the same rate as successes).
+- **An alert admin configuring `failure_rate` thresholds in the web UI has no
+  visibility into whether, or at what rate, the org's SDK integrations
+  sample** — sampling is set in SDK-side code the alert admin may not
+  control or even know about. This is a real operational gap: there is no
+  current mechanism (as of this cycle) for the server to distinguish a "10
+  failures out of 10 sampled runs" scenario from a true 100% failure rate.
+
+None of this violates the event log's own invariants (the sampled-out
+events genuinely never existed server-side, which is different from the log
+being incomplete for events that were ingested) — but it does mean every
+rollup/usage/alert consumer must treat these aggregates as **"over whatever
+reached the server,"** not as ground truth about agent behavior.
+
+---
+
+## 10. Search-Index Gap for Externalized Error Payloads
+
+`runs.searchText` (the field behind the `search_runs` search index,
+ADR-002) is appended to at terminal reconcile when a `run.failed` event
+lands, via `extractErrorMessage(evt.payload)`
+(`convex/helpers/run_fields.ts`, called from both `convex/events.ts` and
+`convex/sdk_ingest.ts`). This extraction reads `payload.message` /
+`payload.errorMessage` / `payload.error.message` directly off the **event's
+stored payload as received**.
+
+When a `run.failed` payload exceeds the 10 KB inline ceiling (Event Log Rule
+3), the stored payload is not the original error object — it is the
+`_externalized` pointer shape (`{ type: "_externalized", originalType,
+_artifact: { artifactId, storageKey, storageBucket, checksum, size } }`,
+`packages/contracts/src/events.ts`). `extractErrorMessage` runs against this
+pointer object, which has none of `message`/`errorMessage`/`error.message`,
+so it returns `undefined` and `runs.searchText` is **not** updated with any
+error text for that run.
+
+**Practical effect:** a run that fails with a large error payload (a long
+stack trace, a big tool-output dump) is *less* discoverable via
+`searchRuns`/`GET /api/v1/runs` full-text search than a run with a small
+error message, purely because of payload size — the opposite of what an
+engineer debugging a bad failure would want. This is a known gap, not yet
+addressed: closing it would require either fetching the externalized
+artifact's content at terminal-reconcile time (an extra blob read on every
+large-payload failure) or truncating/summarizing the original error message
+into `searchText` *before* externalization decides to externalize the full
+payload (i.e. computing a short excerpt earlier in the ingest pipeline, independent
+of the size check). Neither is implemented as of this cycle.
+
+---
+
+## 11. Where This Document Can Go Stale
 
 This file describes source-of-truth code paths, not aspirations. When any of the
 following change, update this document in the same PR: `convex/schema.ts`,
 `convex/sdk_ingest.ts`, `convex/auth.ts`, `convex/crons.ts`,
+`convex/alert_engine.ts`, `convex/webhook_engine.ts`, `convex/email_engine.ts`,
 `packages/contracts/src/{entities,events,api_errors}.ts`,
-`packages/sdk/src/{recorder,flight-recorder,file-spool}.ts`,
+`packages/sdk/src/{recorder,flight-recorder,file-spool,sampling}.ts`,
 `apps/web/src/lib/apiHandler.ts`.

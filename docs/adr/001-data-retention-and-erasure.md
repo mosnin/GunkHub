@@ -54,6 +54,25 @@ partition, because erasure requires deleting it too. The terminal purge record i
 therefore emitted to the Convex function log (console) with org id, counts, and
 timestamp; operators should retain deployment logs per their compliance policy.
 
+## Addendum (Cycle 5): per-run retention scrub covers alert/delivery tables too
+
+The retention window's per-run deletion (`purgeRunSlice`, used by both
+`enforceRetention` and `purgeOrganization`) originally covered comments,
+verification_results, artifacts, and events; a Cycle 4 fix added `evals`
+after finding that a retention-deleted run's eval rows were left orphaned
+forever. This cycle closes the same gap for the ADR-002/003 alerting and
+delivery tables: `alert_events` fired for the run, the `email_deliveries`
+reachable only via those alert_events' `alertEventId`, and `webhook_deliveries`
+tied to the run directly (both the alert-triggered and standalone
+webhook-target creation paths stamp `runId` on the delivery row). The org
+purge already swept these tables org-wide; the per-run window sweep did not
+touch them at all, so a run aging out of an org's opt-in retention window
+could leave its fired-alert and delivery bookkeeping behind indefinitely —
+a real erasure gap in the same family the Cycle 4 `evals` fix addressed, now
+closed the same way (found via new `by_run` indexes on `alert_events` and
+`webhook_deliveries`, deleted within the same per-run batch budget as
+everything else in `purgeRunSlice`).
+
 ## Consequences
 
 - Erasure and offboarding are satisfiable without weakening the event-log contract.

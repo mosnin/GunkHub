@@ -9,6 +9,7 @@ import type { Run } from '@agent-flight-recorder/contracts'
 import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
 import { EnvironmentChip, TriageChip } from '@/components/runs/RunMetaChips'
 import { Badge } from '@/components/ui/Badge'
+import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { bulkReverifyAction, type BulkReverifyResult } from '@/lib/actions/verification'
 import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
@@ -238,6 +239,11 @@ export function SelectableRunList({
                       >
                         {truncateId(run.id, 12)}
                       </Link>
+                      <CopyToClipboardButton
+                        value={run.id}
+                        label="Copy run ID"
+                        className="opacity-0 group-hover:opacity-100 focus:opacity-100"
+                      />
                       {wasSucceeded && (
                         <span className="text-neon-glow text-xs" aria-label="re-verified">✓</span>
                       )}

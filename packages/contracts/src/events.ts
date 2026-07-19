@@ -45,6 +45,17 @@ export interface RunFailedPayload {
   type: "run.failed";
   error: ErrorPayload;
   duration_ms: number;
+  /**
+   * Redacted, size-capped (<=512 char) plain-text summary of the failure,
+   * attached by the SDK as a sibling of `error` so the backend can index
+   * error text into `runs.searchText` WITHOUT parsing/trusting the full
+   * `error` object shape (which is user/agent-controlled and may be large
+   * or arbitrarily nested). See ExternalizedPayload.errorSummary for the
+   * externalized-envelope counterpart — a run.failed payload can carry this
+   * field on either shape depending on whether it was large enough to
+   * externalize.
+   */
+  errorSummary?: string;
 }
 
 export interface RunCancelledPayload {
@@ -163,6 +174,17 @@ export interface ExternalizedPayload {
     checksum: string;
     size: number;
   };
+  /**
+   * Redacted, size-capped (<=512 char) plain-text summary of the failure,
+   * set by the SDK ONLY when `originalType` is "run.failed" and the full
+   * failure payload was large enough to externalize. This is the field that
+   * makes an externalized run.failed searchable at all: the full `error`
+   * object lives in the artifact (not read at ingest time), so without this
+   * sibling summary the backend would have no error text to fold into
+   * `runs.searchText`. See RunFailedPayload.errorSummary for the inline
+   * (non-externalized) counterpart.
+   */
+  errorSummary?: string;
 }
 
 // ---------------------------------------------------------------------------

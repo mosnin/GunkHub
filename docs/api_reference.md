@@ -370,13 +370,18 @@ When a run reaches a terminal state (`run.completed` / `run.failed`) or an
 alert fires, Agent Flight Recorder POSTs a signed envelope to every enabled
 webhook target subscribed to that event type.
 
-> **Cycle-2 status:** the signing/delivery engine
-> (`apps/web/src/lib/delivery.ts`) and the Convex schema/CRUD
-> (`convex/webhooks.ts`, `convex/alerts.ts`) both exist; the scheduler/action
-> that actually triggers a delivery from a terminal event is the piece
-> `docs/design/action_layer.md` describes as still to be wired. The payload
-> shape and verification steps below are the stable contract regardless of
-> when the trigger lands.
+> **Status (final cycle): delivery is fully wired and live.** The signing/
+> delivery engine (`apps/web/src/lib/delivery.ts`), the Convex schema/CRUD
+> (`convex/webhooks.ts`, `convex/alerts.ts`), and the scheduler/action that
+> triggers a delivery from a terminal event are all in place. The moment a
+> run's terminal event lands (`convex/events.ts` / `convex/sdk_ingest.ts`),
+> `ctx.scheduler.runAfter(0, ...)` schedules `alert_engine.runEvalsThenEvaluateAlerts`,
+> which evaluates alert rules and enqueues `webhook_deliveries`/
+> `email_deliveries` rows; two per-minute Convex crons,
+> `webhook_engine:deliverPendingWebhooks` and `email_engine:deliverPendingEmails`
+> (`convex/crons.ts`), drain those queues. See `docs/architecture.md` §8 for
+> the full cron/scheduler picture. The payload shape and verification steps
+> below are the stable contract this pipeline produces.
 
 ### Payload envelope
 

@@ -163,6 +163,8 @@ await recorder.failRun({ message: 'Upstream 503', code: 'SERVICE_UNAVAILABLE' })
 
 Throws if no run is active.
 
+**Searchable error text (`errorSummary`).** `failRun`/`RunRecorder.fail()` compute a short summary — the error message plus the first stack frame, bounded to 512 characters — and attach it as an `errorSummary` string field on the `run.failed` event payload (a sibling of `error`/`duration_ms`, not nested inside `error`). It goes through the same redaction pipeline as every other payload field, and it is preserved even when the rest of the payload is too large (>10 KB) and gets externalized to an artifact — a large stack trace no longer means the failure's error text is unsearchable server-side. See `src/error-summary.ts` for the exact field shape.
+
 ---
 
 ### `recorder.flush()`
@@ -287,6 +289,7 @@ With `alwaysKeepFailures: true`, an unsampled run's events are held in a bounded
 - **Plain-HTTP warning.** Configuring a non-`https` endpoint that is not localhost logs a one-time `console.warn` (the API key and payloads would transit in cleartext). Suppress with `allowInsecureEndpoint: true` if you terminate TLS elsewhere (e.g. a sidecar).
 - **Authentication** is the `x-api-key` header on every request. Every request also carries the wire protocol version as `x-afr-protocol` (currently `1`) so future backends can gate protocol changes.
 - **Rate limiting.** The backend enforces a per-API-key ingest rate limit over a fixed one-minute window; run creation and artifact uploads each charge 1 unit against the same window as events. Exceeding it returns the `RATE_LIMITED` error code — the SDK retains the affected events and retries them on a later flush.
+- **Redaction is defense in depth, not a compliance guarantee.** `RecorderOptions.redact` (see [Redaction](#redaction) below) is regex/path-based pattern matching applied client-side. It has documented false-negatives: an unprefixed/bespoke API key, an SSN written without dashes, or deliberately obfuscated text (e.g. `user (at) example.com`) will NOT be caught by the built-in patterns — only by a `paths` entry you add for your own known-sensitive fields, or a custom `RegExp`. Treat it as a safety net that reduces accidental leakage, never as proof that a payload is free of sensitive data. If you have a regulatory/compliance requirement, do not record sensitive fields in the first place — redact or omit them before calling `recordEvent`, rather than relying on this pipeline to catch them after the fact.
 
 ---
 
@@ -630,6 +633,8 @@ this pattern (including the tool-error path).
 ---
 
 ## Version
+
+v0.6.0 — Searchable error text for large failures (M4): `failRun`/`RunRecorder.fail()` now compute a short, bounded (512 char) `errorSummary` (message + top stack frame) and attach it as a sibling field on the `run.failed` payload; it is redacted like any other payload field and — critically — preserved on the `_externalized` envelope by `externalizePayloadIfLarge` when the full payload (e.g. a big stack trace) exceeds the 10 KB inline threshold, so a failure's error text stays searchable server-side regardless of payload size. New `RecorderOptions`/README security callout documenting redaction's guarantee model (regex/path-based defense in depth, not a compliance guarantee) and its known false-negatives. `FileSpool` now warns (once per path) if a second instance in the same process targets an already-open spool path.
 
 v0.5.0 — `FlightReader`: a typed read client over the public v1 read API (`listRuns`/`getRun`/`getRunEvents`/`iterateEvents`/`getReplay`), so record-and-read is a single-package story. Its fetch/envelope/status-mapping core (`fetchV1`/`V1ApiError` in `src/v1-client.ts`) is the single source of truth shared with `@agent-flight-recorder/cli`'s `apiClient.ts` — the CLI no longer re-implements this logic. New exports: `FlightReader`, `V1ApiError`, `fetchV1`, `tryParseV1Json`, `messageFromV1Body`, plus the v1 data/config types.
 

@@ -6,6 +6,7 @@ import type { AlertChannel, AlertEvent, AlertRule, AlertRuleKind } from '@agent-
 
 import { Button } from '@/components/ui/Button'
 import { Card } from '@/components/ui/Card'
+import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { formatRelativeTime } from '@/lib/utils'
 
@@ -396,7 +397,12 @@ function RuleRow({ rule, onChanged, onDeleted }: { rule: AlertRule; onChanged: (
 
   return (
     <tr>
-      <td className="px-4 py-2 text-sm text-neutral-200">{rule.name}</td>
+      <td className="px-4 py-2 text-sm text-neutral-200">
+        <span className="flex items-center gap-1">
+          {rule.name}
+          <CopyToClipboardButton value={rule.id} label="Copy rule ID" />
+        </span>
+      </td>
       <td className="px-4 py-2 font-mono text-xs text-neutral-400">{KIND_LABEL[rule.kind]}</td>
       <td className="px-4 py-2 font-mono text-xs text-neutral-400">
         {rule.kind === 'failure_rate' ? `${String(rule.thresholdPct ?? '—')}% / ${String(rule.windowMinutes ?? '—')}m` : '—'}
@@ -532,6 +538,7 @@ function FiringHistory({ events }: { events: AlertEvent[] }) {
               />
               <span className="text-neutral-300 flex-1 truncate">{e.summary}</span>
               <span className="text-pewter font-mono">{e.deliveryStatus}</span>
+              <CopyToClipboardButton value={e.id} label="Copy alert event ID" />
               <span className="text-pewter font-mono shrink-0">{formatRelativeTime(e.firedAt)}</span>
             </div>
           ))}

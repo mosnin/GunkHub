@@ -261,6 +261,44 @@ describe('searchRuns — org-scoped (ADR-002)', () => {
     const results = await asA.query(api.runs.searchRuns, { orgId: orgA, searchTerm: 'kaboomerang' })
     expect(results.runs.map((r) => r._id)).toContain(run._id)
   })
+
+  // M4 (searchable error text for externalized failures): when a run.failed
+  // payload is too large and gets externalized, the full `error` object
+  // lives only in the blob artifact and is never read at ingest time. The
+  // SDK attaches a redacted `errorSummary` string as a sibling field on the
+  // `_externalized` envelope specifically so this case still contributes
+  // error text to runs.searchText — see convex/helpers/run_fields.ts
+  // extractErrorMessage, which now checks `errorSummary` before falling
+  // back to `message`/`errorMessage`/`error.message`.
+  it('finds a failed run via errorSummary on an externalized run.failed payload', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asA = t.withIdentity(identity('member', 'a'))
+    const run = await asA.mutation(api.runs.createRun, { orgId: orgA, projectId: projectA, agentId: agentA })
+    await makeRunning(t, run._id)
+    await asA.mutation(api.events.createEvent, {
+      runId: run._id, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
+    })
+    await asA.mutation(api.events.createEvent, {
+      runId: run._id,
+      type: 'run.failed',
+      sequenceNumber: 2,
+      timestamp: Date.now(),
+      payload: {
+        type: '_externalized',
+        originalType: 'run.failed',
+        _artifact: {
+          artifactId: 'art_1', storageKey: 'k', storageBucket: 'b', checksum: 'c', size: 99999,
+        },
+        errorSummary: 'externalized-quasar-meltdown',
+      },
+    })
+    const run2 = await t.run((ctx) => ctx.db.get(run._id))
+    expect(run2?.status).toBe('failed')
+    expect(run2?.searchText).toMatch(/externalized-quasar-meltdown/)
+    const results = await asA.query(api.runs.searchRuns, { orgId: orgA, searchTerm: 'externalized-quasar-meltdown' })
+    expect(results.runs.map((r) => r._id)).toContain(run._id)
+  })
 })
 
 // ---------------------------------------------------------------------------

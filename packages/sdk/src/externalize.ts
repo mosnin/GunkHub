@@ -126,9 +126,28 @@ export async function externalizePayloadIfLarge<T>(
   const pointer = cached ?? (await upload(runId, type, serialized))
   if (cache && !cached) cache.set(serialized, pointer)
 
-  return {
+  const envelope: ExternalizedPayload = {
     type: '_externalized',
     originalType: type as EventType,
     _artifact: pointer,
-  } satisfies ExternalizedPayload
+  }
+
+  // M4: preserve a short inline `errorSummary`, if the original (already
+  // redacted — redaction always runs before this function is called) payload
+  // carried one, as a sibling field on the externalized envelope. Without
+  // this, a big-stack-trace `run.failed` payload — exactly the failures most
+  // worth searching — loses its searchable error text the moment it
+  // externalizes, since the server never sees anything but the artifact
+  // pointer. See error-summary.ts for the full writeup and the server-side
+  // read change this requires.
+  const inlineErrorSummary =
+    payload !== null && typeof payload === 'object' && typeof (payload as Record<string, unknown>)['errorSummary'] === 'string'
+      ? ((payload as Record<string, unknown>)['errorSummary'] as string)
+      : undefined
+
+  if (inlineErrorSummary !== undefined) {
+    return { ...envelope, errorSummary: inlineErrorSummary } as ExternalizedPayload & { errorSummary: string }
+  }
+
+  return envelope
 }

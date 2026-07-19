@@ -87,6 +87,17 @@ export function UsageSection({ data }: UsageSectionProps) {
               <StatTile label="Storage (est.)" value={formatBytes(data.storageEstimateBytes)} />
             </dl>
 
+            <p className="text-xs text-pewter leading-relaxed border-l-2 border-graphite-light pl-2.5">
+              <strong className="text-cloud font-medium">Approximate</strong> — for capacity
+              planning, not billing. These counters are flushed probabilistically (roughly 1-in-10
+              single-unit increments, scaled back up) to avoid contending on one document per
+              organization per day, so they carry sampling variance rather than an exact count.
+              When alert rules evaluate failure rate, they read from a separate bounded sample of
+              recent runs, not these counters — the two numbers are independent approximations and
+              are not expected to reconcile exactly. The event log itself remains the exact,
+              append-only source of truth for anything that needs to be precise.
+            </p>
+
             {data.dailyCounts.length > 0 && <DailyBars dailyCounts={data.dailyCounts} />}
           </div>
         )}

@@ -7,6 +7,7 @@ import type { WebhookDelivery, WebhookEventType, WebhookTarget } from '@agent-fl
 import { Button } from '@/components/ui/Button'
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
+import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { useFocusTrap } from '@/lib/hooks/useFocusTrap'
 import { formatRelativeTime } from '@/lib/utils'
@@ -127,6 +128,7 @@ function DeliveryHistory({ webhookId }: { webhookId: string }) {
           <span className="text-pewter">
             {d.responseCode !== undefined ? `HTTP ${String(d.responseCode)}` : d.error ?? ''}
           </span>
+          <CopyToClipboardButton value={d.id} label="Copy delivery ID" className="shrink-0" />
           <span className="text-pewter ml-auto">attempts: {d.attempts}</span>
           {d.lastAttemptAt && <span className="text-pewter">{formatRelativeTime(d.lastAttemptAt)}</span>}
         </div>
@@ -261,6 +263,7 @@ export function WebhooksSection({ initialWebhooks, isAdmin, loadError }: Webhook
                     <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${w.enabled ? 'bg-neon-glow shadow-[var(--shadow-glow)]' : 'bg-pewter'}`} aria-hidden="true" />
                     <span className="font-mono text-xs text-neutral-300 truncate flex-1">{w.url}</span>
                     <span className="font-mono text-xs text-pewter shrink-0">{w.events.join(', ')}</span>
+                    <CopyToClipboardButton value={w.id} label="Copy webhook ID" className="shrink-0" />
                     <button
                       type="button"
                       onClick={() => setExpandedId((id) => (id === w.id ? null : w.id))}

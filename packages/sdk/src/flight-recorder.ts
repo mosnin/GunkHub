@@ -1,5 +1,6 @@
 import { PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER } from '@agent-flight-recorder/contracts'
 
+import { buildErrorSummary } from './error-summary.js'
 import { externalizePayloadIfLarge, uploadArtifact } from './externalize.js'
 import { redactPayload } from './redaction.js'
 import { warnIfInsecureEndpoint } from './transport.js'
@@ -398,7 +399,18 @@ export class RunRecorder {
     // here would silently discard diagnostic information the caller attached
     // to the error, undermining "make failures explainable" (CLAUDE.md).
     const code = 'code' in originalError ? (originalError as { code?: unknown }).code : undefined
-    const payload: RunFailedPayload = {
+    // M4: short, bounded, searchable error summary — see error-summary.ts.
+    // Carried as a sibling field (not nested under `error`) so it can be
+    // carved out by externalizePayloadIfLarge and preserved even when the
+    // rest of the payload gets replaced with an artifact pointer. The
+    // `RunFailedPayload & { errorSummary?: string }` intersection is a
+    // SDK-local widening, not a contracts change — see error-summary.ts for
+    // the exact field/shape the server side needs to read.
+    const errorSummary = buildErrorSummary({
+      message: originalError.message,
+      ...(originalError.stack !== undefined && { stack: originalError.stack }),
+    })
+    const payload: RunFailedPayload & { errorSummary?: string } = {
       type: 'run.failed',
       error: {
         message: originalError.message,
@@ -406,6 +418,7 @@ export class RunRecorder {
         ...(typeof code === 'string' && { code }),
       },
       duration_ms: Date.now() - this.startedAt,
+      errorSummary,
     }
 
     try {

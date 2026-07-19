@@ -624,6 +624,46 @@ describe('createEvent event-log invariants (authenticated path)', () => {
     ).rejects.toThrow(/contiguous|expected 2/)
   })
 
+  it('AUDIT FIX (cycle 5): a terminal event via createEvent reconciles run.status', async () => {
+    const t = convexTest(schema, modules)
+    const { run } = await seedRoles(t)
+    const m = t.withIdentity(asMember)
+    await m.mutation(api.events.createEvent, {
+      runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
+    })
+    // Before the fix, createEvent (the Clerk-authenticated write path) never
+    // patched run.status/endedAt on a terminal event — only sdkCreateEvents
+    // did — leaving a UI/dashboard-driven terminal event stuck "running".
+    const before = await t.run((ctx) => ctx.db.get(run))
+    expect(before?.status).toBe('running')
+    const endedAt = Date.now()
+    await m.mutation(api.events.createEvent, {
+      runId: run, type: 'run.completed', sequenceNumber: 2, timestamp: endedAt, payload: {},
+    })
+    const after = await t.run((ctx) => ctx.db.get(run))
+    expect(after?.status).toBe('completed')
+    expect(after?.endedAt).toBe(endedAt)
+  })
+
+  it('AUDIT FIX (cycle 5): a run.failed event via createEvent reconciles status and searchText', async () => {
+    const t = convexTest(schema, modules)
+    const { run } = await seedRoles(t)
+    const m = t.withIdentity(asMember)
+    await m.mutation(api.events.createEvent, {
+      runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
+    })
+    await m.mutation(api.events.createEvent, {
+      runId: run,
+      type: 'run.failed',
+      sequenceNumber: 2,
+      timestamp: Date.now(),
+      payload: { error: { message: 'boom: something broke' } },
+    })
+    const after = await t.run((ctx) => ctx.db.get(run))
+    expect(after?.status).toBe('failed')
+    expect(after?.searchText).toMatch(/boom: something broke/)
+  })
+
   it('rejects appending after a terminal event (terminal must be last)', async () => {
     const t = convexTest(schema, modules)
     const { run } = await seedRoles(t)
@@ -634,11 +674,19 @@ describe('createEvent event-log invariants (authenticated path)', () => {
     await m.mutation(api.events.createEvent, {
       runId: run, type: 'run.completed', sequenceNumber: 2, timestamp: Date.now(), payload: {},
     })
+    // AUDIT FIX (cycle 5): createEvent now reconciles run.status to the
+    // terminal status immediately (see the "reconciles run.status" tests
+    // above), so a subsequent append now hits the earlier, more general
+    // "run must be running" guard (RUN_NOT_ACTIVE) rather than reaching the
+    // later "a terminal event has already been recorded" check — the run
+    // genuinely isn't "running" anymore, which is the more accurate error.
+    // Same RUN_NOT_ACTIVE error code as governance.test.ts's equivalent
+    // sdk_ingest-path assertion for the identical scenario.
     await expect(
       m.mutation(api.events.createEvent, {
         runId: run, type: 'tool.call', sequenceNumber: 3, timestamp: Date.now(), payload: {},
       }),
-    ).rejects.toThrow(/terminal/i)
+    ).rejects.toThrow(/RUN_NOT_ACTIVE/)
   })
 
   it('rejects an oversized inline payload (>10 KB)', async () => {

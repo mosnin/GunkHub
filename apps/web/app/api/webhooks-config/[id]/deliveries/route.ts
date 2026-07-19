@@ -42,5 +42,9 @@ export const GET = withApiHandler(
       if (mapped) return mapped
       throw err
     }
-  }
+  },
+  // Clerk-read rate class: higher than the sibling 60/min write limit,
+  // explicit rather than falling back to the global 300/min default, for
+  // consistency with this route family's other explicit limits.
+  { rateLimit: { key: 'org', limitPerMin: 180 } }
 )
