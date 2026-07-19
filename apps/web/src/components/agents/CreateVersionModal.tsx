@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useTransition } from 'react'
 
 import { Button } from '@/components/ui/Button'
 import { createAgentVersionAction } from '@/lib/actions/agent_versions'
+import { EVAL_RULE_REFERENCE, parseEvalRulesInput } from '@/lib/evalRulesValidation'
 import { useFocusTrap } from '@/lib/hooks/useFocusTrap'
 
 interface CreateVersionModalProps {
@@ -22,6 +23,8 @@ export function CreateVersionModal({
   const [version, setVersion] = useState('')
   const [changelog, setChangelog] = useState('')
   const [configSnapshotRaw, setConfigSnapshotRaw] = useState('')
+  const [evalRulesRaw, setEvalRulesRaw] = useState('')
+  const [showRulesReference, setShowRulesReference] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
   const versionRef = useRef<HTMLInputElement>(null)
@@ -33,6 +36,8 @@ export function CreateVersionModal({
       setVersion('')
       setChangelog('')
       setConfigSnapshotRaw('')
+      setEvalRulesRaw('')
+      setShowRulesReference(false)
       setError(null)
     }
   }, [isOpen])
@@ -64,12 +69,19 @@ export function CreateVersionModal({
       }
     }
 
+    const evalRulesResult = parseEvalRulesInput(evalRulesRaw)
+    if (evalRulesResult.error) {
+      setError(evalRulesResult.error)
+      return
+    }
+
     startTransition(async () => {
       const result = await createAgentVersionAction(
         agentId,
         version,
         changelog || undefined,
         parsedConfig,
+        evalRulesResult.rules,
       )
       if ('error' in result) {
         setError(result.error)
@@ -163,6 +175,56 @@ export function CreateVersionModal({
                 aria-describedby={error ? 'create-version-error' : undefined}
                 className="w-full px-3 py-2 text-sm font-mono bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
               />
+            </div>
+
+            {/* Eval rules (JSON editor) */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label
+                  htmlFor="version-eval-rules"
+                  className="block text-xs font-medium text-neutral-400"
+                >
+                  Eval rules (JSON) <span className="text-pewter">(optional)</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setShowRulesReference((v) => !v)}
+                  className="text-xs text-neon-glow hover:text-whiteout transition-colors duration-100"
+                  aria-expanded={showRulesReference}
+                  aria-controls="eval-rules-reference"
+                >
+                  {showRulesReference ? 'Hide reference' : 'Rules reference'}
+                </button>
+              </div>
+              {showRulesReference && (
+                <div
+                  id="eval-rules-reference"
+                  className="mb-2 flex flex-col gap-1.5 rounded-[4px] border border-graphite-light bg-graphite px-3 py-2.5 max-h-40 overflow-y-auto"
+                >
+                  {EVAL_RULE_REFERENCE.map((r) => (
+                    <div key={r.kind} className="text-xs">
+                      <span className="font-mono text-whiteout font-medium">{r.kind}</span>
+                      <span className="text-ash"> — {r.description}</span>
+                      <div className="font-mono text-[11px] text-pewter break-all">{r.example}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <textarea
+                id="version-eval-rules"
+                rows={4}
+                placeholder='[{ "kind": "terminal_status", "expect": ["completed"] }]'
+                value={evalRulesRaw}
+                onChange={(e) => setEvalRulesRaw(e.target.value)}
+                disabled={isPending}
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? 'create-version-error' : undefined}
+                className="w-full px-3 py-2 text-sm font-mono bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
+              />
+              <p className="mt-1 text-xs text-pewter">
+                A structured rule builder is planned for a future cycle — this JSON editor is
+                validated against the 6 supported rule kinds before submit.
+              </p>
             </div>
 
             {/* Error */}

@@ -20,7 +20,7 @@ import { InlineError } from '@/components/ui/InlineError'
 import { getAgent } from '@/lib/services/agents'
 import { listArtifacts } from '@/lib/services/artifacts'
 import { listComments } from '@/lib/services/comments'
-import { listEvalsForRun } from '@/lib/services/evals'
+import { getRunEvalSummary, listEvalsForRun, type RunEvalSummary } from '@/lib/services/evals'
 import { listEvents } from '@/lib/services/events'
 import { getRunVerificationStatus, type VerificationStatus } from '@/lib/services/projection_verify'
 import { getProject } from '@/lib/services/projects'
@@ -66,12 +66,13 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   let commentsData: Comment[] = []
   let childRuns: Awaited<ReturnType<typeof listChildRuns>> = []
   let evalsData: Awaited<ReturnType<typeof listEvalsForRun>> = []
+  let evalSummary: RunEvalSummary | undefined
 
   // Phase 1 — fetch everything that only depends on runId in parallel instead of
   // serially. run + events are the fatal group (drive notFound / ErrorState);
   // replay, artifacts, comments, child runs and evals are additive (non-fatal).
   // allSettled lets one failure not reject the others.
-  const [runSettled, eventsSettled, replaySettled, artifactsSettled, commentsSettled, childRunsSettled, evalsSettled] =
+  const [runSettled, eventsSettled, replaySettled, artifactsSettled, commentsSettled, childRunsSettled, evalsSettled, evalSummarySettled] =
     await Promise.allSettled([
       getRun(runId),
       listEvents({ runId, limit: 200 }),
@@ -80,12 +81,14 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
       listComments(runId, 'run'),
       listChildRuns(runId),
       listEvalsForRun(runId),
+      getRunEvalSummary(runId),
     ])
 
   if (runSettled.status === 'fulfilled') runData = runSettled.value
   if (eventsSettled.status === 'fulfilled') eventsData = eventsSettled.value
   if (childRunsSettled.status === 'fulfilled') childRuns = childRunsSettled.value
   if (evalsSettled.status === 'fulfilled') evalsData = evalsSettled.value
+  if (evalSummarySettled.status === 'fulfilled') evalSummary = evalSummarySettled.value
   const evalsFailed = evalsSettled.status === 'rejected'
 
   // Fatal group error handling — preserve notFound() on "not found", else surface.
@@ -278,7 +281,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
               <InlineError message="Couldn't load evals — refresh to retry." />
             </div>
           ) : (
-            <EvalsPanel evals={evalsData} />
+            <EvalsPanel evals={evalsData} summary={evalSummary} />
           )
         )}
         {activeTab === 'comments' && (

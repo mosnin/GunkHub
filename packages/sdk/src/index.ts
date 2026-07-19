@@ -26,6 +26,8 @@ export { FileSpool } from './file-spool.js'
 export { SDK_VERSION } from './version.js'
 export { redactPayload } from './redaction.js'
 export { decideSampling, hashString } from './sampling.js'
+export { FlightReader } from './reader.js'
+export { V1ApiError, fetchV1, tryParseV1Json, messageFromV1Body } from './v1-client.js'
 
 export type {
   RecorderConfig,
@@ -52,10 +54,21 @@ export type {
   RetryStrategyOptions,
 } from './transport.js'
 export type { FlightRecorderConfig } from './flight-recorder.js'
+export type {
+  FlightReaderConfig,
+  V1ListRunsData,
+  V1GetRunData,
+  V1ListEventsData,
+  V1ReplayData,
+  ListRunsParams,
+  ListEventsParams,
+} from './reader.js'
+export type { V1ApiConfig, V1FetchLike, V1ApiErrorKind, V1Envelope } from './v1-client.js'
 
 // Re-export key contract types so SDK consumers don't need a separate import
 export type {
   EventType,
   Run,
   RunStatus,
+  Event,
 } from '@agent-flight-recorder/contracts'

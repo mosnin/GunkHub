@@ -10,6 +10,7 @@ import { type NextRequest, NextResponse } from 'next/server'
 import type { ApiError } from '@agent-flight-recorder/contracts'
 
 import { withApiHandler } from '@/lib/apiHandler'
+import { resolveRequestedScopes } from '@/lib/apiKeyScopes'
 import { convex } from '@/lib/convexFunctions'
 import {
   getAuthedClient,
@@ -28,9 +29,6 @@ interface ApiKeyDoc {
   expiresAt?: number
   scopes?: string[]
 }
-
-// Scopes an API key may be granted. Ingest routes require "ingest:write".
-const ALLOWED_SCOPES = ['ingest:write', 'ingest:read'] as const
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ConvexArgs = Record<string, any>
@@ -118,19 +116,18 @@ export const POST = withApiHandler('/api/api-keys', async (req: NextRequest, ctx
     rateLimitPerMin = rawRate
   }
 
-  // Optional scopes: validate against the allowed set.
-  let scopes: string[] | undefined
-  const rawScopes = body['scopes']
-  if (Array.isArray(rawScopes)) {
-    const invalid = rawScopes.filter((s) => !ALLOWED_SCOPES.includes(s as (typeof ALLOWED_SCOPES)[number]))
-    if (invalid.length > 0) {
-      return NextResponse.json<ApiError>(
-        { code: 'VALIDATION_ERROR', message: `invalid scope(s): ${invalid.join(', ')}` },
-        { status: 422 },
-      )
-    }
-    scopes = rawScopes as string[]
+  // Scopes: validate against the allowed set (subset check), defaulting to
+  // ["ingest:write"] when omitted — see resolveRequestedScopes for the full
+  // contract (includes "read", minted for the v1 read API / CLI as of this
+  // cycle).
+  const scopesResult = resolveRequestedScopes(body['scopes'])
+  if (!scopesResult.ok) {
+    return NextResponse.json<ApiError>(
+      { code: 'VALIDATION_ERROR', message: scopesResult.error },
+      { status: 422 },
+    )
   }
+  const scopes = scopesResult.scopes
 
   const convexOrgId = await resolveConvexOrgId(clerkOrgId)
   const rawKey = randomBytes(32).toString('hex')
@@ -142,7 +139,7 @@ export const POST = withApiHandler('/api/api-keys', async (req: NextRequest, ctx
     name: name.trim(),
     keyHash,
     ...(expiresAt !== undefined && { expiresAt }),
-    ...(scopes !== undefined && { scopes }),
+    scopes,
     ...(rateLimitPerMin !== undefined && { rateLimitPerMin }),
   }))) as ApiKeyDoc
 

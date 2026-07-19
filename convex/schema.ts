@@ -126,6 +126,17 @@ export default defineSchema({
     // event (extracted error message). Bounded to 2 KB. Not itself a
     // canonical fact about the run — purely a search-index source field.
     searchText: v.optional(v.string()),
+    // Cycle 3 — cost accuracy (docs/adr/002, docs/adr/003 follow-up):
+    // denormalized, bounded (<= MAX_MODELS_SEEN_PER_RUN), deduped list of
+    // model strings tolerantly extracted from this run's `llm.request` /
+    // `llm.response` event payloads at insert time. Lets getAgentCostStats
+    // (Team B, convex/insights.ts) attribute tokens to models without
+    // scanning every event. Same monotonic-add-only justification as
+    // tokensIn/tokensOut above: it is never recomputed from a full replay,
+    // so it cannot drift out of sync in a way a reader could mistake for
+    // authoritative — the event log remains the source of truth for the
+    // underlying payloads themselves.
+    modelsSeen: v.optional(v.array(v.string())),
   })
     .index("by_org", ["orgId"])
     .index("by_org_status", ["orgId", "status"])
@@ -140,6 +151,12 @@ export default defineSchema({
     .index("by_org_session", ["orgId", "sessionId"])
     .index("by_parent", ["parentRunId"])
     .index("by_org_environment_started", ["orgId", "environment", "startedAt"])
+    // Cycle 3 (for Team B's convex/insights.ts compareVersions): exact,
+    // O(matches) lookup of a version's runs instead of the bounded
+    // most-recent-N overfetch-and-filter over by_agent_started. Justified:
+    // compareVersions ships and is being updated to use this index this
+    // same cycle.
+    .index("by_agent_version_started", ["agentVersionId", "startedAt"])
     // ADR-002: full-text search over runs, scoped to the caller's org via
     // filterFields. searchField must be a stored field (searchText).
     .searchIndex("search_runs", {
@@ -423,6 +440,36 @@ export default defineSchema({
   // public mutation. A derived projection over yesterday's terminal runs,
   // computed from a bounded sample (<= 5,000 runs/agent/day); percentiles are
   // therefore approximate for any agent/day exceeding the sample size.
+  // Cycle 3 — completes the deferred alert-email delivery path (ADR-002 /
+  // ADR-003; docs/design/action_layer.md "explicitly deferred to Cycle 2:
+  // the actual email provider integration"). One row per (alertEventId,
+  // channel.target) email channel on a fired alert rule. APPEND-ONLY except
+  // for status/attempt bookkeeping fields — identical rationale to
+  // webhook_deliveries/alert_events: the fact of the alert firing and the
+  // rendered envelope (to/subject/body) are never touched after insert;
+  // only delivery bookkeeping about that already-immutable fact is patched.
+  email_deliveries: defineTable({
+    orgId: v.id("organizations"),
+    alertEventId: v.id("alert_events"),
+    to: v.string(),
+    subject: v.string(),
+    body: v.string(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("delivered"),
+      v.literal("failed"),
+    ),
+    attempts: v.number(),
+    lastAttemptAt: v.optional(v.number()),
+    error: v.optional(v.string()),
+    createdAt: v.number(),
+    // Retry scheduling, same pattern as webhook_deliveries.nextAttemptAt.
+    // Optional/additive; absent = due immediately.
+    nextAttemptAt: v.optional(v.number()),
+  })
+    .index("by_status_created", ["status", "createdAt"])
+    .index("by_alert_event", ["alertEventId"]),
+
   daily_rollups: defineTable({
     orgId: v.id("organizations"),
     agentId: v.id("agents"),

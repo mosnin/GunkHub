@@ -16,6 +16,7 @@
 import { v } from "convex/values";
 
 import { internalMutation } from "./_generated/server.js";
+import { renderAlertEmailText } from "./helpers/notifier.js";
 import { ALERT_FAILURE_RATE_SAMPLE_SIZE, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
@@ -156,34 +157,74 @@ async function findOrCreateAlertWebhookTarget(
 }
 
 /**
+ * Best-effort link back to the run in the web UI. AFR_WEB_BASE_URL is
+ * optional/unset in most deployments this cycle (no operator-facing setup
+ * step exists yet) — falls back to a relative path, which still renders
+ * usefully in a plain-text email even without a configured origin.
+ */
+function buildRunUrl(orgId: Id<"organizations">, runId: Id<"runs">): string {
+  const base = process.env["AFR_WEB_BASE_URL"];
+  const path = `/org/${String(orgId)}/runs/${String(runId)}`;
+  return base ? `${base.replace(/\/$/, "")}${path}` : path;
+}
+
+/**
  * Enqueue delivery for every channel on a fired rule. Webhook channels get a
- * webhook_deliveries row (drained by convex/webhook_engine.ts). Email
- * channels are recorded as fired (the alert_events row itself) but have no
- * delivery mechanism yet — ADR-003 / docs/design/action_layer.md explicitly
- * defer email provider selection to an operator decision; a rule with ONLY
- * email channels will leave its alert_events.deliveryStatus "pending"
- * indefinitely until that lands. This is a known, documented limitation, not
- * a bug.
+ * webhook_deliveries row (drained by convex/webhook_engine.ts). Cycle 3:
+ * email channels now get an email_deliveries row (drained by
+ * convex/email_engine.ts through the configured EmailNotifier —
+ * helpers/notifier.ts), completing the path ADR-003 /
+ * docs/design/action_layer.md previously deferred. `agentName`/`orgName`
+ * are passed in (rather than re-fetched per channel) since the caller
+ * already has them from the run's org/agent for the whole rule loop.
  */
 async function enqueueDeliveries(
   ctx: MutationCtx,
   run: Doc<"runs">,
   rule: Doc<"alert_rules">,
   alertEventId: Id<"alert_events">,
+  agentName: string,
+  orgName: string,
 ): Promise<void> {
   for (const channel of rule.channels) {
-    if (channel.type !== "webhook") continue; // email: deferred, see doc comment above
-    const webhookId = await findOrCreateAlertWebhookTarget(ctx, run.orgId, channel.target);
-    await ctx.db.insert("webhook_deliveries", {
+    if (channel.type === "webhook") {
+      const webhookId = await findOrCreateAlertWebhookTarget(ctx, run.orgId, channel.target);
+      await ctx.db.insert("webhook_deliveries", {
+        orgId: run.orgId,
+        webhookId,
+        event: "alert.fired",
+        runId: run._id,
+        status: "pending",
+        attempts: 0,
+        createdAt: Date.now(),
+        alertEventId,
+        nextAttemptAt: Date.now(),
+      });
+      continue;
+    }
+
+    // channel.type === "email"
+    const now = Date.now();
+    const body = renderAlertEmailText({
+      alertName: rule.name,
+      orgName,
+      runId: String(run._id),
+      runStatus: run.status,
+      agentName,
+      firedAt: now,
+      condition: rule.kind,
+      runUrl: buildRunUrl(run.orgId, run._id),
+    });
+    await ctx.db.insert("email_deliveries", {
       orgId: run.orgId,
-      webhookId,
-      event: "alert.fired",
-      runId: run._id,
+      alertEventId,
+      to: channel.target,
+      subject: `Agent Flight Recorder alert: ${rule.name}`,
+      body,
       status: "pending",
       attempts: 0,
-      createdAt: Date.now(),
-      alertEventId,
-      nextAttemptAt: Date.now(),
+      createdAt: now,
+      nextAttemptAt: now,
     });
   }
 }
@@ -211,6 +252,15 @@ export const evaluateAlertsForRun = internalMutation({
       .withIndex("by_org", (q) => q.eq("orgId", run.orgId))
       .take(MAX_PAGE_SIZE);
 
+    // Fetched once per run (not per rule/channel) for email rendering —
+    // best-effort, never blocks alert firing if either lookup comes back
+    // empty (a deleted agent/org between run creation and alert firing is
+    // an edge case, not a reason to fail the whole evaluation).
+    const agent = await ctx.db.get(run.agentId);
+    const org = await ctx.db.get(run.orgId);
+    const agentName = agent?.name ?? "unknown agent";
+    const orgName = org?.name ?? "unknown organization";
+
     let fired = 0;
     for (const rule of rules) {
       if (!rule.enabled) continue;
@@ -236,7 +286,7 @@ export const evaluateAlertsForRun = internalMutation({
         summary: verdict.summary,
         deliveryStatus: "pending",
       });
-      await enqueueDeliveries(ctx, run, rule, alertEventId);
+      await enqueueDeliveries(ctx, run, rule, alertEventId, agentName, orgName);
       fired++;
     }
 

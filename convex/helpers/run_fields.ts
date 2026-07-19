@@ -11,6 +11,7 @@ import {
   MAX_ENVIRONMENT_LENGTH,
   MAX_LABELS_PER_RUN,
   MAX_LABEL_LENGTH,
+  MAX_MODELS_SEEN_PER_RUN,
   MAX_SEARCH_TEXT_BYTES,
   MAX_SESSION_ID_LENGTH,
 } from "./pagination.js";
@@ -111,6 +112,52 @@ export function extractTokenUsage(payload: unknown): { tokensIn: number; tokensO
     usage["tokensOut"],
   ]);
   return { tokensIn, tokensOut };
+}
+
+/**
+ * Tolerant extraction of a model name/id from an `llm.request` or
+ * `llm.response` event payload. Accepts several shapes seen across SDK
+ * client libraries: a top-level `model`, a nested `request.model` /
+ * `response.model` (some SDKs echo the request under the response payload),
+ * and Anthropic/OpenAI-style `{ model: "..." }` bodies. Never throws — an
+ * unrecognized payload shape simply contributes nothing (cost accuracy is
+ * best-effort, not a validated guarantee).
+ */
+export function extractModel(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const top = payload as Record<string, unknown>;
+
+  const candidates: unknown[] = [top["model"]];
+  for (const key of ["request", "response", "body"]) {
+    const nested = top[key];
+    if (nested && typeof nested === "object") {
+      candidates.push((nested as Record<string, unknown>)["model"]);
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Fold a newly-observed model string into runs.modelsSeen: deduped,
+ * insertion-order preserved, capped at MAX_MODELS_SEEN_PER_RUN. Returns
+ * `undefined` (no patch needed) when the model is absent or already present
+ * and the array is unchanged, so callers can skip a no-op `ctx.db.patch`.
+ */
+export function addModelSeen(
+  existing: string[] | undefined,
+  model: string | undefined,
+): string[] | undefined {
+  if (!model) return undefined;
+  const current = existing ?? [];
+  if (current.includes(model)) return undefined;
+  if (current.length >= MAX_MODELS_SEEN_PER_RUN) return undefined;
+  return [...current, model];
 }
 
 /**

@@ -74,6 +74,34 @@ function getKeyWarning(key: ApiKey, now: number): KeyWarning {
   return { level: null, message: null }
 }
 
+/** The scopes the backend accepts (`/api/api-keys` POST validates against
+ * this same set — see `lib/apiKeyScopes.ts`'s `ALLOWED_KEY_SCOPES`). Ingest
+ * is for the SDK (writing runs/events); Read is for the v1 read API and the
+ * `afr` CLI. A key with neither scope selected is created with no explicit
+ * `scopes` field, which defaults server-side to `["ingest:write"]`. */
+const SCOPE_OPTIONS = [
+  { value: 'ingest:write', label: 'Ingest (write)', help: 'Used by the SDK to record runs and events.' },
+  { value: 'read', label: 'Read', help: 'Used by the v1 read API and the afr CLI.' },
+] as const
+
+function ScopeChips({ scopes }: { scopes: string[] | null }) {
+  if (!scopes || scopes.length === 0) {
+    return <span className="text-xs text-pewter font-mono">full access</span>
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {scopes.map((s) => (
+        <span
+          key={s}
+          className="inline-flex items-center px-1.5 py-0.5 rounded-[4px] text-xs font-mono text-cloud bg-graphite border border-graphite-light"
+        >
+          {s === 'ingest:write' ? 'ingest' : s === 'ingest:read' ? 'ingest-read' : s === 'read' ? 'read' : s}
+        </span>
+      ))}
+    </div>
+  )
+}
+
 function NewKeyModal({
   result,
   isRotation,
@@ -261,6 +289,7 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
   // useEffect fetch (forbidden pattern). Mutations still update this state locally.
   const [keys, setKeys] = useState<ApiKey[]>(initialKeys)
   const [keyName, setKeyName] = useState('')
+  const [selectedScopes, setSelectedScopes] = useState<string[]>(['ingest:write'])
   const [generating, setGenerating] = useState(false)
   const [generateError, setGenerateError] = useState<string | null>(null)
   const [newKey, setNewKey] = useState<GenerateResult | null>(null)
@@ -288,7 +317,10 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
     setGenerating(true)
     setGenerateError(null)
     try {
-      const data = await createKey({ name: keyName.trim() })
+      const data = await createKey({
+        name: keyName.trim(),
+        ...(selectedScopes.length > 0 && { scopes: selectedScopes }),
+      })
       setIsRotationResult(false)
       setRotationSourceName(null)
       setNewKey(data)
@@ -309,6 +341,12 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
     } finally {
       setGenerating(false)
     }
+  }
+
+  function toggleScope(scope: string) {
+    setSelectedScopes((prev) =>
+      prev.includes(scope) ? prev.filter((s) => s !== scope) : [...prev, scope],
+    )
   }
 
   /**
@@ -370,28 +408,59 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
         </div>
 
         <div className="px-5 py-4 flex flex-col gap-4">
-          {/* Key name input + generate button */}
-          <div className="flex items-center gap-2">
-            <input
-              type="text"
-              value={keyName}
-              onChange={(e) => setKeyName(e.target.value)}
-              placeholder="Key name (e.g. production)"
-              className="flex-1 max-w-xs bg-neutral-900 border border-neutral-700 text-neutral-200 text-sm px-3 py-1.5 rounded focus:outline-none focus:ring-1 focus:ring-neon-glow placeholder-neutral-500"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && keyName.trim() && !generating) {
-                  void handleGenerate()
-                }
-              }}
-            />
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => { void handleGenerate() }}
-              disabled={generating || keyName.trim().length === 0}
-            >
-              {generating ? 'Generating…' : 'Generate new key'}
-            </Button>
+          {/* Key name input + scope picker + generate button */}
+          <div className="flex flex-col gap-2.5">
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={keyName}
+                onChange={(e) => setKeyName(e.target.value)}
+                placeholder="Key name (e.g. production)"
+                className="flex-1 max-w-xs bg-neutral-900 border border-neutral-700 text-neutral-200 text-sm px-3 py-1.5 rounded focus:outline-none focus:ring-1 focus:ring-neon-glow placeholder-neutral-500"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && keyName.trim() && !generating) {
+                    void handleGenerate()
+                  }
+                }}
+              />
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => { void handleGenerate() }}
+                disabled={generating || keyName.trim().length === 0}
+              >
+                {generating ? 'Generating…' : 'Generate new key'}
+              </Button>
+            </div>
+
+            <fieldset className="flex flex-wrap items-start gap-4">
+              <legend className="text-xs font-medium text-pewter uppercase tracking-wider mb-1 w-full">
+                Scopes
+              </legend>
+              {SCOPE_OPTIONS.map((opt) => (
+                <label
+                  key={opt.value}
+                  className="flex items-start gap-1.5 text-xs text-cloud cursor-pointer max-w-[220px]"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedScopes.includes(opt.value)}
+                    onChange={() => toggleScope(opt.value)}
+                    className="mt-0.5 accent-neon-glow"
+                  />
+                  <span>
+                    <span className="text-whiteout font-medium">{opt.label}</span>
+                    <span className="block text-pewter">{opt.help}</span>
+                  </span>
+                </label>
+              ))}
+            </fieldset>
+            {selectedScopes.length === 0 && (
+              <p className="text-xs text-pewter">
+                No scope selected — the key will default to full access. Prefer selecting Ingest
+                and/or Read explicitly for least-privilege keys.
+              </p>
+            )}
           </div>
 
           {generateError && (
@@ -424,6 +493,9 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/6">
                       Last used
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/6">
+                      Scopes
                     </th>
                     <th className="px-4 py-3 text-right text-xs font-medium text-neutral-400 uppercase tracking-wider w-1/4">
                       {/* Actions column */}
@@ -461,6 +533,9 @@ export function ApiKeysSection({ initialKeys, loadError }: ApiKeysSectionProps) 
                         </td>
                         <td className="px-4 py-3 font-mono text-xs text-neutral-400 align-top">
                           {k.lastUsedAt ? formatDate(k.lastUsedAt) : 'Never'}
+                        </td>
+                        <td className="px-4 py-3 align-top">
+                          <ScopeChips scopes={k.scopes} />
                         </td>
                         <td className="px-4 py-3 text-right align-top">
                           <div className="flex items-center justify-end gap-3">

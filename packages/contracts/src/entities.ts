@@ -89,6 +89,14 @@ export interface Run {
   tokensOut?: number;
   /** ADR-002: search-index source field — not itself a canonical fact about the run. */
   searchText?: string;
+  /**
+   * Cycle 3 (cost accuracy): bounded (<= 10), deduped list of model
+   * strings tolerantly extracted from this run's llm.request/llm.response
+   * event payloads at insert time. Same denormalized-counter justification
+   * as tokensIn/tokensOut — monotonic add-only, never a recomputed
+   * aggregate, so it cannot drift out of sync with the event log.
+   */
+  modelsSeen?: string[];
 }
 
 export interface Event {

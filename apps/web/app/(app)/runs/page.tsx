@@ -4,6 +4,7 @@ import type { Agent } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
+import { EnvironmentFilterInput } from '@/components/runs/EnvironmentFilterInput'
 import { RunSearchBar } from '@/components/runs/RunSearchBar'
 import { SelectableRunList } from '@/components/runs/SelectableRunList'
 import { ErrorState } from '@/components/ui/ErrorState'
@@ -362,11 +363,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
                 </Link>
               )
             })}
-            {customEnvironment && (
-              <span className="px-2 py-1 rounded text-xs font-mono font-medium border bg-primary-900 text-primary-300 border-primary-700">
-                {customEnvironment}
-              </span>
-            )}
+            <EnvironmentFilterInput customEnvironment={customEnvironment} />
           </div>
         </div>
 

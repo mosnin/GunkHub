@@ -60,4 +60,16 @@ crons.interval(
   {},
 );
 
+// Cycle 3 — the email counterpart. Drains due "pending" email_deliveries
+// rows (alert-rule email channels) through whichever EmailNotifier
+// convex/helpers/notifier.ts's getConfiguredEmailNotifier() resolves to
+// (ConsoleEmailNotifier by default; AFR_EMAIL_PROVIDER=resend opts into a
+// real send). See convex/email_engine.ts.
+crons.interval(
+  "deliver-pending-emails",
+  { minutes: 1 },
+  makeFunctionReference<"action">("email_engine:deliverPendingEmails"),
+  {},
+);
+
 export default crons;

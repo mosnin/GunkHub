@@ -110,6 +110,64 @@ export interface EvalVersionRollupUnavailable {
 
 export type EvalVersionRollup = EvalVersionRollupAvailable | EvalVersionRollupUnavailable
 
+// ---------------------------------------------------------------------------
+// Run-level eval summary — Team B's convex/insights.ts `getRunEvalSummary`
+// (added this cycle). Bound by path in convexFunctions.ts since it may not
+// yet be present in convex/_generated/api at the time this UI cycle was
+// written; falls back to summarizing the run's own eval list (already
+// fetched by the run-detail page via listEvalsForRun) if the query throws.
+// ---------------------------------------------------------------------------
+
+export interface RunEvalSummary {
+  available: boolean
+  total: number
+  passed: number
+  failed: number
+  /** 0-100, one decimal. Null when total === 0. */
+  passRatePct: number | null
+  /** Mean of recorded eval `score` values, when any evals carried a score. */
+  avgScore?: number
+}
+
+export async function getRunEvalSummary(runId: string): Promise<RunEvalSummary> {
+  try {
+    const client = await getAuthedClient()
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const result = await client.query(convex.insights.getRunEvalSummary, { runId })
+    if (!result) return { available: false, total: 0, passed: 0, failed: 0, passRatePct: null }
+    const r = result as Partial<RunEvalSummary>
+    return {
+      available: true,
+      total: r.total ?? 0,
+      passed: r.passed ?? 0,
+      failed: r.failed ?? 0,
+      passRatePct: r.passRatePct ?? null,
+      ...(r.avgScore !== undefined && { avgScore: r.avgScore }),
+    }
+  } catch {
+    // Fall back to summarizing the run's own eval list rather than showing
+    // nothing — same list the Evals tab already renders.
+    try {
+      const evals = await listEvalsForRun(runId)
+      const summary = summarizeEvalPassRate(evals)
+      const scored = evals.filter((e) => e.score !== undefined)
+      const avgScore = scored.length > 0
+        ? scored.reduce((sum, e) => sum + (e.score ?? 0), 0) / scored.length
+        : undefined
+      return {
+        available: true,
+        total: summary.total,
+        passed: summary.passed,
+        failed: summary.failed,
+        passRatePct: summary.passRatePct,
+        ...(avgScore !== undefined && { avgScore }),
+      }
+    } catch {
+      return { available: false, total: 0, passed: 0, failed: 0, passRatePct: null }
+    }
+  }
+}
+
 export async function getEvalRollupForVersion(
   agentVersionId: string,
   range: DashboardRange = '7d',

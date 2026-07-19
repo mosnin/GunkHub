@@ -12,8 +12,10 @@ import {
   MAX_PAGE_SIZE,
 } from "./helpers/pagination.js";
 import {
+  addModelSeen,
   buildSearchText,
   extractErrorMessage,
+  extractModel,
   extractTokenUsage,
 } from "./helpers/run_fields.js";
 import { incrementUsageCounters } from "./usage.js";
@@ -270,6 +272,18 @@ export const createEvent = mutation({
           tokensIn: (run.tokensIn ?? 0) + tokensIn,
           tokensOut: (run.tokensOut ?? 0) + tokensOut,
         });
+      }
+    }
+
+    // Cycle 3 (cost accuracy): denormalize the model onto runs.modelsSeen so
+    // getAgentCostStats (convex/insights.ts) can attribute tokens to models
+    // without scanning every event. Tolerant extraction from either
+    // llm.request or llm.response payloads — see helpers/run_fields.ts.
+    if (args.type === "llm.request" || args.type === "llm.response") {
+      const model = extractModel(args.payload);
+      const updated = addModelSeen(run.modelsSeen, model);
+      if (updated !== undefined) {
+        await ctx.db.patch(args.runId, { modelsSeen: updated });
       }
     }
 

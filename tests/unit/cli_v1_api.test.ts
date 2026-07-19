@@ -208,6 +208,37 @@ describe('afr runs list', () => {
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.exitCode).toBe(3)
   })
+
+  it('parses --triage and --label', () => {
+    const args = parseRunsListArgs(['--triage', 'investigating', '--label', 'prod'])
+    expect(args).toEqual({ triage: 'investigating', label: 'prod' })
+  })
+
+  it('--triage filters client-side (the v1 API has no server-side triage filter)', async () => {
+    const runs = [
+      makeRun({ id: 'run_1', triageState: 'investigating' }),
+      makeRun({ id: 'run_2', triageState: 'resolved' }),
+      makeRun({ id: 'run_3' }), // no triageState -> defaults to "open"
+    ]
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { runs } }))
+    const result = await runRunsList({ triage: 'investigating' }, { apiKey: 'k', baseUrl: 'http://localhost:3000' }, fetchImpl)
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.runs.map((r) => r.id)).toEqual(['run_1'])
+    }
+    // Client-side filter — still only one network call for the page.
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it('--label filters to runs whose tags include the given value', async () => {
+    const runs = [makeRun({ id: 'run_1', tags: ['prod', 'critical'] }), makeRun({ id: 'run_2', tags: ['staging'] })]
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { runs } }))
+    const result = await runRunsList({ label: 'prod' }, { apiKey: 'k', baseUrl: 'http://localhost:3000' }, fetchImpl)
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.runs.map((r) => r.id)).toEqual(['run_1'])
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------

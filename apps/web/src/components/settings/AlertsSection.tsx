@@ -148,8 +148,216 @@ function RuleBuilder({ onCreated }: { onCreated: (rule: AlertRule) => void }) {
   )
 }
 
+const MAX_CHANNELS = 5
+
+interface EditFormState {
+  name: string
+  thresholdPct: string
+  windowMinutes: string
+  channels: AlertChannel[]
+  newChannelType: 'webhook' | 'email'
+  newChannelTarget: string
+}
+
+function toEditForm(rule: AlertRule): EditFormState {
+  return {
+    name: rule.name,
+    thresholdPct: String(rule.thresholdPct ?? 50),
+    windowMinutes: String(rule.windowMinutes ?? 60),
+    channels: rule.channels,
+    newChannelType: 'webhook',
+    newChannelTarget: '',
+  }
+}
+
+/** Client-side validation mirroring the backend (Team C's PUT /api/alerts/[id]):
+ * thresholdPct 0-100 (failure_rate only), windowMinutes > 0 (failure_rate only),
+ * 1-5 channels, each channel needs a non-empty type + target. */
+function validateEditForm(form: EditFormState, kind: AlertRuleKind): string | null {
+  if (!form.name.trim()) return 'Name is required'
+  if (form.channels.length === 0) return 'At least one channel is required'
+  if (form.channels.length > MAX_CHANNELS) return `At most ${String(MAX_CHANNELS)} channels are allowed`
+  if (kind === 'failure_rate') {
+    const pct = Number(form.thresholdPct)
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) return 'Threshold must be between 0 and 100'
+    const win = Number(form.windowMinutes)
+    if (!Number.isFinite(win) || win <= 0) return 'Window minutes must be greater than 0'
+  }
+  return null
+}
+
+function RuleEditForm({
+  rule,
+  onSave,
+  onCancel,
+}: {
+  rule: AlertRule
+  onSave: (rule: AlertRule) => void
+  onCancel: () => void
+}) {
+  const [form, setForm] = useState<EditFormState>(() => toEditForm(rule))
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  function addChannel() {
+    if (!form.newChannelTarget.trim()) return
+    if (form.channels.length >= MAX_CHANNELS) {
+      setError(`At most ${String(MAX_CHANNELS)} channels are allowed`)
+      return
+    }
+    setError(null)
+    setForm((f) => ({
+      ...f,
+      channels: [...f.channels, { type: f.newChannelType, target: f.newChannelTarget.trim() }],
+      newChannelTarget: '',
+    }))
+  }
+
+  function removeChannel(index: number) {
+    setForm((f) => ({ ...f, channels: f.channels.filter((_, i) => i !== index) }))
+  }
+
+  async function handleSave() {
+    const validationError = validateEditForm(form, rule.kind)
+    if (validationError) {
+      setError(validationError)
+      return
+    }
+    setError(null)
+    setSubmitting(true)
+    const { data, error: err } = await apiCall(`/api/alerts/${rule.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: form.name.trim(),
+        channels: form.channels,
+        ...(rule.kind === 'failure_rate' && {
+          thresholdPct: Number(form.thresholdPct),
+          windowMinutes: Number(form.windowMinutes),
+        }),
+      }),
+    })
+    setSubmitting(false)
+    if (err) return setError(err)
+    onSave((data as { rule: AlertRule }).rule)
+  }
+
+  return (
+    <tr>
+      <td colSpan={6} className="px-4 py-3 bg-graphite-deep">
+        <div className="flex flex-col gap-3 p-3 rounded-[4px] border border-graphite-light bg-graphite">
+          <div className="flex flex-wrap gap-2 items-center">
+            <label className="flex items-center gap-1.5 text-xs text-pewter flex-1 min-w-[160px]">
+              name
+              <input
+                type="text"
+                value={form.name}
+                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+                className="flex-1 h-8 px-2 rounded-[4px] bg-graphite-deep border border-graphite-light text-sm text-whiteout outline-none focus:ring-1 focus:ring-neon-glow"
+              />
+            </label>
+            <span className="text-xs font-mono text-pewter shrink-0" title="Kind cannot be changed after creation — delete and recreate to change it.">
+              kind: {KIND_LABEL[rule.kind]}
+            </span>
+          </div>
+
+          {rule.kind === 'failure_rate' && (
+            <div className="flex gap-2">
+              <label className="flex items-center gap-1.5 text-xs text-pewter">
+                threshold %
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={form.thresholdPct}
+                  onChange={(e) => setForm((f) => ({ ...f, thresholdPct: e.target.value }))}
+                  className="w-16 h-8 px-2 rounded-[4px] bg-graphite-deep border border-graphite-light text-sm text-whiteout font-mono outline-none focus:ring-1 focus:ring-neon-glow"
+                />
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-pewter">
+                window (min)
+                <input
+                  type="number"
+                  min={1}
+                  value={form.windowMinutes}
+                  onChange={(e) => setForm((f) => ({ ...f, windowMinutes: e.target.value }))}
+                  className="w-20 h-8 px-2 rounded-[4px] bg-graphite-deep border border-graphite-light text-sm text-whiteout font-mono outline-none focus:ring-1 focus:ring-neon-glow"
+                />
+              </label>
+            </div>
+          )}
+
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs text-pewter uppercase tracking-wider">
+              Channels ({form.channels.length}/{MAX_CHANNELS})
+            </span>
+            <div className="flex flex-wrap gap-1.5">
+              {form.channels.map((c, i) => (
+                <span
+                  key={`${c.type}:${c.target}:${String(i)}`}
+                  className="inline-flex items-center gap-1.5 px-2 py-1 rounded-[4px] text-xs font-mono text-cloud bg-graphite-deep border border-graphite-light"
+                >
+                  {c.type}:{c.target}
+                  <button
+                    type="button"
+                    onClick={() => removeChannel(i)}
+                    aria-label={`Remove channel ${c.target}`}
+                    className="text-pewter hover:text-destructive-400 transition-colors duration-100"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+            {form.channels.length < MAX_CHANNELS && (
+              <div className="flex flex-wrap gap-2 items-center">
+                <select
+                  value={form.newChannelType}
+                  onChange={(e) => setForm((f) => ({ ...f, newChannelType: e.target.value as 'webhook' | 'email' }))}
+                  className="h-8 px-2 rounded-[4px] bg-graphite-deep border border-graphite-light text-sm text-whiteout font-mono outline-none focus:ring-1 focus:ring-neon-glow"
+                >
+                  <option value="webhook">Webhook</option>
+                  <option value="email">Email</option>
+                </select>
+                <input
+                  type="text"
+                  value={form.newChannelTarget}
+                  onChange={(e) => setForm((f) => ({ ...f, newChannelTarget: e.target.value }))}
+                  placeholder={form.newChannelType === 'webhook' ? 'https://…' : 'you@example.com'}
+                  className="flex-1 min-w-[160px] h-8 px-2 rounded-[4px] bg-graphite-deep border border-graphite-light text-sm text-whiteout placeholder-pewter font-mono outline-none focus:ring-1 focus:ring-neon-glow"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      addChannel()
+                    }
+                  }}
+                />
+                <Button variant="secondary" size="sm" onClick={addChannel}>
+                  Add channel
+                </Button>
+              </div>
+            )}
+          </div>
+
+          {error && <p className="text-xs text-destructive-400">{error}</p>}
+
+          <div className="flex items-center gap-2 justify-end">
+            <Button variant="ghost" size="sm" onClick={onCancel} disabled={submitting}>
+              Cancel
+            </Button>
+            <Button variant="primary" size="sm" onClick={() => { void handleSave() }} disabled={submitting}>
+              {submitting ? 'Saving…' : 'Save changes'}
+            </Button>
+          </div>
+        </div>
+      </td>
+    </tr>
+  )
+}
+
 function RuleRow({ rule, onChanged, onDeleted }: { rule: AlertRule; onChanged: (r: AlertRule) => void; onDeleted: (id: string) => void }) {
   const [busy, setBusy] = useState(false)
+  const [editing, setEditing] = useState(false)
 
   async function toggleEnabled() {
     setBusy(true)
@@ -167,6 +375,19 @@ function RuleRow({ rule, onChanged, onDeleted }: { rule: AlertRule; onChanged: (
     const { error } = await apiCall(`/api/alerts/${rule.id}`, { method: 'DELETE' })
     setBusy(false)
     if (!error) onDeleted(rule.id)
+  }
+
+  if (editing) {
+    return (
+      <RuleEditForm
+        rule={rule}
+        onSave={(r) => {
+          onChanged(r)
+          setEditing(false)
+        }}
+        onCancel={() => setEditing(false)}
+      />
+    )
   }
 
   return (
@@ -190,14 +411,24 @@ function RuleRow({ rule, onChanged, onDeleted }: { rule: AlertRule; onChanged: (
         </button>
       </td>
       <td className="px-4 py-2 text-right">
-        <button
-          type="button"
-          onClick={() => { void handleDelete() }}
-          disabled={busy}
-          className="text-xs text-destructive-400 hover:text-destructive-500 transition-colors"
-        >
-          Delete
-        </button>
+        <div className="flex items-center justify-end gap-3">
+          <button
+            type="button"
+            onClick={() => setEditing(true)}
+            disabled={busy}
+            className="text-xs text-neutral-400 hover:text-neutral-300 transition-colors"
+          >
+            Edit
+          </button>
+          <button
+            type="button"
+            onClick={() => { void handleDelete() }}
+            disabled={busy}
+            className="text-xs text-destructive-400 hover:text-destructive-500 transition-colors"
+          >
+            Delete
+          </button>
+        </div>
       </td>
     </tr>
   )

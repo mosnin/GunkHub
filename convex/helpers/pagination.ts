@@ -166,3 +166,27 @@ export const WEBHOOK_MAX_ATTEMPTS = 6;
 
 /** Write ceiling for agent_versions.evalRules (ADR-002 follow-up / Cycle 2). */
 export const MAX_EVAL_RULES_PER_VERSION = 20;
+
+// ---------------------------------------------------------------------------
+// Cycle 3 — cross-wiring & cohesion (read-scope keys, exact version compare,
+// cost-accuracy model denormalization, the deferred alert-email path).
+// ---------------------------------------------------------------------------
+
+/**
+ * Write ceiling for runs.modelsSeen: bounded, deduped list of model strings
+ * extracted from this run's llm.request/llm.response payloads. A run legit­
+ * imately touching more than 10 distinct models in one execution is already
+ * far outside normal usage; the cap exists so a pathological/malformed
+ * payload stream cannot grow the field without bound.
+ */
+export const MAX_MODELS_SEEN_PER_RUN = 10;
+
+/** Batch size for one deliverPendingEmails cron invocation (convex/email_engine.ts). */
+export const EMAIL_DELIVERY_BATCH_SIZE = 50;
+
+/**
+ * Maximum delivery attempts before an email_deliveries row is marked
+ * terminally "failed" (no further retries scheduled). Mirrors
+ * WEBHOOK_MAX_ATTEMPTS's rationale.
+ */
+export const EMAIL_MAX_ATTEMPTS = 6;

@@ -137,5 +137,14 @@ export const convex = {
     getAgentCostStats: makeFunctionReference<Q>('insights:getAgentCostStats'),
     compareVersions: makeFunctionReference<Q>('insights:compareVersions'),
     listEvalsForVersion: makeFunctionReference<Q>('insights:listEvalsForVersion'),
+    // Added this cycle by Team B — a single org-wide per-agent rollup,
+    // replacing the N-calls-per-agent approach in services/dashboard.ts.
+    // Bound by path (not yet in convex/_generated/api at the time this UI
+    // cycle was written); services/dashboard.ts falls back to the old
+    // per-agent-call approach if this query is unavailable/undeployed.
+    getPerAgentDashboardStats: makeFunctionReference<Q>('insights:getPerAgentDashboardStats'),
+    // Added this cycle by Team B — pass/fail/score summary for one run's
+    // evals, used by the run-detail Evals panel header.
+    getRunEvalSummary: makeFunctionReference<Q>('insights:getRunEvalSummary'),
   },
 } as const

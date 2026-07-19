@@ -176,6 +176,78 @@ describe('getAgentCostStats', () => {
       t.withIdentity(identity('admin', 'a')).query(api.insights.getAgentCostStats, { orgId: orgA, agentId: agentB, range: '30d' }),
     ).rejects.toThrow(/NOT_FOUND|not found/i)
   })
+
+  it('attributes a single-model run via modelsSeen with no event scan needed, exactly', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+
+    await t.run(async (ctx) => {
+      const now = Date.now()
+      // NOTE: no events inserted at all for this run — if getAgentCostStats
+      // fell back to event-scanning here, it would find nothing and
+      // attribute $0. The modelsSeen path must attribute cost without ever
+      // reading convex/events.ts's `events` table.
+      await ctx.db.insert('runs', {
+        orgId: orgA, projectId: projectA, agentId: agentA, status: 'completed', startedAt: now, endedAt: now + 1000,
+        metadata: {}, tags: [], tokensIn: 1000, tokensOut: 500, modelsSeen: ['claude-sonnet-4-5'],
+      })
+    })
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const stats = await asAdmin.query(api.insights.getAgentCostStats, { orgId: orgA, agentId: agentA, range: '30d' })
+
+    expect(stats.costAttribution.viaModelsSeen).toBe(1)
+    expect(stats.costAttribution.viaEventScan).toBe(0)
+    expect(stats.unattributedMultiModel).toBe(0)
+    const model = stats.byModel.find((m) => m.model === 'claude-sonnet-4-5')
+    expect(model).toBeTruthy()
+    expect(model!.tokensIn).toBe(1000)
+    expect(model!.tokensOut).toBe(500)
+    expect(model!.matched).toBe(true)
+    expect(stats.totalCostUsd).toBeCloseTo(model!.costUsd)
+  })
+
+  it('attributes a multi-model run to its primary model and counts it as unattributedMultiModel', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+
+    await t.run(async (ctx) => {
+      const now = Date.now()
+      await ctx.db.insert('runs', {
+        orgId: orgA, projectId: projectA, agentId: agentA, status: 'completed', startedAt: now, endedAt: now + 1000,
+        metadata: {}, tags: [], tokensIn: 300, tokensOut: 150,
+        modelsSeen: ['claude-sonnet-4-5', 'gpt-4o'],
+      })
+    })
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const stats = await asAdmin.query(api.insights.getAgentCostStats, { orgId: orgA, agentId: agentA, range: '30d' })
+
+    expect(stats.costAttribution.viaModelsSeen).toBe(1)
+    expect(stats.unattributedMultiModel).toBe(1)
+    // Full run tokens go to the PRIMARY (first) model, none to the secondary.
+    const primary = stats.byModel.find((m) => m.model === 'claude-sonnet-4-5')
+    const secondary = stats.byModel.find((m) => m.model === 'gpt-4o')
+    expect(primary).toBeTruthy()
+    expect(primary!.tokensIn).toBe(300)
+    expect(primary!.tokensOut).toBe(150)
+    expect(secondary).toBeUndefined()
+  })
+
+  it('falls back to event-scan attribution for a run with no modelsSeen recorded', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    // Reuses the events-based seed helper above — that run has no
+    // `modelsSeen` field set, so this must exercise the fallback path.
+    await seedRunWithLlmEvents(t, orgA, projectA, agentA)
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const stats = await asAdmin.query(api.insights.getAgentCostStats, { orgId: orgA, agentId: agentA, range: '30d' })
+
+    expect(stats.costAttribution.viaEventScan).toBe(1)
+    expect(stats.costAttribution.viaModelsSeen).toBe(0)
+    expect(stats.unmatchedModels).toContain('totally-unknown-model-9000')
+  })
 })
 
 describe('compareVersions', () => {
@@ -221,6 +293,69 @@ describe('compareVersions', () => {
     expect(result.versionA.sampleSize).toBe(40)
     expect(result.versionB.sampleSize).toBe(40)
     expect(result.comparison.failureRateSignificance).toBe('likely_regression')
+  })
+
+  it('is EXACT (not a bounded-scan approximation) even when a third version interleaves recency with the compared two', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+
+    const versionB = await t.run((ctx) =>
+      ctx.db.insert('agent_versions', { agentId: agentA, orgId: orgA, version: 'v2', createdAt: Date.now() }),
+    )
+    const versionC = await t.run((ctx) =>
+      ctx.db.insert('agent_versions', { agentId: agentA, orgId: orgA, version: 'v3', createdAt: Date.now() }),
+    )
+
+    // Interleave: version C's runs are the MOST RECENT (would dominate a
+    // most-recent-N overfetch scan), then version A's, then version B's
+    // (oldest). A and B each get an exact, small count; C gets a large count
+    // that would previously have crowded A/B out of a bounded recency scan.
+    await t.run(async (ctx) => {
+      const now = Date.now()
+      // Oldest: version B, 7 runs, 3 failed.
+      for (let i = 0; i < 7; i++) {
+        const startedAt = now - 100_000 + i * 10
+        await ctx.db.insert('runs', {
+          orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionB,
+          status: i < 3 ? 'failed' : 'completed', startedAt, endedAt: startedAt + 5, metadata: {}, tags: [],
+        })
+      }
+      // Middle: version A, 5 runs, 1 failed.
+      for (let i = 0; i < 5; i++) {
+        const startedAt = now - 50_000 + i * 10
+        await ctx.db.insert('runs', {
+          orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionA,
+          status: i < 1 ? 'failed' : 'completed', startedAt, endedAt: startedAt + 5, metadata: {}, tags: [],
+        })
+      }
+      // Most recent + high-volume: version C, 60 runs (would fill a bounded
+      // most-recent-first scan window ahead of A/B under the old approach).
+      for (let i = 0; i < 60; i++) {
+        const startedAt = now - 1000 + i
+        await ctx.db.insert('runs', {
+          orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionC,
+          status: 'completed', startedAt, endedAt: startedAt + 5, metadata: {}, tags: [],
+        })
+      }
+    })
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const result = await asAdmin.query(api.insights.compareVersions, {
+      orgId: orgA, agentVersionIdA: versionA, agentVersionIdB: versionB,
+    })
+
+    // Exact per-version counts, unaffected by version C's higher recent volume.
+    expect(result.versionA.sampleSize).toBe(5)
+    expect(result.versionA.countsByStatus.failed).toBe(1)
+    expect(result.versionA.countsByStatus.completed).toBe(4)
+    expect(result.versionA.exact).toBe(true)
+    expect(result.versionA.truncated).toBe(false)
+
+    expect(result.versionB.sampleSize).toBe(7)
+    expect(result.versionB.countsByStatus.failed).toBe(3)
+    expect(result.versionB.countsByStatus.completed).toBe(4)
+    expect(result.versionB.exact).toBe(true)
+    expect(result.versionB.truncated).toBe(false)
   })
 
   it('rejects comparing versions from different agents', async () => {
@@ -288,6 +423,179 @@ describe('listEvalsForVersion', () => {
       t.withIdentity(identity('admin', 'a')).query(api.insights.listEvalsForVersion, {
         orgId: orgA, agentVersionId: versionB, range: '30d',
       }),
+    ).rejects.toThrow(/NOT_FOUND|not found/i)
+  })
+
+  it('distinguishes "no rules configured" from "rules configured, zero evals yet"', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, agentA } = await seedTwoOrgs(t)
+
+    const versionNoRules = await t.run((ctx) =>
+      ctx.db.insert('agent_versions', { agentId: agentA, orgId: orgA, version: 'no-rules', createdAt: Date.now() }),
+    )
+    const versionWithRules = await t.run((ctx) =>
+      ctx.db.insert('agent_versions', {
+        agentId: agentA, orgId: orgA, version: 'with-rules', createdAt: Date.now(),
+        evalRules: [{ kind: 'terminal_status', expect: ['completed'] }],
+      } as any),
+    )
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const noRulesStats = await asAdmin.query(api.insights.listEvalsForVersion, {
+      orgId: orgA, agentVersionId: versionNoRules, range: '30d',
+    })
+    const withRulesStats = await asAdmin.query(api.insights.listEvalsForVersion, {
+      orgId: orgA, agentVersionId: versionWithRules, range: '30d',
+    })
+
+    expect(noRulesStats.rulesConfigured).toBe(false)
+    expect(noRulesStats.sampleSize).toBe(0)
+    expect(withRulesStats.rulesConfigured).toBe(true)
+    expect(withRulesStats.sampleSize).toBe(0)
+  })
+})
+
+describe('getPerAgentDashboardStats', () => {
+  it('computes a single-pass per-agent breakdown across >= 3 agents from daily_rollups', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA } = await seedTwoOrgs(t)
+
+    const day = dateNDaysAgoUtc(1)
+    const { agent1, agent2, agent3 } = await t.run(async (ctx) => {
+      const now = Date.now()
+      const agent1 = await ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'Agent One', slug: 'one', createdAt: now, updatedAt: now })
+      const agent2 = await ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'Agent Two', slug: 'two', createdAt: now, updatedAt: now })
+      const agent3 = await ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'Agent Three', slug: 'three', createdAt: now, updatedAt: now })
+
+      await ctx.db.insert('daily_rollups', {
+        orgId: orgA, agentId: agent1, date: day,
+        runsTotal: 10, runsFailed: 2, runsCompleted: 8, runsCancelled: 0, runsTimedOut: 0, tokensIn: 100, tokensOut: 50,
+      })
+      await ctx.db.insert('daily_rollups', {
+        orgId: orgA, agentId: agent2, date: day,
+        runsTotal: 4, runsFailed: 0, runsCompleted: 4, runsCancelled: 0, runsTimedOut: 0, tokensIn: 20, tokensOut: 10,
+      })
+      // agent3 has TWO rollup rows in range (two different days) -> must be summed, not overwritten.
+      const dayBefore = dateNDaysAgoUtc(2)
+      await ctx.db.insert('daily_rollups', {
+        orgId: orgA, agentId: agent3, date: dayBefore,
+        runsTotal: 5, runsFailed: 5, runsCompleted: 0, runsCancelled: 0, runsTimedOut: 0, tokensIn: 5, tokensOut: 5,
+      })
+      await ctx.db.insert('daily_rollups', {
+        orgId: orgA, agentId: agent3, date: day,
+        runsTotal: 3, runsFailed: 0, runsCompleted: 3, runsCancelled: 0, runsTimedOut: 0, tokensIn: 3, tokensOut: 3,
+      })
+      return { agent1, agent2, agent3 }
+    })
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const stats = await asAdmin.query(api.insights.getPerAgentDashboardStats, { orgId: orgA, range: '7d' })
+
+    expect(stats).toHaveLength(3)
+    const byAgent = new Map(stats.map((s) => [s.agentId, s]))
+
+    expect(byAgent.get(agent1)?.agentName).toBe('Agent One')
+    expect(byAgent.get(agent1)?.runsTotal).toBe(10)
+    expect(byAgent.get(agent1)?.runsFailed).toBe(2)
+    expect(byAgent.get(agent1)?.failureRate).toBeCloseTo(0.2)
+
+    expect(byAgent.get(agent2)?.agentName).toBe('Agent Two')
+    expect(byAgent.get(agent2)?.runsTotal).toBe(4)
+    expect(byAgent.get(agent2)?.failureRate).toBeCloseTo(0)
+
+    // Summed across both of agent3's rollup rows.
+    expect(byAgent.get(agent3)?.runsTotal).toBe(8)
+    expect(byAgent.get(agent3)?.runsFailed).toBe(5)
+    expect(byAgent.get(agent3)?.tokensIn).toBe(8)
+  })
+
+  it('returns an empty array for an org with no daily_rollups coverage', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const stats = await asAdmin.query(api.insights.getPerAgentDashboardStats, { orgId: orgA, range: '7d' })
+    expect(stats).toEqual([])
+  })
+
+  it('rejects a caller who is not a member of the org', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    await expect(
+      t.withIdentity(identity('admin', 'b')).query(api.insights.getPerAgentDashboardStats, { orgId: orgA, range: '7d' }),
+    ).rejects.toThrow(/Unauthorized|not a member/i)
+  })
+})
+
+describe('getRunEvalSummary', () => {
+  it('computes pass/fail/score rollup for one run', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+
+    const runId = await t.run(async (ctx) => {
+      const now = Date.now()
+      const run = await ctx.db.insert('runs', {
+        orgId: orgA, projectId: projectA, agentId: agentA, status: 'completed', startedAt: now, metadata: {}, tags: [],
+      })
+      await ctx.db.insert('evals', {
+        orgId: orgA, runId: run, agentVersionId: versionA, name: 'rule:0', kind: 'rule',
+        passed: true, score: 1, createdAt: now, createdBy: 'system',
+      })
+      await ctx.db.insert('evals', {
+        orgId: orgA, runId: run, agentVersionId: versionA, name: 'rule:1', kind: 'rule',
+        passed: false, score: 0, details: 'exceeded', createdAt: now, createdBy: 'system',
+      })
+      await ctx.db.insert('evals', {
+        orgId: orgA, runId: run, agentVersionId: versionA, name: 'llm_judge:0', kind: 'llm_judge',
+        passed: true, createdAt: now, createdBy: 'system', // no score reported
+      })
+      return run
+    })
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const summary = await asAdmin.query(api.insights.getRunEvalSummary, { orgId: orgA, runId })
+
+    expect(summary.total).toBe(3)
+    expect(summary.passed).toBe(2)
+    expect(summary.failed).toBe(1)
+    expect(summary.passRate).toBeCloseTo(2 / 3)
+    // averageScore only over the two evals that reported a score: (1 + 0) / 2 = 0.5
+    expect(summary.averageScore).toBeCloseTo(0.5)
+    expect(summary.overallPassed).toBe(false)
+    expect(summary.evals).toHaveLength(3)
+  })
+
+  it('reports nulls for a run with zero evals, not zeros', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await t.run((ctx) => {
+      const now = Date.now()
+      return ctx.db.insert('runs', {
+        orgId: orgA, projectId: projectA, agentId: agentA, status: 'running', startedAt: now, metadata: {}, tags: [],
+      })
+    })
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const summary = await asAdmin.query(api.insights.getRunEvalSummary, { orgId: orgA, runId })
+
+    expect(summary.total).toBe(0)
+    expect(summary.passRate).toBeNull()
+    expect(summary.averageScore).toBeNull()
+    expect(summary.overallPassed).toBeNull()
+  })
+
+  it('rejects a run belonging to a different org', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectB, agentB } = await seedTwoOrgs(t)
+
+    const orgBRunId = await t.run(async (ctx) => {
+      const now = Date.now()
+      return await ctx.db.insert('runs', {
+        orgId: orgB, projectId: projectB, agentId: agentB, status: 'completed', startedAt: now, metadata: {}, tags: [],
+      })
+    })
+
+    await expect(
+      t.withIdentity(identity('admin', 'a')).query(api.insights.getRunEvalSummary, { orgId: orgA, runId: orgBRunId }),
     ).rejects.toThrow(/NOT_FOUND|not found/i)
   })
 })

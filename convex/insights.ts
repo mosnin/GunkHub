@@ -1,13 +1,23 @@
-// Insight Engine (Team B) — cycle 2. Wires the pure engines from cycle 1
-// (convex/helpers/{analytics,pricing,evals}.ts) into org-scoped Convex
-// queries + the eval-execution internal mutation. See
-// docs/design/insight_engine.md for the design/plan this file implements.
+// Insight Engine (Team B) — cycle 3 (cohesion). Cycle 2 wired the pure
+// engines from cycle 1 (convex/helpers/{analytics,pricing,evals}.ts) into
+// org-scoped Convex queries + the eval-execution internal mutation. Cycle 3
+// makes the query set EXACT and COHESIVE against schema Team A landed this
+// same cycle: `runs.by_agent_version_started` (exact per-version
+// compareVersions, replacing the bounded overfetch-and-filter scan) and
+// `runs.modelsSeen` (event-scan-free cost attribution in getAgentCostStats).
+// It also adds getPerAgentDashboardStats (single-pass per-agent dashboard
+// breakdown, for Team E) and getRunEvalSummary (run-detail Evals panel
+// header), and teaches listEvalsForVersion to distinguish "no rules
+// configured" from "rules configured, zero evals in range". See
+// docs/design/insight_engine.md for the original design/plan this file
+// implements.
 //
-// FILE OWNERSHIP: this file (+ insights.test.ts) is the ONLY convex file
-// Team B owns this cycle. Everything else (schema.ts, auth.ts, runs.ts,
-// events.ts, evals.ts, agent_versions.ts, rollups.ts, helpers/*) belongs to
-// Team A / was landed by prior cycles — read-only from here. Any date-math
-// helpers below duplicate (rather than import) the tiny pure equivalents in
+// FILE OWNERSHIP: this file (+ insights.test.ts, and the pure helpers in
+// convex/helpers/{analytics,pricing}.ts) is the ONLY convex surface Team B
+// owns this cycle. Everything else (schema.ts, auth.ts, runs.ts, events.ts,
+// evals.ts, agent_versions.ts, rollups.ts, helpers/run_fields.ts, etc.)
+// belongs to Team A — read-only from here. Any date-math helpers below
+// duplicate (rather than import) the tiny pure equivalents in
 // convex/rollups.ts on purpose: importing another team's internal helper
 // during their own active cycle risks a break if they refactor it, and the
 // duplicated logic is a two-line, stable, side-effect-free calculation.
@@ -29,7 +39,7 @@ import {
   type EvalRunLike,
 } from "./helpers/evals.js";
 import { estimateCostUsd } from "./helpers/pricing.js";
-import { extractTokenUsage } from "./helpers/run_fields.js";
+import { extractModel, extractTokenUsage } from "./helpers/run_fields.js";
 
 import type { Id } from "./_generated/dataModel.js";
 import type { QueryCtx } from "./_generated/server.js";
@@ -278,6 +288,105 @@ export const getDashboardStats = query({
 });
 
 // ---------------------------------------------------------------------------
+// 1b. getPerAgentDashboardStats — single-pass per-agent breakdown for orgs
+//     with multiple agents (replaces N per-agent getDashboardStats calls).
+// ---------------------------------------------------------------------------
+
+/**
+ * Bounded daily_rollups rows read per call, org-wide (all agents, one date
+ * range). Larger than DASHBOARD_ROLLUP_ROW_CAP (which is per-agent-or-org for
+ * a single series) because this query fans out over every agent in the org
+ * in one pass; still bounded rather than an unbounded `.collect()`.
+ */
+const PER_AGENT_DASHBOARD_ROLLUP_ROW_CAP = 10_000;
+
+/** Bound on distinct agents summarized in one getPerAgentDashboardStats call. */
+const PER_AGENT_DASHBOARD_MAX_AGENTS = 500;
+
+export interface PerAgentDashboardStat {
+  agentId: Id<"agents">;
+  agentName: string | undefined;
+  runsTotal: number;
+  runsFailed: number;
+  failureRate: number | null;
+  tokensIn: number;
+  tokensOut: number;
+}
+
+/**
+ * Per-agent dashboard breakdown for an org over the trailing 7/30 UTC
+ * calendar days, computed in ONE org-scoped pass over `daily_rollups`
+ * (grouped by `agentId` in memory) instead of the UI calling
+ * `getDashboardStats` once per agent (N queries, N index scans over the same
+ * date range). Replaces that N-query pattern for any view that renders a
+ * per-agent breakdown (e.g. an org-level agents table).
+ *
+ * DOCUMENTED SIMPLIFICATION (unlike getDashboardStats): this query does NOT
+ * fall back to a live `runs` query for a day with zero rollup coverage (e.g.
+ * "today", before the daily cron has run). It only reflects whatever
+ * `daily_rollups` has for the range. A per-agent view that needs today's
+ * still-uncommitted numbers should still call getDashboardStats for that one
+ * agent; this query is for "give me every agent's trend at a glance," where a
+ * few hours of lag on the current day is an acceptable, documented tradeoff
+ * for avoiding N live-fallback queries.
+ */
+export const getPerAgentDashboardStats = query({
+  args: {
+    orgId: v.id("organizations"),
+    range: v.union(v.literal("7d"), v.literal("30d")),
+  },
+  handler: async (ctx, args): Promise<PerAgentDashboardStat[]> => {
+    await requireOrgMembership(ctx, args.orgId);
+
+    const days = RANGE_DAYS[args.range];
+    const startDate = dateNDaysAgoUtc(days - 1);
+    const endDate = dateNDaysAgoUtc(0);
+
+    const rows = await ctx.db
+      .query("daily_rollups")
+      .withIndex("by_org_date", (q) => q.eq("orgId", args.orgId).gte("date", startDate).lte("date", endDate))
+      .take(PER_AGENT_DASHBOARD_ROLLUP_ROW_CAP);
+
+    const byAgent = new Map<Id<"agents">, RollupAgg>();
+    for (const row of rows) {
+      const agg = byAgent.get(row.agentId) ?? EMPTY_AGG;
+      byAgent.set(row.agentId, addAgg(agg, row));
+    }
+
+    // Bound the number of agents summarized (a pathological org with more
+    // distinct agents in daily_rollups than this cap gets the first
+    // PER_AGENT_DASHBOARD_MAX_AGENTS in insertion order, rather than an
+    // unbounded name-lookup fan-out below).
+    const agentIds = [...byAgent.keys()].slice(0, PER_AGENT_DASHBOARD_MAX_AGENTS);
+
+    // One doc read per distinct agent, in parallel — bounded by the slice
+    // above, and each agent's own document is a cheap point read (not a
+    // scan). Names are best-effort: an agent that has since been deleted
+    // (its runs/rollups outliving it, e.g. mid-retention-purge) is still
+    // included with `agentName: undefined` rather than dropped, since its
+    // historical rollup numbers remain meaningful.
+    const agentDocs = await Promise.all(agentIds.map((id) => ctx.db.get(id)));
+    const nameById = new Map<Id<"agents">, string>();
+    for (const doc of agentDocs) {
+      if (doc && doc.orgId === args.orgId) nameById.set(doc._id, doc.name);
+    }
+
+    return agentIds.map((agentId) => {
+      const agg = byAgent.get(agentId)!;
+      return {
+        agentId,
+        agentName: nameById.get(agentId),
+        runsTotal: agg.runsTotal,
+        runsFailed: agg.runsFailed,
+        failureRate: failureRateOf(agg),
+        tokensIn: agg.tokensIn,
+        tokensOut: agg.tokensOut,
+      };
+    });
+  },
+});
+
+// ---------------------------------------------------------------------------
 // 2. getAgentCostStats
 // ---------------------------------------------------------------------------
 
@@ -319,37 +428,60 @@ export interface AgentCostStats {
   tokensOut: number;
   /** Distinct model keys that contributed tokens but $0 cost (unresolved pricing, or no model string found — reported as "unknown"). */
   unmatchedModels: string[];
-}
-
-/**
- * Tolerant, best-effort extraction of an LLM model string from an event
- * payload. Tries top-level `model`, then `request.model` / `response.model`
- * nesting. Never throws. See docs/design/insight_engine.md section 1 — a run
- * may span multiple models, so cost is computed PER LLM CALL, not per run.
- */
-function extractModelFromPayload(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== "object") return undefined;
-  const p = payload as Record<string, unknown>;
-  const nested = (key: string): unknown =>
-    p[key] && typeof p[key] === "object" ? (p[key] as Record<string, unknown>)["model"] : undefined;
-  const candidates = [p["model"], nested("request"), nested("response")];
-  for (const c of candidates) {
-    if (typeof c === "string" && c.length > 0) return c;
-  }
-  return undefined;
+  /**
+   * Count of sampled runs whose `modelsSeen` recorded MORE THAN ONE distinct
+   * model. Those runs' tokensIn/tokensOut are still attributed in full to
+   * `modelsSeen[0]` (the first model observed on the run, in insertion
+   * order) — see the ATTRIBUTION DECISION note on getAgentCostStats below.
+   * This count exists so the UI can render "N runs used multiple models;
+   * cost is attributed to the primary model only" instead of silently
+   * presenting a single-model breakdown as if it were exact for every run.
+   */
+  unattributedMultiModel: number;
+  /**
+   * How the sampled runs were attributed. `viaModelsSeen` runs used the
+   * denormalized `runs.modelsSeen` field (Team A, cycle 3) — no event reads
+   * needed. `viaEventScan` runs predate that field (or had no LLM calls
+   * recorded on it) and fell back to walking the run's events directly, as
+   * this query did prior to cycle 3. The two counts sum to `sampleSize`.
+   */
+  costAttribution: {
+    viaModelsSeen: number;
+    viaEventScan: number;
+  };
 }
 
 /**
  * Cost stats for one agent over the trailing 7/30 days, broken down by
  * model. `runs.tokensIn`/`tokensOut` (exact, denormalized counters — see
- * ADR-002) give the top-level token totals; the per-model breakdown requires
- * walking each sampled run's events to pair an `llm.response`'s token usage
- * with the model recorded on the nearest preceding `llm.request` (falling
- * back to a model field on the response itself, if present). This is
- * BEST-EFFORT: a payload shape this extractor doesn't recognize contributes
- * its tokens to the "unknown" bucket rather than being silently dropped or
- * guessed. See docs/design/insight_engine.md section 1 for why cost is never
- * persisted.
+ * ADR-002) give the top-level token totals.
+ *
+ * ATTRIBUTION DECISION (cycle 3): as of this cycle, `runs.modelsSeen` (Team
+ * A) denormalizes the deduped, insertion-ordered list of model strings a run
+ * observed across its `llm.request`/`llm.response` events. That field records
+ * WHICH models a run used, but not a PER-MODEL token split — tokensIn/tokensOut
+ * are run-level counters, not per-LLM-call. Proportionally splitting a run's
+ * tokens across N models would require per-model token counts we don't have
+ * without re-reading every event (defeating the point of denormalizing
+ * modelsSeen in the first place). So the honest choice made here is:
+ *
+ *   - A run with exactly one model in `modelsSeen`: attribute its full
+ *     tokensIn/tokensOut to that model. This is EXACT.
+ *   - A run with >1 model in `modelsSeen`: still attribute its full
+ *     tokensIn/tokensOut to `modelsSeen[0]` (the first-observed model) —
+ *     this is a documented APPROXIMATION, not exact — and count the run in
+ *     `unattributedMultiModel` so callers can see how many runs' numbers are
+ *     approximate rather than silently trusting a per-model total that may
+ *     overstate the primary model's cost and understate any secondary
+ *     model's.
+ *   - A run with no `modelsSeen` (older run, predates cycle 3, or no LLM
+ *     calls recorded on the field yet): fall back to the pre-cycle-3
+ *     behavior — walk the run's events (bounded by
+ *     AGENT_COST_MAX_EVENTS_PER_RUN) and pair each `llm.response`'s token
+ *     usage with the nearest preceding `llm.request`'s model.
+ *
+ * See docs/design/insight_engine.md section 1 for why cost is never
+ * persisted (always recomputed at query time from PRICING_TABLE).
  */
 export const getAgentCostStats = query({
   args: {
@@ -373,13 +505,45 @@ export const getAgentCostStats = query({
 
     let tokensIn = 0;
     let tokensOut = 0;
+    let unattributedMultiModel = 0;
+    let viaModelsSeen = 0;
+    let viaEventScan = 0;
     const byModel = new Map<string, { tokensIn: number; tokensOut: number; costUsd: number; matched: boolean }>();
     const unmatchedModels = new Set<string>();
 
-    for (const run of runs) {
-      tokensIn += run.tokensIn ?? 0;
-      tokensOut += run.tokensOut ?? 0;
+    const attribute = (model: string | undefined, inTok: number, outTok: number): void => {
+      const key = model ?? "unknown";
+      const estimate = model
+        ? estimateCostUsd(model, inTok, outTok)
+        : { costUsd: 0, matched: false as const };
+      const entry = byModel.get(key) ?? { tokensIn: 0, tokensOut: 0, costUsd: 0, matched: false };
+      entry.tokensIn += inTok;
+      entry.tokensOut += outTok;
+      entry.costUsd += estimate.costUsd;
+      entry.matched = entry.matched || estimate.matched;
+      byModel.set(key, entry);
+      if (!estimate.matched) unmatchedModels.add(key);
+    };
 
+    for (const run of runs) {
+      const runTokensIn = run.tokensIn ?? 0;
+      const runTokensOut = run.tokensOut ?? 0;
+      tokensIn += runTokensIn;
+      tokensOut += runTokensOut;
+
+      const modelsSeen = run.modelsSeen;
+      if (modelsSeen !== undefined && modelsSeen.length > 0) {
+        // Exact, event-scan-free path (cycle 3): attribute the run's counters
+        // to its primary (first-observed) model. See ATTRIBUTION DECISION above.
+        viaModelsSeen += 1;
+        if (modelsSeen.length > 1) unattributedMultiModel += 1;
+        attribute(modelsSeen[0], runTokensIn, runTokensOut);
+        continue;
+      }
+
+      // Fallback: no modelsSeen recorded on this run — walk its events, same
+      // as the pre-cycle-3 behavior.
+      viaEventScan += 1;
       const events = await ctx.db
         .query("events")
         .withIndex("by_run", (q) => q.eq("runId", run._id))
@@ -389,7 +553,7 @@ export const getAgentCostStats = query({
       let lastRequestModel: string | undefined;
       for (const event of events) {
         if (event.type === "llm.request") {
-          const m = extractModelFromPayload(event.payload);
+          const m = extractModel(event.payload);
           if (m) lastRequestModel = m;
           continue;
         }
@@ -398,20 +562,8 @@ export const getAgentCostStats = query({
         const { tokensIn: inTok, tokensOut: outTok } = extractTokenUsage(event.payload);
         if (inTok === 0 && outTok === 0) continue;
 
-        const model = extractModelFromPayload(event.payload) ?? lastRequestModel;
-        const key = model ?? "unknown";
-        const estimate = model
-          ? estimateCostUsd(model, inTok, outTok)
-          : { costUsd: 0, matched: false as const };
-
-        const entry = byModel.get(key) ?? { tokensIn: 0, tokensOut: 0, costUsd: 0, matched: false };
-        entry.tokensIn += inTok;
-        entry.tokensOut += outTok;
-        entry.costUsd += estimate.costUsd;
-        entry.matched = entry.matched || estimate.matched;
-        byModel.set(key, entry);
-
-        if (!estimate.matched) unmatchedModels.add(key);
+        const model = extractModel(event.payload) ?? lastRequestModel;
+        attribute(model, inTok, outTok);
       }
     }
 
@@ -430,6 +582,8 @@ export const getAgentCostStats = query({
       tokensIn,
       tokensOut,
       unmatchedModels: [...unmatchedModels],
+      unattributedMultiModel,
+      costAttribution: { viaModelsSeen, viaEventScan },
     };
   },
 });
@@ -442,36 +596,81 @@ export const getAgentCostStats = query({
 const VERSION_COMPARE_MAX_RUNS_PER_SIDE = 1000;
 
 /**
- * How many total run documents we're willing to scan (via by_agent_started,
- * which is not itself version-scoped — see note below) while looking for
- * matches for ONE side of the comparison, expressed as a multiple of
- * VERSION_COMPARE_MAX_RUNS_PER_SIDE. There is no `by_agent_version_started`
- * (or similar) index today, so this query must overfetch-and-filter the
- * agent's full run history in descending recency order. See the coordination
- * note in this cycle's report: an index keyed on agentVersionId would make
- * this exact instead of a bounded, most-recent-first best-effort sample.
+ * How many total run documents the FALLBACK path (see below) is willing to
+ * scan via by_agent_started while looking for matches for ONE side of the
+ * comparison, expressed as a multiple of VERSION_COMPARE_MAX_RUNS_PER_SIDE.
+ * Only exercised if `by_agent_version_started` is ever unavailable (kept as a
+ * defense-in-depth fallback — see collectRunSummariesForVersion below).
  */
 const VERSION_COMPARE_SCAN_MULTIPLIER = 5;
 
 interface VersionRunSample {
   summaries: RunSummary[];
   scanned: number;
-  /** True if we stopped before exhausting the agent's run history (hit the sample cap or the scan budget). */
+  /** True if we stopped before exhausting the version's (or, in the fallback path, the agent's) run history — hit the sample cap or the scan budget. */
   truncated: boolean;
+  /**
+   * True when `summaries` is an EXACT set of this version's runs (subject
+   * only to the `truncated` sample cap above) — i.e. sourced via the
+   * `by_agent_version_started` index, which is keyed on `agentVersionId`
+   * directly. False means `summaries` came from the legacy overfetch-and-filter
+   * fallback (see below) and is a best-effort, most-recent-first
+   * approximation rather than a guaranteed-exact per-version sample.
+   */
+  exact: boolean;
 }
 
+/**
+ * EXACT per-version run sample (cycle 3): `runs.by_agent_version_started`
+ * (Team A, `[agentVersionId, startedAt]`) lets us query this version's runs
+ * directly instead of overfetching the agent's full history and filtering in
+ * memory. Every row read here already belongs to `agentVersionId` — there is
+ * no wasted scan over other versions' runs, so `scanned === summaries.length`
+ * (mod the bounded sample cap) and `exact` is always `true`. The sample cap
+ * (`maxMatches`) still applies for a version with more runs than that: this
+ * is EXACT up to `maxMatches`, most-recent-first, with `truncated: true`
+ * flagging that a very high-volume version's totals reflect only its most
+ * recent `maxMatches` runs.
+ */
 async function collectRunSummariesForVersion(
+  ctx: QueryCtx,
+  agentVersionId: Id<"agent_versions">,
+  maxMatches: number,
+): Promise<VersionRunSample> {
+  const rows = await ctx.db
+    .query("runs")
+    .withIndex("by_agent_version_started", (q) => q.eq("agentVersionId", agentVersionId))
+    .order("desc")
+    .take(maxMatches + 1);
+
+  const truncated = rows.length > maxMatches;
+  const bounded = truncated ? rows.slice(0, maxMatches) : rows;
+  const summaries: RunSummary[] = bounded.map((run) => ({
+    status: run.status,
+    startedAt: run.startedAt,
+    endedAt: run.endedAt,
+    tokensIn: run.tokensIn,
+    tokensOut: run.tokensOut,
+  }));
+
+  return { summaries, scanned: summaries.length, truncated, exact: true };
+}
+
+/**
+ * FALLBACK ONLY — legacy pre-cycle-3 path, kept as defense-in-depth in case
+ * `by_agent_version_started` is ever missing or fails at runtime (e.g. a
+ * schema rollback). Overfetches the agent's most-recent runs via
+ * `by_agent_started` (NOT version-scoped) and filters to `agentVersionId` in
+ * memory — a best-effort, most-recent-first APPROXIMATION, not an exact
+ * per-version sample. `compareVersions` only reaches this path if the exact
+ * query above throws.
+ */
+async function collectRunSummariesForVersionFallback(
   ctx: QueryCtx,
   agentId: Id<"agents">,
   agentVersionId: Id<"agent_versions">,
   maxMatches: number,
 ): Promise<VersionRunSample> {
-  // A single bounded, most-recent-first read (NOT `.paginate()` — Convex
-  // allows only one `.paginate()` call per function execution, and
-  // compareVersions runs two of these concurrently via Promise.all, so a
-  // manual pagination loop here would violate that limit at runtime). The
-  // scan cap is generous enough (maxMatches * VERSION_COMPARE_SCAN_MULTIPLIER)
-  // that a single `.take()` is the simpler, equally-bounded choice.
   const maxScan = maxMatches * VERSION_COMPARE_SCAN_MULTIPLIER;
   const candidates = await ctx.db
     .query("runs")
@@ -497,7 +696,27 @@ async function collectRunSummariesForVersion(
     summaries: matches,
     scanned: candidates.length,
     truncated: matches.length >= maxMatches || candidates.length >= maxScan,
+    exact: false,
   };
+}
+
+/**
+ * Collect one version's run sample, preferring the EXACT
+ * `by_agent_version_started` path and falling back to the legacy
+ * overfetch-and-filter approximation ONLY if the exact query throws at
+ * runtime (defense-in-depth — see collectRunSummariesForVersionFallback).
+ */
+async function collectRunSummariesForVersionSafe(
+  ctx: QueryCtx,
+  agentId: Id<"agents">,
+  agentVersionId: Id<"agent_versions">,
+  maxMatches: number,
+): Promise<VersionRunSample> {
+  try {
+    return await collectRunSummariesForVersion(ctx, agentVersionId, maxMatches);
+  } catch {
+    return await collectRunSummariesForVersionFallback(ctx, agentId, agentVersionId, maxMatches);
+  }
 }
 
 export interface VersionCohortSummary {
@@ -506,15 +725,18 @@ export interface VersionCohortSummary {
   sampleSize: number;
   scanned: number;
   truncated: boolean;
+  /** See VersionRunSample.exact — true means this side's sample is guaranteed exact (mod the sample cap). */
+  exact: boolean;
   countsByStatus: Record<string, number>;
 }
 
 /**
- * The flagship "did version B regress vs version A" query. Bounded,
- * best-effort samples of each version's runs (see
- * collectRunSummariesForVersion) are run through `compareCohorts`
- * (convex/helpers/analytics.ts), which returns per-metric deltas plus a
- * plain-language significance hint on failure rate (backed by a
+ * The flagship "did version B regress vs version A" query. As of cycle 3,
+ * each side's run sample is EXACT (see collectRunSummariesForVersion) via
+ * `runs.by_agent_version_started` — no more most-recent-N overfetch-and-filter
+ * approximation in the common case. The samples are run through
+ * `compareCohorts` (convex/helpers/analytics.ts), which returns per-metric
+ * deltas plus a plain-language significance hint on failure rate (backed by a
  * two-proportion z-test with a small-n guard — see that module for the exact
  * statistical caveats).
  */
@@ -540,8 +762,8 @@ export const compareVersions = query({
     }
 
     const [a, b] = await Promise.all([
-      collectRunSummariesForVersion(ctx, versionA.agentId, versionA._id, VERSION_COMPARE_MAX_RUNS_PER_SIDE),
-      collectRunSummariesForVersion(ctx, versionB.agentId, versionB._id, VERSION_COMPARE_MAX_RUNS_PER_SIDE),
+      collectRunSummariesForVersionSafe(ctx, versionA.agentId, versionA._id, VERSION_COMPARE_MAX_RUNS_PER_SIDE),
+      collectRunSummariesForVersionSafe(ctx, versionB.agentId, versionB._id, VERSION_COMPARE_MAX_RUNS_PER_SIDE),
     ]);
 
     const comparison = compareCohorts(a.summaries, b.summaries);
@@ -554,6 +776,7 @@ export const compareVersions = query({
       sampleSize: a.summaries.length,
       scanned: a.scanned,
       truncated: a.truncated,
+      exact: a.exact,
       countsByStatus: statsA.countsByStatus,
     };
     const versionBSummary: VersionCohortSummary = {
@@ -562,6 +785,7 @@ export const compareVersions = query({
       sampleSize: b.summaries.length,
       scanned: b.scanned,
       truncated: b.truncated,
+      exact: b.exact,
       countsByStatus: statsB.countsByStatus,
     };
 
@@ -600,6 +824,17 @@ export interface VersionEvalStats {
   recentFailures: EvalFailureSummary[];
   /** True if the underlying (pre-range-filter) evals sample hit EVAL_LIST_MAX_SAMPLE. */
   truncated: boolean;
+  /**
+   * True if this agent version has at least one eval rule configured
+   * (`agent_versions.evalRules`). Distinguishes "no rules were ever defined
+   * for this version" (rulesConfigured: false, sampleSize: 0 — nothing to
+   * show, not a signal of health) from "rules are configured but this
+   * version simply has zero evals in range yet" (rulesConfigured: true,
+   * sampleSize: 0 — e.g. a brand-new version with no completed runs yet).
+   * The eval-panel UI should render distinct empty states for these two
+   * cases rather than one generic "no data" message.
+   */
+  rulesConfigured: boolean;
 }
 
 /**
@@ -645,6 +880,8 @@ export const listEvalsForVersion = query({
         createdAt: r.createdAt,
       }));
 
+    const rulesConfigured = Array.isArray(version.evalRules) && version.evalRules.length > 0;
+
     return {
       agentVersionId: args.agentVersionId,
       range: args.range,
@@ -654,6 +891,97 @@ export const listEvalsForVersion = query({
       passRate: inRange.length > 0 ? passed / inRange.length : null,
       recentFailures,
       truncated: rows.length >= EVAL_LIST_MAX_SAMPLE,
+      rulesConfigured,
+    };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// 4b. getRunEvalSummary — compact pass/fail/score rollup for ONE run, for the
+//     run-detail Evals panel header (alongside the per-eval list).
+// ---------------------------------------------------------------------------
+
+/** Bounded read of a single run's evals — generous relative to any real rule-set size (MAX_EVAL_RULES_PER_VERSION=20 plus one summary row). */
+const RUN_EVAL_SUMMARY_MAX_SAMPLE = 500;
+
+export interface RunEvalItem {
+  evalId: Id<"evals">;
+  name: string;
+  kind: "rule" | "llm_judge" | "manual";
+  passed: boolean;
+  score: number | undefined;
+  details: string | undefined;
+  createdAt: number;
+}
+
+export interface RunEvalSummary {
+  runId: Id<"runs">;
+  total: number;
+  passed: number;
+  failed: number;
+  passRate: number | null;
+  /** Mean of `score` across evals that reported one (undefined score is excluded, not treated as 0). Null if no eval in this run reported a score. */
+  averageScore: number | null;
+  overallPassed: boolean | null;
+  evals: RunEvalItem[];
+  /** True if this run's evals sample hit RUN_EVAL_SUMMARY_MAX_SAMPLE. */
+  truncated: boolean;
+}
+
+/**
+ * Compact pass/fail/score rollup for one run's evals, for the run-detail
+ * Evals panel header. Complements the per-eval list (same `evals` rows,
+ * already fetchable via `by_run`) with the summary numbers the header wants
+ * so the UI doesn't have to recompute them client-side.
+ */
+export const getRunEvalSummary = query({
+  args: {
+    orgId: v.id("organizations"),
+    runId: v.id("runs"),
+  },
+  handler: async (ctx, args): Promise<RunEvalSummary> => {
+    await requireOrgMembership(ctx, args.orgId);
+
+    const run = await ctx.db.get(args.runId);
+    if (!run || run.orgId !== args.orgId) {
+      throw afrError("NOT_FOUND", "Run not found in this organization");
+    }
+
+    const rows = await ctx.db
+      .query("evals")
+      .withIndex("by_run", (q) => q.eq("runId", args.runId))
+      // Defensive: evals.by_run is not itself org-scoped, but every row for a
+      // given runId is written by code that stamps orgId from the run itself
+      // (see runEvalsForRun / recordEval) — this filter is belt-and-suspenders,
+      // not load-bearing for tenancy (the runId itself was already validated
+      // to belong to args.orgId above).
+      .filter((q) => q.eq(q.field("orgId"), args.orgId))
+      .take(RUN_EVAL_SUMMARY_MAX_SAMPLE);
+
+    const passed = rows.filter((r) => r.passed).length;
+    const failed = rows.length - passed;
+    const scored = rows.filter((r) => r.score !== undefined);
+    const averageScore =
+      scored.length > 0 ? scored.reduce((sum, r) => sum + (r.score ?? 0), 0) / scored.length : null;
+
+    return {
+      runId: args.runId,
+      total: rows.length,
+      passed,
+      failed,
+      passRate: rows.length > 0 ? passed / rows.length : null,
+      averageScore,
+      overallPassed: rows.length > 0 ? failed === 0 : null,
+      evals: rows.map((r) => ({
+        evalId: r._id,
+        name: r.name,
+        kind: r.kind,
+        passed: r.passed,
+        score: r.score,
+        details: r.details,
+        createdAt: r.createdAt,
+      })),
+      truncated: rows.length >= RUN_EVAL_SUMMARY_MAX_SAMPLE,
     };
   },
 });

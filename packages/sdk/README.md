@@ -414,6 +414,102 @@ tradeoff writeup, including the concurrency-semaphore note.
 
 ---
 
+## Reading runs back (`FlightReader`)
+
+`Recorder`/`FlightRecorder` are write-only — they record. `FlightReader` is
+the read half: a typed client over the public v1 read API
+(`GET /api/v1/runs...`, documented in full in `docs/api_reference.md`), so
+"record with `Recorder`, read back with `FlightReader`" is a single-package
+story — no separate HTTP client needed. It's also what
+`@agent-flight-recorder/cli` (`afr runs list|get`, `afr replay`, `afr tail`,
+`afr export`) is built on: `packages/cli/src/apiClient.ts` is a thin wrapper
+over this same class.
+
+```typescript
+import { FlightReader } from '@agent-flight-recorder/sdk'
+
+const reader = new FlightReader({
+  baseUrl: 'https://your-afr-instance.example.com',
+  apiKey: process.env.AFR_READ_KEY!, // a key carrying the "read" scope
+})
+
+// List runs
+const { runs, nextCursor } = await reader.listRuns({ status: 'failed', limit: 25 })
+
+// Get one run
+const { run, eventCount, artifactCount } = await reader.getRun(runs[0].id)
+
+// Page through a run's events manually...
+const { events, nextCursor: eventsCursor } = await reader.getRunEvents(run.id, { limit: 200 })
+
+// ...or let iterateEvents() page transparently
+for await (const event of reader.iterateEvents(run.id)) {
+  console.log(event.sequenceNumber, event.type)
+}
+
+// The server-computed replay projection (same derivation the web UI uses —
+// CLAUDE.md: replay is a derived projection, never stored)
+const { projection, failureSummary } = await reader.getReplay(run.id)
+```
+
+Record-and-read together:
+
+```typescript
+import { Recorder, FlightReader, Events } from '@agent-flight-recorder/sdk'
+
+const recorder = new Recorder({ endpoint, apiKey, agentId: 'agent_support_bot' })
+const run = await recorder.startRun({ query: 'Help me with my order' })
+recorder.recordEvent('llm.request', Events.llmRequest('gpt-4o', messages).payload)
+await recorder.endRun({ reply: 'Done.' })
+
+const reader = new FlightReader({ baseUrl: endpoint, apiKey })
+const { run: readRun, eventCount } = await reader.getRun(run.runId)
+console.log(`${readRun.status} — ${eventCount} events`)
+```
+
+See `examples/read_back.ts` for the full runnable version.
+
+### Methods
+
+| Method | Endpoint | Returns |
+|---|---|---|
+| `listRuns(filters?)` | `GET /api/v1/runs` | `{ runs, nextCursor?, pageSize?, total? }` |
+| `getRun(runId)` | `GET /api/v1/runs/:id` | `{ run, eventCount, artifactCount }` |
+| `getRunEvents(runId, { limit?, cursor? })` | `GET /api/v1/runs/:id/events` | `{ events, nextCursor? }` |
+| `iterateEvents(runId, { pageSize? })` | (pages `getRunEvents` transparently) | `AsyncGenerator<Event>` |
+| `getReplay(runId)` | `GET /api/v1/runs/:id/replay` | `{ projection, failureSummary }` |
+
+`filters` for `listRuns`: `status`, `agentId`, `environment`, `sessionId`, `limit`, `cursor` (all optional).
+
+### Errors
+
+Every method throws a `V1ApiError` (never a raw fetch error) on any
+auth/not-found/rate-limit/server/network/malformed-response failure:
+
+| `err.kind` | Meaning |
+|---|---|
+| `'auth'` | Missing/invalid/expired/revoked key, or the key lacks the `read` scope |
+| `'not_found'` | The run/resource does not exist, or does not belong to the key's org |
+| `'rate_limited'` | Per-key rate limit exceeded — `err.retryAfterSeconds` is set when the server sent `retry-after` |
+| `'server'` | 5xx from the backend — safe to retry with backoff |
+| `'network'` | The request itself failed (DNS, connection refused, timeout) |
+| `'invalid_response'` | The response body didn't match the expected `{ apiVersion, data }` envelope |
+
+`err.status` (HTTP status, when there was one) and `err.code` (the v1
+envelope's `error.code`, e.g. `RUN_NOT_ACTIVE`, when the body provided one)
+are also available.
+
+### Shared implementation note
+
+The fetch call, envelope parsing, and HTTP-status → `kind` mapping used by
+`FlightReader` live in `packages/sdk/src/v1-client.ts` (`fetchV1` /
+`V1ApiError`) — this is the ONE source of truth for that logic.
+`@agent-flight-recorder/cli`'s `apiClient.ts` wraps the same `V1ApiError` in
+its own `ApiClientError` (which additionally carries a CLI process exit
+code) rather than re-implementing the mapping.
+
+---
+
 ## Recipes
 
 Runnable, self-contained examples in `packages/sdk/examples/`. Each has a
@@ -534,6 +630,8 @@ this pattern (including the tool-error path).
 ---
 
 ## Version
+
+v0.5.0 — `FlightReader`: a typed read client over the public v1 read API (`listRuns`/`getRun`/`getRunEvents`/`iterateEvents`/`getReplay`), so record-and-read is a single-package story. Its fetch/envelope/status-mapping core (`fetchV1`/`V1ApiError` in `src/v1-client.ts`) is the single source of truth shared with `@agent-flight-recorder/cli`'s `apiClient.ts` — the CLI no longer re-implements this logic. New exports: `FlightReader`, `V1ApiError`, `fetchV1`, `tryParseV1Json`, `messageFromV1Body`, plus the v1 data/config types.
 
 v0.4.0 — Redaction pipeline (`RecorderOptions.redact`): dot-path + wildcard targeting, built-in named patterns (`email`/`api_key`/`jwt`/`credit_card`/`ssn`/`phone`) with documented false-positive tradeoffs, caller `custom` transform with guaranteed-redacted fallback on throw (`_redactionDegraded: true`), applied identically in both recorder paths before externalization measures payload size. Sampling (`RecorderOptions.sampling`): head sampling by `rate`, `decider` override (fails open), `seedFromRunName` for reproducible decisions, `alwaysKeepFailures` tail-bias shadow buffering so a sampled-out run that fails still ships its full trace. New `onDrop` reason `'sampled_out'`.
 

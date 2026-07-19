@@ -1,8 +1,12 @@
 # Agent Flight Recorder — API Reference
 
-This document covers two HTTP surfaces added in Cycle 2 of the action layer
+This document covers the HTTP surfaces added in Cycles 2-3 of the action layer
 (`docs/design/action_layer.md`, ADR-003 `docs/adr/003-alerting-webhooks-export.md`):
 
+0. **API key management** (`/api/api-keys/**`) — Clerk-authed, how to mint,
+   list, and revoke the keys every other surface below authenticates with —
+   including how to mint a **`read`**-scoped key for the v1 API / CLI
+   (Cycle 3).
 1. **The public v1 read API** (`/api/v1/**`) — key-authed, for the `afr` CLI
    and other external, automated consumers that need to read run/event data
    without a browser session.
@@ -12,12 +16,38 @@ This document covers two HTTP surfaces added in Cycle 2 of the action layer
 
 It also documents how to verify and consume an **outbound webhook
 delivery** — the payload Agent Flight Recorder POSTs to a configured
-webhook target when a run completes/fails or an alert fires.
+webhook target when a run completes/fails or an alert fires — and how the
+`afr` CLI relates to this API.
 
 For the existing SDK-ingest routes (`POST /api/events`, `POST /api/runs`,
 key-authed for writing) and the Clerk-authed run-browsing routes the web UI
 itself uses (`GET /api/runs`, etc.), see their route source directly — this
-document covers only what Cycle 2 added.
+document covers only what Cycles 2-3 added.
+
+---
+
+## 0. Key management
+
+Base path: `/api/api-keys`. Clerk-session authenticated; `POST` and `DELETE`
+additionally require the **admin** org role (Convex enforces this —
+`convex/api_keys.ts` `requireOrgMembership(ctx, orgId, { minimumRole: "admin" })`).
+
+| Method | Path                  | Role required | Notes |
+|--------|-----------------------|----------------|-------|
+| POST   | `/api/api-keys`       | admin          | Body: `{ name, scopes?, expiresAt?, expiresInDays?, rateLimitPerMin? }` → `{ id, name, scopes, createdAt, expiresAt, key }`, 201. **`key` (the raw secret) is present ONLY in this response** — persist it immediately, it cannot be retrieved again (only the SHA-256 hash is stored). |
+| GET    | `/api/api-keys`       | any member     | `{ keys: ApiKeySummary[] }` — raw key and hash never returned |
+| DELETE | `/api/api-keys/{id}`  | admin          | Revokes the key immediately → `{ revoked: true }` |
+
+See [Minting a read key for the v1 API / CLI](#minting-a-read-key-for-the-v1-api--cli)
+below for the `scopes` field's full contract.
+
+```bash
+curl -s -X POST "https://your-afr-host/api/api-keys" \
+  -H "Cookie: __session=..." -H "Content-Type: application/json" \
+  -d '{ "name": "prod SDK key", "expiresInDays": 365 }'
+# => { "id": "...", "name": "prod SDK key", "scopes": ["ingest:write"],
+#      "key": "<raw key, shown ONCE — save it now>", ... }
+```
 
 ---
 
@@ -39,12 +69,48 @@ with a non-empty `scopes` array must include `"read"` to call any `/api/v1/**`
 endpoint — a write-only key (e.g. `scopes: ["ingest:write"]`) is rejected
 with **403 Forbidden**.
 
-> **Known gap, flagged for follow-up:** the key-management UI/route
-> (`POST /api/api-keys`) does not yet expose `"read"` in its allowed-scopes
-> list (`ALLOWED_SCOPES` in `apps/web/app/api/api-keys/route.ts` currently
-> only allows `"ingest:write"` / `"ingest:read"`). Until that list is
-> updated, issue v1-read-API keys with no `scopes` array (full back-compat
-> access) rather than expecting a dedicated read-only key today.
+### Minting a read key for the v1 API / CLI
+
+`POST /api/api-keys` (Clerk-authed, admin role — see
+[0. Key management](#0-key-management) above) accepts an optional `scopes`
+array in its request body:
+
+```bash
+curl -s -X POST "https://your-afr-host/api/api-keys" \
+  -H "Cookie: __session=..." -H "Content-Type: application/json" \
+  -d '{ "name": "afr CLI (read-only)", "scopes": ["read"] }'
+# => { "id": "...", "name": "afr CLI (read-only)", "scopes": ["read"],
+#      "key": "<raw key, shown ONCE — save it now>", ... }
+```
+
+- **Allowed values:** `"ingest:write"`, `"ingest:read"`, `"read"` — a 422
+  `VALIDATION_ERROR` is returned for anything outside this set, or for a
+  non-array/empty `scopes` value.
+- **Omit `scopes` entirely** to get the default, `["ingest:write"]` — this is
+  the right choice for an SDK/ingest key and preserves the behavior of any
+  existing integration that predates this field. (This is a change from the
+  pre-Cycle-3 behavior of leaving `scopes` unset in Convex, which granted
+  unrestricted back-compat access including `read` — omitting the field now
+  explicitly scopes a new key to ingest-only. Existing keys created before
+  this cycle are unaffected; only the *default for new keys created without
+  an explicit `scopes` field* changed.)
+- **Pass `["read"]`** to mint a key for the `afr` CLI or any other v1-API
+  consumer that should only ever read, never ingest — this key will be
+  rejected with 403 by every `/api/events`/`/api/runs` ingest route.
+- **Pass both**, e.g. `["ingest:write", "read"]`, for a single key used by
+  both an SDK integration and its own read-back tooling.
+
+The response's `scopes` field always reflects what was actually stored
+(resolved server-side by `convex/api_keys.ts`'s `createApiKey`, which
+validates the same allowed set independently of the web route) — do not
+assume the request body's `scopes` was accepted verbatim without checking
+the response.
+
+For the `afr` CLI specifically: every `afr` command that talks to
+`/api/v1/**` (`runs list`, `runs get`, `replay`, `tail`, `export` —
+`packages/cli/src/apiClient.ts`) needs a **`read`**-scoped key supplied via
+its `--api-key`/config — mint one with the curl example above and see
+[CLI relationship to the API](#cli-relationship-to-the-api) below.
 
 ### Response envelope
 
@@ -363,7 +429,17 @@ Every delivery carries:
 5. Only accept the delivery if step 4 succeeds.
 
 Reference implementation: `signWebhookPayload` / `verifyWebhookSignature` in
-`apps/web/src/lib/delivery.ts`.
+`apps/web/src/lib/delivery.ts` (server-side signer) and
+`convex/helpers/delivery.ts` (must stay in sync with it — see that file's
+header).
+
+**Runnable consumer example:** [`examples/webhook-consumer/`](../examples/webhook-consumer/)
+is a complete, dependency-free Node HTTP server implementing the
+verify-then-ack flow below end to end — run it with
+`AFR_WEBHOOK_SECRET=<your secret> node examples/webhook-consumer/server.mjs`
+and point a webhook target at it. Its README walks through registering the
+target, the retry/idempotency contract, and how its verification logic is
+tested against the same signing code AFR uses.
 
 ```js
 // Node.js example
@@ -394,3 +470,38 @@ and any other `4xx` to tell Agent Flight Recorder not to retry.
 Consumers should be **idempotent** on `x-afr-delivery-id` regardless — a
 delivery may be retried even after your endpoint successfully processed it
 (e.g. if the response was lost in transit).
+
+---
+
+## 4. The `afr` CLI and this API
+
+`packages/cli` (the `afr` command) is a thin client over the surfaces
+documented above — it introduces no server-side behavior of its own. Every
+`afr` command maps directly onto one of the HTTP calls in this document:
+
+| `afr` command       | Calls |
+|----------------------|-------|
+| `afr runs list`      | `GET /api/v1/runs` |
+| `afr runs get <id>`  | `GET /api/v1/runs/{runId}` |
+| `afr tail <id>`      | `GET /api/v1/runs/{runId}/events` (polled) |
+| `afr replay <id>`    | `GET /api/v1/runs/{runId}/replay` |
+| `afr export <id>`    | `GET /api/v1/runs/{runId}/events` (paginated through to completion) |
+
+All of the above require a **`read`**-scoped API key — see
+[Minting a read key for the v1 API / CLI](#minting-a-read-key-for-the-v1-api--cli).
+Configure it via the `AFR_API_KEY` env var (`AFR_BASE_URL` for the
+deployment host; run `afr config check` to validate both and ping
+`/api/health`) — see `packages/cli/README.md` and `packages/cli/src/env.ts`.
+There is no separate CLI-specific auth mechanism — it is the same
+`x-api-key` header and the same envelope/error-code contract documented in
+[section 1](#1-public-v1-read-api) above. `packages/cli/src/apiClient.ts`
+parses the `{ apiVersion, data }` / `{ apiVersion, error }` envelope
+tolerantly (see that file's header comment), so a CLI built against an
+earlier `apiVersion` degrades gracefully rather than crashing on an
+unrecognized field.
+
+The CLI has **no write commands** against this API (it cannot create runs,
+ingest events, or manage keys/alerts/webhooks) — those remain SDK
+(`packages/sdk`) and web-UI-only surfaces. A `read`-scoped key is sufficient
+for every `afr` command; an `ingest:write`-only key is rejected by all of
+them with `403 FORBIDDEN`.

@@ -105,14 +105,44 @@ export interface AgentDashboardRow {
 }
 
 /**
- * Per-agent breakdown table — insights.getDashboardStats only returns
- * totals for the org (or for one agentId when passed). There is no
- * dedicated "all agents at once" rollup yet, so this calls it once per
- * agent in the org and assembles the table client-side. Acceptable for the
- * typical org's agent count; if that stops being true, ask Team B for a
- * dedicated multi-agent rollup rather than optimizing this further.
+ * Per-agent breakdown table. Uses Team B's single org-wide rollup
+ * (`insights:getPerAgentDashboardStats`, added this cycle) instead of the
+ * previous N-calls-per-agent approach. Falls back to the old per-agent-call
+ * strategy if the new query throws (e.g. not yet deployed in this
+ * environment) — same honest-empty-state precedent as `getDashboardStats`,
+ * but never simply returns nothing when a slower path can still work.
  */
 export async function getPerAgentDashboardStats(range: DashboardRange = '7d'): Promise<AgentDashboardRow[]> {
+  const { orgId: clerkOrgId } = auth()
+  if (!clerkOrgId) return []
+
+  try {
+    const client = await getAuthedClient()
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
+    if (!org) return []
+    const orgDoc = org as Record<string, unknown>
+
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const result = await client.query(convex.insights.getPerAgentDashboardStats, {
+      orgId: orgDoc._id,
+      range,
+    })
+    const r = result as { rows: AgentDashboardRow[] } | AgentDashboardRow[] | null
+    if (!r) return []
+    const rows = Array.isArray(r) ? r : r.rows
+    return rows ?? []
+  } catch {
+    return getPerAgentDashboardStatsFallback(range)
+  }
+}
+
+/**
+ * Previous-cycle strategy: one getDashboardStats call per agent. Kept only as
+ * a fallback for environments where the new single-query rollup isn't
+ * deployed yet.
+ */
+async function getPerAgentDashboardStatsFallback(range: DashboardRange): Promise<AgentDashboardRow[]> {
   let agents
   try {
     agents = await listAgentsByOrg()

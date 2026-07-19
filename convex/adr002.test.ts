@@ -569,3 +569,97 @@ describe('token extraction — tolerant of both payload variants (ADR-002)', () 
     expect(updated.tokensOut).toBe(7)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Cycle 3 — cost accuracy: runs.modelsSeen denormalization
+// ---------------------------------------------------------------------------
+describe('runs.modelsSeen — tolerant model extraction, deduped, bounded (Cycle 3)', () => {
+  it('populates modelsSeen from a top-level `model` field on llm.request/llm.response', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asA = t.withIdentity(identity('member', 'a'))
+    const run = await asA.mutation(api.runs.createRun, { orgId: orgA, projectId: projectA, agentId: agentA })
+    await makeRunning(t, run._id)
+    await asA.mutation(api.events.createEvent, { runId: run._id, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} })
+    await asA.mutation(api.events.createEvent, {
+      runId: run._id, type: 'llm.request', sequenceNumber: 2, timestamp: Date.now(),
+      payload: { model: 'claude-opus-4' },
+    })
+    const updated = await asA.query(api.runs.getRun, { runId: run._id })
+    expect(updated.modelsSeen).toEqual(['claude-opus-4'])
+  })
+
+  it('extracts from a nested request/response.model shape', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asA = t.withIdentity(identity('member', 'a'))
+    const run = await asA.mutation(api.runs.createRun, { orgId: orgA, projectId: projectA, agentId: agentA })
+    await makeRunning(t, run._id)
+    await asA.mutation(api.events.createEvent, { runId: run._id, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} })
+    await asA.mutation(api.events.createEvent, {
+      runId: run._id, type: 'llm.response', sequenceNumber: 2, timestamp: Date.now(),
+      payload: { response: { model: 'gpt-4o' } },
+    })
+    const updated = await asA.query(api.runs.getRun, { runId: run._id })
+    expect(updated.modelsSeen).toEqual(['gpt-4o'])
+  })
+
+  it('dedupes repeated models across multiple events', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asA = t.withIdentity(identity('member', 'a'))
+    const run = await asA.mutation(api.runs.createRun, { orgId: orgA, projectId: projectA, agentId: agentA })
+    await makeRunning(t, run._id)
+    await asA.mutation(api.events.createEvent, { runId: run._id, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} })
+    await asA.mutation(api.events.createEvent, {
+      runId: run._id, type: 'llm.request', sequenceNumber: 2, timestamp: Date.now(), payload: { model: 'claude-opus-4' },
+    })
+    await asA.mutation(api.events.createEvent, {
+      runId: run._id, type: 'llm.response', sequenceNumber: 3, timestamp: Date.now(), payload: { model: 'claude-opus-4' },
+    })
+    await asA.mutation(api.events.createEvent, {
+      runId: run._id, type: 'llm.request', sequenceNumber: 4, timestamp: Date.now(), payload: { model: 'claude-haiku-4' },
+    })
+    const updated = await asA.query(api.runs.getRun, { runId: run._id })
+    expect(updated.modelsSeen).toEqual(['claude-opus-4', 'claude-haiku-4'])
+  })
+
+  it('caps modelsSeen at MAX_MODELS_SEEN_PER_RUN (10) distinct models', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asA = t.withIdentity(identity('member', 'a'))
+    const run = await asA.mutation(api.runs.createRun, { orgId: orgA, projectId: projectA, agentId: agentA })
+    await makeRunning(t, run._id)
+    await asA.mutation(api.events.createEvent, { runId: run._id, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} })
+    let seq = 2
+    for (let i = 0; i < 12; i++) {
+      await asA.mutation(api.events.createEvent, {
+        runId: run._id, type: 'llm.request', sequenceNumber: seq++, timestamp: Date.now(), payload: { model: `model-${i}` },
+      })
+    }
+    const updated = await asA.query(api.runs.getRun, { runId: run._id })
+    expect(updated.modelsSeen).toHaveLength(10)
+    expect(updated.modelsSeen).toEqual([
+      'model-0', 'model-1', 'model-2', 'model-3', 'model-4',
+      'model-5', 'model-6', 'model-7', 'model-8', 'model-9',
+    ])
+  })
+
+  it('is also populated via the API-key ingest path (sdkCreateEvents)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'sdk_models', name: 'k', createdBy: 'u', createdAt: Date.now() })
+    })
+    const created = await t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'sdk_models', agentId: String(agentA) })
+    await t.mutation(api.sdk_ingest.sdkCreateEvents, {
+      apiKeyHash: 'sdk_models',
+      events: [
+        { runId: String(created.id), type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} },
+        { runId: String(created.id), type: 'llm.request', sequenceNumber: 2, timestamp: Date.now(), payload: { model: 'claude-sonnet-5' } },
+      ],
+    })
+    const run = await t.run((ctx) => ctx.db.get(created.id))
+    expect(run!.modelsSeen).toEqual(['claude-sonnet-5'])
+  })
+})

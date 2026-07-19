@@ -75,6 +75,11 @@ export async function createAgentVersion(input: {
   version: string
   changelog?: string
   configSnapshot?: Record<string, unknown>
+  /** Optional eval-auto-run rules (see convex/helpers/evals.ts `EvalRule`),
+      authored via the JSON editor in CreateVersionModal.tsx. Validated
+      client-side (lib/evalRulesValidation.ts) before reaching here; Convex
+      re-validates on write against the same shape. */
+  evalRules?: Record<string, unknown>[]
 }): Promise<AgentVersion> {
   const client = await getAuthedClient()
 
@@ -84,6 +89,7 @@ export async function createAgentVersion(input: {
     version: input.version.trim(),
     ...(input.changelog !== undefined && { changelog: input.changelog }),
     ...(input.configSnapshot !== undefined && { configSnapshot: input.configSnapshot }),
+    ...(input.evalRules !== undefined && input.evalRules.length > 0 && { evalRules: input.evalRules }),
   })
 
   return mapAgentVersion(doc as Record<string, unknown>)

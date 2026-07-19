@@ -39,6 +39,14 @@ $ afr config check
 Configuration OK.
 ```
 
+**Known gap:** this does not currently report the configured key's scope
+(`read` vs `ingest:write`/`ingest:read` — see `docs/api_reference.md`'s
+Scopes section). The v1 read API has no introspection/"whoami" endpoint that
+returns a key's own scopes, so there is nothing for `afr` to call to learn
+it client-side without guessing from a live request's success/failure. If a
+future cycle adds such an endpoint, `config check` should call it and print
+the scope alongside the existing checks.
+
 ### `afr record demo`
 
 Runs a small, representative demo agent end-to-end through the SDK against your configured backend: starts a run, records an `llm.request`/`llm.response` pair and a `tool.call`/`tool.result` pair, then ends the run. This is a real smoke test — run it right after installing to confirm your API key and base URL are wired up correctly, before instrumenting your own agent.
@@ -56,8 +64,8 @@ Prints the CLI and SDK versions.
 
 ```bash
 $ afr version
-afr (Agent Flight Recorder CLI) v0.1.0
-sdk: v0.4.1
+afr (Agent Flight Recorder CLI) v0.2.0
+sdk: v0.5.0
 ```
 
 ### `afr --help` / `afr help`
@@ -71,8 +79,15 @@ the command.
 The commands below talk to the public v1 read API (`GET /api/v1/runs`,
 `/api/v1/runs/:id`, `/api/v1/runs/:id/events`, `/api/v1/runs/:id/replay`) —
 `x-api-key` auth with `read` scope, `{ apiVersion, data }` JSON envelopes on
-success and `{ apiVersion, error: { code, message } }` on failure. See
-`src/apiClient.ts` for the client and its error mapping.
+success and `{ apiVersion, error: { code, message } }` on failure.
+
+`afr` is built on `@agent-flight-recorder/sdk`'s `FlightReader` — the SDK's
+own typed read client. `src/apiClient.ts` is a thin wrapper over
+`FlightReader` (it adds only the CLI's process exit-code convention on top
+of the SDK's `V1ApiError`); the fetch call, envelope parsing, and HTTP-status
+mapping live in exactly one place, `packages/sdk/src/v1-client.ts`, shared by
+both. See the SDK README's "Reading runs back (FlightReader)" section if you
+want the same read access from your own script instead of the CLI.
 
 Exit codes are consistent across all commands: `0` ok, `1` usage (e.g. missing
 `AFR_API_KEY`/`AFR_BASE_URL`, missing required argument), `2` auth (401/403 —
@@ -93,6 +108,13 @@ $ afr runs list --agent agent_support --json
 
 Options: `--status`, `--agent`, `--env`, `--session`, `--limit`, `--json`. Prints
 `No runs found.` for an empty result set instead of an empty table.
+
+`--triage <state>` (`open|investigating|resolved`) and `--label <tag>` are
+also accepted, but **filter client-side** — the v1 read API has no
+server-side triage/tag filter as of this cycle (see
+`docs/api_reference.md`), so these only narrow the runs already returned on
+the current page. Combine with `--status`/`--agent`/`--limit` to narrow the
+server-side query first if you need results beyond one page.
 
 ### `afr runs get <runId>`
 

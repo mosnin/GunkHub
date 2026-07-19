@@ -2,15 +2,14 @@
  * read_back.ts
  *
  * Demonstrates the full write-then-read round trip: record a run with the
- * SDK (as every other example does), then read it back through the public
- * v1 read API (`GET /api/v1/runs/:id`, `GET /api/v1/runs/:id/events`,
- * `GET /api/v1/runs/:id/replay`) that `afr` (packages/cli) also uses.
+ * SDK's `Recorder` (as every other example does), then read it back with the
+ * SDK's own `FlightReader` — the typed client over the public v1 read API
+ * (`GET /api/v1/runs/:id`, `GET /api/v1/runs/:id/events`,
+ * `GET /api/v1/runs/:id/replay`) that `afr` (packages/cli) is now a thin
+ * wrapper over too (see `packages/cli/src/apiClient.ts`).
  *
- * The SDK itself never reads a run back — it is a write-only recording
- * library — so this example intentionally steps outside `Recorder`/
- * `Transport` for the "read" half and talks to the v1 API directly with a
- * plain `fetch`, exactly the way any consumer (a script, a dashboard, the
- * `afr` CLI) would.
+ * Record-and-read is a single-package story: `Recorder` for the write half,
+ * `FlightReader` for the read half, no separate HTTP client needed.
  *
  * --- Run with MockTransport + a simulated v1 API response (default) ---
  *   pnpm tsx packages/sdk/examples/read_back.ts
@@ -20,7 +19,15 @@
  *   pnpm tsx packages/sdk/examples/read_back.ts --live
  */
 
-import { Recorder, Events, type Transport, type TransportAuth, type TransportResponse } from '@agent-flight-recorder/sdk'
+import {
+  Recorder,
+  Events,
+  FlightReader,
+  type Transport,
+  type TransportAuth,
+  type TransportResponse,
+  type V1FetchLike,
+} from '@agent-flight-recorder/sdk'
 
 import type { CreateEventRequest, CreateRunRequest, CreateRunResponse, Run } from '@agent-flight-recorder/contracts'
 
@@ -61,55 +68,45 @@ class MockTransport implements Transport {
 }
 
 // ---------------------------------------------------------------------------
-// v1 read API envelope shapes — mirrors packages/cli/src/apiClient.ts.
-// Every v1 response is wrapped: `{ apiVersion, data }` on success,
-// `{ apiVersion, error: { code, message } }` on failure. Auth is `x-api-key`
-// with `read` scope (a write-scoped key from `startRun`/`recordEvent` above
-// works here too, since `read` is implied by any valid key in this API).
+// Read half — `FlightReader`, the SDK's typed client over the v1 read API.
+// Auth is `x-api-key` with `read` scope (a write-scoped key from
+// `startRun`/`recordEvent` above works here too, since `read` is implied by
+// any valid key with no `scopes` array — see docs/api_reference.md).
+//
+// Without --live, `FlightReader` is given a fake `fetchImpl` that returns a
+// canned envelope, so this example never needs a real server.
 // ---------------------------------------------------------------------------
 
-interface V1Envelope<T> {
-  apiVersion: string
-  data: T
-}
-
-interface V1RunData {
-  run: Run
-  eventCount: number
-  artifactCount: number
-}
-
-/** A canned response used when running without --live, so this example never needs a server. */
-function fakeV1RunResponse(runId: string): V1Envelope<V1RunData> {
-  return {
-    apiVersion: 'v1',
-    data: {
-      run: {
-        id: runId,
-        orgId: 'org_demo',
-        projectId: 'proj_demo',
-        agentId: 'agent_readback_demo',
-        status: 'completed',
-        startedAt: Date.now() - 1500,
-        endedAt: Date.now(),
-        metadata: {},
-        tags: [],
-      },
-      eventCount: 5,
-      artifactCount: 0,
+/** A canned `fetchImpl` used when running without --live, so this example never needs a server. */
+function fakeV1Fetch(runId: string): V1FetchLike {
+  return async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        apiVersion: 'v1',
+        data: {
+          run: {
+            id: runId,
+            orgId: 'org_demo',
+            projectId: 'proj_demo',
+            agentId: 'agent_readback_demo',
+            status: 'completed',
+            startedAt: Date.now() - 1500,
+            endedAt: Date.now(),
+            metadata: {},
+            tags: [],
+          } satisfies Run,
+          eventCount: 5,
+          artifactCount: 0,
+        },
+      }
     },
-  }
-}
-
-/** Read a run back through the real v1 API — used only with --live. */
-async function fetchRunFromV1Api(baseUrl: string, apiKey: string, runId: string): Promise<V1Envelope<V1RunData>> {
-  const res = await fetch(`${baseUrl.replace(/\/$/, '')}/api/v1/runs/${runId}`, {
-    headers: { 'x-api-key': apiKey },
+    async text() {
+      return '(see json())'
+    },
+    headers: { get: () => null },
   })
-  if (!res.ok) {
-    throw new Error(`GET /api/v1/runs/${runId} failed: HTTP ${res.status}`)
-  }
-  return (await res.json()) as V1Envelope<V1RunData>
 }
 
 // ---------------------------------------------------------------------------
@@ -144,22 +141,22 @@ async function fetchRunFromV1Api(baseUrl: string, apiKey: string, runId: string)
   const flush = await recorder.endRun({ ok: true })
   console.log('Run ended. success =', flush.success, ' eventsSubmitted =', flush.eventsSubmitted)
 
-  console.log('\n=== Read half: read the same run back through the v1 API ===\n')
-  console.log(`GET ${baseUrl}/api/v1/runs/${run.runId}   (header: x-api-key: <redacted>)`)
+  console.log('\n=== Read half: read the same run back with FlightReader ===\n')
+  console.log(`FlightReader.getRun(${run.runId})   GET ${baseUrl}/api/v1/runs/${run.runId}   (header: x-api-key: <redacted>)`)
 
-  const envelope = useLive
-    ? await fetchRunFromV1Api(baseUrl, apiKey, run.runId)
-    : fakeV1RunResponse(run.runId)
+  const reader = new FlightReader({ baseUrl, apiKey }, useLive ? undefined : fakeV1Fetch(run.runId))
 
   if (!useLive) {
     console.log('(using a simulated v1 API response — no server required; pass --live to hit a real one)')
   }
 
-  console.log('\napiVersion:', envelope.apiVersion)
-  console.log('run.status:', envelope.data.run.status)
-  console.log('eventCount:', envelope.data.eventCount)
+  const { run: readRun, eventCount } = await reader.getRun(run.runId)
+
+  console.log('\napiVersion: v1')
+  console.log('run.status:', readRun.status)
+  console.log('eventCount:', eventCount)
   console.log(
-    '\nThis is exactly the shape `afr runs get <runId> --json` prints, and what `afr replay`/`afr tail`/`afr export` build on — see packages/cli/src/apiClient.ts.'
+    '\nThis is the same `FlightReader` that `afr runs get <runId> --json` prints, and that `afr replay`/`afr tail`/`afr export` build on — see packages/cli/src/apiClient.ts.'
   )
 
   console.log('\nRead-back round trip completed successfully.')

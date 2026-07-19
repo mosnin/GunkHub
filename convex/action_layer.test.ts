@@ -290,6 +290,120 @@ describe('webhook_engine.deliverPendingWebhooks', () => {
 })
 
 // ---------------------------------------------------------------------------
+// email_engine.deliverPendingEmails — Cycle 3: the deferred alert-email path
+// ---------------------------------------------------------------------------
+describe('email_engine.deliverPendingEmails', () => {
+  const ORIGINAL_ENV = { ...process.env }
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV }
+    vi.restoreAllMocks()
+  })
+
+  it('an alert rule with an email channel enqueues an email_deliveries row with a rendered envelope', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    await asAdmin.mutation(api.alerts.createAlertRule, {
+      orgId: orgA, name: 'fails', kind: 'run_failed',
+      channels: [{ type: 'email', target: 'oncall@example.com' }],
+    })
+    const runId = await seedFailedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.alert_engine.evaluateAlertsForRun, { runId })
+
+    const email = await t.run((ctx) => ctx.db.query('email_deliveries').withIndex('by_status_created', (q) => q.eq('status', 'pending')).first())
+    expect(email).not.toBeNull()
+    expect(email!.orgId).toBe(orgA)
+    expect(email!.to).toBe('oncall@example.com')
+    expect(email!.subject).toContain('fails')
+    expect(email!.body).toContain(String(runId))
+    expect(email!.body).toContain('Agent A')
+  })
+
+  it('console path (unconfigured AFR_EMAIL_PROVIDER): drains cleanly to "delivered" and rolls up alert_events', async () => {
+    delete process.env['AFR_EMAIL_PROVIDER']
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    await asAdmin.mutation(api.alerts.createAlertRule, {
+      orgId: orgA, name: 'fails', kind: 'run_failed',
+      channels: [{ type: 'email', target: 'oncall@example.com' }],
+    })
+    const runId = await seedFailedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.alert_engine.evaluateAlertsForRun, { runId })
+
+    const result = await t.action(internal.email_engine.deliverPendingEmails, {})
+    expect(result.delivered).toBe(1)
+    expect(logSpy).toHaveBeenCalled()
+
+    const email = await t.run((ctx) => ctx.db.query('email_deliveries').withIndex('by_status_created', (q) => q.eq('status', 'delivered')).first())
+    expect(email!.attempts).toBe(1)
+
+    const alertEvent = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).first())
+    expect(alertEvent!.deliveryStatus).toBe('delivered')
+  })
+
+  it('a rule with BOTH a webhook and an email channel only rolls alert_events up once both siblings resolve', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    await asAdmin.mutation(api.alerts.createAlertRule, {
+      orgId: orgA, name: 'fails', kind: 'run_failed',
+      channels: [
+        { type: 'webhook', target: 'https://example.com/hook' },
+        { type: 'email', target: 'oncall@example.com' },
+      ],
+    })
+    const runId = await seedFailedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.alert_engine.evaluateAlertsForRun, { runId })
+
+    // Only the email side resolves first — rollup must NOT fire yet.
+    const emailResult = await t.action(internal.email_engine.deliverPendingEmails, {})
+    expect(emailResult.delivered).toBe(1)
+    let alertEvent = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).first())
+    expect(alertEvent!.deliveryStatus).toBe('pending')
+
+    // Now the webhook side resolves too — rollup fires.
+    vi.spyOn(global, 'fetch').mockResolvedValue(new Response('ok', { status: 200 }))
+    const webhookResult = await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+    expect(webhookResult.delivered).toBe(1)
+    alertEvent = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).first())
+    expect(alertEvent!.deliveryStatus).toBe('delivered')
+  })
+
+  it('never throws out of the batch on a notifier failure — retries then terminally fails', async () => {
+    process.env['AFR_EMAIL_PROVIDER'] = 'resend'
+    process.env['RESEND_API_KEY'] = 'fake_test_key_not_real'
+    process.env['AFR_EMAIL_FROM'] = 'alerts@example.com'
+    vi.spyOn(global, 'fetch').mockResolvedValue(new Response('boom', { status: 500 }))
+
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    await asAdmin.mutation(api.alerts.createAlertRule, {
+      orgId: orgA, name: 'fails', kind: 'run_failed',
+      channels: [{ type: 'email', target: 'oncall@example.com' }],
+    })
+    const runId = await seedFailedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.alert_engine.evaluateAlertsForRun, { runId })
+
+    const first = await t.action(internal.email_engine.deliverPendingEmails, {})
+    expect(first.retried).toBe(1)
+
+    let email = await t.run((ctx) => ctx.db.query('email_deliveries').withIndex('by_status_created', (q) => q.eq('status', 'pending')).first())
+    for (let i = 0; i < 10; i++) {
+      const current = await t.run((ctx) => ctx.db.get(email!._id))
+      if (current!.status === 'failed') break
+      await t.run((ctx) => ctx.db.patch(email!._id, { nextAttemptAt: Date.now() - 1 }))
+      await t.action(internal.email_engine.deliverPendingEmails, {})
+    }
+    email = await t.run((ctx) => ctx.db.get(email!._id))
+    expect(email!.status).toBe('failed')
+    expect(email!.attempts).toBe(6) // EMAIL_MAX_ATTEMPTS
+  })
+})
+
+// ---------------------------------------------------------------------------
 // read_api — scope enforcement + cross-org
 // ---------------------------------------------------------------------------
 describe('read_api — key scope enforcement and cross-org rejection', () => {
@@ -344,6 +458,34 @@ describe('read_api — key scope enforcement and cross-org rejection', () => {
       await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'revoked_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'], revokedAt: Date.now() })
     })
     await expect(t.mutation(api.read_api.apiListRuns, { apiKeyHash: 'revoked_key' })).rejects.toThrow(/Unauthorized/)
+  })
+
+  it('a read-only key (no "ingest:write" scope) cannot call sdkCreateRun (write path rejected)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, agentA } = await seedTwoOrgs(t)
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_only', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] })
+    })
+    await expect(
+      t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'read_only', agentId: String(agentA) }),
+    ).rejects.toThrow(/Forbidden/)
+  })
+
+  it('a combined-scope key (["read", "ingest:write"]) can both create runs AND read them back', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, agentA } = await seedTwoOrgs(t)
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'combined', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read', 'ingest:write'] })
+    })
+
+    const created = await t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'combined', agentId: String(agentA) })
+    expect(created.id).toBeDefined()
+
+    const list = await t.mutation(api.read_api.apiListRuns, { apiKeyHash: 'combined' })
+    expect(list.runs.map((r: any) => r._id)).toContain(created.id)
+
+    const got = await t.mutation(api.read_api.apiGetRun, { apiKeyHash: 'combined', runId: String(created.id) })
+    expect(got.run._id).toBe(created.id)
   })
 })
 

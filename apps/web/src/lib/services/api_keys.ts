@@ -3,6 +3,19 @@ import { auth } from '@clerk/nextjs/server'
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient, resolveConvexOrgId } from '@/lib/convexServer'
 
+// Re-exported for convenience so route code can import the scope contract
+// from this service module alongside listApiKeys — the actual dependency-free
+// implementation lives in apiKeyScopes.ts (see that file's header for why it
+// is split out: it must be importable from tests/unit without a Next.js/
+// Clerk/Convex runtime, which this module pulls in).
+export {
+  ALLOWED_KEY_SCOPES,
+  DEFAULT_KEY_SCOPES,
+  resolveRequestedScopes,
+  type ApiKeyScope,
+  type ResolveScopesResult,
+} from '@/lib/apiKeyScopes'
+
 export interface ApiKeySummary {
   id: string
   name: string

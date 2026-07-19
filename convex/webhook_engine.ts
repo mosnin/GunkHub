@@ -141,12 +141,17 @@ export const markRetry = internalMutation({
 });
 
 /**
- * Roll a fired alert's overall deliveryStatus up from its sibling
- * webhook_deliveries: "delivered" once every sibling has delivered,
- * "failed" once every sibling has resolved and at least one failed,
- * otherwise left "pending" (some siblings still pending/retrying). A no-op
- * if the alert_events row is already resolved (delivered/failed) — the
- * rollup only ever runs once, at the point every sibling first resolves.
+ * Roll a fired alert's overall deliveryStatus up from ALL of its sibling
+ * deliveries — webhook_deliveries AND (Cycle 3) email_deliveries, since a
+ * rule can mix both channel types: "delivered" once every sibling across
+ * BOTH tables has delivered, "failed" once every sibling has resolved and
+ * at least one failed, otherwise left "pending" (some siblings still
+ * pending/retrying). A no-op if the alert_events row is already resolved
+ * (delivered/failed) — the rollup only ever runs once, at the point every
+ * sibling first resolves. Called from both convex/webhook_engine.ts and
+ * convex/email_engine.ts's delivery drains (by name, via
+ * makeFunctionReference — same cross-file pattern already used for
+ * _evaluateAlertsForRunRef/_runEvalsForRunRef).
  */
 export const rollupAlertEventStatus = internalMutation({
   args: { alertEventId: v.id("alert_events") },
@@ -154,10 +159,20 @@ export const rollupAlertEventStatus = internalMutation({
     const alertEvent = await ctx.db.get(args.alertEventId);
     if (!alertEvent || alertEvent.deliveryStatus !== "pending") return;
 
-    const siblings = await ctx.db
-      .query("webhook_deliveries")
-      .withIndex("by_alert_event", (q) => q.eq("alertEventId", args.alertEventId))
-      .collect();
+    const [webhookSiblings, emailSiblings] = await Promise.all([
+      ctx.db
+        .query("webhook_deliveries")
+        .withIndex("by_alert_event", (q) => q.eq("alertEventId", args.alertEventId))
+        .collect(),
+      ctx.db
+        .query("email_deliveries")
+        .withIndex("by_alert_event", (q) => q.eq("alertEventId", args.alertEventId))
+        .collect(),
+    ]);
+    const siblings: { status: "pending" | "delivered" | "failed" }[] = [
+      ...webhookSiblings,
+      ...emailSiblings,
+    ];
     if (siblings.length === 0) return;
 
     const anyPending = siblings.some((d) => d.status === "pending");

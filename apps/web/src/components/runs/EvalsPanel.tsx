@@ -1,3 +1,4 @@
+import type { RunEvalSummary } from '@/lib/services/evals'
 import type { Eval } from '@agent-flight-recorder/contracts'
 
 import { EmptyState } from '@/components/ui/EmptyState'
@@ -5,6 +6,43 @@ import { formatRelativeTime } from '@/lib/utils'
 
 interface EvalsPanelProps {
   evals: Eval[]
+  /** Pass/fail/score header from Team B's insights.getRunEvalSummary.
+      Omitted (or unavailable) hides the header — the per-eval list below
+      still renders either way. */
+  summary?: RunEvalSummary
+}
+
+function SummaryHeader({ summary }: { summary: RunEvalSummary }) {
+  if (!summary.available || summary.total === 0) return null
+  const passColor = summary.passRatePct !== null && summary.passRatePct >= 90
+    ? 'text-neon-glow'
+    : summary.passRatePct !== null && summary.passRatePct < 50
+      ? 'text-destructive-500'
+      : 'text-whiteout'
+  return (
+    <dl className="flex flex-wrap gap-3 px-6 pt-6">
+      <div className="flex-1 min-w-[100px] rounded-[4px] border border-graphite bg-graphite-deep px-4 py-3">
+        <dt className="text-xs font-medium text-pewter uppercase tracking-wider">Pass rate</dt>
+        <dd className={`mt-1 font-mono text-xl tabular-nums ${passColor}`}>
+          {summary.passRatePct !== null ? `${summary.passRatePct.toFixed(1)}%` : '—'}
+        </dd>
+      </div>
+      <div className="flex-1 min-w-[100px] rounded-[4px] border border-graphite bg-graphite-deep px-4 py-3">
+        <dt className="text-xs font-medium text-pewter uppercase tracking-wider">Passed</dt>
+        <dd className="mt-1 font-mono text-xl text-whiteout tabular-nums">{summary.passed}</dd>
+      </div>
+      <div className="flex-1 min-w-[100px] rounded-[4px] border border-graphite bg-graphite-deep px-4 py-3">
+        <dt className="text-xs font-medium text-pewter uppercase tracking-wider">Failed</dt>
+        <dd className="mt-1 font-mono text-xl text-destructive-500 tabular-nums">{summary.failed}</dd>
+      </div>
+      {summary.avgScore !== undefined && (
+        <div className="flex-1 min-w-[100px] rounded-[4px] border border-graphite bg-graphite-deep px-4 py-3">
+          <dt className="text-xs font-medium text-pewter uppercase tracking-wider">Avg score</dt>
+          <dd className="mt-1 font-mono text-xl text-cloud tabular-nums">{summary.avgScore.toFixed(2)}</dd>
+        </div>
+      )}
+    </dl>
+  )
 }
 
 function PassFailChip({ passed }: { passed: boolean }) {
@@ -30,7 +68,7 @@ function PassFailChip({ passed }: { passed: boolean }) {
 }
 
 /** Run-detail Evals tab — every eval recorded against this run (convex/evals.ts, append-only). */
-export function EvalsPanel({ evals }: EvalsPanelProps) {
+export function EvalsPanel({ evals, summary }: EvalsPanelProps) {
   if (evals.length === 0) {
     return (
       <div className="p-6">
@@ -43,7 +81,9 @@ export function EvalsPanel({ evals }: EvalsPanelProps) {
   }
 
   return (
-    <div className="p-6 flex flex-col gap-2">
+    <div className="flex flex-col gap-2 pb-6">
+      {summary && <SummaryHeader summary={summary} />}
+      <div className="px-6 pt-6 flex flex-col gap-2">
       {evals.map((e) => (
         <div
           key={e.id}
@@ -65,6 +105,7 @@ export function EvalsPanel({ evals }: EvalsPanelProps) {
           <span className="text-xs text-pewter shrink-0 font-mono">{formatRelativeTime(e.createdAt)}</span>
         </div>
       ))}
+      </div>
     </div>
   )
 }

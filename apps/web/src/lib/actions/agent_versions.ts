@@ -28,6 +28,7 @@ export async function createAgentVersionAction(
   version: string,
   changelog?: string,
   configSnapshot?: Record<string, unknown>,
+  evalRules?: Record<string, unknown>[],
 ): Promise<{ agentVersion: AgentVersion } | { error: string }> {
   if (!agentId) return { error: 'Agent ID is required' }
   const trimmed = (version ?? '').trim()
@@ -39,6 +40,7 @@ export async function createAgentVersionAction(
       version: trimmed,
       ...(changelog !== undefined && changelog.trim() ? { changelog: changelog.trim() } : {}),
       ...(configSnapshot !== undefined ? { configSnapshot } : {}),
+      ...(evalRules !== undefined ? { evalRules } : {}),
     })
     return { agentVersion }
   } catch (err) {

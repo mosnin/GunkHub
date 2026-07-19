@@ -13,8 +13,10 @@ import {
   MAX_EVENTS_PER_RUN,
 } from "./helpers/pagination.js";
 import {
+  addModelSeen,
   buildSearchText,
   extractErrorMessage,
+  extractModel,
   extractTokenUsage,
   validateEnvironment,
   validateLabels,
@@ -564,6 +566,22 @@ export const sdkCreateEvents = mutation({
             tokensIn: (current?.tokensIn ?? 0) + tokensIn,
             tokensOut: (current?.tokensOut ?? 0) + tokensOut,
           });
+        }
+      }
+
+      // Cycle 3 (cost accuracy): denormalize the model onto runs.modelsSeen,
+      // same tolerant-extraction/bounded-dedup approach as convex/events.ts.
+      // Re-fetch for the same read-your-writes reason as the tokensIn/Out
+      // patch above — a prior iteration in this batch may have already
+      // appended to modelsSeen for the same run.
+      if (evt.type === "llm.request" || evt.type === "llm.response") {
+        const model = extractModel(evt.payload);
+        if (model !== undefined) {
+          const current = await ctx.db.get(runId);
+          const updated = addModelSeen(current?.modelsSeen, model);
+          if (updated !== undefined) {
+            await ctx.db.patch(runId, { modelsSeen: updated });
+          }
         }
       }
 
