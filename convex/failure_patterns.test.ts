@@ -1100,3 +1100,341 @@ describe('regression guard — recordFailurePatternOccurrence auto-reopens a RES
     expect(events.length).toBe(0)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ADR-006 cycle 2 — resolution evidence ("prove the fix held").
+// ---------------------------------------------------------------------------
+
+describe('resolvePattern versionId validation', () => {
+  /** Records one occurrence so a rollup (with an agent set) exists to resolve. */
+  async function seedPattern(t: ReturnType<typeof convexTest>, orgId: any, projectId: any, agentId: any, hash: string, occurredAt = 1_000_000) {
+    const runId = await seedRun(t, orgId, projectId, agentId)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId, runId, agentId, fingerprintHash: hash, class: 'tool_error', label: 'L', salientKey: 'a', occurredAt,
+    })
+    return runId
+  }
+
+  it('accepts a versionId that exists in the caller org AND belongs to an agent the pattern was observed on', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+    await seedPattern(t, orgA, projectA, agentA, 'ok-version')
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, {
+      orgId: orgA, fingerprintHash: 'ok-version', versionId: versionA, note: 'bumped the retry budget',
+    })
+    expect(resolved!.status).toBe('resolved')
+    expect(resolved!.resolvedInVersionId).toBe(versionA)
+    // Evidence snapshot is stamped alongside the resolution.
+    expect(resolved!.resolvedAtOccurrenceCount).toBe(1)
+    expect(typeof resolved!.resolvedAtRunCount).toBe('number')
+  })
+
+  it('REJECTS a cross-org versionId with INVALID_ARGUMENT and does not resolve the pattern', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectA, projectB, agentA, agentB } = await seedTwoOrgs(t)
+    await seedPattern(t, orgA, projectA, agentA, 'cross-org-version')
+    // A real agent_version, but in org B.
+    const versionB = await t.run((ctx) => ctx.db.insert('agent_versions', { agentId: agentB, orgId: orgB, version: 'v1', createdAt: Date.now() }))
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    await expect(
+      asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'cross-org-version', versionId: versionB }),
+    ).rejects.toThrow(/INVALID_ARGUMENT/)
+
+    // Never silently ignored: the pattern must remain UNRESOLVED.
+    const pattern = await t.run((ctx) =>
+      ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'cross-org-version')).first(),
+    )
+    expect(pattern!.status).toBeUndefined()
+    expect(pattern!.resolvedAt).toBeUndefined()
+    expect(pattern!.resolvedInVersionId).toBeUndefined()
+    void projectB
+  })
+
+  it('REJECTS a same-org versionId belonging to a DIFFERENT agent than the pattern was observed on', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedPattern(t, orgA, projectA, agentA, 'cross-agent-version')
+    // A second agent in the SAME org, which this pattern has never been seen on.
+    const otherVersion = await t.run(async (ctx) => {
+      const otherAgent = await ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'Other', slug: 'other', createdAt: Date.now(), updatedAt: Date.now() })
+      return await ctx.db.insert('agent_versions', { agentId: otherAgent, orgId: orgA, version: 'v9', createdAt: Date.now() })
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    await expect(
+      asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'cross-agent-version', versionId: otherVersion }),
+    ).rejects.toThrow(/INVALID_ARGUMENT/)
+
+    const pattern = await t.run((ctx) =>
+      ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'cross-agent-version')).first(),
+    )
+    expect(pattern!.status).toBeUndefined()
+  })
+
+  it('gives the SAME error message for cross-org and cross-agent — no existence oracle for another org\'s version ids', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectA, agentA, agentB } = await seedTwoOrgs(t)
+    await seedPattern(t, orgA, projectA, agentA, 'same-message')
+    const versionB = await t.run((ctx) => ctx.db.insert('agent_versions', { agentId: agentB, orgId: orgB, version: 'v1', createdAt: Date.now() }))
+    const otherVersion = await t.run(async (ctx) => {
+      const otherAgent = await ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'Other', slug: 'other', createdAt: Date.now(), updatedAt: Date.now() })
+      return await ctx.db.insert('agent_versions', { agentId: otherAgent, orgId: orgA, version: 'v9', createdAt: Date.now() })
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const messageOf = async (versionId: any) => {
+      try {
+        await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'same-message', versionId })
+        return 'NO THROW'
+      } catch (e: any) {
+        return String(e.message).replace(/^.*(INVALID_ARGUMENT)/s, '$1').split('\n')[0]
+      }
+    }
+    expect(await messageOf(versionB)).toBe(await messageOf(otherVersion))
+  })
+
+  it('resolves normally when versionId is omitted (the arg is optional, not required)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedPattern(t, orgA, projectA, agentA, 'no-version')
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'no-version' })
+    expect(resolved!.status).toBe('resolved')
+    expect(resolved!.resolvedInVersionId).toBeUndefined()
+  })
+
+  it('returns null (not an INVALID_ARGUMENT throw) for an unknown fingerprint, even with a bad versionId', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, agentB } = await seedTwoOrgs(t)
+    const versionB = await t.run((ctx) => ctx.db.insert('agent_versions', { agentId: agentB, orgId: orgB, version: 'v1', createdAt: Date.now() }))
+    const asMember = t.withIdentity(identity('member', 'a'))
+    // The rollup lookup happens FIRST, so a bad versionId cannot be used to
+    // probe whether a fingerprint exists in this org.
+    expect(
+      await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'nope', versionId: versionB }),
+    ).toBeNull()
+  })
+})
+
+describe('getPatternResolutionEvidence', () => {
+  it('tracks exposure and recurrence counters across a resolve -> recur -> reopen -> resolve sequence', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const hash = 'lifecycle'
+
+    const record = async (occurredAt: number) => {
+      const runId = await seedRun(t, orgA, projectA, agentA)
+      await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+        orgId: orgA, runId, agentId: agentA, fingerprintHash: hash, class: 'tool_error', label: 'L', salientKey: 'a', occurredAt,
+      })
+    }
+
+    // Two failures before anyone looks at it.
+    await record(1_000_000)
+    await record(1_100_000)
+
+    // RESOLVE #1 — snapshot must capture count == 2.
+    const r1 = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: hash, versionId: versionA })
+    expect(r1!.resolvedAtOccurrenceCount).toBe(2)
+    await t.run((ctx) => ctx.db.patch(r1!._id, { resolvedAt: 2_000_000 }))
+
+    let evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: hash })
+    // Nothing has recurred yet -> the fix has held SO FAR.
+    expect(evidence!.exposure!.recurrenceCount).toBe(0)
+    expect(evidence!.exposure!.heldSoFar).toBe(true)
+    expect(evidence!.exposure!.since).toBe(2_000_000)
+    expect(evidence!.resolution!.resolvedInVersionId).toBe(versionA)
+    expect(evidence!.resolution!.resolvedInVersion).toBe('v1')
+
+    // RECUR — a new occurrence after resolvedAt auto-reopens (regression guard).
+    await record(3_000_000)
+    evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: hash })
+    expect(evidence!.pattern.status).toBe('open')
+    expect(evidence!.pattern.regressedAt).toBe(3_000_000)
+    // resolvedAt SURVIVES the auto-reopen, so the "it didn't hold" evidence stays computable.
+    expect(evidence!.exposure!.recurrenceCount).toBe(1)
+    expect(evidence!.exposure!.heldSoFar).toBe(false)
+
+    // MANUAL REOPEN — clears resolvedAt, so there is no live resolution to evidence.
+    await asMember.mutation(api.failure_patterns.reopenPattern, { orgId: orgA, fingerprintHash: hash })
+    evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: hash })
+    expect(evidence!.resolution).toBeNull()
+    expect(evidence!.exposure).toBeNull()
+
+    // RESOLVE #2 — a NEW baseline snapshot at count == 3, so the recurrence
+    // counter restarts from this resolution rather than double-counting the
+    // failures the first resolution already accounted for.
+    const r2 = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: hash })
+    expect(r2!.resolvedAtOccurrenceCount).toBe(3)
+    await t.run((ctx) => ctx.db.patch(r2!._id, { resolvedAt: 4_000_000 }))
+
+    evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: hash })
+    expect(evidence!.exposure!.recurrenceCount).toBe(0)
+    expect(evidence!.exposure!.heldSoFar).toBe(true)
+
+    // And one more recurrence is counted against the SECOND resolution only.
+    await record(5_000_000)
+    evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: hash })
+    expect(evidence!.exposure!.recurrenceCount).toBe(1)
+  })
+
+  it('counts post-resolution run exposure across the pattern\'s affected agents only', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asMember = t.withIdentity(identity('member', 'a'))
+
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'exposure', class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 1_000_000,
+    })
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'exposure' })
+    const resolvedAt = resolved!.resolvedAt!
+
+    // Three runs on the affected agent AFTER resolution...
+    const otherAgent = await t.run((ctx) =>
+      ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'Other', slug: 'other', createdAt: Date.now(), updatedAt: Date.now() }),
+    )
+    await t.run(async (ctx) => {
+      for (let i = 1; i <= 3; i++) {
+        await ctx.db.insert('runs', { orgId: orgA, projectId: projectA, agentId: agentA, status: 'completed', startedAt: resolvedAt + i * 1000, metadata: {}, tags: [] })
+      }
+      // ...and two on an UNRELATED agent, which must NOT count as exposure.
+      for (let i = 1; i <= 2; i++) {
+        await ctx.db.insert('runs', { orgId: orgA, projectId: projectA, agentId: otherAgent, status: 'completed', startedAt: resolvedAt + i * 1000, metadata: {}, tags: [] })
+      }
+    })
+
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'exposure' })
+    expect(evidence!.exposure!.runCount).toBe(3)
+    expect(evidence!.exposure!.runCountTruncated).toBe(false)
+    expect(evidence!.exposure!.agentIds).toEqual([agentA])
+    // heldSoFar is true, and runCount is what makes that meaningful evidence.
+    expect(evidence!.exposure!.heldSoFar).toBe(true)
+  })
+
+  it('returns the lifecycle transition history from the append-only audit log, oldest-first, including the automatic regression', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const hash = 'transitions'
+
+    const run1 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run1, agentId: agentA, fingerprintHash: hash, class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 1_000_000,
+    })
+
+    await asMember.mutation(api.failure_patterns.acknowledgePattern, { orgId: orgA, fingerprintHash: hash })
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: hash })
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 2_000_000 }))
+
+    const run2 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run2, agentId: agentA, fingerprintHash: hash, class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 3_000_000,
+    })
+
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: hash })
+    expect(evidence!.transitions.map((tr: any) => tr.action)).toEqual([
+      'failure_pattern.acknowledged',
+      'failure_pattern.resolved',
+      'failure_pattern.regressed',
+    ])
+    // The automatic reopen is attributed to the system, not to a human.
+    const regressed = evidence!.transitions[2]!
+    expect(regressed.actorClerkUserId).toBe('system')
+    expect(regressed.metadata).toMatchObject({ resolvedAt: 2_000_000, regressedAt: 3_000_000 })
+  })
+
+  it('is org-scoped: a member of org A gets null for org B\'s fingerprint, never an error or a leak', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectB, agentB } = await seedTwoOrgs(t)
+    const runB = await seedRun(t, orgB, projectB, agentB)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgB, runId: runB, agentId: agentB, fingerprintHash: 'org-b-secret', class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 1_000_000,
+    })
+
+    const asMemberA = t.withIdentity(identity('member', 'a'))
+    expect(await asMemberA.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'org-b-secret' })).toBeNull()
+    // And org A cannot pass org B's orgId either.
+    await expect(
+      asMemberA.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgB, fingerprintHash: 'org-b-secret' }),
+    ).rejects.toThrow()
+  })
+
+  it('reports no resolution/exposure for a pattern that has never been resolved, but still returns its transitions', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'never-resolved', class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 1_000_000,
+    })
+    await asMember.mutation(api.failure_patterns.acknowledgePattern, { orgId: orgA, fingerprintHash: 'never-resolved' })
+
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'never-resolved' })
+    expect(evidence!.resolution).toBeNull()
+    expect(evidence!.exposure).toBeNull()
+    expect(evidence!.transitions.map((tr: any) => tr.action)).toEqual(['failure_pattern.acknowledged'])
+  })
+})
+
+describe('affectedAgentIds maintenance (ADR-006 cycle 2)', () => {
+  it('accumulates the deduped agent set across occurrences, and self-heals a pre-cycle rollup that lacks the field', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const secondAgent = await t.run((ctx) =>
+      ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'Second', slug: 'second', createdAt: Date.now(), updatedAt: Date.now() }),
+    )
+
+    const run1 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run1, agentId: agentA, fingerprintHash: 'agents', class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 1_000_000,
+    })
+
+    const find = async () =>
+      await t.run((ctx) =>
+        ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'agents')).first(),
+      )
+    expect((await find())!.affectedAgentIds).toEqual([agentA])
+
+    // Simulate a PRE-CYCLE row by stripping the field, then record another
+    // occurrence: the upsert must repopulate it without any backfill.
+    const rollupId = (await find())!._id
+    await t.run((ctx) => ctx.db.patch(rollupId, { affectedAgentIds: undefined }))
+    const run2 = await seedRun(t, orgA, projectA, secondAgent)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run2, agentId: secondAgent, fingerprintHash: 'agents', class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 2_000_000,
+    })
+    expect((await find())!.affectedAgentIds).toEqual([secondAgent])
+
+    // A repeat of an already-known agent dedupes rather than appending.
+    const run3 = await seedRun(t, orgA, projectA, secondAgent)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run3, agentId: secondAgent, fingerprintHash: 'agents', class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 3_000_000,
+    })
+    expect((await find())!.affectedAgentIds).toEqual([secondAgent])
+  })
+
+  it('falls back to deriving the agent set from occurrences when the rollup predates affectedAgentIds', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'legacy', class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 1_000_000,
+    })
+    // Strip the field to emulate a rollup written before this cycle.
+    await t.run(async (ctx) => {
+      const p = await ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'legacy')).first()
+      await ctx.db.patch(p!._id, { affectedAgentIds: undefined })
+    })
+
+    // Cross-agent validation must still ACCEPT the legitimate version, proving
+    // the occurrence-derived fallback ran rather than rejecting everything.
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'legacy', versionId: versionA })
+    expect(resolved!.resolvedInVersionId).toBe(versionA)
+  })
+})

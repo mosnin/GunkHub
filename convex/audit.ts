@@ -49,6 +49,12 @@ export const AUDIT_ACTIONS = [
   "failure_pattern.acknowledged",
   "failure_pattern.resolved",
   "failure_pattern.reopened",
+  // ADR-006 Cycle 2 — the regression guard's AUTOMATIC reopen. Distinct from
+  // "failure_pattern.reopened" (a human deliberately reopening): this one is
+  // written by recordFailurePatternOccurrence with SYSTEM_ACTOR, and is what
+  // makes the lifecycle transition history reconstructible end-to-end from
+  // the append-only audit log alone — no mutable per-pattern history table.
+  "failure_pattern.regressed",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -57,6 +63,15 @@ const AUDIT_ACTION_SET = new Set<string>(AUDIT_ACTIONS);
 
 /** Actor recorded for changes applied by the Clerk webhook (no human session). */
 export const WEBHOOK_ACTOR = "clerk-webhook";
+
+/**
+ * Actor recorded for transitions the backend applies on its own — no human
+ * and no external webhook, e.g. ADR-006's regression guard auto-reopening a
+ * resolved failure pattern. Reads as a distinct actor so an admin scanning
+ * the audit log can tell "the system did this" apart from "a person did this"
+ * without parsing the action name.
+ */
+export const SYSTEM_ACTOR = "system";
 
 /**
  * Append one audit row. Called from privileged mutations AFTER their own auth

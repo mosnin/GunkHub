@@ -2758,6 +2758,33 @@ export interface PatternLifecycleSnapshot {
   resolvedAt?: number;
   regressedAt?: number;
   count: number;
+
+  // --- cycle 2 ("prove the fix held") evidence fields. All OPTIONAL and all
+  // additive: a caller that does not supply them gets exactly the cycle-1
+  // behaviour out of `summarizeResolutionHealth`'s original fields, and its
+  // resolutions are reported as `unproven` in the new fields (which is the
+  // honest reading — no evidence is not evidence of a holding fix). See
+  // section 12 below.
+
+  /**
+   * How many runs of the relevant agent (or agent version — see
+   * `exposureVersionId`) have executed strictly AFTER `resolvedAt`. This is
+   * the exposure that gives the pattern a chance to recur; without it a
+   * resolution is an untested assertion. `undefined` means "not measured",
+   * which is treated identically to `0` for scoring (see
+   * `FIX_CREDIT_UNPROVEN`) but is reported separately in the summary.
+   */
+  postResolutionRuns?: number;
+  /** Agent version the fix was believed to ship in, if the resolver recorded one. */
+  resolvedInVersionId?: string;
+  /** Agent version the `postResolutionRuns` exposure was actually observed on, if known. */
+  exposureVersionId?: string;
+  /**
+   * When the pattern fired again after the resolution, if it did. Defaults to
+   * `regressedAt` when omitted — `regressedAt` is Team A's lifecycle field and
+   * carries the same meaning for confidence purposes.
+   */
+  recurredAt?: number;
 }
 
 /**
@@ -2870,11 +2897,46 @@ const RESOLUTION_HEALTH_REGRESSION_PENALTY = 50;
  * documented special case returning `healthScore: 100` (a neutral-good
  * default) rather than `0/0`-driven `NaN`.
  *
- * Deterministic: `nowMs` is accepted (per the task's pure-function contract)
- * but this cycle's formula does not currently use it — every input that
- * drives the score is already a plain aggregate over `snapshots`. Kept as a
- * required parameter so a future cycle can add a recency-weighted term
- * without changing this function's signature.
+ * ASSERTED VS. CONFIRMED (cycle 2 — "prove the fix held"). The fields above
+ * count a resolution the moment a human clicks "resolved". The fields below
+ * grade those same resolutions by whether the fix actually held, using
+ * `fixConfidence` (section 12) over the snapshot's optional evidence fields:
+ *
+ *   - `confirmedResolutions` / `provingResolutions` / `unprovenResolutions`
+ *     partition the currently-`resolved` snapshots by
+ *     `fixConfidence(...).state`. (A currently-resolved snapshot cannot be
+ *     `regressed` — a recurrence strictly after its `resolvedAt` would mean
+ *     the guard reopened it; a `regressedAt` that PRECEDES `resolvedAt` is an
+ *     old regression that has since been re-resolved and correctly does not
+ *     count against the new resolution. Any such row is nonetheless folded
+ *     into `unprovenResolutions` defensively rather than dropped, so the
+ *     three buckets always sum to `resolved`.)
+ *   - `resolutionsWithoutEvidence` counts currently-resolved snapshots where
+ *     the caller supplied no `postResolutionRuns` at all. Reported separately
+ *     so a UI can tell "we measured, and nothing has run" apart from "nobody
+ *     wired up the measurement" — they score identically (both unproven) but
+ *     they mean different things to the person reading the dashboard.
+ *   - `confirmationRate` = `confirmedResolutions / resolved`, i.e. of the
+ *     patterns this org calls done, what share are actually PROVEN done. `0`
+ *     (not `NaN`) when `resolved === 0`.
+ *   - `provenHealthScore` is `healthScore` recomputed with each resolution
+ *     weighted by the credit its evidence earned (`FIX_CREDIT_CONFIRMED` 1.0 /
+ *     `FIX_CREDIT_PROVING` 0.5 / `FIX_CREDIT_UNPROVEN` 0.25 /
+ *     `FIX_CREDIT_REGRESSED` 0) instead of counting every resolution as a
+ *     whole point, keeping the identical regression-rate penalty so the two
+ *     numbers are directly comparable. A team that closes patterns without
+ *     them holding scores strictly below a team whose fixes stick, and the
+ *     GAP between `healthScore` and `provenHealthScore` is exactly the amount
+ *     of unverified assertion in the backlog. `total === 0` returns `100`,
+ *     the same neutral-good default as `healthScore`.
+ *
+ * BACKWARD COMPATIBILITY: the cycle-1 fields are untouched, and every cycle-2
+ * field is additive. A caller that supplies no evidence fields sees identical
+ * cycle-1 output; its resolutions simply read as `unproven`.
+ *
+ * Deterministic: `nowMs` is now genuinely used — it is the "now" against which
+ * each resolution's soak time is measured in `fixConfidence`. It is still
+ * never read from the environment.
  *
  * Defensive against a non-array or empty `snapshots`, and against individual
  * snapshots with non-finite/missing timestamps (excluded from timing/rate
@@ -2895,9 +2957,13 @@ export function summarizeResolutionHealth(
   avgTimeToResolutionMs: number | null;
   medianTimeToResolutionMs: number | null;
   healthScore: number;
+  confirmedResolutions: number;
+  provingResolutions: number;
+  unprovenResolutions: number;
+  resolutionsWithoutEvidence: number;
+  confirmationRate: number;
+  provenHealthScore: number;
 } {
-  void nowMs; // accepted per contract; not used by this cycle's formula — see doc comment.
-
   const list = Array.isArray(snapshots) ? snapshots.filter((s): s is PatternLifecycleSnapshot => !!s) : [];
   const total = list.length;
 
@@ -2906,6 +2972,11 @@ export function summarizeResolutionHealth(
   let resolved = 0;
   let regressed = 0;
   let onceResolvedDenom = 0;
+  let confirmedResolutions = 0;
+  let provingResolutions = 0;
+  let unprovenResolutions = 0;
+  let resolutionsWithoutEvidence = 0;
+  let creditedResolved = 0;
   const ttrValues: number[] = [];
 
   for (const s of list) {
@@ -2922,6 +2993,16 @@ export function summarizeResolutionHealth(
     if (s.status === "resolved") {
       const ttr = timeToResolutionMs(s.firstSeenAt, s.resolvedAt);
       if (ttr !== undefined) ttrValues.push(ttr);
+
+      // Cycle 2: grade the assertion. Scoped to CURRENTLY-resolved snapshots so
+      // the three buckets always sum to `resolved`; an auto-reopened pattern is
+      // already carried by `regressed`/`regressionRate` above.
+      const confidence = fixConfidence(fixConfidenceInputFor(s), nowMs);
+      if (confidence.state === "confirmed") confirmedResolutions += 1;
+      else if (confidence.state === "proving") provingResolutions += 1;
+      else unprovenResolutions += 1; // includes the defensive `regressed` case
+      if (!confidence.exposureMeasured) resolutionsWithoutEvidence += 1;
+      creditedResolved += creditForState(confidence.state);
     }
   }
 
@@ -2933,6 +3014,17 @@ export function summarizeResolutionHealth(
   const rawScore = total > 0 ? resolvedFraction * 100 - regressionRate * RESOLUTION_HEALTH_REGRESSION_PENALTY : 100;
   const healthScore = Math.max(0, Math.min(100, Math.round(rawScore)));
 
+  // Same formula as healthScore, but each resolution contributes the credit its
+  // EVIDENCE earned instead of a whole point. Identical regression penalty, so
+  // the two numbers are directly comparable and their gap is readable as "how
+  // much of this org's 'resolved' is unverified assertion".
+  const creditedFraction = total > 0 ? creditedResolved / total : 0;
+  const rawProvenScore =
+    total > 0 ? creditedFraction * 100 - regressionRate * RESOLUTION_HEALTH_REGRESSION_PENALTY : 100;
+  const provenHealthScore = Math.max(0, Math.min(100, Math.round(rawProvenScore)));
+
+  const confirmationRate = resolved > 0 ? confirmedResolutions / resolved : 0;
+
   return {
     total,
     open,
@@ -2943,5 +3035,479 @@ export function summarizeResolutionHealth(
     avgTimeToResolutionMs,
     medianTimeToResolutionMs,
     healthScore,
+    confirmedResolutions,
+    provingResolutions,
+    unprovenResolutions,
+    resolutionsWithoutEvidence,
+    confirmationRate,
+    provenHealthScore,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 12. fixConfidence / deriveFixConfidenceState — cycle 2 of "Resolution"
+//    ("prove the fix held"). Cycle 1 gave the lifecycle a RESOLVED state, but
+//    resolution there is an unearned human assertion: someone clicks
+//    "resolved" and the product believes them. This section is the math that
+//    turns the assertion into evidence.
+//
+//    The claim being tested is narrow and falsifiable: "this failure pattern
+//    has not recurred DESPITE the code path being exercised since the fix."
+//    Two things can make that claim worthless — the pattern came back
+//    (direct disproof), or nothing has run since (nothing was tested). Both
+//    are modelled explicitly and both are reported back to the caller, so the
+//    UI can EXPLAIN the number instead of asserting it. Every function here
+//    is pure and deterministic: no ctx, no db, no Date.now(), no
+//    Math.random() — `nowMs` is always supplied by the caller.
+// ---------------------------------------------------------------------------
+
+/**
+ * Where a resolution sits on the evidence ladder.
+ *
+ * - `unproven`  — resolution asserted, but nothing has exercised the path
+ *                 since (or there is no usable resolution timestamp). Not a
+ *                 failure; just no evidence either way.
+ * - `proving`   — real exposure is accumulating without recurrence, but not
+ *                 yet enough to stake a deploy decision on.
+ * - `confirmed` — enough clean exposure that a pattern which was still live
+ *                 would very probably have fired again by now.
+ * - `regressed` — the pattern fired again after the resolution. The fix did
+ *                 not hold. This is the only state backed by direct proof.
+ */
+export type FixConfidenceState = "unproven" | "proving" | "confirmed" | "regressed";
+
+/**
+ * Inputs to `fixConfidence`. Everything is a plain value supplied by the
+ * caller — nothing is read from the environment.
+ */
+export interface FixConfidenceInput {
+  /** When the pattern was marked resolved. `undefined`/non-finite => no usable resolution. */
+  resolvedAt?: number;
+  /** Agent version the fix was believed to ship in, if recorded. */
+  resolvedInVersionId?: string;
+  /** Agent version the exposure runs were observed on, if known. */
+  exposureVersionId?: string;
+  /** Runs executed strictly after `resolvedAt`. Non-finite/negative is sanitized to 0. */
+  postResolutionRuns?: number;
+  /** When the pattern fired again after the resolution, if it did. */
+  recurredAt?: number;
+}
+
+/** Whether the exposure runs can be attributed to the version the fix shipped in. */
+export type FixVersionAttribution = "matched" | "mismatched" | "unknown";
+
+/**
+ * Why the score is not higher. Purely for UI explanation; ordered by
+ * precedence in `fixConfidence` (see that function).
+ */
+export type FixConfidenceLimit =
+  | "recurrence"
+  | "no-resolution"
+  | "version-mismatch"
+  | "no-exposure"
+  | "accumulating"
+  | "none";
+
+/**
+ * The inspectable result of `fixConfidence`. The score is deliberately
+ * accompanied by every input that produced it: an engineer must be able to
+ * read "0.42 because 21 runs over 2 days on the matching version, no
+ * recurrence" rather than being handed a bare number to trust.
+ */
+export interface FixConfidenceResult {
+  /** `FIX_CONFIDENCE_FLOOR`..`FIX_CONFIDENCE_MAX`, rounded to 4 decimals. Never NaN. */
+  score: number;
+  state: FixConfidenceState;
+  /** Runs that actually count as exposure (sanitized, and zeroed on version mismatch). */
+  exposureRuns: number;
+  /** Sanitized `postResolutionRuns` BEFORE version attribution was applied. */
+  observedRuns: number;
+  versionAttribution: FixVersionAttribution;
+  /** `nowMs - resolvedAt`, clamped to >= 0. `0` when there is no usable resolution. */
+  elapsedMs: number;
+  recurred: boolean;
+  /** Whether a usable (finite) `resolvedAt` was supplied at all. */
+  hasResolution: boolean;
+  /** Whether the caller measured exposure at all (vs. leaving it `undefined`). */
+  exposureMeasured: boolean;
+  /** 0..1 — share of the exposure bar filled. `min(1, exposureRuns / RUNS_FOR_FULL_CREDIT)`. */
+  exposureCredit: number;
+  /** 0..1 — share of the soak bar filled. `min(1, elapsedMs / SOAK_MS_FOR_FULL_CREDIT)`. */
+  soakCredit: number;
+  limitingFactor: FixConfidenceLimit;
+}
+
+/**
+ * Confidence floor. A disproved fix (the pattern recurred) is worth exactly
+ * zero, not "a little": prior clean exposure does not partially survive a
+ * counter-example, it is refuted by it.
+ */
+export const FIX_CONFIDENCE_FLOOR = 0;
+
+/**
+ * Confidence ceiling — 0.95, never 1.0. No finite observation window can
+ * prove the absence of a rare failure, so the product must never render
+ * "100% certain"; the reserved 5% is the standing reminder that this is
+ * evidence, not proof.
+ */
+export const FIX_CONFIDENCE_MAX = 0.95;
+
+/**
+ * Runs of clean exposure that earn full exposure credit — 50.
+ *
+ * WHY 50: the question an engineer is really asking is "would this have come
+ * back by now if I hadn't fixed it?". For a pattern that used to hit even 5%
+ * of runs, 50 clean runs is a ~92% chance (1 - 0.95^50) that it would have
+ * fired at least once had nothing changed. That is the level at which "it
+ * didn't recur" stops being luck and starts being information. Lower (say 10)
+ * would confirm fixes for rare patterns that simply had not been rolled
+ * again; much higher would leave healthy, low-traffic agents permanently
+ * unable to confirm anything.
+ */
+export const FIX_CONFIDENCE_RUNS_FOR_FULL_CREDIT = 50;
+
+/**
+ * Calendar soak that earns full time credit — 7 days.
+ *
+ * WHY 7 DAYS: exactly one full weekly traffic cycle. Plenty of agent failures
+ * are schedule-shaped (weekend batch jobs, Monday peak load, a nightly cron's
+ * input distribution). A fix that has survived every day of the week has been
+ * exposed to the whole cycle; one that has survived four hours of Tuesday
+ * afternoon has not, no matter how many runs it saw in that window.
+ */
+export const FIX_CONFIDENCE_SOAK_MS_FOR_FULL_CREDIT = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Weight carried by exposure alone, before any soak credit — 0.70.
+ *
+ * WHY: exposure is the NECESSARY condition. It is deliberately a multiplier
+ * on the whole score (not a summand) so that zero runs forces zero confidence
+ * however much time has passed — "nothing has run since the fix" must never
+ * read as "the fix held". 0.70 means fully-exposed-but-freshly-shipped tops
+ * out at 0.665, just under the confirm bar: the last stretch has to be earned
+ * with calendar time.
+ */
+export const FIX_CONFIDENCE_EXPOSURE_BASE_WEIGHT = 0.7;
+
+/**
+ * Weight carried by soak time, gated behind exposure — 0.30.
+ *
+ * WHY: time is corroborating, not primary. Traffic can be bursty or
+ * synthetic, so 200 runs in one minute is weaker evidence than the same 200
+ * runs spread across a week — but time with no traffic proves nothing at all,
+ * which is why this term is multiplied by, not added to, exposure credit.
+ * Invariant: BASE + SOAK === 1.
+ */
+export const FIX_CONFIDENCE_SOAK_WEIGHT = 0.3;
+
+/**
+ * Minimum attributed exposure runs before a resolution may leave `unproven` —
+ * 1.
+ *
+ * WHY 1: one run is the smallest amount of exposure that makes the claim
+ * falsifiable at all. Zero runs is not weak evidence, it is the absence of a
+ * test; the state name has to say so.
+ */
+export const FIX_CONFIDENCE_MIN_EXPOSURE_RUNS = 1;
+
+/**
+ * Score at or above which a resolution reads as `confirmed` — 0.70.
+ *
+ * WHY 0.70: this is the number an engineer stakes a deploy decision on, so it
+ * must be unreachable by either axis alone. Given the weights above it
+ * requires, for example, full run exposure (50 runs) PLUS ~20.6 hours of soak,
+ * or 40 runs plus ~5.2 days — i.e. "the path was exercised hard AND it has been
+ * live long enough to see a full slice of real traffic". Anything cheaper to
+ * reach would let a burst of synthetic retries mark a fix confirmed.
+ */
+export const FIX_CONFIDENCE_CONFIRMED_THRESHOLD = 0.7;
+
+/** Clamp `n` into [lo, hi]; non-finite input returns `lo`. Internal to section 12. */
+function clampFinite(n: number, lo: number, hi: number): number {
+  if (!Number.isFinite(n)) return lo;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+/** Round to 4 decimals so scores serialize/compare stably. Internal to section 12. */
+function round4(n: number): number {
+  return Math.round(n * 10000) / 10000;
+}
+
+/**
+ * Derive the evidence state from an already-computed score plus the two facts
+ * that can override it. Exported separately so Team A's mutations and Team
+ * C's routes can label a resolution without recomputing a score, and so the
+ * thresholds are testable in isolation.
+ *
+ * Precedence (documented, and it matters):
+ *   1. `recurred` => `regressed`. Direct disproof outranks everything,
+ *      including missing metadata — a pattern that demonstrably came back did
+ *      not hold, whatever else is or isn't recorded.
+ *   2. `!hasResolution` => `unproven`. Nothing was asserted, so there is
+ *      nothing to prove.
+ *   3. `exposureRuns < FIX_CONFIDENCE_MIN_EXPOSURE_RUNS` => `unproven`.
+ *      Untested, not fixed.
+ *   4. `score >= FIX_CONFIDENCE_CONFIRMED_THRESHOLD` => `confirmed`.
+ *   5. otherwise => `proving`.
+ *
+ * Non-finite `score`/`exposureRuns` are treated as their floors (0), so a
+ * malformed input degrades to `unproven` rather than throwing.
+ */
+export function deriveFixConfidenceState(input: {
+  score: number;
+  exposureRuns: number;
+  recurred: boolean;
+  hasResolution: boolean;
+}): FixConfidenceState {
+  if (input.recurred === true) return "regressed";
+  if (!input.hasResolution) return "unproven";
+  const runs = Number.isFinite(input.exposureRuns) ? input.exposureRuns : 0;
+  // EXPLICIT RULE, not a side effect of the score comparison below: zero
+  // attributed exposure is `unproven`, never `proving`. "Proving" asserts that
+  // evidence is accumulating; with no runs since the resolution, nothing is
+  // accumulating. Keeping this as its own guard means the distinction survives
+  // any future re-tuning of the weights or the confirm threshold.
+  if (runs < FIX_CONFIDENCE_MIN_EXPOSURE_RUNS) return "unproven";
+  const score = Number.isFinite(input.score) ? input.score : FIX_CONFIDENCE_FLOOR;
+  return score >= FIX_CONFIDENCE_CONFIRMED_THRESHOLD ? "confirmed" : "proving";
+}
+
+/**
+ * How much confidence do we have that a resolved failure pattern's fix
+ * actually held?
+ *
+ * FORMULA (all terms inspectable in the returned object):
+ *
+ *   exposureCredit = min(1, exposureRuns / FIX_CONFIDENCE_RUNS_FOR_FULL_CREDIT)
+ *   soakCredit     = min(1, elapsedMs   / FIX_CONFIDENCE_SOAK_MS_FOR_FULL_CREDIT)
+ *   score          = FIX_CONFIDENCE_MAX
+ *                  * exposureCredit
+ *                  * (FIX_CONFIDENCE_EXPOSURE_BASE_WEIGHT
+ *                     + FIX_CONFIDENCE_SOAK_WEIGHT * soakCredit)
+ *
+ * and `score = FIX_CONFIDENCE_FLOOR` outright if the pattern recurred.
+ *
+ * The shape of that expression encodes the two rules this cycle exists for:
+ *   - ZERO EXPOSURE IS NOT CONFIDENCE. `exposureCredit` multiplies the entire
+ *     score, so a resolution with no post-resolution runs scores exactly 0 and
+ *     lands in `unproven` no matter how long ago it was closed.
+ *   - A RECURRENCE COLLAPSES TO THE FLOOR. Not a discount, not a decay: any
+ *     recurrence strictly after `resolvedAt` sets the score to
+ *     `FIX_CONFIDENCE_FLOOR` and the state to `regressed`, discarding all
+ *     prior clean exposure. Evidence of the fix holding is refuted by one
+ *     counter-example.
+ *
+ * VERSION ATTRIBUTION: if BOTH `resolvedInVersionId` and `exposureVersionId`
+ * are supplied and they differ, the exposure did not test the fix — those
+ * runs executed on a different build — so `exposureRuns` is credited as 0
+ * (`versionAttribution: "mismatched"`, `limitingFactor: "version-mismatch"`)
+ * while `observedRuns` still reports what was measured. If either id is
+ * missing, attribution is `"unknown"` and the exposure is credited as
+ * observed: a caller that cannot tell us which version ran should not be
+ * punished, only un-credited callers who tell us it was the wrong one.
+ *
+ * DEGENERATE INPUTS (each pinned by a test):
+ *   - `resolvedAt` undefined/non-finite: `hasResolution: false`, `elapsedMs: 0`,
+ *     score floor, state `unproven`, limit `no-resolution`.
+ *   - `resolvedAt` in the FUTURE relative to `nowMs` (clock skew): `elapsedMs`
+ *     clamps to 0 rather than going negative, so soak credit is 0 but
+ *     exposure still counts. A skewed clock must not manufacture confidence,
+ *     and must not erase measured runs either.
+ *   - `postResolutionRuns` negative, `NaN`, or `Infinity`: sanitized to 0,
+ *     `-` or clamped — never propagated into the score.
+ *   - `nowMs` non-finite: `elapsedMs` 0 (unmeasurable soak), exposure still
+ *     counts.
+ *   - `recurredAt` at or before `resolvedAt`: that is the occurrence that
+ *     PROMPTED the fix, not a recurrence of it — not treated as a regression
+ *     (identical strictness to `isRegression` above).
+ *
+ * Never throws, never returns `NaN`/`Infinity` in any field.
+ */
+export function fixConfidence(input: FixConfidenceInput, nowMs: number): FixConfidenceResult {
+  const safeInput: FixConfidenceInput = input && typeof input === "object" ? input : {};
+
+  const hasResolution =
+    safeInput.resolvedAt !== undefined && Number.isFinite(safeInput.resolvedAt);
+  const resolvedAt = hasResolution ? (safeInput.resolvedAt as number) : undefined;
+
+  // Recurrence: strictly after the resolution (a same-instant or earlier
+  // occurrence is the one that prompted the fix). With no usable resolvedAt,
+  // any recorded recurrence still counts as "came back" — malformed metadata
+  // does not get to hide a counter-example.
+  const recurredAtRaw = safeInput.recurredAt;
+  const hasRecurrenceStamp = recurredAtRaw !== undefined && Number.isFinite(recurredAtRaw);
+  const recurred =
+    hasRecurrenceStamp && (resolvedAt === undefined || recurredAtRaw > resolvedAt);
+
+  // Exposure: sanitize, then attribute to a version if we can.
+  const exposureMeasured =
+    safeInput.postResolutionRuns !== undefined && Number.isFinite(safeInput.postResolutionRuns);
+  const observedRuns = exposureMeasured
+    ? Math.max(0, Math.floor(safeInput.postResolutionRuns as number))
+    : 0;
+
+  const bothVersionsKnown =
+    typeof safeInput.resolvedInVersionId === "string" &&
+    safeInput.resolvedInVersionId.length > 0 &&
+    typeof safeInput.exposureVersionId === "string" &&
+    safeInput.exposureVersionId.length > 0;
+  const versionAttribution: FixVersionAttribution = !bothVersionsKnown
+    ? "unknown"
+    : safeInput.resolvedInVersionId === safeInput.exposureVersionId
+      ? "matched"
+      : "mismatched";
+  const exposureRuns = versionAttribution === "mismatched" ? 0 : observedRuns;
+
+  // Soak: clamped at 0 so future-dated resolutions and non-finite nowMs read
+  // as "no soak yet" rather than as negative time.
+  const elapsedMs =
+    hasResolution && Number.isFinite(nowMs)
+      ? Math.max(0, nowMs - (resolvedAt as number))
+      : 0;
+
+  const exposureCredit = clampFinite(exposureRuns / FIX_CONFIDENCE_RUNS_FOR_FULL_CREDIT, 0, 1);
+  const soakCredit = clampFinite(elapsedMs / FIX_CONFIDENCE_SOAK_MS_FOR_FULL_CREDIT, 0, 1);
+
+  const rawScore =
+    !hasResolution || recurred
+      ? FIX_CONFIDENCE_FLOOR
+      : FIX_CONFIDENCE_MAX *
+        exposureCredit *
+        (FIX_CONFIDENCE_EXPOSURE_BASE_WEIGHT + FIX_CONFIDENCE_SOAK_WEIGHT * soakCredit);
+
+  const score = round4(clampFinite(rawScore, FIX_CONFIDENCE_FLOOR, FIX_CONFIDENCE_MAX));
+
+  const state = deriveFixConfidenceState({ score, exposureRuns, recurred, hasResolution });
+
+  const limitingFactor: FixConfidenceLimit = recurred
+    ? "recurrence"
+    : !hasResolution
+      ? "no-resolution"
+      : versionAttribution === "mismatched"
+        ? "version-mismatch"
+        : exposureRuns < FIX_CONFIDENCE_MIN_EXPOSURE_RUNS
+          ? "no-exposure"
+          : state === "confirmed"
+            ? "none"
+            : "accumulating";
+
+  return {
+    score,
+    state,
+    exposureRuns,
+    observedRuns,
+    versionAttribution,
+    elapsedMs,
+    recurred,
+    hasResolution,
+    exposureMeasured,
+    exposureCredit: round4(exposureCredit),
+    soakCredit: round4(soakCredit),
+    limitingFactor,
+  };
+}
+
+/**
+ * Build the `fixConfidence` input for one lifecycle snapshot. `recurredAt`
+ * falls back to the lifecycle's `regressedAt` — Team A's regression guard
+ * writes that field, and for confidence purposes they mean the same thing.
+ * Internal to section 12.
+ */
+function fixConfidenceInputFor(s: PatternLifecycleSnapshot): FixConfidenceInput {
+  return {
+    resolvedAt: s.resolvedAt,
+    resolvedInVersionId: s.resolvedInVersionId,
+    exposureVersionId: s.exposureVersionId,
+    postResolutionRuns: s.postResolutionRuns,
+    recurredAt: s.recurredAt ?? s.regressedAt,
+  };
+}
+
+/**
+ * Credit a `confirmed` resolution earns toward `provenHealthScore` — 1.0.
+ * Full marks: the fix was asserted AND the assertion survived real exposure.
+ */
+export const FIX_CREDIT_CONFIRMED = 1;
+
+/**
+ * Credit a `proving` resolution earns — 0.5.
+ *
+ * WHY 0.5: genuinely in-between. Real runs have exercised the path without
+ * recurrence, which is more than a bare assertion, but not yet enough to act
+ * on. Half credit keeps a team that ships fixes into live traffic ahead of one
+ * that closes tickets, without letting "it's been fine so far" score as done.
+ */
+export const FIX_CREDIT_PROVING = 0.5;
+
+/**
+ * Credit an `unproven` resolution earns — 0.25.
+ *
+ * WHY 0.25 AND NOT 0: closing a pattern is real triage work — someone
+ * diagnosed it and shipped something — and zeroing it would make the score
+ * indistinguishable from never having looked. But it is mostly an unverified
+ * claim, so it earns a quarter of what a confirmed fix earns. The gap between
+ * `healthScore` and `provenHealthScore` IS the amount of unverified
+ * assertion in a team's backlog; that gap is the point of this cycle.
+ */
+export const FIX_CREDIT_UNPROVEN = 0.25;
+
+/**
+ * Credit a `regressed` resolution earns — 0. It was closed and it came back;
+ * the org is no better off than before it was closed, and the regression rate
+ * penalty in the score handles the additional cost of the churn.
+ */
+export const FIX_CREDIT_REGRESSED = 0;
+
+/** Credit table lookup for a confidence state. Internal to section 12. */
+function creditForState(state: FixConfidenceState): number {
+  switch (state) {
+    case "confirmed":
+      return FIX_CREDIT_CONFIRMED;
+    case "proving":
+      return FIX_CREDIT_PROVING;
+    case "regressed":
+      return FIX_CREDIT_REGRESSED;
+    default:
+      return FIX_CREDIT_UNPROVEN;
+  }
+}
+
+/**
+ * Per-snapshot evidence rollup used by `summarizeResolutionHealth`'s cycle-2
+ * fields. Exported so a caller that already has the snapshot list can render
+ * the same states per-row without re-deriving them.
+ *
+ * SCORING SCOPE — a snapshot is scored iff it has been through resolution at
+ * least once, i.e. it has a finite `resolvedAt` OR a finite `regressedAt`
+ * (the latter covers a pattern the regression guard auto-reopened, which is
+ * now back at `status: "open"` but is precisely the row where "did the fix
+ * hold?" matters most — it did not). A pattern that has never been resolved
+ * gets `null`: there is no fix to have held, and labelling it `unproven`
+ * would imply someone claimed one. `null` entries keep indexes lined up with
+ * the input array.
+ *
+ * PRECEDENCE / AGREEMENT — this state is authoritative over the UI-side
+ * inference `status === "open" && regressedAt != null` (Team E's
+ * `isRegressedPattern` fallback in
+ * `apps/web/src/components/patterns/adapt.ts`). The two agree by
+ * construction: any snapshot matching that predicate has a finite
+ * `regressedAt`, so it is scored here, and `regressedAt` is carried into
+ * `recurredAt`, which forces `state: "regressed"` unless the snapshot has
+ * since been RE-resolved (in which case `resolvedAt > regressedAt`, the
+ * status is no longer `open`, and the UI predicate does not fire either).
+ * A list view and a detail view must never disagree about whether a fix held.
+ */
+export function fixConfidenceForSnapshots(
+  snapshots: PatternLifecycleSnapshot[],
+  nowMs: number,
+): Array<FixConfidenceResult | null> {
+  const list = Array.isArray(snapshots) ? snapshots : [];
+  return list.map((s) => {
+    if (!s) return null;
+    const everResolved =
+      (s.resolvedAt !== undefined && Number.isFinite(s.resolvedAt)) ||
+      (s.regressedAt !== undefined && Number.isFinite(s.regressedAt)) ||
+      s.status === "resolved";
+    return everResolved ? fixConfidence(fixConfidenceInputFor(s), nowMs) : null;
+  });
 }

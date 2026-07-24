@@ -46,7 +46,7 @@ import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
 import { internalMutation, internalQuery, mutation, query } from "./_generated/server.js";
-import { recordAuditEvent } from "./audit.js";
+import { recordAuditEvent, SYSTEM_ACTOR } from "./audit.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
 import { afrError } from "./helpers/errors.js";
 import { MAX_RESOLUTION_NOTE_LENGTH, MAX_RESOLUTION_REF_LENGTH } from "./helpers/pagination.js";
@@ -66,6 +66,8 @@ import type { MutationCtx, QueryCtx } from "./_generated/server.js";
 export const MAX_REPRESENTATIVE_RUN_IDS = 5;
 /** failure_patterns.affectedAgentVersionIds cap. */
 export const MAX_AFFECTED_AGENT_VERSION_IDS = 20;
+/** failure_patterns.affectedAgentIds cap (ADR-006 cycle 2). */
+export const MAX_AFFECTED_AGENT_IDS = 20;
 /** Default / max rows returned by listFailurePatterns. */
 export const DEFAULT_FAILURE_PATTERN_PAGE_SIZE = 50;
 export const MAX_FAILURE_PATTERN_PAGE_SIZE = 200;
@@ -86,6 +88,66 @@ export const SPIKE_ROLLUP_MAX_PATTERNS_PER_RUN = 200;
  * pattern genuinely regresses again.
  */
 export const DEFAULT_PATTERN_SPIKE_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Resolution-evidence constants (ADR-006 cycle 2 — "prove the fix held").
+// ---------------------------------------------------------------------------
+
+/**
+ * Trailing window, in UTC-agnostic milliseconds, over which `resolvePattern`
+ * snapshots a BASELINE run count (`resolvedAtRunCount`) for the pattern's
+ * affected agents. Deliberately the same 14 days as TREND_WINDOW_DAYS so the
+ * "before" number a reader compares live post-resolution exposure against is
+ * measured over the same horizon as the pattern's own trend chart.
+ *
+ * Why a trailing WINDOW rather than an all-time cumulative run count: no
+ * monotonic per-agent run counter exists in this schema, so an all-time count
+ * would mean an unbounded scan inside a mutation. A bounded trailing window
+ * is both cheap and the more useful comparison anyway — "this agent was doing
+ * N runs a fortnight before we called it fixed" is an exposure RATE, which is
+ * what tells you whether M runs since resolution is meaningful evidence or
+ * barely any evidence at all.
+ */
+export const RESOLUTION_BASELINE_WINDOW_MS = TREND_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
+/**
+ * Hard ceiling on how many `runs` rows a single exposure count may read,
+ * across ALL of a pattern's affected agents combined. Both the baseline
+ * snapshot (inside resolvePattern, a mutation) and the live post-resolution
+ * count (inside getPatternResolutionEvidence, a query) respect it, and both
+ * report a `truncated` flag when they hit it rather than silently returning a
+ * capped number as if it were exact. This is what keeps these counts
+ * OBSERVABILITY-GRADE by construction (CLAUDE.md / ADR-002): approximate for
+ * very high-volume agents, never a substitute for the event log.
+ */
+export const RESOLUTION_RUN_SCAN_CAP = 2000;
+
+/** Bounded number of `failure_pattern.*` audit rows getPatternResolutionEvidence returns as lifecycle transitions. */
+export const MAX_PATTERN_LIFECYCLE_TRANSITIONS = 100;
+
+/** Bounded occurrence read used ONLY to derive a pre-cycle-2 rollup's agent set (rows written before `affectedAgentIds` existed). */
+export const MAX_AGENT_SET_OCCURRENCE_SCAN = 200;
+
+/**
+ * The ONE message every rejected `resolvePattern` `versionId` produces —
+ * whether the id is unknown, belongs to another org, or belongs to an agent
+ * this pattern has never been observed on.
+ *
+ * DELIBERATELY IDENTICAL ACROSS ALL THREE CASES: a caller who can distinguish
+ * "no such version" from "that version exists but is not yours" has an
+ * existence oracle for another org's agent_versions ids. One message, one
+ * code, no distinguishable behavior.
+ *
+ * DELIBERATELY FREE OF THE PHRASE "not found": apps/web's
+ * `resolveApiError` (apps/web/src/lib/apiErrorMapping.ts) has a prose
+ * fallback that maps any message merely CONTAINING that phrase to a 404. The
+ * `INVALID_ARGUMENT:` code prefix is matched earlier than that fallback today,
+ * so this is belt-and-braces — but the phrase buys nothing here and its
+ * absence removes any chance of this degrading from a 422 to a 404 if that
+ * resolver's ordering ever changes.
+ */
+export const INVALID_RESOLUTION_VERSION_MESSAGE =
+  "versionId must reference an agent version in this organization that belongs to an agent this pattern has been observed on";
 
 // ---------------------------------------------------------------------------
 // Team B coordination — deriveFailureFingerprint / assessPatternSpike
@@ -419,6 +481,7 @@ export const recordFailurePatternOccurrence = internalMutation({
       label: args.label,
       salientKey: args.salientKey,
       runId: args.runId,
+      agentId: args.agentId,
       agentVersionId: args.agentVersionId,
       occurredAt,
     });
@@ -438,6 +501,31 @@ export const recordFailurePatternOccurrence = internalMutation({
     // rollup's status is now "open", so no later occurrence on this same
     // (still-open) episode can re-enter this branch until a human resolves
     // it again.
+    // ADR-006 cycle 2: record the AUTOMATIC reopen in the append-only audit
+    // log, so getPatternResolutionEvidence can reconstruct the FULL lifecycle
+    // transition history — including the transitions no human made — without
+    // a mutable per-pattern history table. Deliberately OUTSIDE the mute
+    // check below: muting suppresses ALERTS, never the paper trail. Written
+    // with SYSTEM_ACTOR because there is no human actor on this path.
+    if (rollupResult.regressedFire) {
+      await recordAuditEvent(ctx, {
+        orgId: args.orgId,
+        actorClerkUserId: SYSTEM_ACTOR,
+        action: "failure_pattern.regressed",
+        targetType: "failure_pattern",
+        targetId: args.fingerprintHash,
+        metadata: {
+          fingerprintHash: args.fingerprintHash,
+          class: args.class,
+          label: args.label,
+          resolvedAt: rollupResult.regressedFire.resolvedAt,
+          regressedAt: rollupResult.regressedFire.regressedAt,
+          runId: args.runId,
+          muted: rollupResult.regressedFire.muted,
+        },
+      });
+    }
+
     if (rollupResult.regressedFire && !rollupResult.regressedFire.muted) {
       await ctx.runMutation(_firePatternRegressionAlertRef, {
         orgId: rollupResult.regressedFire.orgId,
@@ -508,6 +596,7 @@ async function upsertRollup(
     label: string;
     salientKey: string;
     runId: Id<"runs">;
+    agentId: Id<"agents">;
     agentVersionId: Id<"agent_versions"> | undefined;
     occurredAt: number;
   },
@@ -529,6 +618,7 @@ async function upsertRollup(
       lastSeenAt: args.occurredAt,
       representativeRunIds: [args.runId],
       affectedAgentVersionIds: args.agentVersionId ? [args.agentVersionId] : [],
+      affectedAgentIds: [args.agentId],
     });
     return {};
   }
@@ -541,6 +631,16 @@ async function upsertRollup(
   const affectedAgentVersionIds = args.agentVersionId
     ? dedupCapMostRecentFirst(existing.affectedAgentVersionIds, args.agentVersionId, MAX_AFFECTED_AGENT_VERSION_IDS)
     : existing.affectedAgentVersionIds;
+  // ADR-006 cycle 2: maintain the agent set the same bounded/deduped/
+  // most-recent-first way. `existing.affectedAgentIds` is absent on every
+  // pre-this-cycle row — treated as an empty starting set, so the field
+  // self-heals on the next occurrence without any backfill, and readers that
+  // find it still empty fall back to `deriveAgentIdsFromOccurrences`.
+  const affectedAgentIds = dedupCapMostRecentFirst(
+    existing.affectedAgentIds ?? [],
+    args.agentId,
+    MAX_AFFECTED_AGENT_IDS,
+  );
 
   // REGRESSION GUARD (docs/adr/006-failure-resolution.md): this fingerprint
   // was marked RESOLVED by a human, and a new occurrence just landed dated
@@ -567,6 +667,7 @@ async function upsertRollup(
     lastSeenAt: Math.max(existing.lastSeenAt, args.occurredAt),
     representativeRunIds,
     affectedAgentVersionIds,
+    affectedAgentIds,
   };
 
   let regressedFire: RollupUpsertResult["regressedFire"];
@@ -835,6 +936,132 @@ function validateResolutionFields(args: { note?: string; ref?: string }): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Resolution evidence helpers (ADR-006 cycle 2). Shared by resolvePattern
+// (which snapshots the BEFORE numbers) and getPatternResolutionEvidence
+// (which derives the AFTER numbers live).
+// ---------------------------------------------------------------------------
+
+/**
+ * The set of agents this fingerprint has been observed on.
+ *
+ * Prefers the rollup's own maintained `affectedAgentIds` (bounded, O(1) to
+ * read). Falls back to a BOUNDED scan of the pattern's occurrences for rows
+ * written before that field existed — a pre-this-cycle rollup has no agent
+ * set until its next occurrence lands, and neither cross-agent validation nor
+ * exposure counting should be silently wrong (or silently reject everything)
+ * in the meantime.
+ *
+ * Org-scoped by construction: both sources are reached only via this
+ * fingerprint's own org-scoped rollup / `by_org_fingerprint` occurrence
+ * index, so no agent from another org can enter this set.
+ */
+async function resolveAgentIdsForPattern(
+  ctx: QueryCtx | MutationCtx,
+  pattern: Doc<"failure_patterns">,
+): Promise<Id<"agents">[]> {
+  if (pattern.affectedAgentIds && pattern.affectedAgentIds.length > 0) {
+    return pattern.affectedAgentIds;
+  }
+
+  const occurrences = await ctx.db
+    .query("failure_pattern_occurrences")
+    .withIndex("by_org_fingerprint", (q) =>
+      q.eq("orgId", pattern.orgId).eq("fingerprintHash", pattern.fingerprintHash),
+    )
+    .order("desc")
+    .take(MAX_AGENT_SET_OCCURRENCE_SCAN);
+
+  const seen: Id<"agents">[] = [];
+  for (const occurrence of occurrences) {
+    if (!seen.includes(occurrence.agentId)) seen.push(occurrence.agentId);
+    if (seen.length >= MAX_AFFECTED_AGENT_IDS) break;
+  }
+  return seen;
+}
+
+/** A bounded run-exposure count, explicit about whether it hit the scan ceiling. */
+export interface RunExposureCount {
+  count: number;
+  /** True when RESOLUTION_RUN_SCAN_CAP was reached — `count` is a floor, not an exact total. */
+  truncated: boolean;
+}
+
+/**
+ * Count runs started for `agentIds` after `afterExclusive` (and, when
+ * `untilInclusive` is supplied, up to and including it), across all of them
+ * combined, capped at RESOLUTION_RUN_SCAN_CAP.
+ *
+ * `untilInclusive` is OPTIONAL because the two callers want genuinely
+ * different upper bounds, and the difference is semantic rather than
+ * incidental:
+ *   - The BASELINE read (resolvePattern) passes `resolvedAt`: the upper bound
+ *     IS the thing being measured — runs strictly BEFORE the resolution.
+ *   - The EXPOSURE read (getPatternResolutionEvidence) passes nothing: "runs
+ *     since resolution" is open-ended by definition. Clamping it to
+ *     `Date.now()` would buy nothing except silently dropping any run whose
+ *     `startedAt` sits marginally ahead of the reader's clock — SDK-supplied
+ *     timestamps and clock skew make that a real way to undercount exposure,
+ *     which is the one direction this number must never err in (undercounted
+ *     exposure makes an untested fix look better tested than it is).
+ *
+ * Uses the existing `runs.by_agent_started` index — no new index — so the read
+ * is proportional to the window's run volume, not the agent's lifetime run
+ * count. `truncated` is reported rather than hidden, so a caller can render
+ * "2000+" instead of a wrong exact number.
+ */
+async function countRunsStartedInWindow(
+  ctx: QueryCtx | MutationCtx,
+  agentIds: Id<"agents">[],
+  afterExclusive: number,
+  untilInclusive?: number,
+): Promise<RunExposureCount> {
+  let count = 0;
+  for (const agentId of agentIds) {
+    const remaining = RESOLUTION_RUN_SCAN_CAP - count;
+    if (remaining <= 0) return { count, truncated: true };
+
+    // take(remaining + 1) so hitting the ceiling is DETECTABLE (a full page
+    // plus one) rather than indistinguishable from "exactly `remaining` runs".
+    const rows = await ctx.db
+      .query("runs")
+      .withIndex("by_agent_started", (q) => {
+        const lower = q.eq("agentId", agentId).gt("startedAt", afterExclusive);
+        return untilInclusive === undefined ? lower : lower.lte("startedAt", untilInclusive);
+      })
+      .take(remaining + 1);
+
+    if (rows.length > remaining) return { count: RESOLUTION_RUN_SCAN_CAP, truncated: true };
+    count += rows.length;
+  }
+  return { count, truncated: false };
+}
+
+/**
+ * Validate an operator-supplied `resolvedInVersionId`. Throws
+ * INVALID_ARGUMENT — with ONE message for every rejection reason, see
+ * INVALID_RESOLUTION_VERSION_MESSAGE — when the version does not exist, is not
+ * in the caller's org, or belongs to an agent this pattern has never been
+ * observed on. Never silently ignores a bad id: the whole point of this field
+ * is to make a resolution claim checkable, and a silently-dropped claim is
+ * worse than no claim at all.
+ */
+async function validateResolutionVersion(
+  ctx: MutationCtx,
+  pattern: Doc<"failure_patterns">,
+  versionId: Id<"agent_versions">,
+): Promise<void> {
+  const version = await ctx.db.get(versionId);
+  if (!version || version.orgId !== pattern.orgId) {
+    throw afrError("INVALID_ARGUMENT", INVALID_RESOLUTION_VERSION_MESSAGE);
+  }
+
+  const agentIds = await resolveAgentIdsForPattern(ctx, pattern);
+  if (!agentIds.includes(version.agentId)) {
+    throw afrError("INVALID_ARGUMENT", INVALID_RESOLUTION_VERSION_MESSAGE);
+  }
+}
+
 /**
  * Acknowledge a fingerprint: status -> "acknowledged". A normal member
  * action (like commenting) — signals "someone is looking at this," distinct
@@ -886,8 +1113,21 @@ export const acknowledgePattern = mutation({
  * marker, not a live flag" convention `mutedAt` already established in cycle
  * 3.
  *
+ * EVIDENCE SNAPSHOT (ADR-006 cycle 2 — "prove the fix held"): a resolution is
+ * otherwise an unearned human assertion, so this mutation also stamps the
+ * three point-in-time numbers a later reader needs to judge how well-tested
+ * the claimed fix actually is — `resolvedInVersionId` (the version the
+ * operator believes contains the fix, VALIDATED, never silently dropped),
+ * `resolvedAtOccurrenceCount` (exact, O(1)) and `resolvedAtRunCount` (a
+ * bounded baseline exposure rate). Everything derivable from those plus live
+ * data — exposure since resolution, recurrences since resolution, the
+ * transition history — is computed at query time by
+ * `getPatternResolutionEvidence`, never stored.
+ *
  * Contract for other teams:
- *   `failure_patterns:resolvePattern({ orgId, fingerprintHash, note?, ref? }) => Doc<"failure_patterns"> | null`
+ *   `failure_patterns:resolvePattern({ orgId, fingerprintHash, note?, ref?, versionId? }) => Doc<"failure_patterns"> | null`
+ * NOTE the arg is `versionId`, matching this mutation's existing short
+ * `note`/`ref` arg naming; the FIELD it lands in is `resolvedInVersionId`.
  */
 export const resolvePattern = mutation({
   args: {
@@ -895,6 +1135,7 @@ export const resolvePattern = mutation({
     fingerprintHash: v.string(),
     note: v.optional(v.string()),
     ref: v.optional(v.string()),
+    versionId: v.optional(v.id("agent_versions")),
   },
   handler: async (ctx, args): Promise<Doc<"failure_patterns"> | null> => {
     const { userId } = await getAuthContext(ctx);
@@ -904,13 +1145,32 @@ export const resolvePattern = mutation({
     const pattern = await findRollup(ctx, args.orgId, args.fingerprintHash);
     if (!pattern) return null;
 
+    // Validated AFTER the rollup lookup so an unknown fingerprint still
+    // returns the same plain `null` it always has — a caller cannot use a
+    // deliberately-bad versionId to distinguish "this fingerprint exists in
+    // my org" from "it does not".
+    if (args.versionId !== undefined) {
+      await validateResolutionVersion(ctx, pattern, args.versionId);
+    }
+
     const resolvedAt = Date.now();
+    const agentIds = await resolveAgentIdsForPattern(ctx, pattern);
+    const baseline = await countRunsStartedInWindow(
+      ctx,
+      agentIds,
+      resolvedAt - RESOLUTION_BASELINE_WINDOW_MS,
+      resolvedAt,
+    );
+
     await ctx.db.patch(pattern._id, {
       status: "resolved",
       resolvedAt,
       resolvedByUserId: userId,
       resolutionNote: args.note,
       resolutionRef: args.ref,
+      resolvedInVersionId: args.versionId,
+      resolvedAtOccurrenceCount: pattern.count,
+      resolvedAtRunCount: baseline.count,
     });
 
     await recordAuditEvent(ctx, {
@@ -925,6 +1185,9 @@ export const resolvePattern = mutation({
         label: pattern.label,
         hasNote: args.note !== undefined,
         hasRef: args.ref !== undefined,
+        resolvedInVersionId: args.versionId,
+        resolvedAtOccurrenceCount: pattern.count,
+        resolvedAtRunCount: baseline.count,
       },
     });
 
@@ -975,6 +1238,183 @@ export const reopenPattern = mutation({
     });
 
     return await ctx.db.get(pattern._id);
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Resolution evidence query (ADR-006 cycle 2) — "did the fix hold?"
+// ---------------------------------------------------------------------------
+
+/** One lifecycle transition, reconstructed from the append-only audit log. */
+export interface PatternLifecycleTransition {
+  /** A `failure_pattern.*` AUDIT_ACTIONS value, e.g. "failure_pattern.resolved". */
+  action: string;
+  /** Clerk user id, or `SYSTEM_ACTOR` ("system") for the regression guard's automatic reopen. */
+  actorClerkUserId: string;
+  timestamp: number;
+  metadata?: unknown;
+}
+
+/** The point-in-time claim a human made when resolving. Null when the pattern has no live resolution. */
+export interface PatternResolutionMetadata {
+  resolvedAt: number;
+  resolvedByUserId?: string;
+  resolutionNote?: string;
+  resolutionRef?: string;
+  resolvedInVersionId?: Id<"agent_versions">;
+  /** The `version` string of resolvedInVersionId, denormalized for display only — resolved live, never stored. */
+  resolvedInVersion?: string;
+  resolvedAtOccurrenceCount?: number;
+  resolvedAtRunCount?: number;
+}
+
+/** How much the claimed fix has actually been exercised since it was claimed. */
+export interface PatternResolutionExposure {
+  /** The `resolvedAt` all counts below are measured from. */
+  since: number;
+  /** Runs started for the pattern's affected agents since `since`. Bounded — see `runCountTruncated`. */
+  runCount: number;
+  /** True when RESOLUTION_RUN_SCAN_CAP was hit: `runCount` is a floor ("2000+"), not an exact total. */
+  runCountTruncated: boolean;
+  /** EXACT recurrences since resolution: the rollup's `count` minus its `resolvedAtOccurrenceCount`. */
+  recurrenceCount: number;
+  /** The pre-resolution baseline (`resolvedAtRunCount`) for comparison, when it was captured. */
+  baselineRunCount?: number;
+  /** The agents `runCount` was measured across. */
+  agentIds: Id<"agents">[];
+  /**
+   * Whether the fix has held SO FAR — i.e. zero recurrences since resolution.
+   * Deliberately NOT a claim that the fix is correct: `runCount` is what says
+   * whether "held so far" is meaningful evidence or no evidence at all. A
+   * `heldSoFar: true` with `runCount: 0` means the fix is simply untested.
+   */
+  heldSoFar: boolean;
+}
+
+export interface PatternResolutionEvidenceResult {
+  pattern: Doc<"failure_patterns">;
+  /** Null when there is no live resolution to evidence (never resolved, or manually reopened — reopenPattern clears resolvedAt). */
+  resolution: PatternResolutionMetadata | null;
+  /** Null exactly when `resolution` is null — exposure is always measured from a resolvedAt. */
+  exposure: PatternResolutionExposure | null;
+  /** Oldest-first, bounded to MAX_PATTERN_LIFECYCLE_TRANSITIONS. */
+  transitions: PatternLifecycleTransition[];
+}
+
+/**
+ * Everything a "did the fix hold?" view needs for ONE pattern: the resolution
+ * claim, how much that claim has actually been tested since, and the full
+ * lifecycle transition history.
+ *
+ * DERIVED, NOT STORED. Only the three point-in-time snapshot fields
+ * `resolvePattern` stamps are read from the rollup; exposure and recurrences
+ * are computed live from `runs` and the rollup's own `count`, and the
+ * transition history is reconstructed from the APPEND-ONLY `audit_log` (via
+ * its `by_org_target` index) rather than from a mutable per-pattern history
+ * table. Nothing here adds a second source of truth for the lifecycle, and
+ * this query writes nothing.
+ *
+ * MEMBER-gated, matching the lifecycle mutations it evidences (ADR-006: this
+ * is day-to-day triage, not org-wide config) and matching `getFailurePattern`,
+ * which already exposes `resolvedByUserId`/`acknowledgedByUserId` to members.
+ * NOTE this is deliberately a NARROWER exposure than `audit.ts`'s admin-only
+ * `listAuditLog`: it returns audit rows for exactly ONE `failure_pattern`
+ * target, never the org's audit log at large.
+ *
+ * Returns `null` — never an error — when the fingerprint does not exist IN
+ * THIS ORG, the same "never existed" / "belongs to another org" collapse every
+ * other lookup-by-fingerprint function in this file uses.
+ *
+ * Contract for other teams:
+ *   `failure_patterns:getPatternResolutionEvidence({ orgId, fingerprintHash })
+ *      => PatternResolutionEvidenceResult | null`
+ */
+export const getPatternResolutionEvidence = query({
+  args: { orgId: v.id("organizations"), fingerprintHash: v.string() },
+  handler: async (ctx, args): Promise<PatternResolutionEvidenceResult | null> => {
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "member" });
+
+    const pattern = await ctx.db
+      .query("failure_patterns")
+      .withIndex("by_org_fingerprint", (q) => q.eq("orgId", args.orgId).eq("fingerprintHash", args.fingerprintHash))
+      .first();
+    if (!pattern) return null;
+
+    // Lifecycle transitions: newest-first from the index (so the bound keeps
+    // the MOST RECENT transitions when a pattern has more than the cap), then
+    // reversed to the oldest-first order a timeline renders in.
+    const auditRows = await ctx.db
+      .query("audit_log")
+      .withIndex("by_org_target", (q) =>
+        q.eq("orgId", args.orgId).eq("targetType", "failure_pattern").eq("targetId", args.fingerprintHash),
+      )
+      .order("desc")
+      .take(MAX_PATTERN_LIFECYCLE_TRANSITIONS);
+
+    const transitions: PatternLifecycleTransition[] = auditRows
+      .map((row) => ({
+        action: row.action,
+        actorClerkUserId: row.actorClerkUserId,
+        timestamp: row.timestamp,
+        metadata: row.metadata as unknown,
+      }))
+      .reverse();
+
+    // No live resolution to evidence. Note this is also the state after a
+    // MANUAL reopenPattern (which clears resolvedAt) — but NOT after the
+    // regression guard's auto-reopen, which keeps resolvedAt precisely so
+    // the "your fix didn't hold" evidence below stays computable.
+    if (pattern.resolvedAt === undefined) {
+      return { pattern, resolution: null, exposure: null, transitions };
+    }
+
+    const resolvedInVersion =
+      pattern.resolvedInVersionId !== undefined
+        ? await ctx.db.get(pattern.resolvedInVersionId)
+        : null;
+
+    const resolution: PatternResolutionMetadata = {
+      resolvedAt: pattern.resolvedAt,
+      resolvedByUserId: pattern.resolvedByUserId,
+      resolutionNote: pattern.resolutionNote,
+      resolutionRef: pattern.resolutionRef,
+      resolvedInVersionId: pattern.resolvedInVersionId,
+      // Defensive org re-check: resolvePattern already validated this id, but
+      // a version could in principle have been purged/replaced since, and a
+      // cross-org string must never be rendered from here.
+      resolvedInVersion:
+        resolvedInVersion && resolvedInVersion.orgId === args.orgId ? resolvedInVersion.version : undefined,
+      resolvedAtOccurrenceCount: pattern.resolvedAtOccurrenceCount,
+      resolvedAtRunCount: pattern.resolvedAtRunCount,
+    };
+
+    const agentIds = await resolveAgentIdsForPattern(ctx, pattern);
+    // No upper bound: "runs since resolution" is open-ended — see
+    // countRunsStartedInWindow's doc comment for why clamping to Date.now()
+    // would only ever undercount exposure.
+    const exposureRuns = await countRunsStartedInWindow(ctx, agentIds, pattern.resolvedAt);
+
+    // EXACT when the snapshot exists. When it does not (a row resolved before
+    // this cycle shipped), fall back to 0 rather than inventing a number from
+    // the all-time `count` — a pre-cycle resolution genuinely has no baseline
+    // to subtract, and reporting `count` here would claim every occurrence
+    // the pattern ever had as a post-resolution recurrence.
+    const recurrenceCount =
+      pattern.resolvedAtOccurrenceCount !== undefined
+        ? Math.max(0, pattern.count - pattern.resolvedAtOccurrenceCount)
+        : 0;
+
+    const exposure: PatternResolutionExposure = {
+      since: pattern.resolvedAt,
+      runCount: exposureRuns.count,
+      runCountTruncated: exposureRuns.truncated,
+      recurrenceCount,
+      baselineRunCount: pattern.resolvedAtRunCount,
+      agentIds,
+      heldSoFar: recurrenceCount === 0,
+    };
+
+    return { pattern, resolution, exposure, transitions };
   },
 });
 

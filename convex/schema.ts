@@ -294,7 +294,18 @@ export default defineSchema({
     // Freeform action-specific context (e.g. old/new role, status transition).
     // v.any() is justified: the shape varies per action and is display-only.
     metadata: v.optional(v.any()),
-  }).index("by_org", ["orgId", "timestamp"]),
+  })
+    .index("by_org", ["orgId", "timestamp"])
+    // ADR-006 Cycle 2 (resolution evidence): reconstruct ONE target's
+    // lifecycle transition history from the append-only audit log, rather
+    // than adding a mutable per-entity history table. Used immediately by
+    // convex/failure_patterns.ts's getPatternResolutionEvidence, which needs
+    // every `failure_pattern.*` row for a single fingerprintHash in
+    // timestamp order. Without this index that read is either an unindexed
+    // scan or a `by_org` scan filtered in memory across every audit row the
+    // org has ever written — this index makes it bounded by the number of
+    // rows for THAT target. Not speculative: it has exactly one caller today.
+    .index("by_org_target", ["orgId", "targetType", "targetId", "timestamp"]),
 
   // ---------------------------------------------------------------------------
   // ADR-002 — data model expansion (docs/adr/002-data-model-expansion.md).
@@ -636,6 +647,18 @@ export default defineSchema({
     // Bounded, deduped set of agent versions this fingerprint has been seen
     // on — cap 20 (MAX_AFFECTED_AGENT_VERSION_IDS).
     affectedAgentVersionIds: v.array(v.id("agent_versions")),
+    // ADR-006 Cycle 2: bounded (cap 20, MAX_AFFECTED_AGENT_IDS), deduped,
+    // most-recent-first set of AGENTS this fingerprint has been observed on.
+    // `affectedAgentVersionIds` above cannot stand in for this — a run's
+    // `agentVersionId` is optional, so a fingerprint can have occurrences and
+    // no versions at all. Maintained by recordFailurePatternOccurrence's
+    // upsert. OPTIONAL/ADDITIVE: absent on every pre-this-cycle row, which is
+    // why every reader falls back to deriving the agent set from a bounded
+    // `failure_pattern_occurrences` read instead of requiring a backfill.
+    // Two immediate readers: resolvePattern's cross-agent `versionId`
+    // validation, and getPatternResolutionEvidence's post-resolution run
+    // exposure count.
+    affectedAgentIds: v.optional(v.array(v.id("agents"))),
     // Written by the periodic spike-rollup cron (convex/failure_patterns.ts /
     // convex/crons.ts) — the most recent spike assessment over this
     // pattern's daily trend, itself computed from the ACCURATE
@@ -706,6 +729,43 @@ export default defineSchema({
     // later resolvePattern (see that mutation's doc comment for why it keeps
     // this as history until the next reopen/regression).
     regressedAt: v.optional(v.number()),
+    // ---------------------------------------------------------------------
+    // Resolution EVIDENCE (ADR-006 Cycle 2, "prove the fix held"). A
+    // resolution on its own is an unearned human assertion; these three
+    // fields are the point-in-time snapshot that lets a later reader say how
+    // much the claimed fix has actually been exercised since. All three are
+    // written ONLY by resolvePattern, all optional/additive, and all
+    // OBSERVABILITY-GRADE (CLAUDE.md "Not in v1" / ADR-002): they are
+    // snapshots of derived counters, never facts about any single run, and
+    // discarding them would only mean "we forget how well-tested the fix
+    // was," never that anything about what happened changed.
+    //
+    // Everything else a "did it hold?" view needs — exposure SINCE
+    // resolution, recurrences since resolution, the lifecycle transition
+    // history — is derived at query time (getPatternResolutionEvidence)
+    // from `runs`, this rollup's own `count`, and the append-only
+    // `audit_log`. Nothing about the lifecycle is stored twice.
+    // ---------------------------------------------------------------------
+    // The agent version the operator believes contains the fix. Validated at
+    // resolve time to exist, to belong to the caller's org, AND to belong to
+    // an agent this pattern has actually been observed on — a cross-org or
+    // cross-agent id is rejected with INVALID_ARGUMENT, never silently
+    // dropped. Deliberately distinct from `resolutionRef` (unvalidated free
+    // text): this one is a real typed foreign key.
+    resolvedInVersionId: v.optional(v.id("agent_versions")),
+    // BASELINE EXPOSURE: the number of runs started for this pattern's
+    // affected agents in the RESOLUTION_BASELINE_WINDOW_DAYS immediately
+    // BEFORE resolvedAt. It is the denominator a reader compares live
+    // post-resolution exposure against ("this agent did N runs in the two
+    // weeks before we called it fixed; it has done M since"). Bounded and
+    // therefore approximate for very high-volume agents — see
+    // RESOLUTION_RUN_SCAN_CAP in convex/failure_patterns.ts.
+    resolvedAtRunCount: v.optional(v.number()),
+    // The rollup's own `count` at the instant of resolution. EXACT and O(1).
+    // Post-resolution recurrences are exactly `count - resolvedAtOccurrenceCount`,
+    // with no extra scan — this is why the recurrence half of the evidence
+    // is derivable rather than stored.
+    resolvedAtOccurrenceCount: v.optional(v.number()),
   })
     // One row per (orgId, fingerprintHash): recordFailurePatternOccurrence
     // always resolves the existing rollup (if any) via this index before

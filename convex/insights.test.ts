@@ -2591,6 +2591,15 @@ describe('summarizeResolutionHealth', () => {
       avgTimeToResolutionMs: null,
       medianTimeToResolutionMs: null,
       healthScore: 100,
+      // cycle 2 ("prove the fix held") fields — all additive, all neutral on
+      // empty input. provenHealthScore mirrors healthScore's documented
+      // neutral-good 100 for "no patterns at all".
+      confirmedResolutions: 0,
+      provingResolutions: 0,
+      unprovenResolutions: 0,
+      resolutionsWithoutEvidence: 0,
+      confirmationRate: 0,
+      provenHealthScore: 100,
     })
   })
 
@@ -2832,5 +2841,754 @@ describe('summarizeResolutionHealth', () => {
     const b = summarizeResolutionHealth(snapshots, 999999)
     expect(expect.getState().currentTestName, '').toBeDefined()
     expect(a).toEqual(b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// "Resolution" cycle 2 (Team B): fixConfidence / deriveFixConfidenceState /
+// fixConfidenceForSnapshots + the asserted-vs-confirmed extension to
+// summarizeResolutionHealth. These tests pin INTENDED BEHAVIOUR for every
+// threshold and every degenerate input — not merely "does not throw".
+// ---------------------------------------------------------------------------
+import {
+  fixConfidence,
+  deriveFixConfidenceState,
+  fixConfidenceForSnapshots,
+  FIX_CONFIDENCE_FLOOR,
+  FIX_CONFIDENCE_MAX,
+  FIX_CONFIDENCE_RUNS_FOR_FULL_CREDIT,
+  FIX_CONFIDENCE_SOAK_MS_FOR_FULL_CREDIT,
+  FIX_CONFIDENCE_EXPOSURE_BASE_WEIGHT,
+  FIX_CONFIDENCE_SOAK_WEIGHT,
+  FIX_CONFIDENCE_MIN_EXPOSURE_RUNS,
+  FIX_CONFIDENCE_CONFIRMED_THRESHOLD,
+  FIX_CREDIT_CONFIRMED,
+  FIX_CREDIT_PROVING,
+  FIX_CREDIT_UNPROVEN,
+  FIX_CREDIT_REGRESSED,
+} from './insights'
+import type { FixConfidenceState, FixConfidenceInput, FixConfidenceLimit } from './insights'
+
+const DAY = 24 * 60 * 60 * 1000
+const HOUR = 60 * 60 * 1000
+const NOW = 1000 * DAY
+
+/** Reference implementation of the documented formula, used to cross-check fixConfidence. */
+function expectedScore(exposureRuns: number, elapsedMs: number): number {
+  const e = Math.min(1, Math.max(0, exposureRuns / FIX_CONFIDENCE_RUNS_FOR_FULL_CREDIT))
+  const s = Math.min(1, Math.max(0, elapsedMs / FIX_CONFIDENCE_SOAK_MS_FOR_FULL_CREDIT))
+  const raw = FIX_CONFIDENCE_MAX * e * (FIX_CONFIDENCE_EXPOSURE_BASE_WEIGHT + FIX_CONFIDENCE_SOAK_WEIGHT * s)
+  return Math.round(raw * 10000) / 10000
+}
+
+/** A resolution `soakMs` before NOW with `runs` of post-resolution exposure. */
+function input(runs: number | undefined, soakMs: number, extra: Partial<FixConfidenceInput> = {}): FixConfidenceInput {
+  return { resolvedAt: NOW - soakMs, postResolutionRuns: runs, ...extra }
+}
+
+describe('fix-confidence constants', () => {
+  it('the two evidence weights sum to exactly 1 (documented invariant)', () => {
+    expect(FIX_CONFIDENCE_EXPOSURE_BASE_WEIGHT + FIX_CONFIDENCE_SOAK_WEIGHT).toBe(1)
+  })
+
+  it('has the documented values (a change here is a product decision, not a refactor)', () => {
+    expect(FIX_CONFIDENCE_FLOOR).toBe(0)
+    expect(FIX_CONFIDENCE_MAX).toBe(0.95)
+    expect(FIX_CONFIDENCE_RUNS_FOR_FULL_CREDIT).toBe(50)
+    expect(FIX_CONFIDENCE_SOAK_MS_FOR_FULL_CREDIT).toBe(7 * DAY)
+    expect(FIX_CONFIDENCE_EXPOSURE_BASE_WEIGHT).toBe(0.7)
+    expect(FIX_CONFIDENCE_SOAK_WEIGHT).toBe(0.3)
+    expect(FIX_CONFIDENCE_MIN_EXPOSURE_RUNS).toBe(1)
+    expect(FIX_CONFIDENCE_CONFIRMED_THRESHOLD).toBe(0.7)
+  })
+
+  it('the ceiling is strictly below 1: the product never claims certainty', () => {
+    expect(FIX_CONFIDENCE_MAX).toBeLessThan(1)
+  })
+
+  it('credit table is ordered confirmed > proving > unproven > regressed', () => {
+    expect(FIX_CREDIT_CONFIRMED).toBeGreaterThan(FIX_CREDIT_PROVING)
+    expect(FIX_CREDIT_PROVING).toBeGreaterThan(FIX_CREDIT_UNPROVEN)
+    expect(FIX_CREDIT_UNPROVEN).toBeGreaterThan(FIX_CREDIT_REGRESSED)
+    expect(FIX_CREDIT_CONFIRMED).toBe(1)
+    expect(FIX_CREDIT_REGRESSED).toBe(0)
+  })
+
+  it('full exposure with zero soak lands BELOW the confirm threshold (soak must be earned)', () => {
+    expect(expectedScore(FIX_CONFIDENCE_RUNS_FOR_FULL_CREDIT, 0)).toBeLessThan(FIX_CONFIDENCE_CONFIRMED_THRESHOLD)
+  })
+
+  it('full exposure with full soak lands exactly at the ceiling', () => {
+    expect(expectedScore(FIX_CONFIDENCE_RUNS_FOR_FULL_CREDIT, FIX_CONFIDENCE_SOAK_MS_FOR_FULL_CREDIT)).toBe(
+      FIX_CONFIDENCE_MAX,
+    )
+  })
+})
+
+describe('deriveFixConfidenceState', () => {
+  const cases: Array<{
+    name: string
+    args: { score: number; exposureRuns: number; recurred: boolean; hasResolution: boolean }
+    expected: FixConfidenceState
+  }> = [
+    {
+      name: 'recurrence wins over everything, even a maxed-out score',
+      args: { score: FIX_CONFIDENCE_MAX, exposureRuns: 10000, recurred: true, hasResolution: true },
+      expected: 'regressed',
+    },
+    {
+      name: 'recurrence wins even with no recorded resolution (malformed metadata cannot hide a counter-example)',
+      args: { score: 0, exposureRuns: 0, recurred: true, hasResolution: false },
+      expected: 'regressed',
+    },
+    {
+      name: 'no resolution asserted => unproven (nothing to prove)',
+      args: { score: 0.9, exposureRuns: 500, recurred: false, hasResolution: false },
+      expected: 'unproven',
+    },
+    {
+      name: 'ZERO exposure is unproven, NEVER proving — even with a high score passed in',
+      args: { score: 0.99, exposureRuns: 0, recurred: false, hasResolution: true },
+      expected: 'unproven',
+    },
+    {
+      name: 'exactly MIN_EXPOSURE_RUNS (1) with a low score => proving',
+      args: { score: 0.01, exposureRuns: FIX_CONFIDENCE_MIN_EXPOSURE_RUNS, recurred: false, hasResolution: true },
+      expected: 'proving',
+    },
+    {
+      name: 'score exactly at the confirm threshold => confirmed (>= not >)',
+      args: { score: FIX_CONFIDENCE_CONFIRMED_THRESHOLD, exposureRuns: 50, recurred: false, hasResolution: true },
+      expected: 'confirmed',
+    },
+    {
+      name: 'score one ulp-ish below the confirm threshold => proving',
+      args: { score: FIX_CONFIDENCE_CONFIRMED_THRESHOLD - 0.0001, exposureRuns: 50, recurred: false, hasResolution: true },
+      expected: 'proving',
+    },
+    {
+      name: 'NaN score degrades to the floor => proving (exposure exists) rather than throwing',
+      args: { score: NaN, exposureRuns: 5, recurred: false, hasResolution: true },
+      expected: 'proving',
+    },
+    {
+      name: 'NaN exposureRuns degrades to 0 => unproven',
+      args: { score: 0.9, exposureRuns: NaN, recurred: false, hasResolution: true },
+      expected: 'unproven',
+    },
+    {
+      name: 'negative exposureRuns is below the minimum => unproven',
+      args: { score: 0.9, exposureRuns: -10, recurred: false, hasResolution: true },
+      expected: 'unproven',
+    },
+    {
+      name: 'Infinity exposure is malformed data, sanitized to 0 => unproven, NOT confirmed',
+      args: { score: 0.8, exposureRuns: Infinity, recurred: false, hasResolution: true },
+      expected: 'unproven',
+    },
+    {
+      name: 'a large but FINITE exposure with a confirming score => confirmed',
+      args: { score: 0.8, exposureRuns: 1e6, recurred: false, hasResolution: true },
+      expected: 'confirmed',
+    },
+  ]
+
+  for (const c of cases) {
+    it(c.name, () => {
+      expect(deriveFixConfidenceState(c.args)).toBe(c.expected)
+    })
+  }
+
+  it('never returns anything outside the four documented states, across a malformed battery', () => {
+    const battery = [NaN, Infinity, -Infinity, -1, 0, 0.7, 1, 1e9]
+    for (const score of battery) {
+      for (const exposureRuns of battery) {
+        for (const recurred of [true, false]) {
+          for (const hasResolution of [true, false]) {
+            const state = deriveFixConfidenceState({ score, exposureRuns, recurred, hasResolution })
+            expect(['unproven', 'proving', 'confirmed', 'regressed']).toContain(state)
+          }
+        }
+      }
+    }
+  })
+})
+
+describe('fixConfidence — score math and the three drivers', () => {
+  const table: Array<{
+    name: string
+    runs: number
+    soakMs: number
+    expectedState: FixConfidenceState
+    expectedLimit: FixConfidenceLimit
+  }> = [
+    { name: 'full exposure + full soak => ceiling, confirmed', runs: 50, soakMs: 7 * DAY, expectedState: 'confirmed', expectedLimit: 'none' },
+    { name: 'full exposure + no soak => 0.665, still only proving', runs: 50, soakMs: 0, expectedState: 'proving', expectedLimit: 'accumulating' },
+    { name: 'full exposure + 1 day soak => just over the confirm bar', runs: 50, soakMs: 1 * DAY, expectedState: 'confirmed', expectedLimit: 'none' },
+    { name: 'half exposure + full soak => proving', runs: 25, soakMs: 7 * DAY, expectedState: 'proving', expectedLimit: 'accumulating' },
+    { name: 'single run + full soak => proving with a tiny score', runs: 1, soakMs: 7 * DAY, expectedState: 'proving', expectedLimit: 'accumulating' },
+    { name: 'over-full exposure + over-full soak saturates at the ceiling', runs: 5000, soakMs: 90 * DAY, expectedState: 'confirmed', expectedLimit: 'none' },
+    { name: 'zero exposure + very long soak => floor, unproven', runs: 0, soakMs: 365 * DAY, expectedState: 'unproven', expectedLimit: 'no-exposure' },
+  ]
+
+  for (const c of table) {
+    it(c.name, () => {
+      const r = fixConfidence(input(c.runs, c.soakMs), NOW)
+      expect(r.score).toBe(expectedScore(c.runs, c.soakMs))
+      expect(r.state).toBe(c.expectedState)
+      expect(r.limitingFactor).toBe(c.expectedLimit)
+    })
+  }
+
+  it('the exact documented confirm boundary: 50 runs needs ~20.6h of soak (20h is proving, 21h is confirmed)', () => {
+    expect(fixConfidence(input(50, 20 * HOUR), NOW).state).toBe('proving')
+    expect(fixConfidence(input(50, 21 * HOUR), NOW).state).toBe('confirmed')
+  })
+
+  it('the exact documented confirm boundary: 40 runs needs ~5.2d of soak (5d is proving, 5.5d is confirmed)', () => {
+    expect(fixConfidence(input(40, 5 * DAY), NOW).state).toBe('proving')
+    expect(fixConfidence(input(40, 5.5 * DAY), NOW).state).toBe('confirmed')
+  })
+
+  it('reports all three drivers as separate inspectable fields with their raw units', () => {
+    const r = fixConfidence(input(20, 2 * DAY), NOW)
+    expect(r.exposureRuns).toBe(20) // count of runs
+    expect(r.elapsedMs).toBe(2 * DAY) // milliseconds
+    expect(r.recurred).toBe(false) // boolean
+    // ...and the two normalized sub-scores the UI renders as bars
+    expect(r.exposureCredit).toBe(0.4)
+    expect(r.soakCredit).toBe(round4Local(2 / 7))
+  })
+
+  function round4Local(n: number): number {
+    return Math.round(n * 10000) / 10000
+  }
+
+  it('score is always within [FLOOR, MAX] across a wide sweep', () => {
+    for (const runs of [0, 1, 7, 49, 50, 51, 1e6]) {
+      for (const soak of [0, 1, HOUR, DAY, 7 * DAY, 400 * DAY]) {
+        const r = fixConfidence(input(runs, soak), NOW)
+        expect(r.score).toBeGreaterThanOrEqual(FIX_CONFIDENCE_FLOOR)
+        expect(r.score).toBeLessThanOrEqual(FIX_CONFIDENCE_MAX)
+        expect(Number.isFinite(r.score)).toBe(true)
+      }
+    }
+  })
+
+  it('is monotonic in exposure: more runs never lowers the score', () => {
+    let prev = -1
+    for (const runs of [0, 1, 5, 10, 25, 40, 50, 100]) {
+      const s = fixConfidence(input(runs, 2 * DAY), NOW).score
+      expect(s).toBeGreaterThanOrEqual(prev)
+      prev = s
+    }
+  })
+
+  it('is monotonic in soak: more elapsed time never lowers the score', () => {
+    let prev = -1
+    for (const soak of [0, HOUR, DAY, 3 * DAY, 7 * DAY, 30 * DAY]) {
+      const s = fixConfidence(input(30, soak), NOW).score
+      expect(s).toBeGreaterThanOrEqual(prev)
+      prev = s
+    }
+  })
+
+  it('is deterministic: the same inputs always produce the identical object', () => {
+    const results = new Set<string>()
+    for (let i = 0; i < 10; i++) results.add(JSON.stringify(fixConfidence(input(33, 3 * DAY), NOW)))
+    expect(results.size).toBe(1)
+  })
+})
+
+describe('fixConfidence — zero exposure is unproven, never confident', () => {
+  it('zero post-resolution runs scores exactly the floor even after a year', () => {
+    const r = fixConfidence(input(0, 365 * DAY), NOW)
+    expect(r.score).toBe(FIX_CONFIDENCE_FLOOR)
+    expect(r.state).toBe('unproven')
+    expect(r.limitingFactor).toBe('no-exposure')
+    expect(r.exposureRuns).toBe(0)
+    expect(r.soakCredit).toBe(1) // soak WAS full — and it still bought nothing
+  })
+
+  it('zero exposure is reported as measured when the caller supplied 0 explicitly', () => {
+    const r = fixConfidence(input(0, DAY), NOW)
+    expect(r.exposureMeasured).toBe(true)
+    expect(r.observedRuns).toBe(0)
+  })
+
+  it('unmeasured exposure (undefined) is distinguishable from a measured zero, and scores the same', () => {
+    const r = fixConfidence(input(undefined, DAY), NOW)
+    expect(r.exposureMeasured).toBe(false)
+    expect(r.observedRuns).toBe(0)
+    expect(r.score).toBe(FIX_CONFIDENCE_FLOOR)
+    expect(r.state).toBe('unproven')
+  })
+
+  it('zero exposure can never reach "proving" no matter the soak', () => {
+    for (const soak of [0, DAY, 7 * DAY, 1000 * DAY]) {
+      expect(fixConfidence(input(0, soak), NOW).state).toBe('unproven')
+    }
+  })
+})
+
+describe('fixConfidence — a recurrence collapses confidence to the floor', () => {
+  it('collapses a would-be-ceiling score to exactly the floor', () => {
+    const resolvedAt = NOW - 7 * DAY
+    const clean = fixConfidence({ resolvedAt, postResolutionRuns: 5000 }, NOW)
+    expect(clean.score).toBe(FIX_CONFIDENCE_MAX)
+
+    const recurred = fixConfidence({ resolvedAt, postResolutionRuns: 5000, recurredAt: NOW - DAY }, NOW)
+    expect(recurred.score).toBe(FIX_CONFIDENCE_FLOOR)
+    expect(recurred.state).toBe('regressed')
+    expect(recurred.limitingFactor).toBe('recurrence')
+  })
+
+  it('still reports the prior exposure so the UI can say "it came back after N clean runs"', () => {
+    const r = fixConfidence({ resolvedAt: NOW - 7 * DAY, postResolutionRuns: 5000, recurredAt: NOW - DAY }, NOW)
+    expect(r.exposureRuns).toBe(5000)
+    expect(r.recurred).toBe(true)
+  })
+
+  it('a recurrence at exactly resolvedAt is NOT a regression (it is the occurrence that prompted the fix)', () => {
+    const resolvedAt = NOW - 7 * DAY
+    const r = fixConfidence({ resolvedAt, postResolutionRuns: 50, recurredAt: resolvedAt }, NOW)
+    expect(r.recurred).toBe(false)
+    expect(r.state).toBe('confirmed')
+  })
+
+  it('a recurrence BEFORE resolvedAt is not a regression', () => {
+    const resolvedAt = NOW - 7 * DAY
+    const r = fixConfidence({ resolvedAt, postResolutionRuns: 50, recurredAt: resolvedAt - DAY }, NOW)
+    expect(r.recurred).toBe(false)
+    expect(r.state).toBe('confirmed')
+  })
+
+  it('a recurrence one ms after resolvedAt IS a regression (same strictness as isRegression)', () => {
+    const resolvedAt = NOW - 7 * DAY
+    const r = fixConfidence({ resolvedAt, postResolutionRuns: 50, recurredAt: resolvedAt + 1 }, NOW)
+    expect(r.recurred).toBe(true)
+    expect(r.state).toBe('regressed')
+  })
+
+  it('recurrence outranks a missing resolution timestamp', () => {
+    const r = fixConfidence({ resolvedAt: undefined, recurredAt: NOW - DAY, postResolutionRuns: 10 }, NOW)
+    expect(r.state).toBe('regressed')
+    expect(r.limitingFactor).toBe('recurrence')
+  })
+
+  it('a NaN recurredAt is not a recurrence (malformed, not proof)', () => {
+    const r = fixConfidence({ resolvedAt: NOW - 7 * DAY, postResolutionRuns: 50, recurredAt: NaN }, NOW)
+    expect(r.recurred).toBe(false)
+    expect(r.state).toBe('confirmed')
+  })
+})
+
+describe('fixConfidence — version attribution', () => {
+  const resolvedAt = NOW - 7 * DAY
+
+  it('matched versions credit the exposure in full', () => {
+    const r = fixConfidence(
+      { resolvedAt, postResolutionRuns: 50, resolvedInVersionId: 'v2', exposureVersionId: 'v2' },
+      NOW,
+    )
+    expect(r.versionAttribution).toBe('matched')
+    expect(r.exposureRuns).toBe(50)
+    expect(r.state).toBe('confirmed')
+  })
+
+  it('mismatched versions discard the exposure: those runs did not test this fix', () => {
+    const r = fixConfidence(
+      { resolvedAt, postResolutionRuns: 50, resolvedInVersionId: 'v2', exposureVersionId: 'v3' },
+      NOW,
+    )
+    expect(r.versionAttribution).toBe('mismatched')
+    expect(r.exposureRuns).toBe(0)
+    expect(r.observedRuns).toBe(50) // still reported, so the UI can explain the discard
+    expect(r.score).toBe(FIX_CONFIDENCE_FLOOR)
+    expect(r.state).toBe('unproven')
+    expect(r.limitingFactor).toBe('version-mismatch')
+  })
+
+  it('unknown attribution (either id missing) credits the exposure as observed', () => {
+    for (const extra of [
+      { resolvedInVersionId: 'v2' },
+      { exposureVersionId: 'v2' },
+      {},
+      { resolvedInVersionId: '', exposureVersionId: 'v2' },
+    ]) {
+      const r = fixConfidence({ resolvedAt, postResolutionRuns: 50, ...extra }, NOW)
+      expect(r.versionAttribution).toBe('unknown')
+      expect(r.exposureRuns).toBe(50)
+    }
+  })
+})
+
+describe('fixConfidence — degenerate inputs are pinned, not merely survived', () => {
+  it('resolvedAt undefined on an otherwise-resolved pattern: floor, unproven, "no-resolution"', () => {
+    const r = fixConfidence({ resolvedAt: undefined, postResolutionRuns: 500 }, NOW)
+    expect(r.hasResolution).toBe(false)
+    expect(r.elapsedMs).toBe(0)
+    expect(r.score).toBe(FIX_CONFIDENCE_FLOOR)
+    expect(r.state).toBe('unproven')
+    expect(r.limitingFactor).toBe('no-resolution')
+  })
+
+  it('resolvedAt NaN behaves exactly like undefined', () => {
+    const r = fixConfidence({ resolvedAt: NaN, postResolutionRuns: 500 }, NOW)
+    expect(r.hasResolution).toBe(false)
+    expect(r.state).toBe('unproven')
+    expect(r.limitingFactor).toBe('no-resolution')
+  })
+
+  it('resolvedAt Infinity behaves exactly like undefined', () => {
+    const r = fixConfidence({ resolvedAt: Infinity, postResolutionRuns: 500 }, NOW)
+    expect(r.hasResolution).toBe(false)
+    expect(r.state).toBe('unproven')
+  })
+
+  it('resolvedAt in the FUTURE relative to nowMs: elapsed clamps to 0, never negative', () => {
+    const r = fixConfidence({ resolvedAt: NOW + 30 * DAY, postResolutionRuns: 50 }, NOW)
+    expect(r.elapsedMs).toBe(0)
+    expect(r.soakCredit).toBe(0)
+    expect(r.score).toBe(expectedScore(50, 0))
+    expect(r.state).toBe('proving')
+  })
+
+  it('a future resolvedAt does not erase measured exposure (clock skew must not destroy data either)', () => {
+    const r = fixConfidence({ resolvedAt: NOW + 30 * DAY, postResolutionRuns: 50 }, NOW)
+    expect(r.exposureRuns).toBe(50)
+    expect(r.exposureCredit).toBe(1)
+  })
+
+  it('a future resolvedAt can never manufacture confidence', () => {
+    expect(fixConfidence({ resolvedAt: NOW + 1e12, postResolutionRuns: 50 }, NOW).score).toBeLessThan(
+      FIX_CONFIDENCE_CONFIRMED_THRESHOLD,
+    )
+  })
+
+  it('negative postResolutionRuns sanitizes to 0 exposure (never a negative score)', () => {
+    const r = fixConfidence(input(-50, 7 * DAY), NOW)
+    expect(r.observedRuns).toBe(0)
+    expect(r.exposureRuns).toBe(0)
+    expect(r.score).toBe(FIX_CONFIDENCE_FLOOR)
+    expect(r.state).toBe('unproven')
+    expect(r.exposureMeasured).toBe(true)
+  })
+
+  it('NaN postResolutionRuns reads as unmeasured, scores the floor, leaks no NaN', () => {
+    const r = fixConfidence(input(NaN, 7 * DAY), NOW)
+    expect(r.exposureMeasured).toBe(false)
+    expect(r.observedRuns).toBe(0)
+    expect(Number.isNaN(r.score)).toBe(false)
+    expect(r.score).toBe(FIX_CONFIDENCE_FLOOR)
+  })
+
+  it('Infinity postResolutionRuns reads as unmeasured rather than as infinite confidence', () => {
+    const r = fixConfidence(input(Infinity, 7 * DAY), NOW)
+    expect(r.exposureMeasured).toBe(false)
+    expect(r.exposureRuns).toBe(0)
+    expect(r.score).toBe(FIX_CONFIDENCE_FLOOR)
+  })
+
+  it('fractional run counts floor to whole runs', () => {
+    expect(fixConfidence(input(7.9, DAY), NOW).exposureRuns).toBe(7)
+  })
+
+  it('nowMs NaN: soak is unmeasurable (0) but exposure still counts', () => {
+    const r = fixConfidence({ resolvedAt: NOW - 7 * DAY, postResolutionRuns: 50 }, NaN)
+    expect(r.elapsedMs).toBe(0)
+    expect(r.soakCredit).toBe(0)
+    expect(r.score).toBe(expectedScore(50, 0))
+    expect(Number.isFinite(r.score)).toBe(true)
+  })
+
+  it('nowMs Infinity does not produce an Infinity/NaN score', () => {
+    const r = fixConfidence({ resolvedAt: NOW - 7 * DAY, postResolutionRuns: 50 }, Infinity)
+    expect(Number.isFinite(r.score)).toBe(true)
+    expect(r.score).toBeLessThanOrEqual(FIX_CONFIDENCE_MAX)
+  })
+
+  it('a null/undefined input object degrades to the floor instead of throwing', () => {
+    expect(() => fixConfidence(undefined as unknown as FixConfidenceInput, NOW)).not.toThrow()
+    const r = fixConfidence(undefined as unknown as FixConfidenceInput, NOW)
+    expect(r.score).toBe(FIX_CONFIDENCE_FLOOR)
+    expect(r.state).toBe('unproven')
+  })
+
+  it('an empty input object is unproven with no resolution', () => {
+    const r = fixConfidence({}, NOW)
+    expect(r.state).toBe('unproven')
+    expect(r.limitingFactor).toBe('no-resolution')
+  })
+
+  it('no field of the result is ever NaN or Infinity, across a full malformed battery', () => {
+    const stamps = [undefined, NaN, Infinity, -Infinity, 0, NOW, NOW + 1e12]
+    const counts = [undefined, NaN, Infinity, -Infinity, -5, 0, 3.7, 1e12]
+    for (const resolvedAt of stamps) {
+      for (const recurredAt of stamps) {
+        for (const postResolutionRuns of counts) {
+          const r = fixConfidence({ resolvedAt, recurredAt, postResolutionRuns }, NOW)
+          for (const [key, value] of Object.entries(r)) {
+            if (typeof value === 'number') {
+              expect(Number.isFinite(value), `${key} must be finite`).toBe(true)
+            }
+          }
+          expect(['unproven', 'proving', 'confirmed', 'regressed']).toContain(r.state)
+        }
+      }
+    }
+  })
+})
+
+describe('fixConfidenceForSnapshots', () => {
+  function snapshot(overrides: Partial<PatternLifecycleSnapshot>): PatternLifecycleSnapshot {
+    return { status: 'open', firstSeenAt: NOW - 30 * DAY, lastSeenAt: NOW - 20 * DAY, count: 5, ...overrides }
+  }
+
+  it('returns null for a pattern that has never been through resolution', () => {
+    const out = fixConfidenceForSnapshots([snapshot({ status: 'open' }), snapshot({ status: 'acknowledged' })], NOW)
+    expect(out).toEqual([null, null])
+  })
+
+  it('scores a currently-resolved pattern', () => {
+    const out = fixConfidenceForSnapshots(
+      [snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY, postResolutionRuns: 50 })],
+      NOW,
+    )
+    expect(out[0]?.state).toBe('confirmed')
+  })
+
+  it('scores an AUTO-REOPENED pattern (status open + regressedAt) as regressed — agrees with the UI predicate', () => {
+    const out = fixConfidenceForSnapshots(
+      [snapshot({ status: 'open', resolvedAt: NOW - 7 * DAY, regressedAt: NOW - DAY, postResolutionRuns: 40 })],
+      NOW,
+    )
+    expect(out[0]?.state).toBe('regressed')
+    expect(out[0]?.score).toBe(FIX_CONFIDENCE_FLOOR)
+  })
+
+  it('a RE-resolved pattern (regressedAt precedes the newer resolvedAt) is not re-flagged as regressed', () => {
+    const out = fixConfidenceForSnapshots(
+      [snapshot({ status: 'resolved', regressedAt: NOW - 20 * DAY, resolvedAt: NOW - 7 * DAY, postResolutionRuns: 50 })],
+      NOW,
+    )
+    expect(out[0]?.state).toBe('confirmed')
+  })
+
+  it('recurredAt takes precedence over regressedAt when both are supplied', () => {
+    const out = fixConfidenceForSnapshots(
+      [
+        snapshot({
+          status: 'resolved',
+          resolvedAt: NOW - 7 * DAY,
+          regressedAt: NOW - 20 * DAY, // old, pre-resolution
+          recurredAt: NOW - DAY, // new, post-resolution
+          postResolutionRuns: 50,
+        }),
+      ],
+      NOW,
+    )
+    expect(out[0]?.state).toBe('regressed')
+  })
+
+  it('a resolved-status snapshot with NO resolvedAt scores unproven rather than throwing', () => {
+    const out = fixConfidenceForSnapshots([snapshot({ status: 'resolved', postResolutionRuns: 500 })], NOW)
+    expect(out[0]?.state).toBe('unproven')
+    expect(out[0]?.limitingFactor).toBe('no-resolution')
+  })
+
+  it('preserves index alignment with the input array', () => {
+    const out = fixConfidenceForSnapshots(
+      [
+        snapshot({ status: 'open' }),
+        snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY, postResolutionRuns: 50 }),
+        snapshot({ status: 'acknowledged' }),
+      ],
+      NOW,
+    )
+    expect(out).toHaveLength(3)
+    expect(out[0]).toBeNull()
+    expect(out[1]?.state).toBe('confirmed')
+    expect(out[2]).toBeNull()
+  })
+
+  it('empty and non-array inputs return an empty array without throwing', () => {
+    expect(fixConfidenceForSnapshots([], NOW)).toEqual([])
+    expect(fixConfidenceForSnapshots(undefined as unknown as PatternLifecycleSnapshot[], NOW)).toEqual([])
+  })
+
+  it('tolerates null entries inside the array', () => {
+    const out = fixConfidenceForSnapshots(
+      [null as unknown as PatternLifecycleSnapshot, snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY, postResolutionRuns: 50 })],
+      NOW,
+    )
+    expect(out[0]).toBeNull()
+    expect(out[1]?.state).toBe('confirmed')
+  })
+})
+
+describe('summarizeResolutionHealth — asserted vs. confirmed (cycle 2)', () => {
+  function snapshot(overrides: Partial<PatternLifecycleSnapshot>): PatternLifecycleSnapshot {
+    return { status: 'open', firstSeenAt: NOW - 30 * DAY, lastSeenAt: NOW - 20 * DAY, count: 5, ...overrides }
+  }
+  const confirmedSnap = () =>
+    snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY, postResolutionRuns: 50 })
+  const provingSnap = () => snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY, postResolutionRuns: 10 })
+  const assertedSnap = () => snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY })
+
+  it('THE HEADLINE: a resolution with no evidence scores far below one whose fix held', () => {
+    const asserted = summarizeResolutionHealth([assertedSnap()], NOW)
+    const confirmed = summarizeResolutionHealth([confirmedSnap()], NOW)
+
+    // Cycle 1's healthScore cannot tell them apart at all...
+    expect(asserted.healthScore).toBe(100)
+    expect(confirmed.healthScore).toBe(100)
+    // ...cycle 2's does.
+    expect(asserted.provenHealthScore).toBe(25) // FIX_CREDIT_UNPROVEN
+    expect(confirmed.provenHealthScore).toBe(100)
+    expect(asserted.provenHealthScore).toBeLessThan(confirmed.provenHealthScore)
+  })
+
+  it('a team that closes patterns without them holding never outscores one whose fixes stick', () => {
+    const sticky = summarizeResolutionHealth([confirmedSnap(), confirmedSnap(), confirmedSnap(), confirmedSnap()], NOW)
+    const closer = summarizeResolutionHealth([assertedSnap(), assertedSnap(), assertedSnap(), assertedSnap()], NOW)
+    expect(sticky.healthScore).toBe(closer.healthScore) // identical under cycle 1
+    expect(sticky.provenHealthScore).toBeGreaterThan(closer.provenHealthScore)
+    expect(sticky.confirmationRate).toBe(1)
+    expect(closer.confirmationRate).toBe(0)
+  })
+
+  it('classifies each resolution into exactly one bucket, and the buckets sum to `resolved`', () => {
+    const r = summarizeResolutionHealth(
+      [confirmedSnap(), provingSnap(), assertedSnap(), snapshot({ status: 'open' })],
+      NOW,
+    )
+    expect(r.resolved).toBe(3)
+    expect(r.confirmedResolutions).toBe(1)
+    expect(r.provingResolutions).toBe(1)
+    expect(r.unprovenResolutions).toBe(1)
+    expect(r.confirmedResolutions + r.provingResolutions + r.unprovenResolutions).toBe(r.resolved)
+  })
+
+  it('proving resolutions earn half credit (between asserted and confirmed)', () => {
+    const r = summarizeResolutionHealth([provingSnap()], NOW)
+    expect(r.provingResolutions).toBe(1)
+    expect(r.provenHealthScore).toBe(50) // FIX_CREDIT_PROVING * 100
+  })
+
+  it('resolutionsWithoutEvidence separates "measured zero" from "never measured"', () => {
+    const measuredZero = snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY, postResolutionRuns: 0 })
+    const r = summarizeResolutionHealth([measuredZero, assertedSnap()], NOW)
+    expect(r.unprovenResolutions).toBe(2) // both unproven...
+    expect(r.resolutionsWithoutEvidence).toBe(1) // ...but only one was never measured
+  })
+
+  it('confirmationRate is 0 (never NaN) when nothing is resolved', () => {
+    const r = summarizeResolutionHealth([snapshot({ status: 'open' })], NOW)
+    expect(r.resolved).toBe(0)
+    expect(r.confirmationRate).toBe(0)
+    expect(Number.isNaN(r.confirmationRate)).toBe(false)
+  })
+
+  it('confirmationRate is the confirmed share of resolutions', () => {
+    const r = summarizeResolutionHealth([confirmedSnap(), assertedSnap(), assertedSnap(), assertedSnap()], NOW)
+    expect(r.confirmationRate).toBe(0.25)
+  })
+
+  it('provenHealthScore carries the identical regression penalty as healthScore', () => {
+    // One resolved+confirmed pattern that nonetheless regressed once in the past
+    // and was re-resolved: regressionRate 1 => both scores lose the full 50.
+    const reResolved = snapshot({
+      status: 'resolved',
+      regressedAt: NOW - 20 * DAY,
+      resolvedAt: NOW - 7 * DAY,
+      postResolutionRuns: 50,
+    })
+    const r = summarizeResolutionHealth([reResolved], NOW)
+    expect(r.regressionRate).toBe(1)
+    expect(r.healthScore).toBe(50)
+    expect(r.provenHealthScore).toBe(50)
+  })
+
+  it('provenHealthScore is never above healthScore (evidence can only discount an assertion)', () => {
+    const battery = [confirmedSnap(), provingSnap(), assertedSnap(), snapshot({ status: 'open' }), snapshot({ status: 'acknowledged' })]
+    for (let i = 1; i <= battery.length; i++) {
+      const r = summarizeResolutionHealth(battery.slice(0, i), NOW)
+      expect(r.provenHealthScore).toBeLessThanOrEqual(r.healthScore)
+    }
+  })
+
+  it('both scores stay within 0..100 over a large mixed population', () => {
+    const snapshots = Array.from({ length: 3000 }, (_, i) =>
+      i % 4 === 0 ? confirmedSnap() : i % 4 === 1 ? provingSnap() : i % 4 === 2 ? assertedSnap() : snapshot({ status: 'open' }),
+    )
+    const r = summarizeResolutionHealth(snapshots, NOW)
+    expect(r.total).toBe(3000)
+    expect(r.provenHealthScore).toBeGreaterThanOrEqual(0)
+    expect(r.provenHealthScore).toBeLessThanOrEqual(100)
+    expect(r.confirmedResolutions + r.provingResolutions + r.unprovenResolutions).toBe(r.resolved)
+  })
+
+  it('cycle-1 fields are byte-identical whether or not cycle-2 evidence is supplied (backward compatible)', () => {
+    const withEvidence = summarizeResolutionHealth([confirmedSnap()], NOW)
+    const withoutEvidence = summarizeResolutionHealth([assertedSnap()], NOW)
+    const cycle1 = (r: ReturnType<typeof summarizeResolutionHealth>) => ({
+      total: r.total,
+      open: r.open,
+      acknowledged: r.acknowledged,
+      resolved: r.resolved,
+      regressed: r.regressed,
+      regressionRate: r.regressionRate,
+      avgTimeToResolutionMs: r.avgTimeToResolutionMs,
+      medianTimeToResolutionMs: r.medianTimeToResolutionMs,
+      healthScore: r.healthScore,
+    })
+    expect(cycle1(withEvidence)).toEqual(cycle1(withoutEvidence))
+  })
+
+  it('a resolved snapshot with no resolvedAt lands in unproven without throwing or corrupting the buckets', () => {
+    const r = summarizeResolutionHealth([snapshot({ status: 'resolved', postResolutionRuns: 500 })], NOW)
+    expect(r.resolved).toBe(1)
+    expect(r.unprovenResolutions).toBe(1)
+    expect(r.confirmedResolutions).toBe(0)
+    expect(Number.isFinite(r.provenHealthScore)).toBe(true)
+  })
+
+  it('a future resolvedAt does not produce a confirmed resolution', () => {
+    const r = summarizeResolutionHealth(
+      [snapshot({ status: 'resolved', resolvedAt: NOW + 30 * DAY, postResolutionRuns: 50 })],
+      NOW,
+    )
+    expect(r.confirmedResolutions).toBe(0)
+    expect(r.provingResolutions).toBe(1)
+  })
+
+  it('negative/NaN evidence values never leak into the aggregate scores', () => {
+    const r = summarizeResolutionHealth(
+      [
+        snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY, postResolutionRuns: -100 }),
+        snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY, postResolutionRuns: NaN }),
+        snapshot({ status: 'resolved', resolvedAt: NaN, postResolutionRuns: 50 }),
+      ],
+      NOW,
+    )
+    expect(Number.isFinite(r.provenHealthScore)).toBe(true)
+    expect(Number.isFinite(r.confirmationRate)).toBe(true)
+    expect(r.unprovenResolutions).toBe(3)
+  })
+
+  it('nowMs is genuinely used now: the same snapshots score differently as time passes', () => {
+    const snap = snapshot({ status: 'resolved', resolvedAt: NOW - 7 * DAY, postResolutionRuns: 50 })
+    const soon = summarizeResolutionHealth([snap], NOW - 7 * DAY + HOUR) // ~1h of soak
+    const later = summarizeResolutionHealth([snap], NOW) // 7d of soak
+    expect(soon.confirmedResolutions).toBe(0)
+    expect(later.confirmedResolutions).toBe(1)
+  })
+
+  it('is deterministic for a fixed nowMs', () => {
+    const snapshots = [confirmedSnap(), provingSnap(), assertedSnap()]
+    const results = new Set<string>()
+    for (let i = 0; i < 10; i++) results.add(JSON.stringify(summarizeResolutionHealth(snapshots, NOW)))
+    expect(results.size).toBe(1)
   })
 })

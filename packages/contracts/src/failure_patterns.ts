@@ -54,6 +54,16 @@ export interface FailurePattern {
   representativeRunIds: string[];
   /** Bounded (<= 20), deduped set of agent versions this fingerprint has been seen on. */
   affectedAgentVersionIds: string[];
+  /**
+   * Bounded (<= 20), deduped, most-recent-first set of AGENTS this
+   * fingerprint has been observed on (docs/adr/006-failure-resolution.md
+   * cycle 2). Not derivable from `affectedAgentVersionIds` — a run's
+   * `agentVersionId` is optional, so a fingerprint can have occurrences and
+   * no versions at all. OPTIONAL: absent on every rollup written before this
+   * cycle; it self-heals on that pattern's next occurrence, and backend
+   * readers fall back to deriving the set from occurrences meanwhile.
+   */
+  affectedAgentIds?: string[];
   lastSpikeAssessment?: FailurePatternSpikeAssessment;
   /** Epoch ms of the last time a `pattern_spike` alert was fired for this pattern (cooldown state — see docs/adr/005-failure-patterns.md Cycle 2). */
   lastPatternSpikeAlertFiredAt?: number;
@@ -96,10 +106,109 @@ export interface FailurePattern {
    * `reopenPattern` (a human manually reopening is not itself a regression).
    */
   regressedAt?: number;
+
+  // ---------------------------------------------------------------------
+  // Resolution EVIDENCE (docs/adr/006-failure-resolution.md cycle 2 —
+  // "prove the fix held"). A resolution on its own is an unearned human
+  // assertion; these three fields are the point-in-time snapshot that lets a
+  // later reader judge how much the claimed fix has actually been exercised
+  // since. Written ONLY by `resolvePattern`. OBSERVABILITY-GRADE like every
+  // other field on this rollup — snapshots of derived counters, never facts
+  // about any single run.
+  //
+  // Everything derivable from these plus live data — exposure SINCE
+  // resolution, recurrences since resolution, the lifecycle transition
+  // history — is computed at query time by `getPatternResolutionEvidence`
+  // and is NOT stored on the rollup. See `PatternResolutionEvidence` below.
+  // ---------------------------------------------------------------------
+
+  /**
+   * The agent version the operator believes contains the fix. Validated at
+   * resolve time to exist, to belong to the caller's org, and to belong to an
+   * agent this pattern has been observed on — a cross-org or cross-agent id
+   * is rejected, never silently dropped. Distinct from `resolutionRef`, which
+   * is unvalidated free text.
+   */
+  resolvedInVersionId?: string;
+  /**
+   * BASELINE EXPOSURE: runs started for this pattern's affected agents in the
+   * 14 days immediately BEFORE `resolvedAt` — the denominator to compare live
+   * post-resolution exposure against. Bounded, therefore approximate for very
+   * high-volume agents.
+   */
+  resolvedAtRunCount?: number;
+  /** The rollup's own `count` at the instant of resolution. Post-resolution recurrences are exactly `count - resolvedAtOccurrenceCount`. */
+  resolvedAtOccurrenceCount?: number;
 }
 
 /** Failure pattern lifecycle state (docs/adr/006-failure-resolution.md). Absent on the rollup means "open". */
 export type FailurePatternStatus = "open" | "acknowledged" | "resolved";
+
+// ---------------------------------------------------------------------------
+// Resolution evidence (docs/adr/006-failure-resolution.md cycle 2) — the
+// DERIVED "did the fix hold?" projection returned by
+// `failure_patterns:getPatternResolutionEvidence`. None of this is stored:
+// it is computed at query time from `runs`, the rollup's own `count`, and the
+// append-only `audit_log`, exactly like replay/diff are derived projections
+// over the event log and never source of truth.
+// ---------------------------------------------------------------------------
+
+/** One lifecycle transition, reconstructed from the append-only audit log rather than a mutable history table. */
+export interface PatternLifecycleTransition {
+  /** A `failure_pattern.*` audit action, e.g. "failure_pattern.resolved". `failure_pattern.regressed` is the regression guard's automatic reopen. */
+  action: string;
+  /** Clerk user id, or the literal "system" for transitions the backend applied on its own. */
+  actorClerkUserId: string;
+  timestamp: number;
+  metadata?: unknown;
+}
+
+/** The point-in-time claim a human made when resolving. */
+export interface PatternResolutionMetadata {
+  resolvedAt: number;
+  resolvedByUserId?: string;
+  resolutionNote?: string;
+  resolutionRef?: string;
+  resolvedInVersionId?: string;
+  /** The `version` string of `resolvedInVersionId`, resolved live for display only — never stored. */
+  resolvedInVersion?: string;
+  resolvedAtOccurrenceCount?: number;
+  resolvedAtRunCount?: number;
+}
+
+/** How much the claimed fix has actually been exercised since it was claimed. */
+export interface PatternResolutionExposure {
+  /** The `resolvedAt` every count below is measured from. */
+  since: number;
+  /** Runs started for the pattern's affected agents since `since`. Bounded — see `runCountTruncated`. */
+  runCount: number;
+  /** True when the scan ceiling was hit: `runCount` is a floor ("2000+"), not an exact total. */
+  runCountTruncated: boolean;
+  /** EXACT recurrences since resolution: `count - resolvedAtOccurrenceCount`. */
+  recurrenceCount: number;
+  /** The pre-resolution baseline (`resolvedAtRunCount`) for comparison, when it was captured. */
+  baselineRunCount?: number;
+  /** The agents `runCount` was measured across. */
+  agentIds: string[];
+  /**
+   * Whether the fix has held SO FAR — zero recurrences since resolution.
+   * NOT a claim that the fix is correct: `runCount` is what says whether
+   * "held so far" is meaningful evidence. `heldSoFar: true` with
+   * `runCount: 0` means the fix is simply untested.
+   */
+  heldSoFar: boolean;
+}
+
+/** `getPatternResolutionEvidence`'s full shape. */
+export interface PatternResolutionEvidence {
+  pattern: FailurePattern;
+  /** Null when there is no live resolution to evidence (never resolved, or manually reopened — which clears `resolvedAt`). */
+  resolution: PatternResolutionMetadata | null;
+  /** Null exactly when `resolution` is null — exposure is always measured from a `resolvedAt`. */
+  exposure: PatternResolutionExposure | null;
+  /** Oldest-first, bounded to the 100 most recent transitions. */
+  transitions: PatternLifecycleTransition[];
+}
 
 /** `getFailurePattern`'s full detail shape: the rollup, a bounded recent-occurrences sample, and a 14-day trend. */
 export interface FailurePatternDetail {
