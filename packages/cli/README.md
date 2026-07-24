@@ -26,6 +26,81 @@ export AFR_BASE_URL="https://your-afr-instance.example.com"
 
 ## Command reference
 
+### `afr init`
+
+Frictionless first-run onboarding: get from zero to a recorded run in one command + one run.
+
+1. Checks `AFR_API_KEY` / `AFR_BASE_URL` and pings `GET /api/health` (the same checks as `afr config check`).
+2. Writes a small, runnable starter file (`afr-quickstart.mjs` by default) — plain ESM, no build step — that imports `@agent-flight-recorder/sdk`, records one small demo run end-to-end against your configured backend, and prints the run's web URL.
+3. Prints exact next steps.
+
+```bash
+$ afr init
+[ok] AFR_API_KEY: set
+[ok] AFR_BASE_URL: https://your-afr-instance.example.com
+[ok] GET /api/health: HTTP 200
+
+Wrote starter file: afr-quickstart.mjs
+
+Next steps:
+  1. Run: node afr-quickstart.mjs
+  2. Run: afr runs list
+```
+
+Never overwrites an existing file — re-running `afr init` after the file already exists reports a skip instead of clobbering your edits:
+
+```bash
+$ afr init
+...
+Skipped writing afr-quickstart.mjs — it already exists. Pass --force to overwrite it.
+```
+
+The scaffold is written even if `AFR_API_KEY`/`AFR_BASE_URL` aren't configured yet — the config-check output above it tells you what to set, and "next steps" adds a step to fix that first.
+
+Options: `--out <file>` (default: `afr-quickstart.mjs`), `--force` (overwrite an existing file).
+
+### `afr explain <runId>`
+
+Fetches and renders the root-cause explanation for a run — the CLI moment for the flagship "explainability layer" feature: the failure class as a header, a plain-English summary, the root cause, a suggested fix (when the server generated one), and the event sequence numbers the explanation is grounded in, so you can jump straight to them with `afr replay <runId>` or `afr tail <runId>`.
+
+```bash
+$ afr explain run_a1b2c3d4e5f6
+============================================================
+  Tool Error
+============================================================
+
+Summary:
+  The agent called a tool that timed out and never recovered.
+
+Root cause:
+  The `lookup_order` tool call at seq=4 exceeded its timeout.
+
+Suggested fix:
+  Add a retry with backoff around `lookup_order`.
+
+Cited events (seq): 3, 4, 5
+  -> jump to them with 'afr replay run_a1b2c3d4e5f6' or 'afr tail run_a1b2c3d4e5f6'
+
+Generated: 2026-07-18T09:12:06.000Z
+```
+
+**Honest states** — a run that hasn't failed, or a failed run whose explanation isn't generated yet, print a plain message instead of an error:
+
+```bash
+$ afr explain run_completed_ok
+This run completed successfully — nothing to explain.
+
+$ afr explain run_failed_but_pending
+An explanation hasn't been generated for this run yet.
+Check back shortly, or run 'afr replay run_failed_but_pending' for the raw failure summary in the meantime.
+```
+
+Options: `--json` (prints the raw, derived `{ ok, status, ... }` result).
+
+**How the honest states are derived:** the v1 explanation endpoint itself only ever resolves "an explanation, or null" (mirroring the already-shipped Clerk-authed `GET /api/runs/:id/explanation` — see `docs/design/explanations.md`'s "Known gap: coarse null state"; it cannot tell "not failed" apart from "not explained yet" on its own). `afr explain` disambiguates those two itself by also fetching the run (`afr runs get`'s underlying call) and checking its `status`: `'failed'`/`'timed_out'` + no explanation -> "pending"; anything else + no explanation -> "not_failed". See `packages/cli/src/commands/explain.ts` / `FlightReader.getExplanation()`'s doc in the SDK README for the full writeup.
+
+**Backend status (as of this cycle):** `GET /api/v1/runs/:id/explanation` (the key-authed v1 counterpart of the Clerk-authed route above) does not exist server-side yet. Until it ships, `afr explain` surfaces a "not found" error for every run.
+
 ### `afr config check`
 
 Validates that `AFR_API_KEY` / `AFR_BASE_URL` are set and pings `GET {AFR_BASE_URL}/api/health`. Exits `0` if everything checks out, `1` otherwise.
@@ -64,8 +139,8 @@ Prints the CLI and SDK versions.
 
 ```bash
 $ afr version
-afr (Agent Flight Recorder CLI) v0.2.0
-sdk: v0.5.0
+afr (Agent Flight Recorder CLI) v0.3.0
+sdk: v0.7.0
 ```
 
 ### `afr --help` / `afr help`

@@ -8,6 +8,7 @@ import { ArtifactList } from '@/components/runs/ArtifactList'
 import { CommentThread } from '@/components/runs/CommentThread'
 import { EvalsPanel } from '@/components/runs/EvalsPanel'
 import { EventInspector } from '@/components/runs/EventInspector'
+import { ExplanationPanel } from '@/components/runs/ExplanationPanel'
 import { FailureSummary as FailureSummaryPanel } from '@/components/runs/FailureSummary'
 import { RunBreadcrumb } from '@/components/runs/RunBreadcrumb'
 import { RunHeader } from '@/components/runs/RunHeader'
@@ -17,11 +18,13 @@ import { TriageControl } from '@/components/runs/TriageControl'
 import { VerificationPanel } from '@/components/runs/VerificationPanel'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { InlineError } from '@/components/ui/InlineError'
+import { getCurrentAuth } from '@/lib/auth'
 import { getAgent } from '@/lib/services/agents'
 import { listArtifacts } from '@/lib/services/artifacts'
 import { listComments } from '@/lib/services/comments'
 import { getRunEvalSummary, listEvalsForRun, type RunEvalSummary } from '@/lib/services/evals'
 import { listEvents } from '@/lib/services/events'
+import { getRunExplanation, type RunExplanation } from '@/lib/services/explanations'
 import { getRunVerificationStatus, type VerificationStatus } from '@/lib/services/projection_verify'
 import { getProject } from '@/lib/services/projects'
 import { getReplayProjection } from '@/lib/services/replay'
@@ -67,29 +70,42 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   let childRuns: Awaited<ReturnType<typeof listChildRuns>> = []
   let evalsData: Awaited<ReturnType<typeof listEvalsForRun>> = []
   let evalSummary: RunEvalSummary | undefined
+  let explanation: RunExplanation | null = null
 
   // Phase 1 — fetch everything that only depends on runId in parallel instead of
   // serially. run + events are the fatal group (drive notFound / ErrorState);
-  // replay, artifacts, comments, child runs and evals are additive (non-fatal).
-  // allSettled lets one failure not reject the others.
-  const [runSettled, eventsSettled, replaySettled, artifactsSettled, commentsSettled, childRunsSettled, evalsSettled, evalSummarySettled] =
-    await Promise.allSettled([
-      getRun(runId),
-      listEvents({ runId, limit: 200 }),
-      getReplayProjection(runId),
-      listArtifacts(runId),
-      listComments(runId, 'run'),
-      listChildRuns(runId),
-      listEvalsForRun(runId),
-      getRunEvalSummary(runId),
-    ])
+  // replay, artifacts, comments, child runs, evals, and the failure explanation
+  // are additive (non-fatal). allSettled lets one failure not reject the others.
+  const [
+    runSettled,
+    eventsSettled,
+    replaySettled,
+    artifactsSettled,
+    commentsSettled,
+    childRunsSettled,
+    evalsSettled,
+    evalSummarySettled,
+    explanationSettled,
+  ] = await Promise.allSettled([
+    getRun(runId),
+    listEvents({ runId, limit: 200 }),
+    getReplayProjection(runId),
+    listArtifacts(runId),
+    listComments(runId, 'run'),
+    listChildRuns(runId),
+    listEvalsForRun(runId),
+    getRunEvalSummary(runId),
+    getRunExplanation(runId),
+  ])
 
   if (runSettled.status === 'fulfilled') runData = runSettled.value
   if (eventsSettled.status === 'fulfilled') eventsData = eventsSettled.value
   if (childRunsSettled.status === 'fulfilled') childRuns = childRunsSettled.value
   if (evalsSettled.status === 'fulfilled') evalsData = evalsSettled.value
   if (evalSummarySettled.status === 'fulfilled') evalSummary = evalSummarySettled.value
+  if (explanationSettled.status === 'fulfilled') explanation = explanationSettled.value
   const evalsFailed = evalsSettled.status === 'rejected'
+  const explanationFailed = explanationSettled.status === 'rejected'
 
   // Fatal group error handling — preserve notFound() on "not found", else surface.
   const fatalRejection: unknown =
@@ -156,6 +172,8 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   const { run } = runData
   const events = eventsData?.events ?? []
   const initialNextCursor = eventsData?.nextCursor
+  const isAdmin = getCurrentAuth().orgRole === 'admin'
+  const showExplanation = run.status === 'failed' || run.status === 'timed_out'
 
   return (
     <div className="flex flex-col h-full">
@@ -205,6 +223,19 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
           parentRunId={run.parentRunId}
           sessionId={run.sessionId}
           children={childRuns}
+        />
+      )}
+
+      {/* "Why did this fail?" — the flagship explainability panel. Only for
+          failed/timed_out runs; completed runs never render an empty card.
+          Sits above the failure-summary heuristics and the timeline so it is
+          the first thing the engineer sees. */}
+      {showExplanation && (
+        <ExplanationPanel
+          runId={runId}
+          explanation={explanation}
+          loadFailed={explanationFailed}
+          isAdmin={isAdmin}
         />
       )}
 
@@ -261,7 +292,14 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
           synchronously (no Suspense boundary needed). */}
       <div className="flex-1 min-w-0 overflow-y-auto">
         {activeTab === 'timeline' && (
-          <Timeline runId={runId} events={events} initialNextCursor={initialNextCursor} isLive={run.status === 'running'} />
+          <Timeline
+            runId={runId}
+            events={events}
+            initialNextCursor={initialNextCursor}
+            isLive={run.status === 'running'}
+            citedSequenceNumbers={explanation?.citedSequenceNumbers}
+            focusEventSeq={initialEventSeq}
+          />
         )}
         {activeTab === 'events' && (
           <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} initialEventSeq={initialEventSeq} isLive={run.status === 'running'} />

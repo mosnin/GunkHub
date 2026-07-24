@@ -22,6 +22,19 @@ interface TimelineProps {
   initialNextCursor?: string
   loading?: boolean
   isLive?: boolean
+  /**
+   * Sequence numbers cited by the run's failure explanation (ExplanationPanel).
+   * These events get a subtle left-accent marker so the causal chain the
+   * explanation is grounded in stays visible in context, not just as prose.
+   */
+  citedSequenceNumbers?: number[]
+  /**
+   * On mount, scroll to and highlight the event with this sequence number —
+   * set from the `?event=` query param when navigating here from a cited
+   * event link in ExplanationPanel. Reuses the same window/focus mechanism
+   * as keyboard navigation.
+   */
+  focusEventSeq?: number
 }
 
 /**
@@ -74,7 +87,7 @@ function payloadSummary(event: Event): string {
   return ''
 }
 
-export function Timeline({ runId, events, initialNextCursor, loading, isLive = false }: TimelineProps) {
+export function Timeline({ runId, events, initialNextCursor, loading, isLive = false, citedSequenceNumbers, focusEventSeq }: TimelineProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [extraEvents, setExtraEvents] = useState<Event[]>([])
   const [cursor, setCursor] = useState<string | undefined>(initialNextCursor)
@@ -88,6 +101,14 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
   // True when the most recent live poll failed — drives the "reconnecting…"
   // stale indicator; cleared on the next successful poll.
   const [pollFailed, setPollFailed] = useState(false)
+
+  // Cited-events grounding: which event carries the "just jumped here" strong
+  // highlight (set once on mount, from focusEventSeq), and the row DOM nodes
+  // so we can scroll to it once it is in the rendered window.
+  const [jumpTargetId, setJumpTargetId] = useState<string | null>(null)
+  const rowRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const didInitialJumpRef = useRef(false)
+  const citedSet = new Set(citedSequenceNumbers ?? [])
 
   // Keep a stable ref to extraEvents for use inside the polling effect closure
   const extraEventsRef = useRef<Event[]>(extraEvents)
@@ -203,11 +224,39 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
     return () => clearInterval(timer)
   }, [isLive, cursor, runId]) // re-run when cursor changes so strategy updates
 
+  const allEvents = [...(events ?? []), ...extraEvents]
+
+  // On mount, if we were navigated here with a target sequence number (a
+  // cited-event link from ExplanationPanel), locate it, bring its window into
+  // view, and mark it as the roving-focus + jump target. Runs once.
+  useEffect(() => {
+    if (didInitialJumpRef.current) return
+    if (focusEventSeq === undefined) return
+    if (allEvents.length === 0) return
+    const idx = allEvents.findIndex((e) => e.sequenceNumber === focusEventSeq)
+    const found = allEvents[idx]
+    if (idx === -1 || !found) return
+    didInitialJumpRef.current = true
+    setFollowTail(false)
+    setFocusedIndex(idx)
+    setWindowStart(Math.max(0, idx - Math.floor(WINDOW_SIZE / 2)))
+    setJumpTargetId(found.id)
+  }, [focusEventSeq, allEvents.length])
+
+  // Scroll the jump target into view once its row exists in the rendered
+  // window (re-runs as windowStart settles). Respects prefers-reduced-motion.
+  useEffect(() => {
+    if (!jumpTargetId) return
+    const el = rowRefs.current[jumpTargetId]
+    if (!el) return
+    const prefersReduced =
+      typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    el.scrollIntoView({ behavior: prefersReduced ? 'auto' : 'smooth', block: 'center' })
+  }, [jumpTargetId, windowStart])
+
   if (loading) {
     return <LoadingState message="Loading timeline..." />
   }
-
-  const allEvents = [...(events ?? []), ...extraEvents]
 
   if (allEvents.length === 0) {
     return (
@@ -343,14 +392,21 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
             const absIdx = windowStart + relIdx
             const isExpanded = expandedId === event.id
             const summary = payloadSummary(event)
+            const isCited = citedSet.has(event.sequenceNumber)
+            const isJumpTarget = jumpTargetId === event.id
 
             return (
               <div
                 key={event.id}
                 id={`tlrow-${event.id}`}
+                ref={(el) => { rowRefs.current[event.id] = el }}
                 className={[
                   'flex items-start gap-3 rounded',
-                  focusedIndex === absIdx ? 'ring-1 ring-neon-glow' : '',
+                  isJumpTarget
+                    ? 'ring-2 ring-neon-glow shadow-[var(--shadow-glow)]'
+                    : focusedIndex === absIdx
+                      ? 'ring-1 ring-neon-glow'
+                      : '',
                 ].join(' ')}
               >
                 <div
@@ -360,13 +416,29 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
                   ].join(' ')}
                   aria-hidden="true"
                 />
-                <div className="flex-1 rounded bg-neutral-900 border border-neutral-800 overflow-hidden">
+                <div
+                  className={[
+                    'flex-1 rounded bg-neutral-900 border overflow-hidden',
+                    isCited ? 'border-l-2 border-l-neon-glow border-neutral-800' : 'border-neutral-800',
+                  ].join(' ')}
+                >
                   <button
                     onClick={() => setExpandedId(isExpanded ? null : event.id)}
                     className="w-full px-3 py-2 flex items-center gap-3 text-left hover:bg-neutral-800/60 transition-colors duration-75 group"
                     aria-expanded={isExpanded}
                   >
-                    <span className="text-xs font-mono text-neutral-300 min-w-[140px]">{event.type}</span>
+                    <span className="text-xs font-mono text-neutral-300 min-w-[140px] flex items-center gap-1">
+                      {event.type}
+                      {isCited && (
+                        <span
+                          className="text-neon-glow"
+                          title="Cited in the failure explanation"
+                        >
+                          <span aria-hidden="true">●</span>
+                          <span className="sr-only"> — cited in the failure explanation</span>
+                        </span>
+                      )}
+                    </span>
                     <span className="text-xs font-mono text-pewter w-10 shrink-0">
                       #{event.sequenceNumber}
                     </span>

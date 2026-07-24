@@ -1,16 +1,24 @@
-// Insight Engine (Team B) — cycle 3 (cohesion). Cycle 2 wired the pure
-// engines from cycle 1 (convex/helpers/{analytics,pricing,evals}.ts) into
-// org-scoped Convex queries + the eval-execution internal mutation. Cycle 3
-// makes the query set EXACT and COHESIVE against schema Team A landed this
-// same cycle: `runs.by_agent_version_started` (exact per-version
-// compareVersions, replacing the bounded overfetch-and-filter scan) and
-// `runs.modelsSeen` (event-scan-free cost attribution in getAgentCostStats).
-// It also adds getPerAgentDashboardStats (single-pass per-agent dashboard
-// breakdown, for Team E) and getRunEvalSummary (run-detail Evals panel
-// header), and teaches listEvalsForVersion to distinguish "no rules
-// configured" from "rules configured, zero evals in range". See
-// docs/design/insight_engine.md for the original design/plan this file
-// implements.
+// Insight Engine (Team B) — cycle 3 (cohesion) + Explainability Layer cycle 1.
+// Cycle 2 wired the pure engines from cycle 1
+// (convex/helpers/{analytics,pricing,evals}.ts) into org-scoped Convex
+// queries + the eval-execution internal mutation. Cycle 3 makes the query
+// set EXACT and COHESIVE against schema Team A landed this same cycle:
+// `runs.by_agent_version_started` (exact per-version compareVersions,
+// replacing the bounded overfetch-and-filter scan) and `runs.modelsSeen`
+// (event-scan-free cost attribution in getAgentCostStats). It also adds
+// getPerAgentDashboardStats (single-pass per-agent dashboard breakdown, for
+// Team E) and getRunEvalSummary (run-detail Evals panel header), and teaches
+// listEvalsForVersion to distinguish "no rules configured" from "rules
+// configured, zero evals in range". See docs/design/insight_engine.md for
+// the original design/plan this file implements.
+//
+// Explainability Layer cycle 1 (NEW): adds `buildHeuristicExplanation` (and
+// the `classifyFailure` sub-unit it's built from) — a PURE, deterministic,
+// zero-LLM heuristic engine that answers "why did this run fail?" from the
+// event trace + derived failure summary + eval results alone. Every claim it
+// makes is grounded in a real event/eval; see the GROUNDING GUARANTEE
+// doc-comment above that section. Team A's `generateRunExplanation` (its own
+// file/query) is expected to call this function directly.
 //
 // FILE OWNERSHIP: this file (+ insights.test.ts, and the pure helpers in
 // convex/helpers/{analytics,pricing}.ts) is the ONLY convex surface Team B
@@ -1193,3 +1201,519 @@ export const runEvalsForRun = internalMutation({
     };
   },
 });
+
+// ---------------------------------------------------------------------------
+// 6. buildHeuristicExplanation — pure, deterministic "Why did this fail?"
+//    heuristic engine (NEW this cycle). No `ctx`, no LLM, no external config.
+//    Team A's `generateRunExplanation` (its own file) reads a run + its
+//    events + evals, computes/derives a FailureSummary (apps/web's
+//    buildFailureSummary shape — duplicated here as a minimal structural
+//    type, per this file's existing convention of NOT importing another
+//    team's in-flight module) and calls this function.
+//
+// GROUNDING GUARANTEE: every fact asserted in `summary`/`rootCause`/
+// `suggestedFix` and every number in `citedSeqNums` is read directly off a
+// real input event, the run, or a real eval row — never invented. Concretely:
+//   - citedSeqNums is filtered, at the very end, down to sequenceNumbers that
+//     actually appear in the `events` array passed in (see
+//     VALID_SEQ_NUMS/clampCitedSeqNums below) — even a caller-supplied
+//     failureSummary pointing at a bogus seq number cannot leak through.
+//   - Tool/model names and error text are read from the actual event payload
+//     found at that sequence number, tolerantly and defensively (never
+//     JSON.stringify'd wholesale, never assumed present).
+//   - If no such fact can be found, the field is either omitted (suggestedFix)
+//     or replaced with an honest, generic phrase — never a fabricated
+//     specific (no invented tool names, no invented durations).
+//   - The whole function is wrapped so it NEVER throws: any unexpected shape
+//     (missing run, malformed events, non-array evals, NaN sequence numbers,
+//     circular payloads accessed only via typeof-guarded property reads)
+//     degrades to failureClass "unknown" with an honest "couldn't determine
+//     a specific cause" summary, still citing the terminal event when one
+//     can be identified.
+// ---------------------------------------------------------------------------
+
+export type HeuristicFailureClass =
+  | "tool_timeout"
+  | "tool_error"
+  | "llm_error"
+  | "assertion_failed"
+  | "terminal_error"
+  | "incomplete"
+  | "unknown";
+
+/** Minimal run shape this engine needs. Duplicated (not imported) from contracts/schema per this file's convention. */
+export interface HeuristicRunLike {
+  status: string;
+  startedAt: number;
+  endedAt?: number;
+}
+
+/** Minimal event shape this engine needs — a superset of EvalEventLike (adds sequenceNumber as required, not optional). */
+export interface HeuristicEventLike {
+  type: string;
+  sequenceNumber: number;
+  timestamp?: number;
+  payload?: unknown;
+}
+
+/** Mirrors apps/web's FailurePoint (packages/contracts/src/replay.ts) structurally — not imported, to avoid coupling to that team's module during their active cycle. */
+export interface HeuristicFailurePointLike {
+  sequenceNumber: number;
+  type: string;
+  errorMessage?: string;
+  reason?: string;
+}
+
+/** Mirrors apps/web's FailureSummary structurally. */
+export interface HeuristicFailureSummaryLike {
+  hasFailure: boolean;
+  primaryFailure: HeuristicFailurePointLike | null;
+  allFailurePoints: HeuristicFailurePointLike[];
+  isIncomplete: boolean;
+  cannotInfer: boolean;
+}
+
+/** Minimal eval shape — mirrors evals table rows / RuleResult explanations. */
+export interface HeuristicEvalLike {
+  name: string;
+  passed: boolean;
+  details?: string;
+}
+
+export interface HeuristicExplanationInput {
+  run: HeuristicRunLike;
+  events: HeuristicEventLike[];
+  failureSummary: HeuristicFailureSummaryLike;
+  evals: HeuristicEvalLike[];
+}
+
+export interface ExplanationResult {
+  /** Plain-English narrative, <= 2KB. */
+  summary: string;
+  /** The single most likely proximate cause, <= 1KB. */
+  rootCause: string;
+  /** Concrete, honest suggestion — omitted (not guessed) when none applies. */
+  suggestedFix?: string;
+  /** Real sequenceNumbers from `events`, <= 20, deduped, ascending. */
+  citedSeqNums: number[];
+  failureClass: HeuristicFailureClass;
+}
+
+const EXPLANATION_SUMMARY_MAX_CHARS = 2000; // ~2KB of plain ASCII/UTF-8 English text
+const EXPLANATION_ROOT_CAUSE_MAX_CHARS = 1000; // ~1KB
+const EXPLANATION_FIX_MAX_CHARS = 1000; // ~1KB
+const EXPLANATION_MAX_CITED_SEQ_NUMS = 20;
+/** Defensive bound: never let this pure function do unbounded work even if a caller hands it an enormous events array. Most-recent events matter most for failure context, so we keep the tail (plus the first event, for RUN_STARTED context) when trimming. */
+const EXPLANATION_MAX_EVENTS_SCANNED = 1000;
+/** Backward-search window (in array positions, not sequence-number distance) used when hunting for the tool.call/llm.request that preceded a failure. Generous relative to any realistic single-run event burst between a request and its failure. */
+const EXPLANATION_BACKWARD_WINDOW = 100;
+
+function truncateText(s: string, maxChars: number): string {
+  return s.length > maxChars ? s.slice(0, maxChars) : s;
+}
+
+/** Never throws — returns undefined for anything that isn't a plain object. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+/** Tolerant string field read. Never throws. */
+function stringField(obj: Record<string, unknown> | undefined, key: string): string | undefined {
+  if (!obj) return undefined;
+  const v = obj[key];
+  return typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+}
+
+/**
+ * Tolerant model-name extraction from an llm.request/llm.response payload.
+ * Deliberately duplicates (does not import) helpers/run_fields.ts's
+ * extractModel — this file owns zero coupling to Team A's actively-changing
+ * modules, matching the header note at the top of this file.
+ */
+function extractModelLoose(payload: unknown): string | undefined {
+  const top = asRecord(payload);
+  if (!top) return undefined;
+  const direct = stringField(top, "model");
+  if (direct) return direct;
+  for (const key of ["request", "response", "body"]) {
+    const nested = asRecord(top[key]);
+    const m = stringField(nested, "model");
+    if (m) return m;
+  }
+  return undefined;
+}
+
+/** Tolerant call_id extraction (tool.call / tool.result / tool.error payloads share this field). */
+function extractCallId(payload: unknown): string | undefined {
+  return stringField(asRecord(payload), "call_id");
+}
+
+/** Tolerant tool name extraction (tool.call payload). */
+function extractToolName(payload: unknown): string | undefined {
+  return stringField(asRecord(payload), "name");
+}
+
+/**
+ * Sort ascending by sequenceNumber, dropping any entry whose sequenceNumber
+ * isn't a finite number (hostile/malformed input) rather than letting it
+ * corrupt the sort or downstream lookups. Then bound the result: keep the
+ * first event (RUN_STARTED context) plus the most recent
+ * EXPLANATION_MAX_EVENTS_SCANNED - 1, since a failure's evidence is almost
+ * always near the end of the trace.
+ */
+function sanitizeAndBoundEvents(events: HeuristicEventLike[]): HeuristicEventLike[] {
+  const valid = (Array.isArray(events) ? events : []).filter(
+    (e): e is HeuristicEventLike =>
+      !!e && typeof e === "object" && typeof e.sequenceNumber === "number" && Number.isFinite(e.sequenceNumber) && typeof e.type === "string",
+  );
+  valid.sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+  if (valid.length <= EXPLANATION_MAX_EVENTS_SCANNED) return valid;
+
+  const first = valid[0]!;
+  const tail = valid.slice(valid.length - (EXPLANATION_MAX_EVENTS_SCANNED - 1));
+  return tail[0] === first ? tail : [first, ...tail];
+}
+
+function findEventBySeq(sorted: HeuristicEventLike[], seqNum: number): HeuristicEventLike | undefined {
+  return sorted.find((e) => e.sequenceNumber === seqNum);
+}
+
+/** Nearest preceding event (by array position) matching `type`, searched within a bounded backward window from `fromIndex`. */
+function findPrecedingEventOfType(
+  sorted: HeuristicEventLike[],
+  fromIndex: number,
+  type: string,
+): HeuristicEventLike | undefined {
+  const start = Math.max(0, fromIndex - EXPLANATION_BACKWARD_WINDOW);
+  for (let i = fromIndex - 1; i >= start; i--) {
+    if (sorted[i]!.type === type) return sorted[i];
+  }
+  return undefined;
+}
+
+/** Nearest preceding tool.call event whose call_id matches, searched within a bounded backward window. */
+function findPrecedingToolCall(
+  sorted: HeuristicEventLike[],
+  fromIndex: number,
+  callId: string | undefined,
+): HeuristicEventLike | undefined {
+  const start = Math.max(0, fromIndex - EXPLANATION_BACKWARD_WINDOW);
+  for (let i = fromIndex - 1; i >= start; i--) {
+    const e = sorted[i]!;
+    if (e.type !== "tool.call") continue;
+    if (callId === undefined) return e; // best-effort: no call_id to match on, take the nearest tool.call
+    if (extractCallId(e.payload) === callId) return e;
+  }
+  return undefined;
+}
+
+function looksLikeTimeout(text: string | undefined): boolean {
+  if (!text) return false;
+  return /\btime(d)?[\s-]?out\b/i.test(text);
+}
+
+export interface FailureClassification {
+  failureClass: HeuristicFailureClass;
+  /** The raw event that is the strongest evidence for this classification, or null if none applies/was found. */
+  evidenceEvent: HeuristicEventLike | null;
+}
+
+/**
+ * Classify the failure into one of the fixed `HeuristicFailureClass` values.
+ * Pure, never throws (see buildHeuristicExplanation's top-level guard for the
+ * outermost safety net; this function is defensive on its own too since it's
+ * exported as an independently-testable unit).
+ *
+ * Priority order (highest to lowest):
+ *   1. incomplete       — failureSummary says the run has no terminal event.
+ *   2. tool_timeout/tool_error/llm_error/terminal_error — driven by
+ *      failureSummary.primaryFailure's `reason`, refined by inspecting the
+ *      actual event payload at that sequence number.
+ *   3. assertion_failed — no execution-trace failure point, but at least one
+ *      eval failed (a run can execute cleanly and still fail an eval).
+ *   4. unknown          — cannotInfer, or nothing above matched.
+ */
+export function classifyFailure(input: HeuristicExplanationInput): FailureClassification {
+  const { run, failureSummary, evals } = input;
+  const sorted = sanitizeAndBoundEvents(input.events);
+
+  if (failureSummary?.isIncomplete) {
+    return { failureClass: "incomplete", evidenceEvent: null };
+  }
+
+  const primary = failureSummary?.primaryFailure ?? null;
+  if (primary && typeof primary.sequenceNumber === "number" && Number.isFinite(primary.sequenceNumber)) {
+    const evidenceEvent = findEventBySeq(sorted, primary.sequenceNumber) ?? null;
+    const reason = primary.reason;
+
+    if (reason === "failed_tool") {
+      const isTimeout = looksLikeTimeout(primary.errorMessage) || looksLikeTimeout(stringField(asRecord(evidenceEvent?.payload), "message"));
+      return { failureClass: isTimeout ? "tool_timeout" : "tool_error", evidenceEvent };
+    }
+    if (reason === "failed_llm") {
+      return { failureClass: "llm_error", evidenceEvent };
+    }
+    if (reason === "run_failed" || reason === "error_event") {
+      return { failureClass: "terminal_error", evidenceEvent };
+    }
+    // Unrecognized reason string (forward-compat / hostile input): fall through.
+  }
+
+  const hasFailedEval = Array.isArray(evals) && evals.some((e) => e && e.passed === false);
+  if (hasFailedEval) {
+    return { failureClass: "assertion_failed", evidenceEvent: null };
+  }
+
+  if (run?.status === "failed" && !primary) {
+    // Run is marked failed but no failure point could be located at all —
+    // honest "unknown", not a fabricated terminal_error.
+    return { failureClass: "unknown", evidenceEvent: null };
+  }
+
+  return { failureClass: "unknown", evidenceEvent: null };
+}
+
+/** Collect the set of real, finite sequenceNumbers present in `events` — the sole source of truth citedSeqNums may draw from. */
+function realSeqNumSet(events: HeuristicEventLike[]): Set<number> {
+  const set = new Set<number>();
+  for (const e of events) {
+    if (typeof e.sequenceNumber === "number" && Number.isFinite(e.sequenceNumber)) set.add(e.sequenceNumber);
+  }
+  return set;
+}
+
+/** Dedupe, filter to real sequence numbers, sort ascending, cap length — the grounding enforcement point for citedSeqNums. */
+function clampCitedSeqNums(candidates: Array<number | undefined | null>, validSeqNums: Set<number>): number[] {
+  const seen = new Set<number>();
+  for (const c of candidates) {
+    if (typeof c === "number" && Number.isFinite(c) && validSeqNums.has(c)) seen.add(c);
+  }
+  return [...seen].sort((a, b) => a - b).slice(0, EXPLANATION_MAX_CITED_SEQ_NUMS);
+}
+
+function lastEventOf(sorted: HeuristicEventLike[]): HeuristicEventLike | undefined {
+  return sorted.length > 0 ? sorted[sorted.length - 1] : undefined;
+}
+
+/**
+ * Build a grounded, plain-English explanation of why a run failed, from its
+ * event trace + derived failure summary + eval results alone. Zero external
+ * config, zero LLM calls — a fixed heuristic decision tree over real data.
+ *
+ * NEVER THROWS: the entire body is wrapped in try/catch; any unexpected
+ * shape yields the "unknown" fallback (see buildUnknownFallback) rather than
+ * propagating an exception to the caller (Team A's generateRunExplanation).
+ */
+export function buildHeuristicExplanation(input: HeuristicExplanationInput): ExplanationResult {
+  try {
+    return buildHeuristicExplanationInner(input);
+  } catch {
+    return buildUnknownFallback(input);
+  }
+}
+
+function buildUnknownFallback(input: HeuristicExplanationInput): ExplanationResult {
+  let sorted: HeuristicEventLike[] = [];
+  try {
+    sorted = sanitizeAndBoundEvents(input?.events ?? []);
+  } catch {
+    sorted = [];
+  }
+  const terminal = lastEventOf(sorted);
+  const validSeqNums = realSeqNumSet(sorted);
+  return {
+    summary:
+      "We couldn't determine a specific cause for this run from its recorded trace. The available event data was insufficient, malformed, or did not match any known failure pattern.",
+    rootCause: "Unable to determine a root cause from the available trace data.",
+    citedSeqNums: clampCitedSeqNums([terminal?.sequenceNumber], validSeqNums),
+    failureClass: "unknown",
+  };
+}
+
+function buildHeuristicExplanationInner(input: HeuristicExplanationInput): ExplanationResult {
+  const run = input.run;
+  const evals = Array.isArray(input.evals) ? input.evals : [];
+  const failureSummary = input.failureSummary;
+  const sorted = sanitizeAndBoundEvents(input.events);
+  const validSeqNums = realSeqNumSet(sorted);
+  const terminal = lastEventOf(sorted);
+
+  // Guard: nothing to explain (healthy, completed run with no failed evals).
+  // Not one of the documented failure classes to invent a new one for, so we
+  // use "unknown" but with an honest, distinct message — this function is
+  // documented as "shouldn't be called" for this case, but must still return
+  // something sensible rather than throwing or fabricating a failure.
+  const hasFailedEval = evals.some((e) => e && e.passed === false);
+  if (!failureSummary?.hasFailure && !hasFailedEval && run?.status !== "failed" && !failureSummary?.isIncomplete) {
+    return {
+      summary: `This run completed with status "${String(run?.status)}" and no failure or eval failure was detected in its trace. There is nothing to explain.`,
+      rootCause: "No failure detected.",
+      citedSeqNums: clampCitedSeqNums([terminal?.sequenceNumber], validSeqNums),
+      failureClass: "unknown",
+    };
+  }
+
+  const { failureClass, evidenceEvent } = classifyFailure(input);
+
+  if (failureClass === "incomplete") {
+    return {
+      summary: `This run has no terminal event recorded yet — its last observed event is ${terminal ? `#${terminal.sequenceNumber} (${terminal.type})` : "not available"}. It is either still in progress or the SDK failed to emit a completion event.`,
+      rootCause: "The run has no RUN_COMPLETED/RUN_FAILED/RUN_CANCELLED terminal event in its trace.",
+      suggestedFix:
+        "If the agent process has actually exited, check whether the SDK's terminal-event flush ran (e.g. an uncaught exception before the finally/completion hook). Otherwise this run may simply still be in progress.",
+      citedSeqNums: clampCitedSeqNums([terminal?.sequenceNumber], validSeqNums),
+      failureClass,
+    };
+  }
+
+  if (failureClass === "tool_timeout" || failureClass === "tool_error") {
+    const primary = failureSummary?.primaryFailure ?? null;
+    const failSeq = evidenceEvent?.sequenceNumber ?? primary?.sequenceNumber;
+    const evidenceIndex = evidenceEvent ? sorted.indexOf(evidenceEvent) : -1;
+    const callId = evidenceEvent ? extractCallId(evidenceEvent.payload) : undefined;
+    const toolCallEvent =
+      evidenceIndex >= 0 ? findPrecedingToolCall(sorted, evidenceIndex, callId) : undefined;
+    const toolName = toolCallEvent ? extractToolName(toolCallEvent.payload) : undefined;
+    const errorMessage = primary?.errorMessage ?? stringField(asRecord(evidenceEvent?.payload), "message");
+    const toolLabel = toolName ? `\`${toolName}\`` : "a tool";
+    const lastSuccessEvent = evidenceIndex >= 0 ? sorted[evidenceIndex - 1] : undefined;
+
+    const stepsNote =
+      lastSuccessEvent !== undefined
+        ? `The agent had progressed to event #${lastSuccessEvent.sequenceNumber} (${lastSuccessEvent.type}) before things went wrong; `
+        : "";
+    const verb = failureClass === "tool_timeout" ? "timed out" : "failed";
+    const summary = truncateText(
+      `This run failed because the ${toolLabel} tool call ${verb}${failSeq !== undefined ? ` at event #${failSeq}` : ""}${errorMessage ? ` ("${truncateText(errorMessage, 300)}")` : ""}. ${stepsNote}the run was marked "${String(run.status)}"${terminal ? ` at event #${terminal.sequenceNumber}` : ""}.`,
+      EXPLANATION_SUMMARY_MAX_CHARS,
+    );
+    const rootCause = truncateText(
+      `The ${toolLabel} tool call ${verb}${errorMessage ? `: ${errorMessage}` : ", with no error message recorded on the event."}`,
+      EXPLANATION_ROOT_CAUSE_MAX_CHARS,
+    );
+    const suggestedFix = truncateText(
+      failureClass === "tool_timeout"
+        ? `Consider raising the timeout configured for ${toolLabel}, or adding a fallback/retry path for it.`
+        : `Check the inputs given to ${toolLabel}${failSeq !== undefined ? ` at event #${failSeq}` : ""} — the tool reported an error rather than timing out.`,
+      EXPLANATION_FIX_MAX_CHARS,
+    );
+
+    return {
+      summary,
+      rootCause,
+      suggestedFix,
+      citedSeqNums: clampCitedSeqNums(
+        [lastSuccessEvent?.sequenceNumber, toolCallEvent?.sequenceNumber, failSeq, terminal?.sequenceNumber],
+        validSeqNums,
+      ),
+      failureClass,
+    };
+  }
+
+  if (failureClass === "llm_error") {
+    const primary = failureSummary?.primaryFailure ?? null;
+    const failSeq = evidenceEvent?.sequenceNumber ?? primary?.sequenceNumber;
+    const evidenceIndex = evidenceEvent ? sorted.indexOf(evidenceEvent) : -1;
+    const requestEvent = evidenceIndex >= 0 ? findPrecedingEventOfType(sorted, evidenceIndex, "llm.request") : undefined;
+    const model = requestEvent ? extractModelLoose(requestEvent.payload) : undefined;
+    const errorMessage = primary?.errorMessage ?? stringField(asRecord(evidenceEvent?.payload), "message");
+    const modelLabel = model ? `\`${model}\`` : "the model";
+    const lastSuccessEvent = evidenceIndex >= 0 ? sorted[evidenceIndex - 1] : undefined;
+
+    const summary = truncateText(
+      `This run failed because a call to ${modelLabel} errored${failSeq !== undefined ? ` at event #${failSeq}` : ""}${errorMessage ? ` ("${truncateText(errorMessage, 300)}")` : ""}. The run was marked "${String(run.status)}"${terminal ? ` at event #${terminal.sequenceNumber}` : ""}.`,
+      EXPLANATION_SUMMARY_MAX_CHARS,
+    );
+    const rootCause = truncateText(
+      `The LLM call to ${modelLabel} errored${errorMessage ? `: ${errorMessage}` : ", with no error message recorded on the event."}`,
+      EXPLANATION_ROOT_CAUSE_MAX_CHARS,
+    );
+    const suggestedFix = truncateText(
+      `Review the request sent to ${modelLabel}${requestEvent ? ` at event #${requestEvent.sequenceNumber}` : ""} (prompt size, parameters, or provider-side incident) — the error was on the model call itself, not a tool.`,
+      EXPLANATION_FIX_MAX_CHARS,
+    );
+
+    return {
+      summary,
+      rootCause,
+      suggestedFix,
+      citedSeqNums: clampCitedSeqNums(
+        [lastSuccessEvent?.sequenceNumber, requestEvent?.sequenceNumber, failSeq, terminal?.sequenceNumber],
+        validSeqNums,
+      ),
+      failureClass,
+    };
+  }
+
+  if (failureClass === "assertion_failed") {
+    const failedEval = evals.find((e) => e && e.passed === false);
+    const evalName = failedEval?.name ?? "an eval";
+    const details = failedEval?.details;
+    const summary = truncateText(
+      `This run's execution completed (status "${String(run.status)}"), but it failed the "${evalName}" eval${details ? `: ${truncateText(details, 300)}` : "."}${terminal ? ` The run's terminal event is #${terminal.sequenceNumber}.` : ""}`,
+      EXPLANATION_SUMMARY_MAX_CHARS,
+    );
+    const rootCause = truncateText(
+      `The "${evalName}" eval reported a failure${details ? `: ${details}` : ", with no further detail recorded."}`,
+      EXPLANATION_ROOT_CAUSE_MAX_CHARS,
+    );
+    const suggestedFix = truncateText(
+      `Review the "${evalName}" rule's expected condition against this run's actual behavior${details ? ` (${details})` : ""}, and adjust either the rule or the agent to close the gap.`,
+      EXPLANATION_FIX_MAX_CHARS,
+    );
+
+    return {
+      summary,
+      rootCause,
+      suggestedFix,
+      citedSeqNums: clampCitedSeqNums([terminal?.sequenceNumber], validSeqNums),
+      failureClass,
+    };
+  }
+
+  if (failureClass === "terminal_error") {
+    const primary = failureSummary?.primaryFailure ?? null;
+    const failSeq = evidenceEvent?.sequenceNumber ?? primary?.sequenceNumber;
+    const errorMessage = primary?.errorMessage ?? stringField(asRecord(evidenceEvent?.payload), "message");
+    const evidenceIndex = evidenceEvent ? sorted.indexOf(evidenceEvent) : -1;
+    const lastSuccessEvent = evidenceIndex >= 0 ? sorted[evidenceIndex - 1] : undefined;
+
+    const summary = truncateText(
+      `This run was marked "${String(run.status)}"${failSeq !== undefined ? ` at event #${failSeq}` : ""}${errorMessage ? ` with the reported error: "${truncateText(errorMessage, 400)}"` : ", with no error message recorded on the terminal event."}`,
+      EXPLANATION_SUMMARY_MAX_CHARS,
+    );
+    const rootCause = truncateText(
+      errorMessage
+        ? `The run's terminal event reported: ${errorMessage}`
+        : `The run ended with status "${String(run.status)}" but no error message was recorded on the terminal event.`,
+      EXPLANATION_ROOT_CAUSE_MAX_CHARS,
+    );
+    const suggestedFix = errorMessage
+      ? truncateText(
+          `Investigate the reported error${failSeq !== undefined ? ` at event #${failSeq}` : ""}: "${truncateText(errorMessage, 300)}".`,
+          EXPLANATION_FIX_MAX_CHARS,
+        )
+      : undefined;
+
+    return {
+      summary,
+      rootCause,
+      ...(suggestedFix !== undefined && { suggestedFix }),
+      citedSeqNums: clampCitedSeqNums([lastSuccessEvent?.sequenceNumber, failSeq, terminal?.sequenceNumber], validSeqNums),
+      failureClass,
+    };
+  }
+
+  // failureClass === "unknown": either cannotInfer, or nothing matched.
+  return {
+    summary: failureSummary?.cannotInfer
+      ? `This run was marked "${String(run.status)}", but no failure indicators (error events, a run.failed message, or a failed eval) were found in its trace to explain why.`
+      : `We couldn't determine a specific cause for this run's "${String(run.status)}" status from its recorded trace.`,
+    rootCause: "Unable to determine a root cause from the available trace data.",
+    citedSeqNums: clampCitedSeqNums([terminal?.sequenceNumber], validSeqNums),
+    failureClass: "unknown",
+  };
+}

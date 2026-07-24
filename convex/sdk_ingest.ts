@@ -203,6 +203,13 @@ const _runEvalsThenEvaluateAlertsRef = makeFunctionReference<"action">(
   "alert_engine:runEvalsThenEvaluateAlerts",
 );
 
+// ADR-004 — "Why did this fail?" run explanations. Scheduled ALONGSIDE the
+// eval/alert wrapper above (no ordering dependency on it). See
+// convex/run_explanations.ts.
+const _generateRunExplanationRef = makeFunctionReference<"action">(
+  "run_explanations:generateRunExplanation",
+);
+
 /**
  * Throws if a payload exceeds the 10 KB inline limit (UTF-8 bytes). Applied to
  * EVERY payload with no type-based exemption: a genuine externalized pointer is a
@@ -620,6 +627,12 @@ export const sdkCreateEvents = mutation({
         // the two mutations with a real ordering guarantee (see the
         // module-level comment above).
         await ctx.scheduler.runAfter(0, _runEvalsThenEvaluateAlertsRef, { runId });
+
+        // ADR-004: schedule explanation generation only for the failure path
+        // (run.completed never gets one — see convex/run_explanations.ts).
+        if (evt.type === "run.failed") {
+          await ctx.scheduler.runAfter(0, _generateRunExplanationRef, { runId });
+        }
       }
 
       // Advance in-memory state so the next event in the batch validates against it.

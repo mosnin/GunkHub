@@ -1,5 +1,6 @@
 // Status transitions: pending -> running -> completed|failed|cancelled|timed_out
 
+import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
@@ -17,6 +18,16 @@ import { incrementUsageCounters } from "./usage.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
 import type { MutationCtx } from "./_generated/server.js";
+
+// ADR-004 — "Why did this fail?" run explanations. updateRunStatus is an
+// admin-driven terminal transition that does NOT go through convex/events.ts's
+// run.failed event path, so it must independently schedule explanation
+// generation for any transition landing on failed/timed_out/cancelled — see
+// convex/run_explanations.ts.
+const _generateRunExplanationRef = makeFunctionReference<"action">(
+  "run_explanations:generateRunExplanation",
+);
+const EXPLAINABLE_STATUSES = new Set(["failed", "timed_out", "cancelled"]);
 
 /**
  * List runs scoped to the caller's org, with optional filters.
@@ -559,6 +570,12 @@ export const updateRunStatus = mutation({
       targetId: String(args.runId),
       metadata: { from: run.status, to: args.status },
     });
+
+    // ADR-004: schedule explanation generation, NON-BLOCKING, for any
+    // admin-driven transition into a failure state.
+    if (EXPLAINABLE_STATUSES.has(args.status)) {
+      await ctx.scheduler.runAfter(0, _generateRunExplanationRef, { runId: args.runId });
+    }
 
     return await ctx.db.get(args.runId);
   },

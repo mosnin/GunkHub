@@ -754,3 +754,271 @@ describe('runEvalsForRun', () => {
     if (result.skipped) expect(result.reason).toBe('run_not_found')
   })
 })
+
+// ---------------------------------------------------------------------------
+// buildHeuristicExplanation / classifyFailure (Explainability Layer cycle 1)
+//
+// These are PURE functions (no ctx, no convex-test harness needed) — tested
+// directly against plausible event traces. Every test that checks
+// citedSeqNums also verifies each cited number is a real sequenceNumber that
+// appeared in the input `events` array (the grounding guarantee), and every
+// classification test verifies the summary text contains the actual tool
+// name / model / error text from the seeded trace, never a placeholder.
+// ---------------------------------------------------------------------------
+import { buildHeuristicExplanation, classifyFailure } from './insights'
+import type {
+  HeuristicEvalLike,
+  HeuristicEventLike,
+  HeuristicExplanationInput,
+  HeuristicFailureSummaryLike,
+  HeuristicRunLike,
+} from './insights'
+
+function assertCitedSeqNumsAreReal(citedSeqNums: number[], events: HeuristicEventLike[]) {
+  const real = new Set(events.map((e) => e.sequenceNumber))
+  for (const n of citedSeqNums) {
+    expect(real.has(n)).toBe(true)
+  }
+}
+
+describe('buildHeuristicExplanation / classifyFailure', () => {
+  it('classifies a timed-out tool call as tool_timeout, grounded in the real tool name and error text', () => {
+    const events: HeuristicEventLike[] = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      { type: 'tool.call', sequenceNumber: 12, payload: { name: 'search_docs', call_id: 'call-1', input: {} } },
+      { type: 'tool.error', sequenceNumber: 13, payload: { call_id: 'call-1', error: { message: 'search_docs timed out after 30s' } } },
+      { type: 'run.failed', sequenceNumber: 41, payload: { error: { message: 'search_docs timed out after 30s' } } },
+    ]
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 1000 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 13, type: 'tool.error', reason: 'failed_tool', errorMessage: 'search_docs timed out after 30s' },
+      allFailurePoints: [
+        { sequenceNumber: 13, type: 'tool.error', reason: 'failed_tool', errorMessage: 'search_docs timed out after 30s' },
+        { sequenceNumber: 41, type: 'run.failed', reason: 'run_failed', errorMessage: 'search_docs timed out after 30s' },
+      ],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    const classification = classifyFailure(input)
+    expect(classification.failureClass).toBe('tool_timeout')
+
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('tool_timeout')
+    expect(result.summary).toContain('search_docs')
+    expect(result.summary).toContain('timed out after 30s')
+    expect(result.summary.length).toBeLessThanOrEqual(2000)
+    expect(result.rootCause.length).toBeLessThanOrEqual(1000)
+    expect(result.suggestedFix).toBeDefined()
+    expect(result.suggestedFix!.length).toBeLessThanOrEqual(1000)
+    expect(result.citedSeqNums.length).toBeGreaterThan(0)
+    expect(result.citedSeqNums.length).toBeLessThanOrEqual(20)
+    expect(result.citedSeqNums).toContain(13)
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('classifies a non-timeout tool failure as tool_error, grounded in the real tool name', () => {
+    const events: HeuristicEventLike[] = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      { type: 'tool.call', sequenceNumber: 5, payload: { name: 'write_file', call_id: 'call-9', input: { path: '/tmp/x' } } },
+      { type: 'tool.error', sequenceNumber: 6, payload: { call_id: 'call-9', error: { message: 'permission denied' } } },
+      { type: 'run.failed', sequenceNumber: 7, payload: { error: { message: 'permission denied' } } },
+    ]
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 500 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 6, type: 'tool.error', reason: 'failed_tool', errorMessage: 'permission denied' },
+      allFailurePoints: [{ sequenceNumber: 6, type: 'tool.error', reason: 'failed_tool', errorMessage: 'permission denied' }],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('tool_error')
+    expect(result.summary).toContain('write_file')
+    expect(result.summary).toContain('permission denied')
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('classifies a failed llm.request/response pair as llm_error, grounded in the real model name', () => {
+    const events: HeuristicEventLike[] = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      { type: 'llm.request', sequenceNumber: 2, payload: { model: 'claude-sonnet-4-5', messages: [] } },
+      { type: 'llm.error', sequenceNumber: 3, payload: { error: { message: 'rate limit exceeded' } } },
+      { type: 'run.failed', sequenceNumber: 4, payload: { error: { message: 'rate limit exceeded' } } },
+    ]
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 200 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 3, type: 'llm.error', reason: 'failed_llm', errorMessage: 'rate limit exceeded' },
+      allFailurePoints: [{ sequenceNumber: 3, type: 'llm.error', reason: 'failed_llm', errorMessage: 'rate limit exceeded' }],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('llm_error')
+    expect(result.summary).toContain('claude-sonnet-4-5')
+    expect(result.summary).toContain('rate limit exceeded')
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('classifies a run with a failed eval (but otherwise clean execution) as assertion_failed, naming the eval', () => {
+    const events: HeuristicEventLike[] = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      { type: 'run.completed', sequenceNumber: 2, payload: { output: {}, duration_ms: 100 } },
+    ]
+    const run: HeuristicRunLike = { status: 'completed', startedAt: 0, endedAt: 100 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: false,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: null,
+      allFailurePoints: [],
+    }
+    const evals: HeuristicEvalLike[] = [
+      { name: 'rule:0:max_duration_ms', passed: false, details: 'Duration 2000ms exceeds the 500ms limit.' },
+    ]
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals }
+
+    const classification = classifyFailure(input)
+    expect(classification.failureClass).toBe('assertion_failed')
+
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('assertion_failed')
+    expect(result.summary).toContain('rule:0:max_duration_ms')
+    expect(result.rootCause).toContain('Duration 2000ms exceeds the 500ms limit.')
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('classifies run.failed with an error message and no other events as terminal_error', () => {
+    const events: HeuristicEventLike[] = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      { type: 'run.failed', sequenceNumber: 2, payload: { error: { message: 'unexpected crash in agent harness' } } },
+    ]
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 50 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 2, type: 'run.failed', reason: 'run_failed', errorMessage: 'unexpected crash in agent harness' },
+      allFailurePoints: [{ sequenceNumber: 2, type: 'run.failed', reason: 'run_failed', errorMessage: 'unexpected crash in agent harness' }],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('terminal_error')
+    expect(result.summary).toContain('unexpected crash in agent harness')
+    expect(result.citedSeqNums).toContain(2)
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('classifies a run with no terminal event as incomplete', () => {
+    const events: HeuristicEventLike[] = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      { type: 'tool.call', sequenceNumber: 2, payload: { name: 'search_docs', call_id: 'c1' } },
+    ]
+    const run: HeuristicRunLike = { status: 'running', startedAt: 0 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: false,
+      isIncomplete: true,
+      cannotInfer: false,
+      primaryFailure: null,
+      allFailurePoints: [],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('incomplete')
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('never throws on a hostile/partial trace and yields "unknown", still citing a real terminal event', () => {
+    const events = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      // Hostile entries: NaN sequenceNumber, non-object payload, missing fields.
+      { type: 'weird', sequenceNumber: NaN, payload: 'not-an-object' },
+      { type: 'run.failed', sequenceNumber: 2, payload: null },
+      // A prototype-pollution attempt embedded in payload — must never be touched unsafely.
+      { type: 'tool.error', sequenceNumber: 3, payload: { __proto__: { polluted: true }, call_id: 123 } },
+    ] as unknown as HeuristicEventLike[]
+    const run = { status: 'failed', startedAt: 0, endedAt: 10 } as HeuristicRunLike
+    // A hostile failureSummary: primaryFailure points at a seq number that
+    // doesn't exist in `events` at all, and has an unrecognized `reason`.
+    const failureSummary = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 9999, type: 'bogus', reason: 'not_a_real_reason' },
+      allFailurePoints: [],
+    } as unknown as HeuristicFailureSummaryLike
+    const evals = 'not-an-array' as unknown as HeuristicEvalLike[]
+    const input = { run, events, failureSummary, evals } as HeuristicExplanationInput
+
+    expect(() => buildHeuristicExplanation(input)).not.toThrow()
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('unknown')
+    expect(typeof result.summary).toBe('string')
+    expect(result.summary.length).toBeGreaterThan(0)
+    // The bogus 9999 seq number must NEVER leak into citedSeqNums (grounding guarantee).
+    expect(result.citedSeqNums).not.toContain(9999)
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events.filter((e) => Number.isFinite(e.sequenceNumber)))
+  })
+
+  it('does not throw on a completely empty/garbage input', () => {
+    expect(() =>
+      buildHeuristicExplanation({} as unknown as HeuristicExplanationInput),
+    ).not.toThrow()
+    const result = buildHeuristicExplanation({} as unknown as HeuristicExplanationInput)
+    expect(result.failureClass).toBe('unknown')
+    expect(result.citedSeqNums).toEqual([])
+  })
+
+  it('yields a sensible, non-throwing result for a completed run with no failures (guard case — should not normally be called)', () => {
+    const events: HeuristicEventLike[] = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      { type: 'run.completed', sequenceNumber: 2, payload: { output: {}, duration_ms: 10 } },
+    ]
+    const run: HeuristicRunLike = { status: 'completed', startedAt: 0, endedAt: 10 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: false,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: null,
+      allFailurePoints: [],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('unknown')
+    expect(result.summary.length).toBeGreaterThan(0)
+    expect(result.suggestedFix).toBeUndefined()
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('caps citedSeqNums at 20 even with a large, dense trace', () => {
+    const events: HeuristicEventLike[] = []
+    for (let i = 1; i <= 200; i++) {
+      events.push({ type: i % 2 === 0 ? 'tool.call' : 'tool.result', sequenceNumber: i, payload: { name: 'noisy_tool', call_id: `c${i}` } })
+    }
+    events.push({ type: 'tool.error', sequenceNumber: 201, payload: { call_id: 'c200', error: { message: 'boom' } } })
+    events.push({ type: 'run.failed', sequenceNumber: 202, payload: { error: { message: 'boom' } } })
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 1000 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 201, type: 'tool.error', reason: 'failed_tool', errorMessage: 'boom' },
+      allFailurePoints: [{ sequenceNumber: 201, type: 'tool.error', reason: 'failed_tool', errorMessage: 'boom' }],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    const result = buildHeuristicExplanation(input)
+    expect(result.citedSeqNums.length).toBeLessThanOrEqual(20)
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+})

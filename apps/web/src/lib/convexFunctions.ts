@@ -94,6 +94,7 @@ export const convex = {
     apiGetRun: makeFunctionReference<M>('read_api:apiGetRun'),
     apiGetRunEvents: makeFunctionReference<M>('read_api:apiGetRunEvents'),
     apiGetReplay: makeFunctionReference<M>('read_api:apiGetReplay'),
+    apiGetExplanation: makeFunctionReference<M>('read_api:apiGetExplanation'),
   },
   // convex/alerts.ts already exists (data agent, ADR-002/003) — the management
   // API routes wrap these directly.
@@ -128,6 +129,27 @@ export const convex = {
   usage: {
     getUsageForDay: makeFunctionReference<Q>('usage:getUsageForDay'),
     listRecentUsage: makeFunctionReference<Q>('usage:listRecentUsage'),
+  },
+  // ADR-004 — run explanations ("Why did this fail?"). Landed this cycle as
+  // convex/run_explanations.ts (Team A) — file name corrected here from an
+  // earlier `explanations:*` guess (Team E) made before that file landed.
+  // getRunExplanation(runId) -> RunExplanation | null (member-gated,
+  // org-scoped; null both when the run hasn't failed/timed_out/cancelled
+  // AND when generation hasn't completed yet — see services/explanations.ts
+  // for the "coarse null" caveat this implies for the GET route).
+  explanations: {
+    getRunExplanation: makeFunctionReference<Q>('run_explanations:getRunExplanation'),
+    // Team C (action layer) — admin-gated regeneration, backing
+    // POST /api/runs/[id]/explanation/regenerate. This is an ACTION (not a
+    // mutation) in convex/run_explanations.ts — it runs the full
+    // generate-and-validate pipeline synchronously, including the optional
+    // LLM call, so it must be invoked via `client.action(...)`, not
+    // `client.mutation(...)`. It enforces `admin` role itself
+    // (_requireAdminForRegenerate) and returns a `GenerateRunExplanationResult`
+    // status object, NOT the explanation doc — services/explanations.ts
+    // re-fetches getRunExplanation after a successful regenerate to return
+    // the fresh explanation to the route.
+    regenerateRunExplanation: makeFunctionReference<A>('run_explanations:regenerateRunExplanation'),
   },
   // Team B's analytics/insights surface (convex/insights.ts) — dashboard
   // stats, per-agent cost estimates, version-comparison cohorts, and the

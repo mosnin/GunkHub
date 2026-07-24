@@ -501,6 +501,43 @@ export default defineSchema({
     // cross-org table scan. Mirrors webhook_deliveries.by_org.
     .index("by_org", ["orgId", "createdAt"]),
 
+  // ADR-004 — run explanations ("Why did this fail?"). Cached, regeneratable
+  // (delete + insert) per run: at most ONE row per runId. NOT append-only —
+  // this is a generated/derived artifact (grounded in the immutable event
+  // log, but itself never asserted to be a fact about what happened), unlike
+  // events/evals/audit_log. Regeneration is itself audited via
+  // `run_explanation.regenerated` (convex/audit.ts) so "who asked for a
+  // fresh explanation, and when" stays visible.
+  run_explanations: defineTable({
+    orgId: v.id("organizations"),
+    runId: v.id("runs"),
+    kind: v.union(v.literal("heuristic"), v.literal("llm")),
+    summary: v.string(), // <= MAX_EXPLANATION_SUMMARY_BYTES (2 KB)
+    rootCause: v.string(), // <= MAX_EXPLANATION_ROOT_CAUSE_BYTES (1 KB)
+    suggestedFix: v.optional(v.string()), // <= MAX_EXPLANATION_SUGGESTED_FIX_BYTES (1 KB)
+    // The events (by sequenceNumber) this explanation cites. Every entry is
+    // validated at write time to correspond to a real event on this run — see
+    // convex/run_explanations.ts. <= MAX_CITED_SEQUENCE_NUMBERS (20).
+    citedSequenceNumbers: v.array(v.number()),
+    // Free-form classifier label from Team B's heuristic engine (e.g.
+    // "llm_error", "tool_error", "timeout", "unknown") — NOT a closed enum
+    // here, since Team B's classifier vocabulary can grow without a schema
+    // change.
+    failureClass: v.string(),
+    generatedAt: v.number(),
+    // Present only when kind === "llm" — the model identifier used, for audit/debugging.
+    model: v.optional(v.string()),
+    // Schema version of the explanation shape itself (RUN_EXPLANATION_SCHEMA_VERSION),
+    // so a future shape change can be detected/migrated without guessing from field presence.
+    version: v.number(),
+  })
+    // One row per run: getRunExplanation/regenerate always resolve via this
+    // index (query, take the single (at most one) match). Regenerate deletes
+    // the existing row before inserting the new one, so "at most one per
+    // runId" is maintained by write-time discipline, not a unique constraint
+    // (Convex has none) — see upsertRunExplanation.
+    .index("by_run", ["runId"]),
+
   daily_rollups: defineTable({
     orgId: v.id("organizations"),
     agentId: v.id("agents"),

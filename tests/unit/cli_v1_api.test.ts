@@ -7,6 +7,7 @@
 import {
   getRun,
   getRunEvents,
+  getRunExplanation,
   getRunReplay,
   listRuns,
   parseExportArgs,
@@ -149,6 +150,21 @@ describe('apiClient — error mapping', () => {
     )
     await getRunReplay(config, 'run_1', replayFetch)
     expect(replayFetch).toHaveBeenCalledWith(expect.stringContaining('/api/v1/runs/run_1/replay'), expect.any(Object))
+  })
+
+  it('getRunExplanation targets /api/v1/runs/:id/explanation and surfaces the { explanation } data as-is', async () => {
+    const data = { explanation: null }
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data }))
+    await expect(getRunExplanation(config, 'run_1', fetchImpl)).resolves.toEqual(data)
+    expect(fetchImpl).toHaveBeenCalledWith(expect.stringContaining('/api/v1/runs/run_1/explanation'), expect.any(Object))
+  })
+
+  it('getRunExplanation maps a 404 (run not found) to kind=not_found, exitCode=3', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(404, { error: { message: 'Run not found' } }))
+    await expect(getRunExplanation(config, 'missing', fetchImpl)).rejects.toMatchObject({
+      kind: 'not_found',
+      exitCode: 3,
+    })
   })
 })
 

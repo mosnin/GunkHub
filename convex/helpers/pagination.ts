@@ -190,3 +190,35 @@ export const EMAIL_DELIVERY_BATCH_SIZE = 50;
  * WEBHOOK_MAX_ATTEMPTS's rationale.
  */
 export const EMAIL_MAX_ATTEMPTS = 6;
+
+// ---------------------------------------------------------------------------
+// ADR-004 — run explanations ("Why did this fail?"). See
+// docs/adr/004-run-explanations.md.
+// ---------------------------------------------------------------------------
+
+/** run_explanations.summary write ceiling (plain text). */
+export const MAX_EXPLANATION_SUMMARY_BYTES = 2 * 1024;
+
+/** run_explanations.rootCause write ceiling (plain text). */
+export const MAX_EXPLANATION_ROOT_CAUSE_BYTES = 1 * 1024;
+
+/** run_explanations.suggestedFix write ceiling (plain text, optional). */
+export const MAX_EXPLANATION_SUGGESTED_FIX_BYTES = 1 * 1024;
+
+/** Write ceiling for run_explanations.citedSequenceNumbers. */
+export const MAX_CITED_SEQUENCE_NUMBERS = 20;
+
+/**
+ * Bounded event read used to build grounding context (both for the
+ * deterministic heuristic and the optional LLM prompt). Generous relative to
+ * MAX_CITED_SEQUENCE_NUMBERS — an explanation only ever cites a handful of
+ * events, but the heuristic/LLM need enough surrounding context (the last N
+ * events leading up to the terminal event) to find them.
+ */
+export const EXPLANATION_MAX_EVENTS = 500;
+
+/** Bounded read of a run's evals, for explanation grounding context. */
+export const EXPLANATION_MAX_EVALS = 100;
+
+/** Current schema version stamped on every generated run_explanations row. */
+export const RUN_EXPLANATION_SCHEMA_VERSION = 1;

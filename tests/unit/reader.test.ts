@@ -192,6 +192,58 @@ describe('FlightReader', () => {
 })
 
 // ---------------------------------------------------------------------------
+// FlightReader.getExplanation — the "explainability layer" root-cause read
+// ---------------------------------------------------------------------------
+
+describe('FlightReader.getExplanation', () => {
+  it('hits GET /api/v1/runs/:id/explanation with x-api-key auth', async () => {
+    const data = { explanation: null }
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data }))
+    const reader = new FlightReader(config, fetchImpl)
+    const result = await reader.getExplanation('run_1')
+    expect(result).toEqual(data)
+    expect(fetchImpl).toHaveBeenCalledWith(expect.stringContaining('/api/v1/runs/run_1/explanation'), {
+      headers: { 'x-api-key': 'k' },
+    })
+  })
+
+  it('resolves a full RunExplanation when one is cached', async () => {
+    const data = {
+      explanation: {
+        id: 'exp_1',
+        orgId: 'org_1',
+        runId: 'run_1',
+        kind: 'heuristic',
+        summary: 'The agent called a tool that timed out and never recovered.',
+        rootCause: 'The `lookup_order` tool call at seq=4 exceeded its timeout.',
+        suggestedFix: 'Add a retry with backoff around `lookup_order`.',
+        citedSequenceNumbers: [3, 4, 5],
+        failureClass: 'tool_error',
+        generatedAt: 1_700_000_000_000,
+        version: 1,
+      },
+    }
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data }))
+    const reader = new FlightReader(config, fetchImpl)
+    const result = await reader.getExplanation('run_1')
+    expect(result).toEqual(data)
+  })
+
+  it("resolves { explanation: null } without throwing — a successful, honest 'nothing to show yet' result, not an error", async () => {
+    const data = { explanation: null }
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data }))
+    const reader = new FlightReader(config, fetchImpl)
+    await expect(reader.getExplanation('run_1')).resolves.toEqual(data)
+  })
+
+  it('still throws V1ApiError for a genuine failure (run not found)', async () => {
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(404, { error: { message: 'Run not found' } }))
+    const reader = new FlightReader(config, fetchImpl)
+    await expect(reader.getExplanation('missing')).rejects.toMatchObject({ kind: 'not_found', message: 'Run not found' })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // FlightReader — error classes (mirrors the CLI's apiClient error mapping —
 // both share fetchV1/V1ApiError under the hood)
 // ---------------------------------------------------------------------------

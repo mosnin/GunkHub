@@ -231,3 +231,33 @@ export const apiGetReplay = mutation({
     );
   },
 });
+
+// Key-authed (read scope) counterpart to run_explanations.getRunExplanation —
+// the "Why did this fail?" root-cause for the v1 API / `afr explain`. Org is
+// derived from the key, never a client arg. Returns { explanation: null } for
+// runs that aren't in an explainable (failed/timed_out/cancelled) state or that
+// have no explanation generated yet, mirroring the Clerk-authed route's shape.
+const V1_EXPLAINABLE_STATUSES = new Set(["failed", "timed_out", "cancelled"]);
+
+export const apiGetExplanation = mutation({
+  args: { apiKeyHash: v.string(), runId: v.string() },
+  handler: async (ctx, args) => {
+    const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+    const runId = args.runId as Id<"runs">;
+    const run = await ctx.db.get(runId);
+    if (!run || run.orgId !== apiKey.orgId) {
+      throw new Error("Run not found in this organization");
+    }
+    if (!V1_EXPLAINABLE_STATUSES.has(run.status)) {
+      return { explanation: null };
+    }
+    const explanation = await ctx.db
+      .query("run_explanations")
+      .withIndex("by_run", (q) => q.eq("runId", runId))
+      .first();
+    if (!explanation || explanation.orgId !== run.orgId) {
+      return { explanation: null };
+    }
+    return { explanation };
+  },
+});

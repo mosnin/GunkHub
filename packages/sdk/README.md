@@ -453,6 +453,17 @@ for await (const event of reader.iterateEvents(run.id)) {
 // The server-computed replay projection (same derivation the web UI uses —
 // CLAUDE.md: replay is a derived projection, never stored)
 const { projection, failureSummary } = await reader.getReplay(run.id)
+
+// The root-cause explanation for a run (the "explainability layer", ADR-004)
+const { explanation } = await reader.getExplanation(run.id)
+if (explanation) {
+  console.log(explanation.failureClass, explanation.summary, explanation.rootCause)
+  console.log('cited events:', explanation.citedSequenceNumbers)
+} else {
+  // null covers BOTH "run hasn't failed" and "failed but not explained yet" —
+  // see getExplanation()'s doc / the table below for how to tell them apart.
+  console.log('nothing to show yet')
+}
 ```
 
 Record-and-read together:
@@ -481,8 +492,32 @@ See `examples/read_back.ts` for the full runnable version.
 | `getRunEvents(runId, { limit?, cursor? })` | `GET /api/v1/runs/:id/events` | `{ events, nextCursor? }` |
 | `iterateEvents(runId, { pageSize? })` | (pages `getRunEvents` transparently) | `AsyncGenerator<Event>` |
 | `getReplay(runId)` | `GET /api/v1/runs/:id/replay` | `{ projection, failureSummary }` |
+| `getExplanation(runId)` | `GET /api/v1/runs/:id/explanation` | `{ explanation: RunExplanation \| null }` |
 
 `filters` for `listRuns`: `status`, `agentId`, `environment`, `sessionId`, `limit`, `cursor` (all optional).
+
+### `getExplanation(runId)` — the "explainability layer" root-cause read (ADR-004)
+
+Fetches the cached root-cause explanation for a run. Resolves `{ explanation }`, mirroring the existing Clerk-authed `GET /api/runs/:id/explanation` exactly — `explanation` is a `RunExplanation` (`kind: 'heuristic' | 'llm'`, `summary`, `rootCause`, `suggestedFix?`, `citedSequenceNumbers`, `failureClass`, `generatedAt`, `model?` when `kind === 'llm'`) when one is cached, or `null` when there's nothing to show yet. `null` resolving is a *successful* call, not an error — never wrap this in try/catch to detect it.
+
+**Known gap (`docs/design/explanations.md` "Known gap: coarse null state"):** `null` covers BOTH "this run hasn't failed — nothing to explain" AND "this run failed but generation hasn't completed/been triggered yet." The endpoint cannot distinguish those two on its own. If you need to tell them apart, pair a `null` result with the run's own `status` (`getRun(runId)` — ADR-004 generates explanations for `'failed'` and `'timed_out'` runs):
+
+```typescript
+const [{ run }, { explanation }] = await Promise.all([reader.getRun(runId), reader.getExplanation(runId)])
+if (explanation) {
+  // ready
+} else if (run.status === 'failed' || run.status === 'timed_out') {
+  // pending — failed but not explained yet
+} else {
+  // not_failed — nothing to explain
+}
+```
+
+This is exactly what `@agent-flight-recorder/cli`'s `afr explain` does — see `packages/cli/src/commands/explain.ts`.
+
+`V1ApiError` is still thrown for genuine failures (the run doesn't exist: `kind: 'not_found'`; auth; rate limiting; network; malformed response) — exactly like every other `FlightReader` method.
+
+**Server-side status (as of this cycle):** `GET /api/v1/runs/:id/explanation` (the key-authed v1 counterpart of the already-shipped Clerk-authed `GET /api/runs/:id/explanation`) does not exist yet — this method is written against the exact same response shape that route already returns (backed by `convex/run_explanations.ts`), so wiring the v1 route should be a thin proxy with no SDK-side change required. Calling it today surfaces a `V1ApiError` with `kind: 'not_found'` until the route is registered.
 
 ### Errors
 
@@ -633,6 +668,8 @@ this pattern (including the tool-error path).
 ---
 
 ## Version
+
+v0.7.0 — `FlightReader.getExplanation(runId)`: a typed read method over the "explainability layer" root-cause endpoint (`GET /api/v1/runs/:id/explanation`, ADR-004), resolving `{ explanation: RunExplanation | null }` — mirrors the already-shipped Clerk-authed `GET /api/runs/:id/explanation` exactly, including its documented coarse-null gap (`null` means either "not failed" or "not explained yet"; pair with `getRun` to disambiguate, as `afr explain` does). New exports: `V1GetExplanationData`, `RunExplanation`, `RunExplanationKind` (re-exported from contracts). The v1 route itself does not exist yet — see the method's JSDoc for the expected contract, pending platform/data team follow-up to wire it as a thin proxy over `convex/run_explanations.ts`.
 
 v0.6.0 — Searchable error text for large failures (M4): `failRun`/`RunRecorder.fail()` now compute a short, bounded (512 char) `errorSummary` (message + top stack frame) and attach it as a sibling field on the `run.failed` payload; it is redacted like any other payload field and — critically — preserved on the `_externalized` envelope by `externalizePayloadIfLarge` when the full payload (e.g. a big stack trace) exceeds the 10 KB inline threshold, so a failure's error text stays searchable server-side regardless of payload size. New `RecorderOptions`/README security callout documenting redaction's guarantee model (regex/path-based defense in depth, not a compliance guarantee) and its known false-negatives. `FileSpool` now warns (once per path) if a second instance in the same process targets an already-open spool path.
 

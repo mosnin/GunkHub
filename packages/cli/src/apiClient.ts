@@ -20,6 +20,7 @@ import type {
   ListRunsParams,
   V1ApiErrorKind,
   V1FetchLike,
+  V1GetExplanationData,
   V1GetRunData,
   V1ListEventsData,
   V1ListRunsData,
@@ -99,7 +100,7 @@ function toApiClientError(err: unknown): never {
 // v1 response data shapes — re-exported from the SDK reader, the source of truth
 // ---------------------------------------------------------------------------
 
-export type { V1ListRunsData, V1GetRunData, V1ListEventsData, V1ReplayData, ListRunsParams, ListEventsParams }
+export type { V1ListRunsData, V1GetRunData, V1ListEventsData, V1ReplayData, V1GetExplanationData, ListRunsParams, ListEventsParams }
 
 // ---------------------------------------------------------------------------
 // Public API — thin FlightReader wrappers
@@ -141,6 +142,18 @@ export async function getRunEvents(
 export async function getRunReplay(config: ApiClientConfig, runId: string, fetchImpl?: ApiFetchLike): Promise<V1ReplayData> {
   try {
     return await new FlightReader(config, fetchImpl).getReplay(runId)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+export async function getRunExplanation(
+  config: ApiClientConfig,
+  runId: string,
+  fetchImpl?: ApiFetchLike
+): Promise<V1GetExplanationData> {
+  try {
+    return await new FlightReader(config, fetchImpl).getExplanation(runId)
   } catch (err) {
     toApiClientError(err)
   }

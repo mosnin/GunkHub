@@ -40,6 +40,8 @@ export const AUDIT_ACTIONS = [
   "alert_rule.deleted",
   "webhook.created",
   "webhook.deleted",
+  // ADR-004 — run explanations.
+  "run_explanation.regenerated",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

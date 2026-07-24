@@ -72,6 +72,14 @@ const _runEvalsThenEvaluateAlertsRef = makeFunctionReference<"action">(
   "alert_engine:runEvalsThenEvaluateAlerts",
 );
 
+// ADR-004 — "Why did this fail?" run explanations. Scheduled ALONGSIDE (not
+// as part of) the eval/alert wrapper above — explanation generation has no
+// ordering dependency on evals/alerts, and must never add latency or failure
+// risk to the ingest path. See convex/run_explanations.ts for the pipeline.
+const _generateRunExplanationRef = makeFunctionReference<"action">(
+  "run_explanations:generateRunExplanation",
+);
+
 // Applied to EVERY payload with no type-based exemption: a genuine externalized
 // pointer is tiny and passes, while a client-spoofed `type: "_externalized"` field
 // must not be a way to smuggle a large payload past the guard.
@@ -336,6 +344,14 @@ export const createEvent = mutation({
     // independent runAfter(0, ...) calls.
     if (TERMINAL_EVENT_TYPES.has(args.type)) {
       await ctx.scheduler.runAfter(0, _runEvalsThenEvaluateAlertsRef, { runId: args.runId });
+    }
+
+    // ADR-004: on a run.failed terminal event, schedule "Why did this fail?"
+    // explanation generation, NON-BLOCKING. run.completed never gets one
+    // (getRunExplanation returns null for non-failure statuses), so this is
+    // scheduled only for run.failed, not every terminal event.
+    if (args.type === "run.failed") {
+      await ctx.scheduler.runAfter(0, _generateRunExplanationRef, { runId: args.runId });
     }
 
     const event = await ctx.db.get(eventId);

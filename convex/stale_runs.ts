@@ -16,6 +16,13 @@ import type { Id } from "./_generated/dataModel.js";
 const _listStaleRuns = makeFunctionReference<"query">("stale_runs:listStaleRuns");
 const _markRunTimedOut = makeFunctionReference<"mutation">("stale_runs:markRunTimedOut");
 
+// ADR-004 — "Why did this fail?" run explanations. A stale run marked
+// timed_out never appends a run.failed event, so this cron must
+// independently schedule explanation generation — see convex/run_explanations.ts.
+const _generateRunExplanationRef = makeFunctionReference<"action">(
+  "run_explanations:generateRunExplanation",
+);
+
 export const listStaleRuns = internalQuery({
   args: {},
   handler: async (ctx) => {
@@ -45,6 +52,9 @@ export const markRunTimedOut = internalMutation({
       status: "timed_out",
       endedAt: Date.now(),
     });
+
+    // ADR-004: schedule explanation generation, NON-BLOCKING.
+    await ctx.scheduler.runAfter(0, _generateRunExplanationRef, { runId: args.runId });
   },
 });
 

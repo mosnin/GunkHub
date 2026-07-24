@@ -132,3 +132,25 @@ export async function apiGetReplay(apiKeyHash: string, runId: string): Promise<A
   }
   return { projection: result as ApiGetReplayResponse['projection'] }
 }
+
+/**
+ * v1 read-API: the run's root-cause explanation ("Why did this fail?"), keyed
+ * by a `read`-scoped API key. Returns `{ explanation: RunExplanation | null }`
+ * — null when the run isn't in an explainable state or has no explanation yet.
+ * Mirrors the Clerk-authed `GET /api/runs/[id]/explanation` shape so the SDK
+ * `FlightReader.getExplanation` / `afr explain` consume one contract.
+ */
+export async function apiGetExplanation(
+  apiKeyHash: string,
+  runId: string,
+): Promise<{ explanation: unknown }> {
+  const client = getPublicClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await withConvexTimeout(
+    client.mutation(convex.read_api.apiGetExplanation, { apiKeyHash, runId }),
+  )
+  if (result && typeof result === 'object' && 'explanation' in result) {
+    return result as { explanation: unknown }
+  }
+  return { explanation: null }
+}

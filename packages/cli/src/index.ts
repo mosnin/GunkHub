@@ -5,13 +5,15 @@
  * against a deployment via `AFR_API_KEY` / `AFR_BASE_URL` env vars (see
  * `src/env.ts`).
  *
- * `record demo` / `config check` / `version` talk to the SDK / `/api/health`
- * directly. `runs list|get`, `replay`, `tail`, and `export` talk to the
- * public v1 read API (`GET /api/v1/runs...`, see `src/apiClient.ts`) via
- * `x-api-key` auth.
+ * `init` / `record demo` / `config check` / `version` talk to the SDK /
+ * `/api/health` directly. `runs list|get`, `replay`, `tail`, `export`, and
+ * `explain` talk to the public v1 read API (`GET /api/v1/runs...`, see
+ * `src/apiClient.ts`) via `x-api-key` auth.
  */
 import { printConfigCheck, runConfigCheck } from './commands/config-check.js'
+import { EXPLAIN_HELP, parseExplainArgs, printExplain, runExplain } from './commands/explain.js'
 import { EXPORT_HELP, parseExportArgs, printExport, runExport } from './commands/export.js'
+import { INIT_HELP, parseInitArgs, printInit, runInit } from './commands/init.js'
 import { printRecordDemo, runRecordDemo } from './commands/record-demo.js'
 import { REPLAY_HELP, parseReplayArgs, printReplay, runReplay } from './commands/replay.js'
 import { RUNS_GET_HELP, parseRunsGetArgs, printRunsGet, runRunsGet } from './commands/runs-get.js'
@@ -27,6 +29,10 @@ export { runConfigCheck, printConfigCheck } from './commands/config-check.js'
 export type { ConfigCheck, ConfigCheckResult, FetchLike } from './commands/config-check.js'
 export { runRecordDemo, printRecordDemo } from './commands/record-demo.js'
 export type { RecordDemoResult } from './commands/record-demo.js'
+export { parseInitArgs, runInit, printInit, quickstartFileContents, DEFAULT_QUICKSTART_FILE } from './commands/init.js'
+export type { InitArgs, InitResult, FileExistsLike, WriteFileLike as InitWriteFileLike } from './commands/init.js'
+export { parseExplainArgs, runExplain, printExplain } from './commands/explain.js'
+export type { ExplainArgs, ExplainResult } from './commands/explain.js'
 export * from './apiClient.js'
 export { parseRunsListArgs, runRunsList, printRunsList } from './commands/runs-list.js'
 export type { RunsListArgs, RunsListResult } from './commands/runs-list.js'
@@ -47,6 +53,7 @@ Usage:
   afr <command> [subcommand] [args]
 
 Commands:
+  afr init                      Zero-to-recorded-run onboarding: check config, write a starter file, print next steps
   afr record demo              Run a small demo agent end-to-end against your configured backend
   afr config check             Validate AFR_API_KEY / AFR_BASE_URL and ping /api/health
   afr version                  Print CLI and SDK version
@@ -55,6 +62,7 @@ Commands:
   afr replay <runId>            Replay a run's event sequence as a transcript
   afr tail <runId>               Tail a run's events live
   afr export <runId>             Export a run's run/events/replay bundle
+  afr explain <runId>            Root-cause explanation for a run — failure class, summary, root cause, suggested fix
 
 Run 'afr <command> --help' for command-specific options.
 
@@ -102,6 +110,32 @@ export async function main(argv: string[], log: (line: string) => void = console
       }
       log(`Unknown 'config' subcommand: ${subcommand ?? '(none)'}. Try 'afr config check'.`)
       return 1
+    }
+
+    case 'init': {
+      const args = parseInitArgs(afterCommand)
+      if (args.help) {
+        log(INIT_HELP)
+        return 0
+      }
+      const result = await runInit(args)
+      printInit(result, log)
+      return result.exitCode
+    }
+
+    case 'explain': {
+      const args = parseExplainArgs(afterCommand)
+      if (args.help) {
+        log(EXPLAIN_HELP)
+        return 0
+      }
+      if (!args.runId) {
+        log("Usage: afr explain <runId>. Run 'afr explain --help' for details.")
+        return 1
+      }
+      const result = await runExplain(args.runId)
+      printExplain(args, result, log)
+      return result.ok ? 0 : result.exitCode
     }
 
     case 'record': {

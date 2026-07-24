@@ -23,7 +23,7 @@ import { warnIfInsecureEndpoint } from './transport.js'
 import { fetchV1, V1ApiError } from './v1-client.js'
 
 import type { V1ApiConfig, V1FetchLike } from './v1-client.js'
-import type { Event, FailureSummary, ReplayProjection, Run, RunStatus } from '@agent-flight-recorder/contracts'
+import type { Event, FailureSummary, ReplayProjection, Run, RunExplanation, RunStatus } from '@agent-flight-recorder/contracts'
 
 // ---------------------------------------------------------------------------
 // v1 response data shapes (entity types reused from contracts — read-only)
@@ -51,6 +51,30 @@ export interface V1ListEventsData {
 export interface V1ReplayData {
   projection: ReplayProjection
   failureSummary: FailureSummary
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/runs/:id/explanation — the "explainability layer" root-cause
+// read (ADR-004, `docs/adr/004-run-explanations.md`). See getExplanation()
+// below for the full contract writeup, including the known coarse-null gap.
+// ---------------------------------------------------------------------------
+
+/**
+ * Response shape for the run-explanation read, mirroring the existing
+ * Clerk-authed `GET /api/runs/:id/explanation`
+ * (`apps/web/app/api/runs/[id]/explanation/route.ts`) exactly: `explanation`
+ * is `null` when there is nothing to show yet.
+ *
+ * **Known gap (`docs/design/explanations.md` "Known gap: coarse null
+ * state"):** `null` covers BOTH "this run hasn't failed — nothing to
+ * explain" AND "this run failed but generation hasn't completed/been
+ * triggered yet." This shape cannot distinguish them on its own — pair a
+ * `null` result with the run's own `status` (e.g. via {@link
+ * FlightReader.getRun}) if you need to tell those two apart, the same way
+ * `@agent-flight-recorder/cli`'s `afr explain` does.
+ */
+export interface V1GetExplanationData {
+  explanation: RunExplanation | null
 }
 
 export interface ListRunsParams {
@@ -224,5 +248,41 @@ export class FlightReader {
    */
   getReplay(runId: string): Promise<V1ReplayData> {
     return fetchV1<V1ReplayData>(this.config, `/api/v1/runs/${encodeURIComponent(runId)}/replay`, {}, this.fetchImpl)
+  }
+
+  /**
+   * Fetch the cached root-cause explanation for a run — ADR-004's
+   * "explainability layer" (CLAUDE.md's v1 outcome: "make failures
+   * explainable"). Mirrors {@link getReplay}: a GET against a v1 read
+   * endpoint, `x-api-key` auth, `{ apiVersion, data }` envelope.
+   *
+   * Resolves `{ explanation }`, where `explanation` is `null` when there is
+   * nothing to show yet — see {@link V1GetExplanationData}'s doc for the
+   * documented coarse-null gap (it cannot distinguish "run hasn't failed"
+   * from "failed but not explained yet" on its own). This is a *successful*
+   * resolution, not an error — never throws for a `null` result. `V1ApiError`
+   * is still thrown for genuine failures (the run does not exist:
+   * `kind: 'not_found'`; auth; rate limiting; network; malformed response).
+   *
+   * **Server-side status (as of this cycle):** `GET /api/v1/runs/:id/explanation`
+   * (the key-authed v1 counterpart of the already-shipped Clerk-authed
+   * `GET /api/runs/:id/explanation`) does not exist yet — this method is
+   * written against the exact same response shape that route already
+   * returns (`{ explanation: RunExplanation | null }`, backed by
+   * `convex/run_explanations.ts`), so wiring the v1 route should be a thin
+   * proxy with no SDK-side change required once it exists. Calling this
+   * today surfaces a `V1ApiError` with `kind: 'not_found'` (no route
+   * registered) until then.
+   *
+   * @param runId - the run's id.
+   * @throws {@link V1ApiError} on any auth/not-found/rate-limit/server/network/parse failure.
+   */
+  getExplanation(runId: string): Promise<V1GetExplanationData> {
+    return fetchV1<V1GetExplanationData>(
+      this.config,
+      `/api/v1/runs/${encodeURIComponent(runId)}/explanation`,
+      {},
+      this.fetchImpl
+    )
   }
 }
