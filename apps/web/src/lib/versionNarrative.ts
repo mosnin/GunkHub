@@ -19,17 +19,19 @@
  *   2. The "most common new failure class" clause (the `tool_timeout on
  *      search_docs` part of the brief's example narrative) is INCLUDED ONLY
  *      IF the caller supplies `failureClassCounts` (and, for the "on X" tool
- *      detail, `failureClassExamples`) on BOTH cohorts. As of this cycle,
- *      `compareVersions` does NOT expose a per-version failure-class
- *      breakdown — it only returns `countsByStatus` (pending/running/
- *      completed/failed/cancelled/timed_out), not a breakdown of *why* the
- *      failed ones failed. See the route file and this cycle's report for
- *      the exact ask to Team B: a `failureClassCounts` map per cohort,
- *      sourced from the already-stored `run_explanations.failureClass`
- *      field (convex/insights.ts's `HeuristicFailureClass` union — see
- *      run_explanations.ts / insights.ts `classifyFailure`), grouped by
- *      `agentVersionId`. Until that lands, this module still produces a
- *      complete, honest narrative — just without the failure-class clause.
+ *      detail, `failureClassExamples`) on BOTH cohorts.
+ *
+ * Cycle 3 update: `narrativeInputFromComparison` (below) now reads
+ * `raw.versionA.failureClassCounts` / `raw.versionB.failureClassCounts`
+ * (plus the parallel `failureClassExamples` map) directly off each cohort,
+ * per Team B's cycle-3 addition to `compareVersions`'s `VersionCohortSummary`
+ * (`convex/insights.ts`) — a per-version breakdown of `HeuristicFailureClass`
+ * counts sourced from `run_explanations.failureClass`, grouped by
+ * `agentVersionId`. The fields are OPTIONAL on `RawVersionCohort` precisely
+ * because they are optional at the Convex layer too (an older cached
+ * `compareVersions` response, or a cohort with zero failed runs to classify,
+ * may omit them) — this module still produces a complete, honest narrative
+ * without the failure-class clause whenever either side is missing.
  */
 
 // ---------------------------------------------------------------------------
@@ -103,6 +105,15 @@ export interface VersionNarrativeResult {
 export interface RawVersionCohort {
   version: string
   sampleSize: number
+  /**
+   * Team B's cycle-3 addition to `VersionCohortSummary` — per-version
+   * `HeuristicFailureClass` counts. Optional: a cohort with zero classified
+   * failures (or an older response predating this field) omits it. Treated
+   * as opaque strings here, same as `VersionNarrativeCohort.failureClassCounts`.
+   */
+  failureClassCounts?: Record<string, number>
+  /** Optional per-class representative detail (e.g. a tool name), same shape as `VersionNarrativeCohort.failureClassExamples`. */
+  failureClassExamples?: Record<string, string>
 }
 
 export interface RawCohortComparison {
@@ -119,12 +130,14 @@ export interface RawVersionComparison {
 
 /**
  * Adapts a raw `compareVersions` result into `VersionNarrativeInput`.
- * `failureClassCounts` / `failureClassExamples` are deliberately NOT
- * populated: `compareVersions` does not expose a per-version failure-class
- * breakdown as of this cycle (see this file's header — the ask to Team B).
- * When it does, wire it through here; `buildVersionNarrative` already
- * supports it and will include the failure-class clause automatically once
- * both cohorts carry non-undefined counts.
+ * `failureClassCounts` / `failureClassExamples` are passed through verbatim
+ * from each cohort — never synthesized, never defaulted to `{}` when the
+ * source field is `undefined` (see `VersionNarrativeCohort.failureClassCounts`'s
+ * doc: `{}` and `undefined` are different, non-interchangeable claims).
+ * `buildVersionNarrative` only activates the failure-class clause when BOTH
+ * cohorts carry a non-undefined map, so an older/partial `compareVersions`
+ * response (one side missing the field) still yields a complete, honest
+ * narrative without that clause.
  */
 export function narrativeInputFromComparison(raw: RawVersionComparison): VersionNarrativeInput {
   return {
@@ -132,11 +145,23 @@ export function narrativeInputFromComparison(raw: RawVersionComparison): Version
       version: raw.versionA.version,
       sampleSize: raw.versionA.sampleSize,
       failureRate: raw.comparison.failureRate.a,
+      ...(raw.versionA.failureClassCounts !== undefined && {
+        failureClassCounts: raw.versionA.failureClassCounts,
+      }),
+      ...(raw.versionA.failureClassExamples !== undefined && {
+        failureClassExamples: raw.versionA.failureClassExamples,
+      }),
     },
     versionB: {
       version: raw.versionB.version,
       sampleSize: raw.versionB.sampleSize,
       failureRate: raw.comparison.failureRate.b,
+      ...(raw.versionB.failureClassCounts !== undefined && {
+        failureClassCounts: raw.versionB.failureClassCounts,
+      }),
+      ...(raw.versionB.failureClassExamples !== undefined && {
+        failureClassExamples: raw.versionB.failureClassExamples,
+      }),
     },
     significance: raw.comparison.failureRateSignificance,
   }

@@ -415,6 +415,76 @@ describe('compareVersions', () => {
       }),
     ).rejects.toThrow(/NOT_FOUND|not found/i)
   })
+
+  // Cycle 3 (Team B, deferred enhancement): per-cohort failureClassCounts,
+  // sourced from run_explanations.by_run, reusing the cohort run collection
+  // (a.runIds/b.runIds) rather than re-scanning `runs`. Powers Team C's
+  // narrativeInputFromComparison "most common new failure class" clause.
+  it('groups per-cohort run_explanations.failureClass, omits runs with no explanation, and is immune to a mismatched-org explanation row', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectA, agentA, versionA } = await seedTwoOrgs(t)
+    const versionB = await t.run((ctx) =>
+      ctx.db.insert('agent_versions', { agentId: agentA, orgId: orgA, version: 'v2', createdAt: Date.now() }),
+    )
+
+    const { runIdsA, runIdsB } = await t.run(async (ctx) => {
+      const now = Date.now()
+      const runIdsA = []
+      for (let i = 0; i < 3; i++) {
+        const startedAt = now - (3 - i) * 1000
+        runIdsA.push(
+          await ctx.db.insert('runs', {
+            orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionA,
+            status: 'failed', startedAt, endedAt: startedAt + 500, metadata: {}, tags: [],
+          }),
+        )
+      }
+      const runIdsB = []
+      for (let i = 0; i < 2; i++) {
+        const startedAt = now - (2 - i) * 1000
+        runIdsB.push(
+          await ctx.db.insert('runs', {
+            orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionB,
+            status: 'failed', startedAt, endedAt: startedAt + 500, metadata: {}, tags: [],
+          }),
+        )
+      }
+      return { runIdsA, runIdsB }
+    })
+
+    await t.run(async (ctx) => {
+      const now = Date.now()
+      const base = {
+        kind: 'heuristic' as const,
+        summary: 's', rootCause: 'r', citedSequenceNumbers: [], generatedAt: now, version: 1,
+      }
+      // Version A cohort: two tool_timeout explanations. runIdsA[2] is
+      // deliberately left WITHOUT an explanation row -> must not be counted
+      // (honest sample, not an exhaustive classification).
+      await ctx.db.insert('run_explanations', { ...base, orgId: orgA, runId: runIdsA[0], failureClass: 'tool_timeout' })
+      await ctx.db.insert('run_explanations', { ...base, orgId: orgA, runId: runIdsA[1], failureClass: 'tool_timeout' })
+
+      // CROSS-ORG ISOLATION (defense-in-depth): a corrupted/mismatched-org
+      // row physically pointing at runIdsA[2] (a real org-A run) but stamped
+      // with org B's id — simulating a bug elsewhere in the write path. The
+      // belt-and-suspenders `row.orgId !== orgId` check in
+      // collectFailureClassCounts must reject it, so it contributes NOTHING
+      // to org A's cohort counts (not even under "unknown").
+      await ctx.db.insert('run_explanations', { ...base, orgId: orgB, runId: runIdsA[2], failureClass: 'unknown' })
+
+      // Version B cohort: one tool_error explanation.
+      await ctx.db.insert('run_explanations', { ...base, orgId: orgA, runId: runIdsB[0], failureClass: 'tool_error' })
+    })
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const result = await asAdmin.query(api.insights.compareVersions, {
+      orgId: orgA, agentVersionIdA: versionA, agentVersionIdB: versionB,
+    })
+
+    expect(result.versionA.failureClassCounts).toEqual({ tool_timeout: 2 })
+    expect(result.versionA.failureClassCounts.unknown).toBeUndefined()
+    expect(result.versionB.failureClassCounts).toEqual({ tool_error: 1 })
+  })
 })
 
 describe('listEvalsForVersion', () => {
@@ -1409,6 +1479,177 @@ describe('buildHeuristicExplanation / classifyFailure', () => {
 
     const result = buildHeuristicExplanation(input)
     expect(result.citedSeqNums.length).toBeLessThanOrEqual(20)
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  // -------------------------------------------------------------------------
+  // Explainability Layer cycle 3 (Team B): ADVERSARIAL grounding audit.
+  //
+  // Each case below feeds buildHeuristicExplanation an actively hostile or
+  // degenerate input and asserts THREE invariants from the GROUNDING
+  // GUARANTEE doc comment: (1) it never throws, (2) citedSeqNums never
+  // contains a sequenceNumber absent from the real `events` array, and (3)
+  // no tool name / model name / error text appears in the output that wasn't
+  // read from the real trace.
+  // -------------------------------------------------------------------------
+
+  it('ADVERSARIAL: a payload with __proto__ and constructor keys is read tolerantly and never causes prototype pollution or a throw', () => {
+    const events = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      {
+        type: 'tool.call',
+        sequenceNumber: 2,
+        payload: JSON.parse('{"name":"real_tool","call_id":"c1","__proto__":{"polluted":true},"constructor":{"prototype":{"polluted":true}}}'),
+      },
+      {
+        type: 'tool.error',
+        sequenceNumber: 3,
+        payload: JSON.parse('{"call_id":"c1","__proto__":{"message":"should not be read as a message"},"constructor":"not-a-function","error":{"message":"real tool error text","__proto__":{"message":"fake nested message"}}}'),
+      },
+      { type: 'run.failed', sequenceNumber: 4, payload: { error: { message: 'real tool error text' } } },
+    ] as unknown as HeuristicEventLike[]
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 100 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 3, type: 'tool.error', reason: 'failed_tool', errorMessage: 'real tool error text' },
+      allFailurePoints: [{ sequenceNumber: 3, type: 'tool.error', reason: 'failed_tool', errorMessage: 'real tool error text' }],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    expect(() => buildHeuristicExplanation(input)).not.toThrow()
+    const result = buildHeuristicExplanation(input)
+    // JSON.parse never actually sets Object.prototype's own polluted key (the
+    // "__proto__" string key in a JSON object literal is just an own data
+    // property here, not the exotic accessor), but the assertion below proves
+    // the shared Object.prototype was never mutated as a side effect of
+    // reading these payloads regardless.
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined()
+    expect(result.failureClass).toBe('tool_error')
+    expect(result.summary).toContain('real_tool')
+    expect(result.summary).toContain('real tool error text')
+    expect(result.summary).not.toContain('fake nested message')
+    expect(result.summary).not.toContain('should not be read as a message')
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('ADVERSARIAL: a 1MB event payload does not throw, does not get echoed verbatim, and stays within the documented length caps', () => {
+    const hugeString = 'x'.repeat(1024 * 1024) // 1MB
+    const events: HeuristicEventLike[] = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      { type: 'tool.call', sequenceNumber: 2, payload: { name: 'big_payload_tool', call_id: 'c1', input: { blob: hugeString } } },
+      { type: 'tool.error', sequenceNumber: 3, payload: { call_id: 'c1', error: { message: `boom: ${hugeString}` } } },
+      { type: 'run.failed', sequenceNumber: 4, payload: { error: { message: `boom: ${hugeString}` } } },
+    ]
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 100 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 3, type: 'tool.error', reason: 'failed_tool', errorMessage: `boom: ${hugeString}` },
+      allFailurePoints: [{ sequenceNumber: 3, type: 'tool.error', reason: 'failed_tool', errorMessage: `boom: ${hugeString}` }],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    expect(() => buildHeuristicExplanation(input)).not.toThrow()
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('tool_error')
+    expect(result.summary).toContain('big_payload_tool')
+    // The huge error text is truncated, never echoed in full -> the caps
+    // documented on ExplanationResult must hold even for a 1MB source field.
+    expect(result.summary.length).toBeLessThanOrEqual(2000)
+    expect(result.rootCause.length).toBeLessThanOrEqual(1000)
+    expect(result.suggestedFix!.length).toBeLessThanOrEqual(1000)
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('ADVERSARIAL: negative, NaN, and duplicate sequence numbers never throw and never corrupt citedSeqNums grounding', () => {
+    const events = [
+      { type: 'run.started', sequenceNumber: -5, payload: {} }, // negative but finite -> a real (if unusual) seq number
+      { type: 'tool.call', sequenceNumber: 2, payload: { name: 'flaky_tool', call_id: 'c1' } },
+      { type: 'tool.call', sequenceNumber: 2, payload: { name: 'flaky_tool', call_id: 'c1' } }, // duplicate seqNum: same call re-delivered
+      { type: 'weird', sequenceNumber: NaN, payload: { name: 'should_never_appear' } }, // dropped by sanitizeAndBoundEvents
+      { type: 'tool.error', sequenceNumber: 3, payload: { call_id: 'c1', error: { message: 'flaky_tool exploded' } } },
+      { type: 'run.failed', sequenceNumber: 4, payload: { error: { message: 'flaky_tool exploded' } } },
+    ] as unknown as HeuristicEventLike[]
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 100 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 3, type: 'tool.error', reason: 'failed_tool', errorMessage: 'flaky_tool exploded' },
+      allFailurePoints: [{ sequenceNumber: 3, type: 'tool.error', reason: 'failed_tool', errorMessage: 'flaky_tool exploded' }],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    expect(() => buildHeuristicExplanation(input)).not.toThrow()
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('tool_error')
+    expect(result.summary).toContain('flaky_tool')
+    expect(result.summary).not.toContain('should_never_appear')
+    // NaN is not a "real" sequenceNumber for grounding purposes -> must never appear cited.
+    expect(result.citedSeqNums.every((n) => Number.isFinite(n))).toBe(true)
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events.filter((e) => Number.isFinite(e.sequenceNumber)))
+  })
+
+  it('ADVERSARIAL: a failureSummary pointing at a completely nonexistent seqNum never leaks that number into citedSeqNums', () => {
+    const events: HeuristicEventLike[] = [
+      { type: 'run.started', sequenceNumber: 1, payload: {} },
+      { type: 'run.failed', sequenceNumber: 2, payload: { error: { message: 'real failure' } } },
+    ]
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 100 }
+    // primaryFailure cites seq 500000, which never appears in `events`.
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 500000, type: 'tool.error', reason: 'failed_tool', errorMessage: 'a lie about a tool that never ran' },
+      allFailurePoints: [{ sequenceNumber: 500000, type: 'tool.error', reason: 'failed_tool', errorMessage: 'a lie about a tool that never ran' }],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    expect(() => buildHeuristicExplanation(input)).not.toThrow()
+    const result = buildHeuristicExplanation(input)
+    expect(result.citedSeqNums).not.toContain(500000)
+    assertCitedSeqNumsAreReal(result.citedSeqNums, events)
+  })
+
+  it('ADVERSARIAL: an empty events array never throws and yields no citations', () => {
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 100 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 3, type: 'tool.error', reason: 'failed_tool', errorMessage: 'orphaned failure summary, no matching event' },
+      allFailurePoints: [{ sequenceNumber: 3, type: 'tool.error', reason: 'failed_tool', errorMessage: 'orphaned failure summary, no matching event' }],
+    }
+    const input: HeuristicExplanationInput = { run, events: [], failureSummary, evals: [] }
+
+    expect(() => buildHeuristicExplanation(input)).not.toThrow()
+    const result = buildHeuristicExplanation(input)
+    expect(result.citedSeqNums).toEqual([])
+    expect(typeof result.summary).toBe('string')
+    expect(result.summary.length).toBeGreaterThan(0)
+  })
+
+  it('ADVERSARIAL: a run whose only event is the terminal marker itself never throws and cites only that real event', () => {
+    const events: HeuristicEventLike[] = [{ type: 'run.failed', sequenceNumber: 1, payload: { error: { message: 'immediate failure, nothing else ran' } } }]
+    const run: HeuristicRunLike = { status: 'failed', startedAt: 0, endedAt: 5 }
+    const failureSummary: HeuristicFailureSummaryLike = {
+      hasFailure: true,
+      isIncomplete: false,
+      cannotInfer: false,
+      primaryFailure: { sequenceNumber: 1, type: 'run.failed', reason: 'run_failed', errorMessage: 'immediate failure, nothing else ran' },
+      allFailurePoints: [{ sequenceNumber: 1, type: 'run.failed', reason: 'run_failed', errorMessage: 'immediate failure, nothing else ran' }],
+    }
+    const input: HeuristicExplanationInput = { run, events, failureSummary, evals: [] }
+
+    expect(() => buildHeuristicExplanation(input)).not.toThrow()
+    const result = buildHeuristicExplanation(input)
+    expect(result.failureClass).toBe('terminal_error')
+    expect(result.summary).toContain('immediate failure, nothing else ran')
+    expect(result.citedSeqNums).toEqual([1])
     assertCitedSeqNumsAreReal(result.citedSeqNums, events)
   })
 })

@@ -261,6 +261,52 @@ alerting and webhook/email delivery actually live end to end: terminal event
 `email_deliveries` row → drained by the per-minute crons above. See
 `docs/api_reference.md` §3 for the outbound delivery contract this produces.
 
+**Run explanation lifecycle ("Why did this fail?", ADR-004 — also not a
+cron, an inline scheduler call):** the same terminal-transition paths that
+schedule alert evaluation above also schedule
+`ctx.scheduler.runAfter(0, ...)` against `run_explanations:generateRunExplanation`
+whenever a run lands in `failed`, `timed_out`, or `cancelled` — the
+`run.failed` terminal event (`convex/events.ts`, `convex/sdk_ingest.ts`), an
+admin's `updateRunStatus` call, and the `expire-stale-runs` cron above (a run
+that cron transitions to `timed_out` gets an explanation scheduled the same
+way a directly-failed run does). Generation is non-blocking relative to
+whatever mutation/cron scheduled it, and never runs for `completed` or
+still-active runs — `getRunExplanation` returns `null` for those rather than
+a placeholder.
+
+Each generation:
+
+1. Computes a deterministic `FailureSummary` from the run's own event log
+   (`convex/helpers/failure_summary.ts`, a dependency-free mirror of
+   `apps/web/src/lib/replay/failure.ts` — Convex cannot import across the
+   `apps/web` boundary) plus its evals.
+2. ALWAYS computes `buildHeuristicExplanation` (`convex/insights.ts`) first
+   — zero-config, deterministic, and the result that ships whenever no LLM
+   provider is configured or the LLM path is skipped/discarded.
+3. Optionally also calls a configured `ExplanationLLM`
+   (`convex/helpers/llm_provider.ts` — `NoopExplanationLLM` by default,
+   `HttpExplanationLLM` when `AFR_LLM_PROVIDER=http`) with a grounding prompt
+   listing only the run's real `sequenceNumber`s, fenced with an
+   `UNTRUSTED_TRACE_DATA` delimiter around every agent/tool-controlled
+   string (event excerpts, failure reason/message) — `neutralizeTraceMarkers`
+   strips any literal occurrence of the fence markers from that content first
+   so trace data can never forge a fake close/reopen of the fence.
+4. Validates any LLM result via `validateCitedSeqNums` — citations not
+   present in the run's own event window are stripped — and discards the LLM
+   result entirely (falling back to the heuristic) unless what remains cites
+   at least one real event and has a non-empty summary/root cause. This is
+   the unconditional grounding guarantee: no stored explanation, from either
+   path, can cite a fabricated event.
+5. Stores one row per run in `run_explanations` (delete-then-insert
+   regeneration, not append-only — a generated artifact *about* the
+   immutable event log, not an observation recorded *into* it) and audits
+   every regeneration (`run_explanation.regenerated` in `audit_log`).
+
+`regenerateRunExplanation` (admin-gated action, `POST
+/api/runs/[id]/explanation/regenerate`) re-runs this same pipeline
+synchronously on demand. See `docs/adr/004-run-explanations.md` and
+`docs/design/explanations.md` for the full threat model and HTTP surface.
+
 ---
 
 ## 9. Sampling and Its Effect on Rollups, Alerts, and Usage Counters

@@ -236,6 +236,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
           explanation={explanation}
           loadFailed={explanationFailed}
           isAdmin={isAdmin}
+          runEndedAt={run.endedAt}
         />
       )}
 

@@ -251,6 +251,45 @@ replay view — CLAUDE.md: replay is a derived projection, never stored).
 }
 ```
 
+#### `GET /api/v1/runs/{runId}/explanation`
+
+The "Why did this fail?" root-cause explanation (ADR-004), for the `afr
+explain` CLI command and `FlightReader.getExplanation` (SDK). Requires the
+`read` scope, same as every other v1 endpoint above.
+
+```json
+{
+  "apiVersion": "2026-07-19",
+  "data": {
+    "explanation": {
+      "kind": "heuristic",
+      "summary": "The run failed after 3 consecutive tool_error events calling search_docs.",
+      "rootCause": "search_docs returned a 500 starting at sequence 14 and never recovered.",
+      "suggestedFix": "Check search_docs's upstream health before retrying this agent version.",
+      "citedSequenceNumbers": [12, 14, 17],
+      "failureClass": "tool_error",
+      "generatedAt": 1753315200000
+    }
+  },
+  "requestId": "req_abc123"
+}
+```
+
+`data.explanation` is `null` (not an error) when the run is not in an
+explainable status (`failed` / `timed_out` / `cancelled`) or generation
+hasn't completed yet. This v1 (`x-api-key`) response does not currently
+carry the `status: "not_eligible" | "pending" | "ready"` discriminant the
+Clerk-authed `GET /api/runs/[id]/explanation` route now returns (see
+`docs/design/explanations.md`) — `convex/read_api.ts`'s `apiGetExplanation`
+would need the same discriminant added to close this gap for API-key
+callers too. `kind` is `"heuristic"` (always available,
+zero-config, deterministic) or `"llm"` (only present when an LLM provider is
+configured and its result passed grounding validation — see ADR-004).
+`citedSequenceNumbers` are real `sequenceNumber`s from this run's own event
+log; every number in that array is guaranteed to correspond to a real event
+this key's org can already read via `GET /api/v1/runs/{runId}/events` — no
+citation in a stored explanation can point to a fabricated event.
+
 ### Rate limits
 
 The v1 read API uses its own key-bucketed rate class, keyed by a hash
@@ -361,6 +400,55 @@ curl -s -X POST "https://your-afr-host/api/webhooks-config" \
   -d '{ "url": "https://example.com/hook", "events": ["run.failed", "run.completed"] }'
 # => { "webhook": { "id": "...", "url": "...", "secret": "<64-hex-chars, save this now>", ... } }
 ```
+
+### Version comparison & narrative
+
+`GET /api/agents/{agentId}/versions/compare?a={versionIdA}&b={versionIdB}&explain=1`
+
+Clerk-session authenticated, any org member. Wraps `convex/insights.ts`
+`compareVersions` (the "did version B regress vs version A" cohort
+comparison) and, only when `explain=1` is present, additionally builds a
+grounded plain-English narrative (`apps/web/src/lib/versionNarrative.ts`).
+Both `versionA`/`versionB` must belong to the `{agentId}` in the path — this
+is checked as defense-in-depth on top of `compareVersions`'s own check that
+the two version IDs share an agent with each other, so a caller cannot use a
+version ID from a different agent to pull cross-agent data through this
+URL shape.
+
+Accepts both `a`/`b` and `versionA`/`versionB` query param names (a
+compatibility shim for two params guessed independently before this route's
+contract was finalized); `a`/`b` win if both pairs are somehow present.
+
+```json
+{
+  "agentId": "agent_1",
+  "versionA": { "id": "ver_a", "version": "1.4", "sampleSize": 120, "...": "..." },
+  "versionB": { "id": "ver_b", "version": "1.5", "sampleSize": 100, "...": "..." },
+  "comparison": { "failureRate": { "a": 0.08, "b": 0.34, "...": "..." }, "...": "..." },
+  "verdict": "regression",
+  "narrative": "v1.5 fails 34% vs v1.4's 8% (likely regression, p<0.05). The most common new failure class is tool_timeout on search_docs.",
+  "narrativeDetail": {
+    "significance": "likely_regression",
+    "usedFailureClassBreakdown": true,
+    "citedFailureClass": "tool_timeout"
+  }
+}
+```
+
+`verdict`/`narrative`/`narrativeDetail` are present only when `explain=1` is
+passed — omitting it returns just the raw `agentId`/`versionA`/`versionB`/
+`comparison` passthrough, for callers that only want the cohort numbers.
+`narrative` never states a failure class or "on `<tool>`" detail that wasn't
+present in `compareVersions`'s own per-version `failureClassCounts` /
+`failureClassExamples` (added to `VersionCohortSummary` this cycle) — an
+`insufficient_data` or `inconclusive` `narrativeDetail.significance` always
+yields an honest "not enough data" / "not statistically significant"
+narrative rather than a fabricated cause, and `usedFailureClassBreakdown` is
+`false` whenever either cohort is missing the breakdown (e.g. a cohort with
+no classified failures, or a `compareVersions` response predating this
+field). Errors: `404 NOT_FOUND` for an unknown/cross-org/cross-agent version
+ID, `422 INVALID_ARGUMENT` if the two versions don't share an agent,
+`401`/`403` for missing auth / non-member.
 
 ---
 

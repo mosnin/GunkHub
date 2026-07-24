@@ -108,6 +108,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
   const [jumpTargetId, setJumpTargetId] = useState<string | null>(null)
   const rowRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const didInitialJumpRef = useRef(false)
+  const didFocusJumpTargetRef = useRef(false)
   const citedSet = new Set(citedSequenceNumbers ?? [])
 
   // Keep a stable ref to extraEvents for use inside the polling effect closure
@@ -245,6 +246,11 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
 
   // Scroll the jump target into view once its row exists in the rendered
   // window (re-runs as windowStart settles). Respects prefers-reduced-motion.
+  // Also moves real DOM focus onto the row's toggle button — arriving here
+  // is a full page navigation from a cited-event link in ExplanationPanel,
+  // so a keyboard or screen-reader user needs their focus relocated, not
+  // just a visual highlight/scroll that only a sighted mouse user benefits
+  // from.
   useEffect(() => {
     if (!jumpTargetId) return
     const el = rowRefs.current[jumpTargetId]
@@ -252,6 +258,13 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
     const prefersReduced =
       typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
     el.scrollIntoView({ behavior: prefersReduced ? 'auto' : 'smooth', block: 'center' })
+    if (!didFocusJumpTargetRef.current) {
+      const btn = el.querySelector('button')
+      if (btn instanceof HTMLElement) {
+        btn.focus({ preventScroll: true })
+        didFocusJumpTargetRef.current = true
+      }
+    }
   }, [jumpTargetId, windowStart])
 
   if (loading) {
@@ -346,7 +359,7 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
             title={followTail ? 'Following tail — click to pause' : 'Tail paused — click to resume'}
           >
             {followTail && (
-              <span className="w-1.5 h-1.5 rounded-full bg-neon-glow animate-neon-pulse" aria-hidden="true" />
+              <span className="w-1.5 h-1.5 rounded-full bg-neon-glow animate-neon-pulse forced-colors:bg-[Highlight]" aria-hidden="true" />
             )}
             <span>{followTail ? 'live' : 'paused'}</span>
           </button>

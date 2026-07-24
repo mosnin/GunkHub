@@ -21,6 +21,23 @@ const REPO_ROOT = path.join(__dirname, '..')
 // Convex table name → contracts interface name.
 // Only tables with a corresponding public contract type are listed here.
 // Internal-only tables (user_memberships, api_keys) are intentionally excluded.
+//
+// ALSO INTENTIONALLY EXCLUDED (Cycle 3 audit — closes the gap Cycle 2 flagged
+// re: run_explanations/generationMs): generated/derived-artifact tables whose
+// contract type lives in its OWN file rather than packages/contracts/src/
+// entities.ts — run_explanations (RunExplanation, run_explanations.ts),
+// daily_rollups (DailyRollup, usage.ts), alerts/alert_events
+// (webhooks.ts/alerts.ts), webhook_deliveries (webhooks.ts). This checker
+// only parses entities.ts (see parseContractsInterfaceProperties below), by
+// design — it is not a generic multi-file schema/contracts differ. These
+// tables are NOT unverified: their schema.ts <-> contracts field parity is
+// checked by hand at review time (and exercised by each table's own test
+// suite, e.g. convex/run_explanations.test.ts), the same discipline this
+// script automates for the core entity hierarchy. If a future cycle wants
+// automated coverage for one of these tables, the fix is to extend
+// parseContractsInterfaceProperties to accept multiple contracts files (or
+// move the interface into entities.ts) and add it to this map — not to
+// silently assume today's absence here means "unchecked forever".
 const TABLE_TO_INTERFACE: Record<string, string> = {
   organizations: 'Organization',
   projects: 'Project',

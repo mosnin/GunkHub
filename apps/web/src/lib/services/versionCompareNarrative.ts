@@ -42,6 +42,17 @@ export interface RawVersionCohort {
   truncated: boolean
   exact: boolean
   countsByStatus: Record<string, number>
+  /**
+   * Team B's cycle-3 addition to `VersionCohortSummary` (`convex/insights.ts`)
+   * — per-version `HeuristicFailureClass` counts, sourced from
+   * `run_explanations.failureClass`. Optional (a cohort with no classified
+   * failures, or a response from before this field existed, omits it) — see
+   * `@/lib/versionNarrative`'s `RawVersionCohort` for the same optionality
+   * and the grounding contract this feeds.
+   */
+  failureClassCounts?: Record<string, number>
+  /** Optional per-class representative detail (e.g. a tool name). */
+  failureClassExamples?: Record<string, string>
 }
 
 export interface RawCohortComparison {

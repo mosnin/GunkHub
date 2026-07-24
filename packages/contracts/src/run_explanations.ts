@@ -38,3 +38,23 @@ export interface RunExplanationSummary {
   failureClass: string;
   kind: RunExplanationKind;
 }
+
+/**
+ * Cycle 3 addition (additive, 0.7.4 -> 0.7.5): the explicit status
+ * discriminant `getRunExplanation` (convex/run_explanations.ts) and
+ * `apiGetExplanation` (convex/read_api.ts) now return alongside the
+ * explanation itself. Closes a "coarse null" gap where "this run will never
+ * have an explanation" (not failed/timed_out/cancelled) and "eligible, but
+ * generation hasn't landed yet" were indistinguishable to a caller — both
+ * used to read as `null`/`{ explanation: null }`, forcing a UI consumer to
+ * guess from the run's own `endedAt` client-side.
+ */
+export type RunExplanationQueryStatus = "not_eligible" | "pending" | "ready";
+
+/** The full shape `getRunExplanation`/`apiGetExplanation` return: the `status` discriminant above, the explanation itself (or null), and the run's own status/endedAt so a caller can apply a grace period without a second round-trip. */
+export interface RunExplanationQueryResult {
+  status: RunExplanationQueryStatus;
+  explanation: RunExplanation | null;
+  runStatus: string;
+  runEndedAt?: number;
+}

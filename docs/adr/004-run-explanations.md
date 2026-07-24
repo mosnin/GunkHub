@@ -1,6 +1,6 @@
 # ADR 004 — Run Explanations ("Why did this fail?")
 
-Status: Accepted
+Status: Shipped (final as of Explainability Layer cycle 3)
 Date: 2026-07-24
 Relates to: ADR-0002 (event log is canonical), ADR-0003 (tenancy boundary),
 ADR-002 (evals/data model expansion), ADR-003 (alerting)
@@ -87,3 +87,46 @@ membership check before touching any row.
 - No vendor SDK or vendor-specific request/response shape is introduced by
   this change — `HttpExplanationLLM` is generic HTTP, opt-in, and disabled by
   default (`AFR_LLM_PROVIDER` unset ⇒ heuristic-only, zero external calls).
+
+## Cycle 3 — final state
+
+This feature is DONE as of this cycle; the two paths, the grounding
+guarantee, and the injection mitigations below are the shipped, final
+design (see `docs/design/explanations.md` for the full HTTP-surface and
+threat-model writeup this section summarizes):
+
+- **Two generation paths, one trust hierarchy.** `buildHeuristicExplanation`
+  (Team B, `convex/insights.ts`) is deterministic, zero-config, and ALWAYS
+  computed first — it is the explanation that ships when no LLM provider is
+  configured, and the fallback whenever the LLM path is skipped, discarded,
+  or fails. The optional LLM path (`AFR_LLM_PROVIDER=http`) only ever
+  supplements or replaces the heuristic result after passing the grounding
+  gate below; it never runs instead of computing the heuristic first, and it
+  never gets a path to bypass that gate.
+- **Grounding guarantee, unconditional.** `validateCitedSeqNums` strips any
+  `citedSeqNums` (from either path) not present in the run's own event
+  window, and the grounding gate in `generateRunExplanation` discards an LLM
+  result entirely (falling back to the heuristic) unless, after that
+  filtering, it cites at least one real sequence number and has a non-empty
+  `summary`/`rootCause`. No explanation this feature stores can cite a
+  fabricated event.
+- **Injection mitigations, both layers shipped.** Layer 1 (citation
+  validation, above) is what actually neutralizes a successful injection
+  attempt. Layer 2 (structural isolation — the `UNTRUSTED_TRACE_DATA` fence
+  around every trace-derived field in the grounding prompt, plus
+  `neutralizeTraceMarkers` closing the cycle-3 delimiter-forging gap) is
+  defense-in-depth on top of it. Neither layer, individually or combined,
+  guarantees narrative *accuracy* on real, correctly-cited events — see
+  `docs/design/explanations.md`'s "Layer 2" and "What this does not defend
+  against" sections for the honest residual. This is why the deterministic
+  heuristic explanation remains the trusted default rather than a stopgap.
+- **Coarse null state resolved at the source.** `getRunExplanation` now
+  returns an explicit `status: "not_eligible" | "pending" | "ready"`
+  discriminant (Team A) alongside `explanation`/`runStatus`/`runEndedAt`;
+  `services/explanations.ts`'s `getRunExplanationWithStatus` and `GET
+  /api/runs/[id]/explanation` (Team C) expose it end-to-end. The UI
+  (`ExplanationPanel`, the failed-runs-list preview) has not yet adopted it —
+  it still uses a client-side `isStillAnalyzing`/`ANALYZING_GRACE_PERIOD_MS`
+  time heuristic, which remains a reasonable approximation but is superseded
+  in precision by the real discriminant now available over HTTP. See
+  `docs/design/explanations.md`'s equivalent section for the adoption gap.

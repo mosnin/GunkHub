@@ -689,6 +689,13 @@ const VERSION_COMPARE_SCAN_MULTIPLIER = 5;
 
 interface VersionRunSample {
   summaries: RunSummary[];
+  /**
+   * The `_id` of every run in `summaries`, same order, same length — carried
+   * alongside (rather than looked up again) so a caller that needs to read
+   * MORE per-run data (e.g. compareVersions' failureClassCounts breakdown)
+   * can reuse this cohort collection instead of re-scanning `runs`.
+   */
+  runIds: Id<"runs">[];
   scanned: number;
   /** True if we stopped before exhausting the version's (or, in the fallback path, the agent's) run history — hit the sample cap or the scan budget. */
   truncated: boolean;
@@ -735,8 +742,9 @@ async function collectRunSummariesForVersion(
     tokensIn: run.tokensIn,
     tokensOut: run.tokensOut,
   }));
+  const runIds: Id<"runs">[] = bounded.map((run) => run._id);
 
-  return { summaries, scanned: summaries.length, truncated, exact: true };
+  return { summaries, runIds, scanned: summaries.length, truncated, exact: true };
 }
 
 /**
@@ -762,6 +770,7 @@ async function collectRunSummariesForVersionFallback(
     .take(maxScan);
 
   const matches: RunSummary[] = [];
+  const matchIds: Id<"runs">[] = [];
   for (const run of candidates) {
     if (run.agentVersionId === agentVersionId) {
       matches.push({
@@ -771,12 +780,14 @@ async function collectRunSummariesForVersionFallback(
         tokensIn: run.tokensIn,
         tokensOut: run.tokensOut,
       });
+      matchIds.push(run._id);
       if (matches.length >= maxMatches) break;
     }
   }
 
   return {
     summaries: matches,
+    runIds: matchIds,
     scanned: candidates.length,
     truncated: matches.length >= maxMatches || candidates.length >= maxScan,
     exact: false,
@@ -811,6 +822,70 @@ export interface VersionCohortSummary {
   /** See VersionRunSample.exact — true means this side's sample is guaranteed exact (mod the sample cap). */
   exact: boolean;
   countsByStatus: Record<string, number>;
+  /**
+   * Per-`HeuristicFailureClass` count of this cohort's runs, sourced from
+   * `run_explanations.failureClass` (one point lookup per run via the
+   * `by_run` index — see collectFailureClassCounts). A run with no
+   * `run_explanations` row (no explanation was ever generated for it) is
+   * simply not counted — this is an honest sample of "runs we have a
+   * classified explanation for," not an exhaustive classification of every
+   * failed run in the cohort. Bounded to
+   * VERSION_COMPARE_MAX_EXPLANATION_LOOKUPS_PER_SIDE runs (most-recent-first,
+   * same order as `collectRunSummariesForVersion`), independent of and
+   * smaller than the cohort's own sample cap — see that constant's doc
+   * comment for why. Powers Team C's `narrativeInputFromComparison` "most
+   * common new failure class" clause (apps/web/src/lib/versionNarrative.ts).
+   */
+  failureClassCounts: Partial<Record<HeuristicFailureClass, number>>;
+}
+
+/**
+ * Bounded, ADDITIONAL read budget for the failureClassCounts breakdown: at
+ * most this many point lookups (via run_explanations.by_run — one row per
+ * runId, never a scan) per side of a compareVersions call. Deliberately
+ * smaller than VERSION_COMPARE_MAX_RUNS_PER_SIDE (1000): this enhancement's
+ * lookups are reads ON TOP OF the run sample compareVersions already fetches
+ * for compareCohorts, so it is capped independently to bound how much this
+ * feature can add to compareVersions' total read cost — worst case
+ * 2 * 200 = 400 additional point reads, regardless of how large either
+ * cohort is. Applied to the SAME most-recent-first run order
+ * collectRunSummariesForVersion(Fallback) already produced (no re-scan, no
+ * re-sort), so the 200 runs sampled here are the 200 most recent runs in
+ * whatever sample compareCohorts itself is already using.
+ */
+const VERSION_COMPARE_MAX_EXPLANATION_LOOKUPS_PER_SIDE = 200;
+
+/**
+ * Group a bounded, most-recent-first slice of a cohort's runIds by their
+ * `run_explanations.failureClass`, via one `by_run` point lookup per runId
+ * (see VERSION_COMPARE_MAX_EXPLANATION_LOOKUPS_PER_SIDE for the bound and its
+ * rationale). A run with no explanation row is not counted — it is neither a
+ * zero nor an "unknown," it is simply absent from every bucket, since we have
+ * no classified fact about it (honest, not a guess). Tenancy: `runIds` are
+ * only ever runs already validated (by the caller) to belong to `orgId`
+ * (compareVersions validates versionA/versionB's org before ever collecting
+ * run samples), so `by_run` alone is sufficient to resolve the right row —
+ * the `row.orgId !== orgId` check below is belt-and-suspenders defense in
+ * depth, not load-bearing, matching the pattern in getRunEvalSummary.
+ */
+async function collectFailureClassCounts(
+  ctx: QueryCtx,
+  orgId: Id<"organizations">,
+  runIds: Id<"runs">[],
+): Promise<Partial<Record<HeuristicFailureClass, number>>> {
+  const bounded = runIds.slice(0, VERSION_COMPARE_MAX_EXPLANATION_LOOKUPS_PER_SIDE);
+  const rows = await Promise.all(
+    bounded.map((runId) => ctx.db.query("run_explanations").withIndex("by_run", (q) => q.eq("runId", runId)).first()),
+  );
+
+  const counts: Partial<Record<HeuristicFailureClass, number>> = {};
+  for (const row of rows) {
+    if (!row) continue; // no explanation generated for this run — not counted (honest).
+    if (row.orgId !== orgId) continue; // defensive tenancy check; not load-bearing (see doc comment above).
+    const failureClass = row.failureClass as HeuristicFailureClass;
+    counts[failureClass] = (counts[failureClass] ?? 0) + 1;
+  }
+  return counts;
 }
 
 /**
@@ -853,6 +928,14 @@ export const compareVersions = query({
     const statsA = computeRunStats(a.summaries);
     const statsB = computeRunStats(b.summaries);
 
+    // Reuses the cohort run collections above (a.runIds/b.runIds) — no
+    // re-scan of `runs` — for a bounded, independent read against
+    // run_explanations. See VERSION_COMPARE_MAX_EXPLANATION_LOOKUPS_PER_SIDE.
+    const [failureClassCountsA, failureClassCountsB] = await Promise.all([
+      collectFailureClassCounts(ctx, args.orgId, a.runIds),
+      collectFailureClassCounts(ctx, args.orgId, b.runIds),
+    ]);
+
     const versionASummary: VersionCohortSummary = {
       id: versionA._id,
       version: versionA.version,
@@ -861,6 +944,7 @@ export const compareVersions = query({
       truncated: a.truncated,
       exact: a.exact,
       countsByStatus: statsA.countsByStatus,
+      failureClassCounts: failureClassCountsA,
     };
     const versionBSummary: VersionCohortSummary = {
       id: versionB._id,
@@ -870,6 +954,7 @@ export const compareVersions = query({
       truncated: b.truncated,
       exact: b.exact,
       countsByStatus: statsB.countsByStatus,
+      failureClassCounts: failureClassCountsB,
     };
 
     return {

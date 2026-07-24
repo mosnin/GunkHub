@@ -53,6 +53,7 @@ import { type NextRequest, NextResponse } from 'next/server'
 
 import type { ApiError } from '@agent-flight-recorder/contracts'
 
+import { hasOrgAuthContext } from '@/lib/apiAuthGuard'
 import { mapApiError } from '@/lib/apiErrorMapping'
 import { withApiHandler } from '@/lib/apiHandler'
 import {
@@ -69,13 +70,18 @@ interface RouteParams {
 export const GET = withApiHandler(
   '/api/agents/[agentId]/versions/compare',
   async (req: NextRequest, ctx, { params }: RouteParams) => {
-    const { userId, orgId: clerkOrgId } = auth()
-    if (!userId || !clerkOrgId) {
+    // Uses the same shared `hasOrgAuthContext` predicate as every sibling
+    // Clerk-authed route (explanation GET/POST, alerts/webhooks-config) —
+    // audited this cycle for consistency (this route previously duplicated
+    // the userId/orgId check inline).
+    const authResult = auth()
+    if (!hasOrgAuthContext(authResult)) {
       return NextResponse.json<ApiError>(
         { code: 'UNAUTHORIZED', message: 'Authentication required' },
         { status: 401 },
       )
     }
+    const clerkOrgId = authResult.orgId
     ctx.setOrgId(clerkOrgId)
 
     const searchParams = req.nextUrl.searchParams

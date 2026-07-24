@@ -110,3 +110,95 @@ describe('GET /api/agents/[agentId]/versions/compare — narrative wiring (expla
     expect(result.narrative).toContain('Not enough data')
   })
 })
+
+describe('GET /api/agents/[agentId]/versions/compare — failureClassCounts wiring (Team B cycle-3 field)', () => {
+  // Team B's cycle-3 addition to `compareVersions`'s `VersionCohortSummary`:
+  // a per-version `failureClassCounts` map. This block proves the adapter
+  // (a) passes it through when BOTH cohorts supply it, (b) stays silent when
+  // only one side does, and (c) never invents a class/tool that wasn't in
+  // the input — the same grounding contract `version_narrative.test.ts`
+  // exercises on `buildVersionNarrative` directly, but here through the full
+  // `compareVersions`-shaped adapter this route actually calls.
+  function rawComparisonWithCounts(
+    countsA?: Record<string, number>,
+    countsB?: Record<string, number>,
+    examplesB?: Record<string, string>,
+  ): RawVersionComparison {
+    return {
+      agentId: 'agent_1',
+      versionA: { version: '1.4', sampleSize: 120, ...(countsA && { failureClassCounts: countsA }) },
+      versionB: {
+        version: '1.5',
+        sampleSize: 100,
+        ...(countsB && { failureClassCounts: countsB }),
+        ...(examplesB && { failureClassExamples: examplesB }),
+      },
+      comparison: {
+        failureRate: { a: 0.08, b: 0.34 },
+        failureRateSignificance: 'likely_regression',
+      },
+    }
+  }
+
+  it('passes failureClassCounts through per-cohort when both sides supply it', () => {
+    const raw = rawComparisonWithCounts({ tool_timeout: 1, tool_error: 2 }, { tool_timeout: 20, tool_error: 3 })
+    const input = narrativeInputFromComparison(raw)
+    expect(input.versionA.failureClassCounts).toEqual({ tool_timeout: 1, tool_error: 2 })
+    expect(input.versionB.failureClassCounts).toEqual({ tool_timeout: 20, tool_error: 3 })
+  })
+
+  it('end-to-end: the compare route\'s narrative activates the "most common new failure class" clause with real Team B counts', () => {
+    const raw = rawComparisonWithCounts(
+      { tool_timeout: 1, tool_error: 2 },
+      { tool_timeout: 20, tool_error: 3 },
+      { tool_timeout: 'search_docs' },
+    )
+    const result = narrateVersionComparison(raw)
+    expect(result.usedFailureClassBreakdown).toBe(true)
+    expect(result.citedFailureClass).toBe('tool_timeout')
+    expect(result.narrative).toContain('most common new failure class is tool_timeout on search_docs')
+  })
+
+  it('stays silent (no clause, no citedFailureClass) when only one cohort supplies counts', () => {
+    const raw = rawComparisonWithCounts(undefined, { tool_timeout: 20 })
+    const input = narrativeInputFromComparison(raw)
+    expect(input.versionA.failureClassCounts).toBeUndefined()
+    expect(input.versionB.failureClassCounts).toEqual({ tool_timeout: 20 })
+
+    const result = narrateVersionComparison(raw)
+    expect(result.usedFailureClassBreakdown).toBe(false)
+    expect(result.citedFailureClass).toBeUndefined()
+    expect(result.narrative).not.toContain('failure class')
+  })
+
+  it('never cites a class or tool name absent from the supplied counts/examples (no fabrication)', () => {
+    const raw = rawComparisonWithCounts(
+      { tool_timeout: 5 },
+      { tool_timeout: 40 },
+      // No example supplied for tool_timeout — the narrative must not guess one.
+    )
+    const result = narrateVersionComparison(raw)
+    expect(result.citedFailureClass).toBe('tool_timeout')
+    expect(result.narrative).not.toContain(' on ')
+    // A class never present in either cohort's counts must never appear.
+    expect(result.narrative).not.toContain('tool_permission_denied')
+  })
+
+  it('honest insufficient_data narrative still omits the failure-class clause even when counts are present', () => {
+    // Grounding must not be short-circuited by significance: an
+    // insufficient_data verdict never states a cause, regardless of whether
+    // failureClassCounts happens to be attached to the raw comparison.
+    const raw: RawVersionComparison = {
+      ...rawComparisonWithCounts({ tool_timeout: 1 }, { tool_timeout: 2 }),
+      comparison: {
+        failureRate: { a: 0.08, b: 0.34 },
+        failureRateSignificance: 'insufficient_data',
+      },
+    }
+    const result = narrateVersionComparison(raw)
+    expect(result.significance).toBe('insufficient_data')
+    expect(result.usedFailureClassBreakdown).toBe(false)
+    expect(result.narrative).not.toContain('failure class')
+    expect(result.narrative).toContain('Not enough data')
+  })
+})

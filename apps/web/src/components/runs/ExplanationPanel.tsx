@@ -3,6 +3,7 @@ import Link from 'next/link'
 import type { RunExplanation } from '@/lib/services/explanations'
 
 import { ExplanationRegenerateButton } from '@/components/runs/ExplanationRegenerateButton'
+import { isStillAnalyzing } from '@/lib/services/explanations'
 import { formatRelativeTime } from '@/lib/utils'
 
 interface ExplanationPanelProps {
@@ -12,6 +13,17 @@ interface ExplanationPanelProps {
   /** True when the explanation fetch itself threw — additive/non-fatal, rest of the page still renders. */
   loadFailed: boolean
   isAdmin: boolean
+  /**
+   * The run's terminal timestamp (`run.endedAt`), if any. Used only to soften
+   * the "coarse null" gap (see `lib/services/explanations.ts`): a `null`
+   * explanation covers both "still generating" and "never triggered / never
+   * will be", and this component can't tell those apart from the data it
+   * gets. Once a run has been over for a while with still no explanation,
+   * showing an indefinite pulsing "Analyzing…" is dishonest — it looks like
+   * live work is happening when it almost certainly is not. Past the
+   * threshold this renders a neutral "not available" message instead.
+   */
+  runEndedAt?: number
 }
 
 function formatFailureClass(cls: string): string {
@@ -29,7 +41,9 @@ function formatFailureClass(cls: string): string {
  * highlight the cited event, and marks every cited event with a left-accent
  * tick so the causal chain stays visible in context, not just from here.
  */
-export function ExplanationPanel({ runId, explanation, loadFailed, isAdmin }: ExplanationPanelProps) {
+export function ExplanationPanel({ runId, explanation, loadFailed, isAdmin, runEndedAt }: ExplanationPanelProps) {
+  const stillAnalyzing = isStillAnalyzing(runEndedAt)
+
   return (
     <section
       aria-label="Why this run failed"
@@ -45,13 +59,20 @@ export function ExplanationPanel({ runId, explanation, loadFailed, isAdmin }: Ex
           Couldn&apos;t load the failure analysis for this run — refresh to retry.
         </p>
       ) : !explanation ? (
-        <div className="flex items-center gap-2">
-          <span
-            className="w-1.5 h-1.5 rounded-full bg-neon-glow animate-neon-pulse shrink-0"
-            aria-hidden="true"
-          />
-          <p className="text-sm text-neutral-500">Analyzing this run&apos;s failure…</p>
-        </div>
+        stillAnalyzing ? (
+          <div className="flex items-center gap-2">
+            <span
+              className="w-1.5 h-1.5 rounded-full bg-neon-glow animate-neon-pulse shrink-0 forced-colors:bg-[Highlight]"
+              aria-hidden="true"
+            />
+            <p className="text-sm text-neutral-500">Analyzing this run&apos;s failure…</p>
+          </div>
+        ) : (
+          <p className="text-sm text-neutral-500">
+            No failure analysis is available for this run.
+            {isAdmin && ' Use Regenerate above to run one now.'}
+          </p>
+        )
       ) : (
         <div className="flex flex-col gap-3">
           {/* Failure class + honest provenance — never implies AI on the heuristic path */}

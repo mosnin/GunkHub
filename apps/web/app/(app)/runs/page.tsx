@@ -212,8 +212,13 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
       .filter((r) => r.status === 'failed' || r.status === 'timed_out')
       .map((r) => r.id)
     if (failedRunIds.length > 0) {
-      const { getRunExplanationSummaries } = await import('@/lib/services/explanations')
-      explanationSummaries = await getRunExplanationSummaries(failedRunIds)
+      const { getRunExplanationSummaries, withAnalyzingGracePeriod } = await import('@/lib/services/explanations')
+      const raw = await getRunExplanationSummaries(failedRunIds)
+      // Downgrade "analyzing" to "unavailable" (renders nothing, see
+      // ExplanationPreview) for runs that ended long enough ago that
+      // generation was evidently never scheduled/completed — an indefinite
+      // pulse on those rows would be dishonest, not just imprecise.
+      explanationSummaries = withAnalyzingGracePeriod(raw, runs.runs)
     }
   }
 

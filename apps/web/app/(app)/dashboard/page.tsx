@@ -14,7 +14,7 @@ import { CodeBlock } from '@/components/ui/CodeBlock'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { Reveal, RevealGroup, RevealItem } from '@/components/ui/Motion'
 import { getDashboardStats, getPerAgentDashboardStats, type DashboardRange } from '@/lib/services/dashboard'
-import { getRunExplanationSummaries } from '@/lib/services/explanations'
+import { getRunExplanationSummaries, withAnalyzingGracePeriod } from '@/lib/services/explanations'
 import { getRecentFailedVerifications } from '@/lib/services/projection_verify'
 import { listRuns } from '@/lib/services/runs'
 import { truncateId, formatRelativeTime } from '@/lib/utils'
@@ -101,7 +101,11 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
     .filter((r) => r.status === 'failed' || r.status === 'timed_out')
     .map((r) => r.id)
   if (failedRunIds.length > 0) {
-    explanationSummaries = await getRunExplanationSummaries(failedRunIds)
+    const raw = await getRunExplanationSummaries(failedRunIds)
+    // Downgrade "analyzing" to "unavailable" (renders nothing, see
+    // ExplanationPreview) for runs that ended long enough ago that
+    // generation was evidently never scheduled/completed.
+    explanationSummaries = withAnalyzingGracePeriod(raw, runs)
   }
 
   // Non-fatal: verification issues section is hidden if fetch fails

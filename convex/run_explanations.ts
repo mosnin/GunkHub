@@ -251,14 +251,57 @@ export function truncateToBytes(s: string, maxBytes: number): string {
 }
 
 /**
+ * AUDIT FIX (Cycle 3, finding LLM-OUTPUT-INJECTION-1): strips ASCII/Latin-1
+ * control characters — C0 (0x00-0x1F, excluding \t \n \r) and C1 (0x7F-0x9F)
+ * — from LLM/heuristic-produced text before it is stored. `truncateToBytes`
+ * and `llm_provider.ts`'s `clampString` only bound LENGTH; neither strips
+ * CONTENT. The UI (React) already escapes HTML/markup on render, so this is
+ * not an XSS fix — but a malicious/compromised provider embedding raw ANSI
+ * escape sequences, form-feeds, or other control bytes in `summary`/
+ * `rootCause`/`suggestedFix` would still corrupt a plain-text consumer that
+ * doesn't do that escaping, e.g. `afr explain` printing straight to a
+ * terminal (packages/cli, sdk_quality-owned) or a log line this explanation
+ * gets copied into. Stored explanation text must be plain text — this is the
+ * server-side enforcement point for that, applied regardless of which
+ * consumer eventually renders it. Never throws.
+ */
+export function stripControlChars(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    const isTab = code === 9;
+    const isLf = code === 10;
+    const isCr = code === 13;
+    const isC0Control = code <= 31 && !isTab && !isLf && !isCr;
+    const isDelOrC1Control = code >= 127 && code <= 159;
+    if (isC0Control || isDelOrC1Control) continue;
+    out += s[i];
+  }
+  return out;
+}
+
+/** Sanitize (strip control chars) then bound (truncate to a UTF-8 byte budget) a stored explanation field, in that order — the single point every stored summary/rootCause/suggestedFix string passes through. */
+export function finalizeExplanationText(s: string, maxBytes: number): string {
+  return truncateToBytes(stripControlChars(s), maxBytes);
+}
+
+/**
  * Filters citedSeqNums down to ones that actually exist in `available`
  * (the sequenceNumbers of the events the caller supplied as context), and
  * caps the result at MAX_CITED_SEQUENCE_NUMBERS. This is THE grounding
  * enforcement point: neither the heuristic engine's nor an LLM provider's
  * output is trusted to have cited real events without this check.
+ *
+ * AUDIT (Cycle 3): hardened against hostile input beyond "cites a real
+ * event" — `Number.isInteger` rejects NaN, +/-Infinity, and fractional
+ * values outright (a real sequenceNumber is always a positive integer, so
+ * this never rejects a legitimate citation); `available.has(n)` alone
+ * already rejects negative/huge/fabricated seqNums and duplicates are
+ * removed by the `Set`. See run_explanations.test.ts's "hostile input"
+ * block for NaN/negative/duplicate/10000-fake-seqs coverage.
  */
 export function validateCitedSeqNums(citedSeqNums: number[], available: ReadonlySet<number>): number[] {
-  const deduped = [...new Set(citedSeqNums)].filter((n) => available.has(n));
+  const deduped = [...new Set(citedSeqNums)].filter((n) => Number.isInteger(n) && available.has(n));
   return deduped.slice(0, MAX_CITED_SEQUENCE_NUMBERS);
 }
 
@@ -278,6 +321,24 @@ export function validateCitedSeqNums(citedSeqNums: number[], available: Readonly
 const UNTRUSTED_TRACE_START = "<<<UNTRUSTED_TRACE_DATA>>>";
 const UNTRUSTED_TRACE_END = "<<<END_UNTRUSTED_TRACE_DATA>>>";
 
+/**
+ * AUDIT FIX (Cycle 3, CRITICAL — delimiter-forging prompt injection): every
+ * field interpolated into the prompt below (`excerpt`, event `type`,
+ * `primary.type`/`reason`/`errorMessage`) is agent/tool-controlled. Without
+ * this step, a hostile tool result containing a LITERAL occurrence of
+ * `UNTRUSTED_TRACE_END` followed by fabricated "trusted" instructions and a
+ * fake re-opening `UNTRUSTED_TRACE_START` would forge a close/reopen of the
+ * fence — placing attacker-authored text in the region the model is told to
+ * treat as trusted instructions, even though `validateCitedSeqNums` still
+ * blocks any fabricated citation that text tries to plant. Every untrusted
+ * string is passed through this BEFORE interpolation so the literal marker
+ * text can never appear inside the fenced block other than at the two
+ * positions this function itself places them.
+ */
+function neutralizeTraceMarkers(s: string): string {
+  return s.split(UNTRUSTED_TRACE_START).join("<<<TRACE_MARKER>>>").split(UNTRUSTED_TRACE_END).join("<<<TRACE_MARKER>>>");
+}
+
 /** Builds the grounding prompt sent to a configured LLM provider. Exported for unit testing. */
 export function buildGroundingPrompt(input: {
   runStatus: string;
@@ -286,11 +347,15 @@ export function buildGroundingPrompt(input: {
 }): GroundedExplanationPrompt {
   const availableSequenceNumbers = input.events.map((e) => e.sequenceNumber);
   const eventLines = input.events
-    .map((e) => `  [seq ${e.sequenceNumber}] ${e.type}${e.excerpt ? ` — ${e.excerpt}` : ""}`)
+    .map((e) => {
+      const safeType = neutralizeTraceMarkers(e.type);
+      const safeExcerpt = e.excerpt !== undefined ? neutralizeTraceMarkers(e.excerpt) : undefined;
+      return `  [seq ${e.sequenceNumber}] ${safeType}${safeExcerpt ? ` — ${safeExcerpt}` : ""}`;
+    })
     .join("\n");
   const primary = input.failureSummary.primaryFailure;
   const primaryLine = primary
-    ? `Primary failure point: sequence ${primary.sequenceNumber} (${primary.type}, reason: ${primary.reason}${primary.errorMessage ? `, message: "${primary.errorMessage}"` : ""}).`
+    ? `Primary failure point: sequence ${primary.sequenceNumber} (${neutralizeTraceMarkers(primary.type)}, reason: ${neutralizeTraceMarkers(primary.reason)}${primary.errorMessage ? `, message: "${neutralizeTraceMarkers(primary.errorMessage)}"` : ""}).`
     : "No specific failure event could be identified in the available window.";
 
   const prompt = [
@@ -433,11 +498,11 @@ export const generateRunExplanation = internalAction({
     }
 
     let kind: "heuristic" | "llm" = "heuristic";
-    let summary = truncateToBytes(heuristic.summary, MAX_EXPLANATION_SUMMARY_BYTES);
-    let rootCause = truncateToBytes(heuristic.rootCause, MAX_EXPLANATION_ROOT_CAUSE_BYTES);
+    let summary = finalizeExplanationText(heuristic.summary, MAX_EXPLANATION_SUMMARY_BYTES);
+    let rootCause = finalizeExplanationText(heuristic.rootCause, MAX_EXPLANATION_ROOT_CAUSE_BYTES);
     let suggestedFix =
       heuristic.suggestedFix !== undefined
-        ? truncateToBytes(heuristic.suggestedFix, MAX_EXPLANATION_SUGGESTED_FIX_BYTES)
+        ? finalizeExplanationText(heuristic.suggestedFix, MAX_EXPLANATION_SUGGESTED_FIX_BYTES)
         : undefined;
     let citedSequenceNumbers = validateCitedSeqNums(heuristic.citedSeqNums, availableSeqNums);
     let model: string | undefined;
@@ -472,11 +537,11 @@ export const generateRunExplanation = internalAction({
 
         if (trustworthy) {
           kind = "llm";
-          summary = truncateToBytes(llmResult.summary, MAX_EXPLANATION_SUMMARY_BYTES);
-          rootCause = truncateToBytes(llmResult.rootCause, MAX_EXPLANATION_ROOT_CAUSE_BYTES);
+          summary = finalizeExplanationText(llmResult.summary, MAX_EXPLANATION_SUMMARY_BYTES);
+          rootCause = finalizeExplanationText(llmResult.rootCause, MAX_EXPLANATION_ROOT_CAUSE_BYTES);
           suggestedFix =
             llmResult.suggestedFix !== undefined
-              ? truncateToBytes(llmResult.suggestedFix, MAX_EXPLANATION_SUGGESTED_FIX_BYTES)
+              ? finalizeExplanationText(llmResult.suggestedFix, MAX_EXPLANATION_SUGGESTED_FIX_BYTES)
               : undefined;
           citedSequenceNumbers = validatedCites;
           model = process.env["AFR_LLM_MODEL"];
@@ -514,26 +579,54 @@ export const generateRunExplanation = internalAction({
 // ---------------------------------------------------------------------------
 
 /**
- * Member-gated: the explanation for a run, or `null` if the run isn't in a
- * failed/timed_out/cancelled state (completed/pending/running runs never get
- * one) or hasn't been generated yet (e.g. generation is still in flight on
- * the scheduler, or `buildHeuristicExplanation` isn't available yet).
+ * AUDIT FIX (Cycle 3, MEDIUM — coarse-null): `getRunExplanation` used to
+ * collapse two very different states into the same `null`: "this run will
+ * never get an explanation" (not failed/timed_out/cancelled) and "an
+ * explanation is still being generated" (eligible, but generation hasn't
+ * landed yet — still scheduled, in flight, or was skipped/purged). A caller
+ * (the web UI's `ExplanationPanel`, `apps/web/src/lib/services/
+ * explanations.ts`) cannot distinguish "show nothing, ever" from "keep
+ * showing an analyzing spinner" from that alone, and — per that file's own
+ * documented gap — was forced to guess from the run's `endedAt` client-side.
+ * `status` is the explicit discriminant: `"not_eligible"` (never will have
+ * one), `"pending"` (eligible, not generated yet), `"ready"` (explanation
+ * present). `runStatus`/`runEndedAt` are included so a caller doesn't need a
+ * second round-trip to apply its own grace-period logic.
+ */
+export type RunExplanationQueryStatus = "not_eligible" | "pending" | "ready";
+
+export interface RunExplanationQueryResult {
+  status: RunExplanationQueryStatus;
+  explanation: Doc<"run_explanations"> | null;
+  runStatus: string;
+  runEndedAt: number | undefined;
+}
+
+/**
+ * Member-gated: the explanation for a run, plus the `status` discriminant
+ * above so a caller can render "not eligible" / "still analyzing" /
+ * "ready" distinctly instead of treating every non-explanation as the same
+ * indefinite "analyzing" state.
  */
 export const getRunExplanation = query({
   args: { runId: v.id("runs") },
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<RunExplanationQueryResult> => {
     const run = await ctx.db.get(args.runId);
     if (!run) throw afrError("NOT_FOUND", "Run not found");
     await requireOrgMembership(ctx, run.orgId);
 
-    if (!EXPLAINABLE_STATUSES.has(run.status)) return null;
+    if (!EXPLAINABLE_STATUSES.has(run.status)) {
+      return { status: "not_eligible", explanation: null, runStatus: run.status, runEndedAt: run.endedAt };
+    }
 
     const explanation = await ctx.db
       .query("run_explanations")
       .withIndex("by_run", (q) => q.eq("runId", args.runId))
       .first();
-    if (!explanation || explanation.orgId !== run.orgId) return null;
-    return explanation;
+    if (!explanation || explanation.orgId !== run.orgId) {
+      return { status: "pending", explanation: null, runStatus: run.status, runEndedAt: run.endedAt };
+    }
+    return { status: "ready", explanation, runStatus: run.status, runEndedAt: run.endedAt };
   },
 });
 

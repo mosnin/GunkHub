@@ -6,14 +6,18 @@
 // runs/[id]/triage/route.ts) and lets Convex's own gate produce a clean 403
 // if the caller isn't in the run's org.
 //
-// Response body is intentionally honest about the two "nothing to show"
-// cases the brief calls out:
-//   - `{ explanation: null }` — no cached explanation yet (run hasn't
-//     failed, or generation hasn't completed/been triggered). The client
-//     cannot distinguish "not a failed run" from "still generating" from
-//     this alone today — see docs/design/explanations.md's "Known gap:
-//     coarse null state" for why, and what a future Convex-side status field
-//     would resolve.
+// Response body:
+//   - `{ explanation, status, runStatus, runEndedAt? }` — `status` is the
+//     REAL discriminant (`"not_eligible" | "pending" | "ready"`) Team A
+//     added to `run_explanations:getRunExplanation` this cycle (ADR-004,
+//     cycle 3), closing what was previously a documented "coarse null
+//     state" gap (`explanation: null` used to mean either "not a failed
+//     run" or "still generating", indistinguishably). `explanation` is
+//     still `null` for BOTH `not_eligible` and `pending` — existing callers
+//     reading only `.explanation` are unaffected — but any caller (or a
+//     future `ExplanationPanel` revision) that wants the precise reason can
+//     now read `status` instead of guessing from `runEndedAt` client-side.
+//     See `@/lib/services/explanations`'s `getRunExplanationWithStatus`.
 //   - A thrown Convex/network error still maps through `mapApiError` to a
 //     real error status — that is NOT the same as `explanation: null` and
 //     must never be silently coerced into it.
@@ -25,7 +29,7 @@ import type { ApiError } from '@agent-flight-recorder/contracts'
 import { hasOrgAuthContext } from '@/lib/apiAuthGuard'
 import { mapApiError } from '@/lib/apiErrorMapping'
 import { withApiHandler } from '@/lib/apiHandler'
-import { getRunExplanation } from '@/lib/services/explanations'
+import { getRunExplanationWithStatus } from '@/lib/services/explanations'
 
 interface RouteParams {
   params: { id: string }
@@ -44,8 +48,8 @@ export const GET = withApiHandler(
     ctx.setOrgId(authResult.orgId)
 
     try {
-      const explanation = await getRunExplanation(params.id)
-      return NextResponse.json({ explanation })
+      const result = await getRunExplanationWithStatus(params.id)
+      return NextResponse.json(result)
     } catch (err) {
       const mapped = mapApiError(err, ctx.requestId)
       if (mapped) return mapped

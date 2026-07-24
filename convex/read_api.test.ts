@@ -63,6 +63,7 @@ describe('read_api.apiGetExplanation', () => {
     await seedExplanation(t, orgA, runId, 'The LLM call timed out.')
 
     const result = await t.mutation(api.read_api.apiGetExplanation, { apiKeyHash: 'read_key', runId: String(runId) })
+    expect(result.status).toBe('ready')
     expect(result.explanation).not.toBeNull()
     expect(result.explanation.summary).toBe('The LLM call timed out.')
     expect(result.explanation.failureClass).toBe('llm_error')
@@ -107,10 +108,12 @@ describe('read_api.apiGetExplanation', () => {
     await seedExplanation(t, orgA, runId, 'Should never be returned.')
 
     const result = await t.mutation(api.read_api.apiGetExplanation, { apiKeyHash: 'read_key', runId: String(runId) })
-    expect(result).toEqual({ explanation: null })
+    expect(result.status).toBe('not_eligible')
+    expect(result.explanation).toBeNull()
+    expect(result.runStatus).toBe('completed')
   })
 
-  it('a failed run with no explanation generated yet returns { explanation: null }', async () => {
+  it('a failed run with no explanation generated yet returns status "pending", distinct from "not_eligible"', async () => {
     const t = convexTest(schema, modules)
     const { orgA, projectA, agentA } = await seedTwoOrgs(t)
     await t.run(async (ctx) => {
@@ -119,6 +122,8 @@ describe('read_api.apiGetExplanation', () => {
     const runId = await seedRun(t, orgA, projectA, agentA, 'failed')
 
     const result = await t.mutation(api.read_api.apiGetExplanation, { apiKeyHash: 'read_key', runId: String(runId) })
-    expect(result).toEqual({ explanation: null })
+    expect(result.status).toBe('pending')
+    expect(result.explanation).toBeNull()
+    expect(result.runStatus).toBe('failed')
   })
 })

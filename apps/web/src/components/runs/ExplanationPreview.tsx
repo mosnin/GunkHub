@@ -11,6 +11,12 @@ interface ExplanationPreviewProps {
  * without an explanation degrades to exactly what it looked like before this
  * feature existed. Calm and dense — a failure-class chip plus one truncated
  * line of prose, never markup, never a layout-shifting block.
+ *
+ * The caller (see `withAnalyzingGracePeriod` in `lib/services/explanations.ts`)
+ * is responsible for downgrading `analyzing` to `unavailable` once a run has
+ * been over long enough that generation evidently isn't coming — this
+ * component trusts whatever state it's handed and never shows an indefinite
+ * pulse on its own.
  */
 export function ExplanationPreview({ state }: ExplanationPreviewProps) {
   if (state.status === 'unavailable') return null

@@ -234,9 +234,18 @@ export const apiGetReplay = mutation({
 
 // Key-authed (read scope) counterpart to run_explanations.getRunExplanation —
 // the "Why did this fail?" root-cause for the v1 API / `afr explain`. Org is
-// derived from the key, never a client arg. Returns { explanation: null } for
-// runs that aren't in an explainable (failed/timed_out/cancelled) state or that
-// have no explanation generated yet, mirroring the Clerk-authed route's shape.
+// derived from the key, never a client arg.
+//
+// AUDIT FIX (Cycle 3, MEDIUM — coarse-null, same finding as
+// run_explanations.getRunExplanation): this used to return
+// `{ explanation: null }` for both "will never have one" (not
+// failed/timed_out/cancelled) and "not generated yet" (eligible, still in
+// flight). `status` is the explicit discriminant now, mirroring
+// run_explanations.ts's `RunExplanationQueryStatus` exactly, so `afr explain`
+// (packages/cli, sdk_quality-owned) can print "not applicable" vs "still
+// analyzing, try again shortly" instead of the same blank result for both.
+// `explanation` is kept (rather than removed) for backward compatibility
+// with any existing caller that only checked truthiness of that field.
 const V1_EXPLAINABLE_STATUSES = new Set(["failed", "timed_out", "cancelled"]);
 
 export const apiGetExplanation = mutation({
@@ -249,15 +258,15 @@ export const apiGetExplanation = mutation({
       throw new Error("Run not found in this organization");
     }
     if (!V1_EXPLAINABLE_STATUSES.has(run.status)) {
-      return { explanation: null };
+      return { status: "not_eligible" as const, explanation: null, runStatus: run.status, runEndedAt: run.endedAt };
     }
     const explanation = await ctx.db
       .query("run_explanations")
       .withIndex("by_run", (q) => q.eq("runId", runId))
       .first();
     if (!explanation || explanation.orgId !== run.orgId) {
-      return { explanation: null };
+      return { status: "pending" as const, explanation: null, runStatus: run.status, runEndedAt: run.endedAt };
     }
-    return { explanation };
+    return { status: "ready" as const, explanation, runStatus: run.status, runEndedAt: run.endedAt };
   },
 });

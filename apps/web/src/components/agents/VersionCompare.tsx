@@ -36,11 +36,21 @@ const NARRATIVE_STYLE: Record<VersionCompareNarrative['significance'], { label: 
 function NarrativeCallout({ narrative }: { narrative: VersionCompareNarrative }) {
   const style = NARRATIVE_STYLE[narrative.significance] ?? NARRATIVE_STYLE.inconclusive
   return (
-    <div className="rounded-[4px] border border-graphite bg-graphite-deep px-4 py-3">
+    <div
+      role="note"
+      aria-label={`What changed: ${style.label}`}
+      className="rounded-[4px] border border-graphite bg-graphite-deep px-4 py-3"
+    >
       <p className="text-xs font-mono uppercase tracking-wider text-pewter mb-1.5">
         What changed · <span className={style.textClassName}>{style.label}</span>
       </p>
       <p className="text-sm leading-relaxed text-whiteout">{narrative.narrative}</p>
+      {/* Provenance — matches ExplanationPanel's "Heuristic · deterministic" /
+          "AI-generated" wording so the two "why" surfaces read as one system.
+          This narrative is always computed deterministically from cohort
+          counts (lib/versionNarrative.ts), never a model, so it always reads
+          the same way — no ambiguity to disclose per-instance. */}
+      <p className="mt-1.5 text-xs font-mono text-pewter">Heuristic · deterministic</p>
     </div>
   )
 }
@@ -152,36 +162,45 @@ export function VersionCompare({ versions }: VersionCompareProps) {
           </button>
         </div>
 
-        {error && <p className="text-xs text-destructive-400">{error}</p>}
-
-        {result && !result.available && (
-          <p className="text-sm text-neutral-500">
-            Comparison data isn&#39;t available yet for one or both versions — there may not be enough runs recorded.
+        {error && (
+          <p role="alert" className="text-xs text-destructive-400">
+            {error}
           </p>
         )}
 
-        {result?.available && (
-          <div className="flex flex-col gap-3">
-            {result.narrative && <NarrativeCallout narrative={result.narrative} />}
-            <div className="flex flex-wrap gap-3">
-              <CohortCard label="Version A" stats={result.versionA} />
-              <CohortCard label="Version B" stats={result.versionB} />
+        {/* aria-live: the compare result replaces this region asynchronously
+            (after a button click, not a route change), so screen-reader
+            users need to be told it changed — not just see it appear. */}
+        <div aria-live="polite" className="flex flex-col gap-3">
+          {result && !result.available && (
+            <p className="text-sm text-neutral-500">
+              Comparison data isn&#39;t available yet for one or both versions — there may not be enough runs recorded.
+            </p>
+          )}
+
+          {result?.available && (
+            <div className="flex flex-col gap-3">
+              {result.narrative && <NarrativeCallout narrative={result.narrative} />}
+              <div className="flex flex-wrap gap-3">
+                <CohortCard label="Version A" stats={result.versionA} />
+                <CohortCard label="Version B" stats={result.versionB} />
+              </div>
+              {(() => {
+                const verdict = VERDICT_STYLE[result.comparison.verdict] ?? VERDICT_STYLE['inconclusive'] ?? {
+                  label: result.comparison.verdict,
+                  className: 'bg-graphite text-cloud border-graphite-light',
+                }
+                return (
+                  <span
+                    className={`inline-flex self-start items-center px-2.5 py-1 rounded-[4px] text-xs font-mono font-medium border ${verdict.className}`}
+                  >
+                    {verdict.label}
+                  </span>
+                )
+              })()}
             </div>
-            {(() => {
-              const verdict = VERDICT_STYLE[result.comparison.verdict] ?? VERDICT_STYLE['inconclusive'] ?? {
-                label: result.comparison.verdict,
-                className: 'bg-graphite text-cloud border-graphite-light',
-              }
-              return (
-                <span
-                  className={`inline-flex self-start items-center px-2.5 py-1 rounded-[4px] text-xs font-mono font-medium border ${verdict.className}`}
-                >
-                  {verdict.label}
-                </span>
-              )
-            })()}
-          </div>
-        )}
+          )}
+        </div>
       </div>
     </Card>
   )
