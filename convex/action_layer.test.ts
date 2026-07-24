@@ -441,7 +441,7 @@ describe('webhook_engine.deliverPendingWebhooks', () => {
     expect(sigMatch).not.toBeNull()
     const [, ts, sig] = sigMatch!
     const target = await t.run((ctx) => ctx.db.query('webhook_targets').withIndex('by_org', (q) => q.eq('orgId', orgA)).first())
-    const expectedSig = signWebhookPayload(target!.secret, JSON.stringify(body), Number(ts))
+    const expectedSig = await signWebhookPayload(target!.secret, JSON.stringify(body), Number(ts))
     expect(`t=${ts},v1=${sig}`).toBe(expectedSig)
   })
 

@@ -581,7 +581,40 @@ jobs:
           NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_Y2xlcmsuZTJlLmludmFsaWQk
           CLERK_SECRET_KEY: sk_test_dummy00000000000000000000000000000000000000000
           NEXT_PUBLIC_CONVEX_URL: https://example-e2e-placeholder.convex.cloud
+          # The authenticated tier cannot run without a Clerk DEVELOPMENT instance
+          # and a seeded Convex deployment — neither of which exists yet, and
+          # neither of which CI can provision for itself. Without this ack the
+          # coverage guard fails the job, which would leave `e2e` permanently red
+          # on something no contributor can fix. A job that is always red is a job
+          # everyone learns to ignore, and then it reports nothing at all.
+          #
+          # This is NOT a silent skip. With the ack set, the guard still runs and
+          # still prints the full report — every uncovered journey and every
+          # missing variable — as an annotation and a job summary. The failure is
+          # downgraded; the information is not.
+          #
+          # REMOVE THIS LINE once E2E_CLERK_* and a real NEXT_PUBLIC_CONVEX_URL are
+          # configured as repository secrets. See tests/e2e/README.md for the six
+          # variables and the Clerk dashboard settings they require.
+          AFR_E2E_ACK_NO_AUTH_COVERAGE: "1"
         run: pnpm e2e
+
+      - name: Report authenticated e2e coverage
+        if: always()
+        run: |
+          {
+            echo "### Authenticated e2e coverage"
+            echo
+            echo "The authenticated tier is **not running**: 0 of 10 journeys execute."
+            echo "Every signed-in surface — run trace, event inspector, replay, diff,"
+            echo "failure patterns, resolution lifecycle — is unverified end to end."
+            echo
+            echo "This job being green means the UNAUTHENTICATED tier passed. It does"
+            echo "not mean the product works when signed in."
+            echo
+            echo "To close this: see \`tests/e2e/README.md\`, then delete the"
+            echo "\`AFR_E2E_ACK_NO_AUTH_COVERAGE\` line from this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Playwright report on failure
         if: failure()

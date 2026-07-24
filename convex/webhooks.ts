@@ -7,8 +7,14 @@
 // change — recordWebhookDelivery/updateWebhookDeliveryStatus are
 // internal-only entry points for a future delivery worker.
 
-import { randomBytes } from "node:crypto";
-
+// RUNTIME NOTE (deploy blocker fixed 2026-07-24): this module used to
+// `import { randomBytes } from "node:crypto"`. Convex's default runtime is a
+// V8 isolate without Node builtins, and the `"use node"` escape hatch is legal
+// only in files that export exclusively actions — this file exports queries and
+// mutations, so it can never carry it. Secret generation now goes through
+// `helpers/random.ts`'s `randomHex`, which uses Web Crypto's
+// `crypto.getRandomValues` (present in the isolate, synchronous, CSPRNG) and
+// produces the identical 64-char lowercase hex string.
 import { v } from "convex/values";
 
 import { internalMutation, query, mutation } from "./_generated/server.js";
@@ -17,6 +23,7 @@ import { getAuthContext, requireOrgMembership } from "./auth.js";
 import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from "./helpers/delivery.js";
 import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_WEBHOOK_EVENTS } from "./helpers/pagination.js";
+import { randomHex } from "./helpers/random.js";
 
 import type { Doc } from "./_generated/dataModel.js";
 
@@ -92,7 +99,7 @@ export const createWebhook = mutation({
 
     validateWebhookArgs(args);
 
-    const secret = randomBytes(32).toString("hex");
+    const secret = randomHex(32);
     const now = Date.now();
     const webhookId = await ctx.db.insert("webhook_targets", {
       orgId: args.orgId,

@@ -21,9 +21,22 @@
  *
  * This module does not read or write Convex tables — it is pure/transport
  * logic only, exactly like its apps/web counterpart.
+ *
+ * RUNTIME NOTE (deploy blocker fixed 2026-07-24): this file used to
+ * `import { createHmac } from "node:crypto"` and `{ isIP } from "node:net"`.
+ * Convex's DEFAULT runtime is a V8 isolate with no Node builtins; a module may
+ * only use them under a `"use node"` directive, which is legal only in files
+ * exporting exclusively actions. This module is imported by `webhooks.ts` and
+ * `alerts.ts` (both mutation modules), so `"use node"` was never available to
+ * it. Both imports are gone:
+ *   - HMAC now uses Web Crypto (`crypto.subtle`), which the isolate provides.
+ *     Its API is async, so `signWebhookPayload` is now async.
+ *   - `isIP` is reimplemented in pure TS below (`ipVersion`), differential-
+ *     tested against `node:net.isIP` over millions of vectors.
+ * The apps/web mirror still runs under Node and keeps its `node:crypto` path;
+ * the two remain byte-for-byte equivalent (see webhook_crypto.test.ts).
  */
-import { createHmac } from "node:crypto";
-import { isIP } from "node:net";
+import { bytesToHex } from "./random.js";
 
 // ---------------------------------------------------------------------------
 // Signature (svix-style: t=<unix-seconds>,v1=<hex hmac-sha256>)
@@ -33,10 +46,38 @@ import { isIP } from "node:net";
  * HMAC-SHA256-sign a webhook payload, svix-style. See
  * apps/web/src/lib/delivery.ts's signWebhookPayload for the full consumer
  * verification-steps doc comment (identical format here).
+ *
+ * ASYNC (Web Crypto), unlike the apps/web mirror which is sync (node:crypto).
+ * The BYTES are identical: Web Crypto's HMAC key material is the UTF-8 encoding
+ * of `secret` (exactly what `createHmac("sha256", secret)` uses for a string
+ * key), and the signed content is the UTF-8 encoding of `${timestamp}.${body}`
+ * (exactly what `.update(string)` uses). Wire format is unchanged, so already-
+ * shipped consumers keep verifying.
  */
-export function signWebhookPayload(secret: string, body: string, timestamp: number): string {
+export async function signWebhookPayload(
+  secret: string,
+  body: string,
+  timestamp: number,
+): Promise<string> {
   const signedContent = `${String(timestamp)}.${body}`;
-  const hex = createHmac("sha256", secret).update(signedContent).digest("hex");
+  const encoder = new TextEncoder();
+  const secretBytes = encoder.encode(secret);
+  // node:crypto accepts a zero-length HMAC key; Web Crypto's importKey rejects
+  // one with a DataError. HMAC zero-pads any key shorter than the hash's
+  // 64-byte block, so an all-zero 64-byte key is bit-identical to the empty
+  // key — asserted against a node:crypto vector in webhook_crypto.test.ts.
+  // No live secret is empty (they are all randomHex(32)); this only keeps a
+  // hypothetical legacy/blank row signing instead of throwing.
+  const keyBytes = secretBytes.length === 0 ? new Uint8Array(64) : secretBytes;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(signedContent));
+  const hex = bytesToHex(new Uint8Array(signature));
   return `t=${String(timestamp)},v1=${hex}`;
 }
 
@@ -46,6 +87,82 @@ export function signWebhookPayload(secret: string, body: string, timestamp: numb
 
 const BLOCKED_HOSTNAME_SUFFIXES = [".internal", ".local"];
 const BLOCKED_HOSTNAME_EXACT = new Set(["localhost"]);
+
+// --- pure-TS replacement for node:net's isIP (see RUNTIME NOTE at the top) ---
+//
+// Semantics must match `node:net.isIP` EXACTLY, in both directions: a literal
+// this function fails to recognise as an IP would skip the private/reserved
+// range checks below and silently WEAKEN the SSRF guard. `webhook_crypto.test.ts`
+// differential-tests `ipVersion` against the real `node:net.isIP` over a
+// hand-written edge-case corpus plus millions of generated vectors.
+//
+// Rules replicated (all verified against Node 20's isIP):
+//   IPv4: exactly four decimal octets 0-255, NO leading zeros ("01" is not an IP).
+//   IPv6: hex groups of 1-4 digits; at most one "::"; "::" must stand for at
+//         least one group (8 explicit groups + "::" is invalid); an embedded
+//         IPv4 tail is legal only as the final textual group and counts as two
+//         groups; an optional "%zone" suffix is accepted (Node accepts one on
+//         any IPv6 literal, not just link-local) with charset [0-9A-Za-z.:-]+.
+const IPV4_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])";
+const IPV4_RE = new RegExp(`^${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3}$`);
+const IPV6_GROUP_RE = /^[0-9a-fA-F]{1,4}$/;
+const IPV6_ZONE_RE = /^[0-9A-Za-z.:-]+$/;
+
+function isIPv4Literal(s: string): boolean {
+  return IPV4_RE.test(s);
+}
+
+function isIPv6Literal(s: string): boolean {
+  let address = s;
+  const pct = s.indexOf("%");
+  if (pct !== -1) {
+    if (!IPV6_ZONE_RE.test(s.slice(pct + 1))) return false;
+    address = s.slice(0, pct);
+  }
+  if (address.length === 0) return false;
+
+  const dbl = address.indexOf("::");
+  let left: string[];
+  let right: string[];
+  if (dbl === -1) {
+    left = address.split(":");
+    right = [];
+  } else {
+    if (address.indexOf("::", dbl + 1) !== -1) return false; // more than one "::"
+    const leftStr = address.slice(0, dbl);
+    const rightStr = address.slice(dbl + 2);
+    left = leftStr === "" ? [] : leftStr.split(":");
+    right = rightStr === "" ? [] : rightStr.split(":");
+  }
+
+  const groups = [...left, ...right];
+  if (groups.length === 0) return dbl !== -1; // "::" on its own is valid
+
+  // An embedded IPv4 tail is only legal as the very last textual group. When
+  // the address ends in "::", the last atom lives in `left` and is therefore
+  // not trailing ("1.2.3.4::" is not an IPv6 address).
+  const ipv4TailIndex = dbl !== -1 && right.length === 0 ? -1 : groups.length - 1;
+
+  let count = 0;
+  for (let i = 0; i < groups.length; i++) {
+    const group = groups[i] as string;
+    if (i === ipv4TailIndex && group.includes(".")) {
+      if (!isIPv4Literal(group)) return false;
+      count += 2;
+      continue;
+    }
+    if (!IPV6_GROUP_RE.test(group)) return false;
+    count += 1;
+  }
+  return dbl === -1 ? count === 8 : count <= 7;
+}
+
+/** Drop-in replacement for `node:net`'s `isIP`: 4, 6, or 0. Exported for the differential test. */
+export function ipVersion(host: string): 0 | 4 | 6 {
+  if (isIPv4Literal(host)) return 4;
+  if (isIPv6Literal(host)) return 6;
+  return 0;
+}
 
 function isPrivateIpv4(ip: string): boolean {
   const octets = ip.split(".").map(Number);
@@ -104,11 +221,11 @@ export function assertSafeWebhookUrl(url: string): void {
     throw new UnsafeWebhookUrlError(`hostname "${hostname}" uses a blocked internal suffix`);
   }
 
-  const ipVersion = isIP(hostname);
-  if (ipVersion === 4 && isPrivateIpv4(hostname)) {
+  const version = ipVersion(hostname);
+  if (version === 4 && isPrivateIpv4(hostname)) {
     throw new UnsafeWebhookUrlError(`IP literal "${hostname}" is in a private/reserved range`);
   }
-  if (ipVersion === 6 && isPrivateIpv6(hostname)) {
+  if (version === 6 && isPrivateIpv6(hostname)) {
     throw new UnsafeWebhookUrlError(`IP literal "${hostname}" is in a private/reserved range`);
   }
 }
@@ -179,7 +296,7 @@ export async function deliverWebhook(params: DeliverWebhookParams): Promise<Deli
 
   const body = JSON.stringify(payload);
   const timestamp = Math.floor(Date.now() / 1000);
-  const signature = signWebhookPayload(secret, body, timestamp);
+  const signature = await signWebhookPayload(secret, body, timestamp);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
