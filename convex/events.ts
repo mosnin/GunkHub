@@ -4,7 +4,7 @@ import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
-import { requireOrgMembership } from "./auth.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
 import { afrError } from "./helpers/errors.js";
 import {
   DEFAULT_PAGE_SIZE,
@@ -109,11 +109,16 @@ export const listEvents = query({
     afterSeq: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the run is observed only afterwards, so a run in another org and a run
+    // that does not exist are indistinguishable.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
     const run = await ctx.db.get(args.runId);
-    if (!run) {
+    if (!run || run.orgId !== orgId) {
       throw new Error("Run not found");
     }
-    await requireOrgMembership(ctx, run.orgId);
 
     const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
 
@@ -160,11 +165,16 @@ export const getEvent = query({
     eventId: v.id("events"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the event is observed only afterwards. An event in another org and an
+    // event that does not exist produce the same error on the same path.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
     const event = await ctx.db.get(args.eventId);
-    if (!event) {
+    if (!event || event.orgId !== orgId) {
       throw new Error("Event not found");
     }
-    await requireOrgMembership(ctx, event.orgId);
     return event;
   },
 });
@@ -183,14 +193,22 @@ export const createEvent = mutation({
     parentEventId: v.optional(v.id("events")),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.runId. Writing to the append-only event log requires
+    // at least "member" — a read-only viewer must never be able to mutate the
+    // log (P0 authorization gate) — and that role gate is now applied to the
+    // caller's OWN org, so the "Forbidden" it raises is runId-independent.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "member" });
+
+    // Cross-org run and nonexistent run collapse to one outcome on one path.
+    // This is a WRITE path: the check must also come before the idempotency
+    // read below, so a cross-org caller cannot learn whether a given
+    // (runId, sequenceNumber) pair already exists in another org.
     const run = await ctx.db.get(args.runId);
-    if (!run) {
+    if (!run || run.orgId !== orgId) {
       throw new Error("Run not found");
     }
-
-    // Writing to the append-only event log requires at least "member". A read-only
-    // viewer must never be able to mutate the log (P0 authorization gate).
-    await requireOrgMembership(ctx, run.orgId, { minimumRole: "member" });
 
     // Idempotency FIRST (mirrors sdkCreateEvents): a retry of an already-stored
     // event returns idempotently regardless of run status.

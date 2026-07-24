@@ -11,6 +11,7 @@ import type { AgentVersion } from '@agent-flight-recorder/contracts'
 
 import { Card } from '@/components/ui/Card'
 import { compareVersionsAction } from '@/lib/actions/agent_versions'
+import { isEmpty, isOk } from '@/lib/services/serviceResult'
 
 interface VersionCompareProps {
   versions: AgentVersion[]
@@ -97,7 +98,7 @@ export function VersionCompare({ versions }: VersionCompareProps) {
           <h2 className="text-sm font-semibold text-neutral-200">Compare versions</h2>
         </div>
         <div className="px-5 py-4">
-          <p className="text-sm text-neutral-500">
+          <p className="text-sm text-pewter">
             Create a second version to compare cohorts.
           </p>
         </div>
@@ -172,13 +173,28 @@ export function VersionCompare({ versions }: VersionCompareProps) {
             (after a button click, not a route change), so screen-reader
             users need to be told it changed — not just see it appear. */}
         <div aria-live="polite" className="flex flex-col gap-3">
-          {result && !result.available && (
-            <p className="text-sm text-neutral-500">
-              Comparison data isn&#39;t available yet for one or both versions — there may not be enough runs recorded.
-            </p>
+          {/* `result === null` is a THIRD state — not yet compared — and stays
+              distinct from 'empty'. It renders nothing, which is right: the
+              user has not asked a question yet, so there is no answer to
+              explain. Once they have, 'empty' and 'error' diverge.
+              No role="alert" here: the parent aria-live region already
+              announces the swap, and an assertive alert inside it would
+              double-announce. */}
+          {result !== null && !isOk(result) && (
+            isEmpty(result) ? (
+              <p className="text-sm text-pewter">{result.message}</p>
+            ) : (
+              <p className="flex items-start gap-2 text-sm text-ember">
+                <span
+                  className="w-1.5 h-1.5 rounded-full bg-destructive-500 shrink-0 mt-1.5"
+                  aria-hidden="true"
+                />
+                <span>{result.message}</span>
+              </p>
+            )
           )}
 
-          {result?.available && (
+          {result !== null && isOk(result) && (
             <div className="flex flex-col gap-3">
               {result.narrative && <NarrativeCallout narrative={result.narrative} />}
               <div className="flex flex-wrap gap-3">

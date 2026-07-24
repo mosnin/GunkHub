@@ -271,7 +271,7 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
                 setDraftTags(savedTags)
                 setIsEditing(true)
               }}
-              className="inline-flex items-center gap-0.5 text-xs text-pewter hover:text-neutral-500 transition-colors font-mono"
+              className="inline-flex items-center gap-0.5 text-xs text-pewter hover:text-cloud transition-colors font-mono"
               aria-label="Edit tags"
               title="Edit tags"
             >
@@ -300,7 +300,7 @@ export function RunHeader({ runId, status, agentName, agentVersionLabel, started
       {/* Metadata — collapsible details, only when metadata has keys */}
       {metadata && Object.keys(metadata).length > 0 && (
         <details className="mt-2">
-          <summary className="text-xs text-pewter cursor-pointer hover:text-neutral-500 select-none">
+          <summary className="text-xs text-pewter cursor-pointer hover:text-cloud select-none">
             Metadata ({Object.keys(metadata).length} field{Object.keys(metadata).length !== 1 ? 's' : ''})
           </summary>
           <dl className="mt-2 flex flex-col gap-1">

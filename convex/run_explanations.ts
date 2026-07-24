@@ -133,8 +133,8 @@ const _listRecentEventsForExplanationRef = makeFunctionReference<"query">(
 const _listEvalsForExplanationRef = makeFunctionReference<"query">("run_explanations:_listEvalsForExplanation");
 const _upsertRunExplanationRef = makeFunctionReference<"mutation">("run_explanations:_upsertRunExplanation");
 const _getExistingExplanationRef = makeFunctionReference<"query">("run_explanations:_getExistingExplanation");
-const _requireAdminForRegenerateRef = makeFunctionReference<"query">(
-  "run_explanations:_requireAdminForRegenerate",
+const _resolveRegenerateAccessRef = makeFunctionReference<"query">(
+  "run_explanations:_resolveRegenerateAccess",
 );
 const _recordRegenerateAuditRef = makeFunctionReference<"mutation">("run_explanations:_recordRegenerateAudit");
 export const _generateRunExplanationRef = makeFunctionReference<"action">(
@@ -628,9 +628,18 @@ export interface RunExplanationQueryResult {
 export const getRunExplanation = query({
   args: { runId: v.id("runs") },
   handler: async (ctx, args): Promise<RunExplanationQueryResult> => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.runId. This previously threw
+    // "NOT_FOUND: Run not found" for a missing run but
+    // "Unauthorized: not a member of this organization" for a run owned by
+    // another org — an existence oracle. Both now collapse to the same
+    // NOT_FOUND on the same code path, matching the posture already documented
+    // on getRunExplanationSummaries below.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
     const run = await ctx.db.get(args.runId);
-    if (!run) throw afrError("NOT_FOUND", "Run not found");
-    await requireOrgMembership(ctx, run.orgId);
+    if (!run || run.orgId !== orgId) throw afrError("NOT_FOUND", "Run not found");
 
     if (!EXPLAINABLE_STATUSES.has(run.status)) {
       return { status: "not_eligible", explanation: null, runStatus: run.status, runEndedAt: run.endedAt };
@@ -699,20 +708,43 @@ export const getRunExplanationSummaries = query({
   },
 });
 
-/** Admin-role check for regenerateRunExplanation. Internal only — mirrors projection_verify.ts's _requireMembershipForReverify. */
-export const _requireAdminForRegenerate = internalQuery({
-  args: { clerkUserId: v.string(), orgId: v.id("organizations") },
+/**
+ * Resolve the CALLER's own organization and enforce the admin role for
+ * regenerateRunExplanation. Internal only — mirrors projection_verify.ts's
+ * _resolveReverifyAccess.
+ *
+ * Deliberately takes no runId and knows nothing about any run: every throw here
+ * is a statement about the caller alone, so none of them can be used to probe
+ * for the existence of a run in another org. It previously took the RUN's orgId,
+ * which both authorized against whichever org the record happened to belong to
+ * and made its "Unauthorized"/"Forbidden" throws runId-dependent.
+ *
+ * regenerateRunExplanation compares the returned orgId against the run's own
+ * orgId and collapses any mismatch into the same NOT_FOUND it raises for a run
+ * that does not exist.
+ */
+export const _resolveRegenerateAccess = internalQuery({
+  args: { clerkUserId: v.string(), clerkOrgId: v.string() },
   handler: async (ctx, args) => {
     const ROLE_RANK: Record<string, number> = { viewer: 0, member: 1, admin: 2 };
+
+    const org = await ctx.db
+      .query("organizations")
+      .withIndex("by_clerk_org_id", (q) => q.eq("clerkOrgId", args.clerkOrgId))
+      .unique();
+    if (!org) throw new Error("Unauthorized: organization not found");
+
     const membership = await ctx.db
       .query("user_memberships")
       .withIndex("by_clerk_user", (q) => q.eq("clerkUserId", args.clerkUserId))
-      .filter((q) => q.eq(q.field("orgId"), args.orgId))
+      .filter((q) => q.eq(q.field("orgId"), org._id))
       .unique();
     if (!membership) throw new Error("Unauthorized: not a member of this organization");
     if ((ROLE_RANK[membership.role] ?? 0) < (ROLE_RANK["admin"] ?? 0)) {
       throw new Error("Forbidden: admin role required to regenerate a run explanation");
     }
+
+    return { orgId: org._id };
   },
 });
 
@@ -745,11 +777,27 @@ export const regenerateRunExplanation = action({
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) throw afrError("UNAUTHORIZED", "Unauthorized");
     const clerkUserId = identity.subject;
+    const clerkOrgId = (identity as unknown as Record<string, unknown>)["org_id"] as string | undefined;
+    if (!clerkOrgId) throw afrError("UNAUTHORIZED", "Unauthorized: no organization context");
+
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve the caller's OWN org and role
+    // FIRST. Everything above and in this call is independent of args.runId, so
+    // its throws reveal nothing about which runs exist. This previously
+    // authorized against `run.orgId` AFTER fetching the run, which produced a
+    // three-way oracle on a WRITE path: "NOT_FOUND: Run not found" (no such
+    // run), "Unauthorized: not a member..." (foreign run, non-member), and
+    // "Forbidden: admin role required..." (foreign run, non-admin member) —
+    // the last of which also leaked the caller's membership tier.
+    const access = (await ctx.runQuery(_resolveRegenerateAccessRef, {
+      clerkUserId,
+      clerkOrgId,
+    })) as { orgId: Id<"organizations"> };
 
     const run = (await ctx.runQuery(_getRunForExplanationRef, { runId: args.runId })) as Doc<"runs"> | null;
-    if (!run) throw afrError("NOT_FOUND", "Run not found");
 
-    await ctx.runQuery(_requireAdminForRegenerateRef, { clerkUserId, orgId: run.orgId });
+    // Cross-org run and nonexistent run collapse to one outcome on one path,
+    // before any audit row or explanation is written.
+    if (!run || run.orgId !== access.orgId) throw afrError("NOT_FOUND", "Run not found");
 
     if (!EXPLAINABLE_STATUSES.has(run.status)) {
       throw afrError("INVALID_ARGUMENT", `Cannot generate an explanation for a run with status "${run.status}"`);

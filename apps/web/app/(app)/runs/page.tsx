@@ -9,12 +9,14 @@ import { EnvironmentFilterInput } from '@/components/runs/EnvironmentFilterInput
 import { RunSearchBar } from '@/components/runs/RunSearchBar'
 import { SelectableRunList } from '@/components/runs/SelectableRunList'
 import { ErrorState } from '@/components/ui/ErrorState'
+import { InlineError } from '@/components/ui/InlineError'
 import { listAgentsByOrg } from '@/lib/services/agents'
 import {
   batchGetRunVerificationStatuses,
   type VerificationStatus,
 } from '@/lib/services/projection_verify'
 import { listRuns } from '@/lib/services/runs'
+import { isError, isOk } from '@/lib/services/serviceResult'
 
 export const metadata: Metadata = { title: 'Runs' }
 
@@ -194,13 +196,26 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
     // Non-fatal: agent dropdown is hidden if fetch fails
   }
 
-  // Batch-fetch verification statuses for this page of runs (non-fatal)
-  let verificationStatuses: Record<string, VerificationStatus> = {}
-  if (runs?.runs && runs.runs.length > 0) {
-    verificationStatuses = await batchGetRunVerificationStatuses(
-      runs.runs.map((r) => r.id),
-    )
-  }
+  // Batch-fetch verification statuses for this page of runs (non-fatal).
+  //
+  // The Integrity column renders an em-dash for any run with no status, so a
+  // failed batch lookup used to be indistinguishable from "these runs were
+  // checked and had nothing to report" — a whole column of reassuring blanks.
+  // We now keep the failure and explain it above the table.
+  const verificationResult =
+    runs?.runs && runs.runs.length > 0
+      ? await batchGetRunVerificationStatuses(runs.runs.map((r) => r.id))
+      : null
+  // Undefined — NOT {} — when the lookup did not succeed. An empty map would
+  // make SelectableRunList render an Integrity column in which every run reads
+  // as unverified/em-dash, silently relabelling the whole page. Undefined
+  // hides the column, and `verificationError` explains why above the table.
+  const verificationStatuses: Record<string, VerificationStatus> | undefined =
+    verificationResult !== null && isOk(verificationResult) ? verificationResult.statuses : undefined
+  // 'empty' here means "no runs to check", which the empty run list already
+  // says. Only a real failure is worth a notice.
+  const verificationError =
+    verificationResult !== null && isError(verificationResult) ? verificationResult.message : null
 
   // "Why did this fail?" list preview — capped to the visible FAILED/timed_out
   // rows on this page only (never the whole list) to bound the per-run fetch
@@ -226,10 +241,16 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
   // listRunsByVerification; this only refines "passed" into "verified" vs
   // "partial" within the already server-filtered page (see
   // matchesFineGrainedVerify above).
+  // When statuses failed to load we cannot refine, and refining on an absent
+  // map would filter EVERY run out of a verified/partial view — an empty page
+  // that looks like a real answer. Fall back to the server's own filtering
+  // (listRunsByVerification already applied it) and let the notice explain.
   const filteredRuns = runs?.runs
-    ? runs.runs.filter((run) =>
-        matchesFineGrainedVerify(verificationStatuses[run.id], verifyFilter),
-      )
+    ? verificationStatuses === undefined
+      ? runs.runs
+      : runs.runs.filter((run) =>
+          matchesFineGrainedVerify(verificationStatuses[run.id], verifyFilter),
+        )
     : undefined
 
   return (
@@ -429,12 +450,17 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
             message={error}
           />
         ) : (
-          <SelectableRunList
-            runs={filteredRuns}
-            agentVersionLabels={agentVersionLabels}
-            verificationStatuses={verificationStatuses}
-            explanationSummaries={explanationSummaries}
-          />
+          <>
+            {verificationError && (
+              <InlineError message={verificationError} className="mb-2" />
+            )}
+            <SelectableRunList
+              runs={filteredRuns}
+              agentVersionLabels={agentVersionLabels}
+              verificationStatuses={verificationStatuses}
+              explanationSummaries={explanationSummaries}
+            />
+          </>
         )}
       </div>
 

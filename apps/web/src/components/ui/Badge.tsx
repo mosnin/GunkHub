@@ -12,7 +12,7 @@ interface BadgeProps {
 const statusConfig: Record<RunStatus, { label: string; className: string; dot: string }> = {
   pending: {
     label: 'pending',
-    className: 'bg-graphite text-ash border-graphite-light',
+    className: 'bg-graphite text-pewter border-graphite-light',
     dot: 'bg-pewter',
   },
   running: {

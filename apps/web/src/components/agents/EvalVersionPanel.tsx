@@ -2,6 +2,8 @@ import type { EvalVersionRollup } from '@/lib/services/evals'
 
 import { Card } from '@/components/ui/Card'
 import { EmptyState } from '@/components/ui/EmptyState'
+import { ErrorState } from '@/components/ui/ErrorState'
+import { isEmpty, isOk } from '@/lib/services/serviceResult'
 
 interface EvalVersionPanelProps {
   version: string
@@ -48,7 +50,7 @@ export function EvalVersionPanel({ version, evalRules, rollup }: EvalVersionPane
             Configured rules
           </h3>
           {evalRules.length === 0 ? (
-            <p className="text-sm text-neutral-500">
+            <p className="text-sm text-pewter">
               No eval rules configured on this version. Evals can still be recorded manually via the API.
             </p>
           ) : (
@@ -66,13 +68,23 @@ export function EvalVersionPanel({ version, evalRules, rollup }: EvalVersionPane
           <h3 className="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2">
             Pass rate
           </h3>
-          {!rollup.available ? (
-            <EmptyState
-              title="No eval rollup available yet"
-              description="This fills in once evals have been recorded against runs of this version."
-            />
+          {/* Reconciled, not stacked. There are two distinct ways to genuinely
+              have no evals — no rollup document at all ('empty'), or a rollup
+              that exists but covers no evals in range (sampleSize 0) — and
+              they now share one EmptyState presentation with cause-specific
+              copy. The old bare <p> for the second case is gone. A failed
+              query is a separate branch and cannot reach either. */}
+          {!isOk(rollup) ? (
+            isEmpty(rollup) ? (
+              <EmptyState title="No evals recorded for this version" description={rollup.message} />
+            ) : (
+              <ErrorState title="Couldn't load the eval rollup" message={rollup.message} />
+            )
           ) : rollup.sampleSize === 0 ? (
-            <p className="text-sm text-neutral-500">No evals recorded against this version yet.</p>
+            <EmptyState
+              title="No evals recorded for this version"
+              description="A rollup exists for this version, but it covers no evals in the selected range."
+            />
           ) : (
             <div className="flex flex-col gap-3">
               <dl className="flex flex-wrap gap-3">
@@ -107,7 +119,7 @@ export function EvalVersionPanel({ version, evalRules, rollup }: EvalVersionPane
                     >
                       <span className="text-whiteout font-medium">{f.name}</span>
                       <span className="text-pewter font-mono">{f.kind}</span>
-                      {f.details && <span className="text-ash truncate flex-1">{f.details}</span>}
+                      {f.details && <span className="text-pewter truncate flex-1">{f.details}</span>}
                     </a>
                   ))}
                 </div>

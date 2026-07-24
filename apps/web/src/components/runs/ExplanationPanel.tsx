@@ -55,7 +55,7 @@ export function ExplanationPanel({ runId, explanation, loadFailed, isAdmin, runE
       </div>
 
       {loadFailed ? (
-        <p className="text-sm text-neutral-500">
+        <p className="text-sm text-pewter">
           Couldn&apos;t load the failure analysis for this run — refresh to retry.
         </p>
       ) : !explanation ? (
@@ -65,10 +65,10 @@ export function ExplanationPanel({ runId, explanation, loadFailed, isAdmin, runE
               className="w-1.5 h-1.5 rounded-full bg-neon-glow animate-neon-pulse shrink-0 forced-colors:bg-[Highlight]"
               aria-hidden="true"
             />
-            <p className="text-sm text-neutral-500">Analyzing this run&apos;s failure…</p>
+            <p className="text-sm text-pewter">Analyzing this run&apos;s failure…</p>
           </div>
         ) : (
-          <p className="text-sm text-neutral-500">
+          <p className="text-sm text-pewter">
             No failure analysis is available for this run.
             {isAdmin && ' Use Regenerate above to run one now.'}
           </p>

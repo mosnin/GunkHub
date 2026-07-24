@@ -71,7 +71,7 @@ export default async function SettingsPage() {
             <h2 className="text-sm font-semibold text-neutral-200">Organization</h2>
           </div>
           <div className="px-5 py-4">
-            <label className="block text-xs font-medium text-neutral-500 mb-1.5" htmlFor="org-name">
+            <label className="block text-xs font-medium text-pewter mb-1.5" htmlFor="org-name">
               Name
             </label>
             <input

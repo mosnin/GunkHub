@@ -1,10 +1,22 @@
 import { auth } from '@clerk/nextjs/server'
 
+import {
+  unavailableEmpty,
+  unavailableError,
+  unavailableNoOrg,
+  unavailableOrgUnresolved,
+} from './serviceResult'
+
 import type { DashboardRange } from './dashboard'
+import type { ServiceResult } from './serviceResult'
 import type { Eval, EvalKind } from '@agent-flight-recorder/contracts'
+
 
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient } from '@/lib/convexServer'
+
+const ROLLUP_SUBJECT = 'eval results for this version'
+const RUN_SUMMARY_SUBJECT = 'eval results for this run'
 
 
 function mapEval(doc: Record<string, unknown>): Eval {
@@ -92,8 +104,7 @@ export interface EvalRecentFailure {
   createdAt: number
 }
 
-export interface EvalVersionRollupAvailable {
-  available: true
+export interface EvalVersionRollupData {
   agentVersionId: string
   range: DashboardRange
   sampleSize: number
@@ -104,11 +115,7 @@ export interface EvalVersionRollupAvailable {
   truncated: boolean
 }
 
-export interface EvalVersionRollupUnavailable {
-  available: false
-}
-
-export type EvalVersionRollup = EvalVersionRollupAvailable | EvalVersionRollupUnavailable
+export type EvalVersionRollup = ServiceResult<EvalVersionRollupData>
 
 // ---------------------------------------------------------------------------
 // Run-level eval summary — Team B's convex/insights.ts `getRunEvalSummary`
@@ -118,8 +125,7 @@ export type EvalVersionRollup = EvalVersionRollupAvailable | EvalVersionRollupUn
 // fetched by the run-detail page via listEvalsForRun) if the query throws.
 // ---------------------------------------------------------------------------
 
-export interface RunEvalSummary {
-  available: boolean
+export interface RunEvalSummaryData {
   total: number
   passed: number
   failed: number
@@ -129,11 +135,15 @@ export interface RunEvalSummary {
   avgScore?: number
 }
 
-export async function getRunEvalSummary(runId: string): Promise<RunEvalSummary> {
-  try {
-    const { orgId: clerkOrgId } = auth()
-    if (!clerkOrgId) return { available: false, total: 0, passed: 0, failed: 0, passRatePct: null }
+export type RunEvalSummary = ServiceResult<RunEvalSummaryData>
 
+const NO_EVALS_MESSAGE = 'No evals recorded for this run.'
+
+export async function getRunEvalSummary(runId: string): Promise<RunEvalSummary> {
+  const { orgId: clerkOrgId } = auth()
+  if (!clerkOrgId) return unavailableNoOrg(RUN_SUMMARY_SUBJECT)
+
+  try {
     const client = await getAuthedClient()
 
     // `insights:getRunEvalSummary` requires { orgId, runId }. This call omitted
@@ -145,7 +155,7 @@ export async function getRunEvalSummary(runId: string): Promise<RunEvalSummary> 
     // exactly as listEvalsForVersion below already does.
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
-    if (!org) return { available: false, total: 0, passed: 0, failed: 0, passRatePct: null }
+    if (!org) return unavailableOrgUnresolved(RUN_SUMMARY_SUBJECT)
     const orgDoc = org as Record<string, unknown>
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -153,36 +163,48 @@ export async function getRunEvalSummary(runId: string): Promise<RunEvalSummary> 
       orgId: orgDoc._id,
       runId,
     })
-    if (!result) return { available: false, total: 0, passed: 0, failed: 0, passRatePct: null }
-    const r = result as Partial<RunEvalSummary>
+    // Query returned. Nothing there means nothing was recorded — legitimately
+    // empty, and the only branch in this function entitled to claim that.
+    if (!result) return unavailableEmpty(NO_EVALS_MESSAGE)
+    const r = result as Partial<RunEvalSummaryData>
+    if ((r.total ?? 0) === 0) return unavailableEmpty(NO_EVALS_MESSAGE)
     return {
-      available: true,
+      status: 'ok',
       total: r.total ?? 0,
       passed: r.passed ?? 0,
       failed: r.failed ?? 0,
       passRatePct: r.passRatePct ?? null,
       ...(r.avgScore !== undefined && { avgScore: r.avgScore }),
     }
-  } catch {
+  } catch (primaryErr) {
     // Fall back to summarizing the run's own eval list rather than showing
-    // nothing — same list the Evals tab already renders.
+    // nothing — same list the Evals tab already renders. This is a legitimate
+    // recovery, not a swallow: if it succeeds we have real data and can
+    // honestly report 'ok'/'empty'; if it also fails we report 'error'.
     try {
       const evals = await listEvalsForRun(runId)
+      if (evals.length === 0) return unavailableEmpty(NO_EVALS_MESSAGE)
       const summary = summarizeEvalPassRate(evals)
       const scored = evals.filter((e) => e.score !== undefined)
       const avgScore = scored.length > 0
         ? scored.reduce((sum, e) => sum + (e.score ?? 0), 0) / scored.length
         : undefined
       return {
-        available: true,
+        status: 'ok',
         total: summary.total,
         passed: summary.passed,
         failed: summary.failed,
         passRatePct: summary.passRatePct,
         ...(avgScore !== undefined && { avgScore }),
       }
-    } catch {
-      return { available: false, total: 0, passed: 0, failed: 0, passRatePct: null }
+    } catch (fallbackErr) {
+      // Both paths failed. We know nothing about this run's evals.
+      return unavailableError(RUN_SUMMARY_SUBJECT, fallbackErr, {
+        service: 'evals',
+        fn: 'getRunEvalSummary',
+        runId,
+        primaryErr,
+      })
     }
   }
 }
@@ -192,13 +214,13 @@ export async function getEvalRollupForVersion(
   range: DashboardRange = '7d',
 ): Promise<EvalVersionRollup> {
   const { orgId: clerkOrgId } = auth()
-  if (!clerkOrgId) return { available: false }
+  if (!clerkOrgId) return unavailableNoOrg(ROLLUP_SUBJECT)
 
   try {
     const client = await getAuthedClient()
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
-    if (!org) return { available: false }
+    if (!org) return unavailableOrgUnresolved(ROLLUP_SUBJECT)
     const orgDoc = org as Record<string, unknown>
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -207,11 +229,21 @@ export async function getEvalRollupForVersion(
       agentVersionId,
       range,
     })
-    if (!result) return { available: false }
+    // Query succeeded with no rollup: nothing has been recorded for this
+    // version and range. This is the only honest "fills in once evals have
+    // been recorded" branch.
+    if (!result) {
+      return unavailableEmpty('No evals recorded for this version in this range yet.')
+    }
 
-    const r = result as Omit<EvalVersionRollupAvailable, 'available' | 'range'>
-    return { available: true, range, ...r }
-  } catch {
-    return { available: false }
+    const r = result as Omit<EvalVersionRollupData, 'range'>
+    return { status: 'ok', range, ...r }
+  } catch (err) {
+    return unavailableError(ROLLUP_SUBJECT, err, {
+      service: 'evals',
+      fn: 'getEvalRollupForVersion',
+      agentVersionId,
+      range,
+    })
   }
 }

@@ -51,16 +51,18 @@ CI (`.github/workflows/ci.yml`) runs: typecheck, lint, dependency-audit,
 schema-drift, build, test, and integration-test, on every push to `main`/`feature/**`/
 `fix/**`/`claude/**` and every PR into `main`.
 
-### The `tests/` package has two typecheck projects
+### The `tests/` package has three typecheck projects
 
-`pnpm --filter @agent-flight-recorder/tests typecheck` runs **two** `tsc` invocations,
+`pnpm --filter @agent-flight-recorder/tests typecheck` runs **three** `tsc` invocations,
 not one. Nothing extra to remember day to day — `pnpm typecheck` and `validate.sh` both
-pick this up — but it matters if you add a test that imports backend code.
+pick this up — but it matters if you add a test that imports backend code or renders a
+React component.
 
 | Project | Covers | Notable option |
 |---------|--------|----------------|
-| `tests/tsconfig.json` | every test **except** the seam files listed in its `exclude` | `exactOptionalPropertyTypes: true` (inherited from `tsconfig.base.json`) |
-| `tests/tsconfig.convex-seam.json` | only the seam files, plus whatever `convex/` code they pull in | extends `convex/tsconfig.json`, so `exactOptionalPropertyTypes: false` |
+| `tests/tsconfig.json` | every test **except** the files listed in its `exclude` | `exactOptionalPropertyTypes: true` (inherited from `tsconfig.base.json`) |
+| `tests/tsconfig.convex-seam.json` | only the Convex seam files, plus whatever `convex/` code they pull in | extends `convex/tsconfig.json`, so `exactOptionalPropertyTypes: false` |
+| `tests/tsconfig.dom.json` | only the DOM tests, plus whatever `apps/web/` components they render | extends `apps/web/tsconfig.json`, so `exactOptionalPropertyTypes: false`; `jsx: react-jsx` |
 
 **Why the split.** `convex/tsconfig.json` deliberately turns
 `exactOptionalPropertyTypes` off: Convex's generated document types declare optional
@@ -84,6 +86,77 @@ list short — every file on it trades `exactOptionalPropertyTypes` for visibili
 Convex types, which is only the right trade for a file whose entire job is pinning a
 cross-boundary seam. An ordinary test that just needs a shape should import it from
 `@agent-flight-recorder/contracts` and stay in the strict project.
+
+`tests/tsconfig.dom.json` exists for exactly the same reason, one boundary over:
+`apps/web/tsconfig.json` also sets `exactOptionalPropertyTypes: false`, so a test that
+imports a React component drags web source that is correct under its own config into the
+strict project and fails on idiomatic prop forwarding (`<Badge mutedAt={p.mutedAt} />`,
+where `mutedAt?: number` meets `number | undefined`). Same resolution: extend the owning
+package's tsconfig rather than relax this one.
+
+---
+
+## Writing a DOM test
+
+Most suites in `tests/` run under `environment: 'node'` and that is the default. A test
+that renders a React component opts **into** jsdom per-file. The global environment is
+deliberately not flipped: ~67 node suites have no use for a DOM, and giving SDK, Convex
+and service tests browser globals (`window`, `localStorage`) their production runtime
+does not have would let a test pass for the wrong reason.
+
+**1. Name the file `.tsx` and declare the environment in its first docblock.**
+
+```tsx
+/**
+ * @vitest-environment jsdom
+ */
+import { render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+
+import { PatternStatusFilter } from '@/components/patterns/PatternStatusFilter'
+```
+
+The docblock must be the **first** comment in the file — Vitest reads it there and
+nowhere else. `tests/setup/global.ts` then loads `tests/setup/dom.ts` (jest-dom matchers
+plus unmount-between-tests) automatically, gated on `document` existing, so node suites
+never pay for it.
+
+**2. Register the file in the right projects.** A new `.tsx` DOM test needs three
+one-line edits, or it will fail `typecheck` and `lint` while still passing `test`:
+
+- add it to `include` in `tests/tsconfig.dom.json`
+- add it to `exclude` in `tests/tsconfig.json`
+- add it to the `files` list in `tests/.eslintrc.js`, which points type-aware linting at
+  `tsconfig.dom.json` (the root config's `**/*.test.ts` override does not match `.tsx`)
+
+**3. Assert on the accessibility tree, not on markup.** Prefer
+`getByRole`/`getByLabelText`/`toHaveAccessibleName` over class names and test IDs — a
+role query fails when the thing a user relies on breaks, a class query fails when
+someone renames a utility. `tests/unit/patterns_a11y.test.tsx` is the worked example
+and carries reusable helpers for tab-stop enumeration, `sr-only`-stripped visible text,
+`aria-hidden`-stripped announced text, and live-region discovery.
+
+**4. Two Vite behaviours that will bite you.**
+
+- **`next/link` and `@clerk/nextjs/server` are not resolvable from `tests/`** (they are
+  `apps/web` dependencies, and pnpm's `node_modules` are isolated). Both are aliased to
+  stubs in `tests/stubs/`, wired up in `tests/vitest.config.ts`. Next **route** files
+  (`loading.tsx`, `page.tsx`) live outside the `@/*` alias and import via `@app/*`.
+- **`new URL('../x', import.meta.url)` is statically rewritten by Vite** into an asset
+  URL, which under jsdom resolves against `http://localhost:3000/@fs/...` — so
+  `fileURLToPath` throws `ERR_INVALID_URL_SCHEME`. It works in node suites and breaks in
+  DOM ones. Use `path.resolve(fileURLToPath(import.meta.url), '../…')` instead; a bare
+  `import.meta.url` is not rewritten.
+
+**5. Never assert on a real network call.** Stub with `vi.stubGlobal('fetch', …)` and
+`vi.unstubAllGlobals()` in `afterEach`. Interactions go through `userEvent`, and every
+`userEvent` call is awaited — a floating one leaves React state updates unflushed and
+produces failures that look like race conditions.
+
+**Cost.** The DOM harness (`jsdom`, `@testing-library/{react,dom,jest-dom,user-event}`)
+is devDependency-only, ~29 MB installed, and adds roughly 2.5s to the `tests` package's
+wall clock — almost all of it the one jsdom file, plus ~11ms per node file for the
+gated setup import.
 
 ---
 

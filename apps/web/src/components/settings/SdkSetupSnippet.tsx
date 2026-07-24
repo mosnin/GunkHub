@@ -23,27 +23,27 @@ export function SdkSetupSnippet() {
     <Card>
       <div className="px-5 py-4 border-b border-neutral-800">
         <h2 className="text-sm font-semibold text-neutral-200">SDK Setup</h2>
-        <p className="mt-0.5 text-xs text-neutral-500">
+        <p className="mt-0.5 text-xs text-pewter">
           Install the SDK and start recording runs from your agent code.
         </p>
       </div>
 
       <div className="px-5 py-4 flex flex-col gap-4">
         <div>
-          <p className="text-xs font-medium text-neutral-500 mb-1.5 uppercase tracking-wider">
+          <p className="text-xs font-medium text-pewter mb-1.5 uppercase tracking-wider">
             Installation
           </p>
           <CodeBlock content={installCommand} language="shell" maxHeight="60px" />
         </div>
 
         <div>
-          <p className="text-xs font-medium text-neutral-500 mb-1.5 uppercase tracking-wider">
+          <p className="text-xs font-medium text-pewter mb-1.5 uppercase tracking-wider">
             Basic usage
           </p>
           <CodeBlock content={usageSnippet} language="typescript" />
         </div>
 
-        <p className="text-xs text-neutral-500 leading-relaxed">
+        <p className="text-xs text-pewter leading-relaxed">
           Get your API key from the API Keys section below. Find your project and agent IDs on the{' '}
           <span className="text-neutral-400">Projects</span> page.
         </p>

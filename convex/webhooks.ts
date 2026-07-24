@@ -127,11 +127,15 @@ export const createWebhook = mutation({
 export const deleteWebhook = mutation({
   args: { webhookId: v.id("webhook_targets") },
   handler: async (ctx, args) => {
-    const hook = await ctx.db.get(args.webhookId);
-    if (!hook) throw new Error("Webhook not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.webhookId — this is a destructive WRITE path, so the
+    // collapse must precede the delete, not follow it.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
 
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, hook.orgId, { minimumRole: "admin" });
+    // Cross-org webhook and nonexistent webhook collapse to one outcome.
+    const hook = await ctx.db.get(args.webhookId);
+    if (!hook || hook.orgId !== orgId) throw new Error("Webhook not found");
 
     await ctx.db.delete(args.webhookId);
 
@@ -151,16 +155,25 @@ export const deleteWebhook = mutation({
 export const listWebhookDeliveries = query({
   args: { webhookId: v.id("webhook_targets"), limit: v.optional(v.number()) },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the webhook is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
+
+    // Cross-org webhook and nonexistent webhook collapse to one outcome.
     const hook = await ctx.db.get(args.webhookId);
-    if (!hook) throw new Error("Webhook not found");
-    await requireOrgMembership(ctx, hook.orgId, { minimumRole: "admin" });
+    if (!hook || hook.orgId !== orgId) throw new Error("Webhook not found");
 
     const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
-    return await ctx.db
+    const rows = await ctx.db
       .query("webhook_deliveries")
       .withIndex("by_webhook", (q) => q.eq("webhookId", args.webhookId))
       .order("desc")
       .take(limit);
+
+    // Defence in depth: a delivery row stamped with a different org than its
+    // webhook is a data defect, not something to hand back across the boundary.
+    return rows.filter((d) => d.orgId === orgId);
   },
 });
 

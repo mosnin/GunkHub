@@ -105,7 +105,7 @@ export function ShortcutOverlay({ isOpen, onClose }: ShortcutOverlayProps) {
         <div className="px-5 py-4 flex flex-col gap-5 overflow-y-auto">
           {SHORTCUT_GROUPS.map((group) => (
             <div key={group.title} className="flex flex-col gap-2">
-              <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">
+              <p className="text-xs font-medium text-pewter uppercase tracking-wider">
                 {group.title}
               </p>
               <dl className="flex flex-col gap-1.5">

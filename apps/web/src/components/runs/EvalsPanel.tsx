@@ -2,6 +2,9 @@ import type { RunEvalSummary } from '@/lib/services/evals'
 import type { Eval } from '@agent-flight-recorder/contracts'
 
 import { EmptyState } from '@/components/ui/EmptyState'
+import { ErrorState } from '@/components/ui/ErrorState'
+import { InlineError } from '@/components/ui/InlineError'
+import { isError, isOk } from '@/lib/services/serviceResult'
 import { formatRelativeTime } from '@/lib/utils'
 
 interface EvalsPanelProps {
@@ -12,8 +15,28 @@ interface EvalsPanelProps {
   summary?: RunEvalSummary
 }
 
+/**
+ * Deliberate decision on the 'error' branch, not a mechanical port.
+ *
+ * The mechanical translation of `!summary.available` is `!isOk(summary)`,
+ * which returns null and renders NOTHING when the rollup query throws. That is
+ * the same self-concealing failure this contract exists to remove, just
+ * quieter: the engineer sees a list of evals with no pass rate and cannot tell
+ * whether the aggregate is missing because it does not apply or because the
+ * backend fell over.
+ *
+ * So the branches diverge:
+ *   'error'            → a compact InlineError. Deliberately not ErrorState —
+ *                        the eval rows below still render fine, so this is an
+ *                        additive failure, which is exactly what InlineError
+ *                        is for. Silence here would be the bug.
+ *   'empty' / total 0  → null IS correct. There is genuinely no aggregate to
+ *                        show and the list below already says so. Rendering
+ *                        an error for a true empty would be its own lie.
+ */
 function SummaryHeader({ summary }: { summary: RunEvalSummary }) {
-  if (!summary.available || summary.total === 0) return null
+  if (isError(summary)) return <InlineError message={summary.message} className="mx-6 mt-6" />
+  if (!isOk(summary) || summary.total === 0) return null
   const passColor = summary.passRatePct !== null && summary.passRatePct >= 90
     ? 'text-neon-glow'
     : summary.passRatePct !== null && summary.passRatePct < 50
@@ -70,6 +93,17 @@ function PassFailChip({ passed }: { passed: boolean }) {
 /** Run-detail Evals tab — every eval recorded against this run (convex/evals.ts, append-only). */
 export function EvalsPanel({ evals, summary }: EvalsPanelProps) {
   if (evals.length === 0) {
+    // A failed summary query is evidence the eval subsystem is unhealthy, so
+    // "nothing has been recorded" is not a claim we can honestly make here —
+    // an empty list plus a thrown rollup is indistinguishable from a total
+    // outage. Lead with the failure instead of the reassurance.
+    if (summary && isError(summary)) {
+      return (
+        <div className="p-6">
+          <ErrorState title="Couldn't load evals for this run" message={summary.message} />
+        </div>
+      )
+    }
     return (
       <div className="p-6">
         <EmptyState
@@ -99,7 +133,7 @@ export function EvalsPanel({ evals, summary }: EvalsPanelProps) {
               )}
             </div>
             {e.details && (
-              <p className="mt-1 text-xs text-ash leading-relaxed break-words">{e.details}</p>
+              <p className="mt-1 text-xs text-pewter leading-relaxed break-words">{e.details}</p>
             )}
           </div>
           <span className="text-xs text-pewter shrink-0 font-mono">{formatRelativeTime(e.createdAt)}</span>

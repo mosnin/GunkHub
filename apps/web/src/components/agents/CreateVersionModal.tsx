@@ -204,8 +204,8 @@ export function CreateVersionModal({
                   {EVAL_RULE_REFERENCE.map((r) => (
                     <div key={r.kind} className="text-xs">
                       <span className="font-mono text-whiteout font-medium">{r.kind}</span>
-                      <span className="text-ash"> — {r.description}</span>
-                      <div className="font-mono text-[11px] text-pewter break-all">{r.example}</div>
+                      <span className="text-pewter"> — {r.description}</span>
+                      <div className="font-mono text-xs text-pewter break-all">{r.example}</div>
                     </div>
                   ))}
                 </div>

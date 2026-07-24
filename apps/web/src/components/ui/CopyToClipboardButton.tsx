@@ -36,7 +36,13 @@ export function CopyToClipboardButton({
       title={label}
       aria-label={label}
       className={[
+        // House focus ring, matching ui/Button.tsx. This control previously
+        // declared none and relied on whatever the surrounding row happened to
+        // supply (PatternRow's `focus:opacity-100` made it visible but is not
+        // an indicator), so on the Blackout ground it fell back to the UA
+        // hairline. globals.css adds a forced-colors outline on top of this.
         'inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono transition-colors duration-100 hover:bg-neutral-800',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neon-glow focus-visible:ring-offset-2 focus-visible:ring-offset-blackout',
         copied ? 'text-neon-glow' : 'text-pewter hover:text-cloud',
         className ?? '',
       ].join(' ')}

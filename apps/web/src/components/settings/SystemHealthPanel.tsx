@@ -23,12 +23,12 @@ export function SystemHealthPanel() {
 
       <div className="px-5 py-4">
         {!health ? (
-          <p className="text-sm text-neutral-500">Health check unavailable.</p>
+          <p className="text-sm text-pewter">Health check unavailable.</p>
         ) : (
           <dl className="flex flex-col gap-3">
             {/* Storage row */}
             <div className="flex items-center justify-between">
-              <dt className="text-xs font-medium text-neutral-500 uppercase tracking-wider">
+              <dt className="text-xs font-medium text-pewter uppercase tracking-wider">
                 Storage
               </dt>
               <dd className="flex items-center gap-2">
@@ -47,7 +47,7 @@ export function SystemHealthPanel() {
 
             {/* Projection row */}
             <div className="flex items-center justify-between">
-              <dt className="text-xs font-medium text-neutral-500 uppercase tracking-wider">
+              <dt className="text-xs font-medium text-pewter uppercase tracking-wider">
                 Projection
               </dt>
               <dd className="flex items-center gap-2">
@@ -58,7 +58,7 @@ export function SystemHealthPanel() {
 
             {/* Environment row */}
             <div className="flex items-center justify-between">
-              <dt className="text-xs font-medium text-neutral-500 uppercase tracking-wider">
+              <dt className="text-xs font-medium text-pewter uppercase tracking-wider">
                 Environment
               </dt>
               <dd>

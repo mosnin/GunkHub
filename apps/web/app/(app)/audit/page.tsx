@@ -76,14 +76,14 @@ function AuditRow({ entry }: { entry: AuditLogEntry }) {
       </td>
       <td className="px-3 py-2.5 align-top">
         <div className="flex items-center gap-1 min-w-0">
-          <span className="text-xs font-mono text-neutral-500 shrink-0">{entry.targetType}</span>
+          <span className="text-xs font-mono text-pewter shrink-0">{entry.targetType}</span>
           <span className="text-xs font-mono text-neutral-300 truncate" title={entry.targetId}>
             {truncateId(entry.targetId, 12)}
           </span>
           <CopyToClipboardButton value={entry.targetId} label="Copy target ID" />
         </div>
       </td>
-      <td className="px-3 py-2.5 text-xs font-mono text-neutral-500 align-top max-w-[360px] truncate" title={summarizeMetadata(entry.metadata)}>
+      <td className="px-3 py-2.5 text-xs font-mono text-pewter align-top max-w-[360px] truncate" title={summarizeMetadata(entry.metadata)}>
         {summarizeMetadata(entry.metadata)}
       </td>
     </tr>

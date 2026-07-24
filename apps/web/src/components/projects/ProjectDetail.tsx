@@ -151,7 +151,7 @@ export function ProjectDetail({ project, agents }: ProjectDetailProps) {
         <Card>
           <div className="px-5 py-4 border-b border-neutral-800">
             <p className="text-sm font-medium text-neutral-200">Record runs for this project</p>
-            <p className="mt-0.5 text-xs text-neutral-500">
+            <p className="mt-0.5 text-xs text-pewter">
               {firstAgent != null
                 ? `Using agent: ${firstAgent.name}`
                 : 'Create an agent above to get the agent ID for this snippet.'}

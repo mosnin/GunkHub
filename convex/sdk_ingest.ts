@@ -254,12 +254,15 @@ export const checkIngestAuth = query({
     ) {
       throw new Error(`Forbidden: API key lacks required scope "${INGEST_WRITE}"`);
     }
+    // TENANCY (CLAUDE.md Tenancy Rule 3). The key's org is already resolved
+    // above from the key alone, so the collapse costs nothing. This previously
+    // threw "Run not found" for a missing run but "Unauthorized" for a run in
+    // another org — and because this is a side-effect-free, unrate-limited
+    // pre-flight query, that made it a free run-ID existence oracle across
+    // every tenant in the deployment. Both cases are now one outcome.
     const run = await ctx.db.get(args.runId as Id<"runs">);
-    if (!run) {
+    if (!run || run.orgId !== apiKey.orgId) {
       throw new Error("Run not found");
-    }
-    if (run.orgId !== apiKey.orgId) {
-      throw new Error("Unauthorized");
     }
     return { ok: true as const };
   },
@@ -291,14 +294,14 @@ export const sdkCreateRun = mutation({
     await enforceRateLimit(ctx, apiKey, 1);
 
     const agentId = args.agentId as Id<"agents">;
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Cross-org protection: the agent must
+    // belong to the same org as the API key. The missing case and the foreign
+    // case are collapsed into one outcome so this cannot be used to enumerate
+    // other orgs' agent IDs — matching the agentVersionId and parentRunId
+    // checks immediately below, which already had the correct shape.
     const agent = await ctx.db.get(agentId);
-    if (!agent) {
+    if (!agent || agent.orgId !== apiKey.orgId) {
       throw new Error("Agent not found");
-    }
-
-    // Cross-org protection: the agent must belong to the same org as the API key
-    if (agent.orgId !== apiKey.orgId) {
-      throw new Error("Unauthorized");
     }
 
     const agentVersionId = args.agentVersionId
@@ -429,15 +432,14 @@ export const sdkCreateEvents = mutation({
 
     for (const evt of args.events) {
       const runId = evt.runId as Id<"runs">;
+      // TENANCY (CLAUDE.md Tenancy Rule 3). Cross-org protection, collapsed
+      // into one outcome with the missing-run case. This loop walks a
+      // caller-supplied array, so a split here would let one call probe a whole
+      // batch of foreign run IDs at once.
       const run = await ctx.db.get(runId);
 
-      if (!run) {
+      if (!run || run.orgId !== apiKey.orgId) {
         throw new Error(`Run not found: ${evt.runId}`);
-      }
-
-      // Cross-org protection
-      if (run.orgId !== apiKey.orgId) {
-        throw new Error("Unauthorized");
       }
 
       // Idempotency FIRST: a retry of an already-stored event must return its ID
@@ -675,15 +677,12 @@ export const sdkUpdateRunStatus = mutation({
     const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
 
     const runId = args.runId as Id<"runs">;
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Cross-org protection, collapsed into
+    // one outcome with the missing-run case.
     const run = await ctx.db.get(runId);
 
-    if (!run) {
+    if (!run || run.orgId !== apiKey.orgId) {
       throw new Error("Run not found");
-    }
-
-    // Cross-org protection
-    if (run.orgId !== apiKey.orgId) {
-      throw new Error("Unauthorized");
     }
 
     if (TERMINAL_STATUSES.has(run.status)) {
@@ -728,15 +727,14 @@ export const sdkCreateArtifact = mutation({
     await enforceRateLimit(ctx, apiKey, 1);
 
     const runId = args.runId as Id<"runs">;
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Cross-org protection, collapsed into
+    // one outcome with the missing-run case — and placed before the
+    // deduplication read below, so a foreign key cannot learn which checksums
+    // already exist on another org's run.
     const run = await ctx.db.get(runId);
 
-    if (!run) {
+    if (!run || run.orgId !== apiKey.orgId) {
       throw new Error("Run not found");
-    }
-
-    // Cross-org protection
-    if (run.orgId !== apiKey.orgId) {
-      throw new Error("Unauthorized");
     }
 
     // Deduplication: if an artifact with the same (runId, checksum) already exists,
@@ -816,12 +814,12 @@ export const sdkRecordEval = mutation({
     const apiKey = await resolveApiKey(ctx, args.apiKeyHash, INGEST_WRITE);
 
     const runId = args.runId as Id<"runs">;
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Cross-org protection, collapsed into
+    // one outcome with the missing-run case — matching the Clerk-auth twin of
+    // this mutation, evals.ts's recordEval.
     const run = await ctx.db.get(runId);
-    if (!run) {
+    if (!run || run.orgId !== apiKey.orgId) {
       throw new Error("Run not found");
-    }
-    if (run.orgId !== apiKey.orgId) {
-      throw new Error("Unauthorized");
     }
 
     validateEvalFields(args);

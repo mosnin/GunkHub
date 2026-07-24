@@ -27,11 +27,14 @@ export const recordEval = mutation({
     details: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const run = await ctx.db.get(args.runId);
-    if (!run) throw new Error("Run not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.runId — this is a WRITE path.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "member" });
 
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, run.orgId, { minimumRole: "member" });
+    // Cross-org run and nonexistent run collapse to one outcome.
+    const run = await ctx.db.get(args.runId);
+    if (!run || run.orgId !== orgId) throw new Error("Run not found");
 
     validateEvalFields(args);
 
@@ -65,16 +68,25 @@ export const recordEval = mutation({
 export const listEvalsForRun = query({
   args: { runId: v.id("runs"), limit: v.optional(v.number()) },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the run is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
+    // Cross-org run and nonexistent run collapse to one outcome.
     const run = await ctx.db.get(args.runId);
-    if (!run) throw new Error("Run not found");
-    await requireOrgMembership(ctx, run.orgId);
+    if (!run || run.orgId !== orgId) throw new Error("Run not found");
 
     const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
-    return await ctx.db
+    const rows = await ctx.db
       .query("evals")
       .withIndex("by_run", (q) => q.eq("runId", args.runId))
       .order("desc")
       .take(limit);
+
+    // Defence in depth: an eval row stamped with a different org than its run is
+    // a data defect, not something to hand back across the boundary.
+    return rows.filter((r) => r.orgId === orgId);
   },
 });
 

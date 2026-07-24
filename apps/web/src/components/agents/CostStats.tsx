@@ -2,6 +2,8 @@ import type { AgentCostStats } from '@/lib/services/cost'
 
 import { Card } from '@/components/ui/Card'
 import { EmptyState } from '@/components/ui/EmptyState'
+import { ErrorState } from '@/components/ui/ErrorState'
+import { isEmpty, isOk } from '@/lib/services/serviceResult'
 
 function formatUsd(n: number): string {
   return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`
@@ -27,11 +29,15 @@ export function CostStats({ stats }: CostStatsProps) {
       </div>
 
       <div className="px-5 py-4">
-        {!stats.available ? (
-          <EmptyState
-            title="Cost estimates aren't available yet"
-            description="This activates once cost rollups have been computed for this agent — no runs, or the analytics pipeline hasn't caught up yet."
-          />
+        {/* The interim copy here used to hedge across all three outcomes at
+            once ("no runs yet, or the pipeline lagged, or the query failed")
+            because the boolean could not tell them apart. It can now. */}
+        {!isOk(stats) ? (
+          isEmpty(stats) ? (
+            <EmptyState title="No cost data for this range" description={stats.message} />
+          ) : (
+            <ErrorState title="Couldn't load cost estimates" message={stats.message} />
+          )
         ) : (
           <div className="flex flex-col gap-4">
             <dl className="flex flex-wrap gap-3">

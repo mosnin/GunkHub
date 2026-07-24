@@ -36,11 +36,16 @@ export const listAgents = query({
     projectId: v.id("projects"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the project is observed only afterwards, so a project in another org and
+    // a project that does not exist are indistinguishable.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
     const project = await ctx.db.get(args.projectId);
-    if (!project) {
+    if (!project || project.orgId !== orgId) {
       throw new Error("Project not found");
     }
-    await requireOrgMembership(ctx, project.orgId);
 
     // Bounded: at most MAX_PAGE_SIZE agents returned (no unbounded .collect()).
     const agents = await ctx.db
@@ -48,7 +53,9 @@ export const listAgents = query({
       .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
       .take(MAX_PAGE_SIZE);
 
-    return agents;
+    // Defence in depth: an agent stamped with a different org than its project
+    // is a data defect, not something to hand back across the boundary.
+    return agents.filter((a) => a.orgId === orgId);
   },
 });
 
@@ -60,11 +67,15 @@ export const getAgent = query({
     agentId: v.id("agents"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the agent is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
     const agent = await ctx.db.get(args.agentId);
-    if (!agent) {
+    if (!agent || agent.orgId !== orgId) {
       throw new Error("Agent not found");
     }
-    await requireOrgMembership(ctx, agent.orgId);
     return agent;
   },
 });
@@ -80,15 +91,21 @@ export const createAgent = mutation({
     description: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const project = await ctx.db.get(args.projectId);
-    if (!project) {
-      throw new Error("Project not found");
-    }
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.projectId — this is a WRITE path.
+    //
     // P0 authorization gate: creating an agent is a structural change, gated to
     // "admin" like createProject (above it in the hierarchy) and
-    // createAgentVersion (below it). Previously this defaulted to viewer.
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, project.orgId, { minimumRole: "admin" });
+    // createAgentVersion (below it). The gate is applied to the caller's OWN
+    // org, so its "Forbidden" is projectId-independent.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
+
+    // Cross-org project and nonexistent project collapse to one outcome.
+    const project = await ctx.db.get(args.projectId);
+    if (!project || project.orgId !== orgId) {
+      throw new Error("Project not found");
+    }
 
     const now = Date.now();
     const agentId = await ctx.db.insert("agents", {

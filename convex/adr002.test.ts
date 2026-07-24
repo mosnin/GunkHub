@@ -339,7 +339,12 @@ describe('evals — append-only, cross-org rejected (ADR-002)', () => {
     const asB = t.withIdentity(identity('admin', 'b'))
     await expect(
       asB.mutation(api.evals.recordEval, { runId: runA, name: 'x', kind: 'manual', passed: true }),
-    ).rejects.toThrow(/Unauthorized|not a member/i)
+      // The cross-org rejection is unchanged; only the MESSAGE changed. It is
+      // now the same "Run not found" raised for a run that does not exist, so
+      // this mutation cannot be used as an existence oracle over org A's run
+      // ids (CLAUDE.md Tenancy Rule 3). See convex/tenancy_oracle.test.ts for
+      // the test that asserts the two outcomes are deep-equal.
+    ).rejects.toThrow(/Run not found/)
   })
 
   it("sdkRecordEval rejects a key writing against another org's run (cross-org)", async () => {
@@ -353,7 +358,9 @@ describe('evals — append-only, cross-org rejected (ADR-002)', () => {
       t.mutation(api.sdk_ingest.sdkRecordEval, {
         apiKeyHash: 'hash_cross', runId: runA, name: 'x', kind: 'manual', passed: true,
       }),
-    ).rejects.toThrow(/Unauthorized/)
+      // Still rejected; the message is now collapsed with the nonexistent-run
+      // case so a valid key cannot enumerate another org's run ids.
+    ).rejects.toThrow(/Run not found/)
   })
 })
 

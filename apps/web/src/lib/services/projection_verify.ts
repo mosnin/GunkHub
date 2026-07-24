@@ -1,7 +1,21 @@
 import { auth } from '@clerk/nextjs/server'
 
+import {
+  okList,
+  unavailableEmpty,
+  unavailableError,
+  unavailableNoOrg,
+  unavailableOrgUnresolved,
+} from './serviceResult'
+
+import type { ServiceListResult, ServiceResult } from './serviceResult'
+
+
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient } from '@/lib/convexServer'
+
+const FAILED_VERIFICATIONS_SUBJECT = 'recent verification results'
+const BATCH_STATUS_SUBJECT = 'verification status for these runs'
 
 /** Canonical unverified state — used as a default when no result exists. */
 export const UNVERIFIED_STATUS: VerificationStatus = {
@@ -103,24 +117,44 @@ export async function getRunVerificationStatus(runId: string): Promise<Verificat
 
 /**
  * Batch-fetch verification statuses for a set of run IDs.
- * Returns a map from runId → VerificationStatus. Entries with no result map to UNVERIFIED_STATUS.
- * Non-fatal: returns an empty object on auth or network failure.
- * Org membership is enforced by the Convex query.
+ *
+ * On success, every requested runId maps to a status; runs with no stored
+ * result map to `UNVERIFIED_STATUS`. That per-run fallback is CORRECT and
+ * stays — see the tenancy note below.
+ *
+ * Previously this returned `Record<string, VerificationStatus>` and did
+ * `catch { return {} }`. Callers then read a missing key as UNVERIFIED, so a
+ * failed batch silently relabelled every run in the list as "not verified" —
+ * an integrity claim fabricated out of a network error. The `'error'` branch
+ * now says so instead.
+ *
+ * TENANCY. `convex/projection_verify.ts` `batchGetVerificationResults`
+ * enforces org membership on `orgId`, then filters each row with
+ * `result?.orgId === args.orgId ? result : null`. A runId belonging to another
+ * org therefore comes back as `{ runId, result: null }` — byte-identical to a
+ * run that simply has no verification record. That indistinguishability is
+ * load-bearing, and nothing here disturbs it: the only failure this function
+ * reports is a whole-batch one, which carries no per-run information. Do NOT
+ * add a per-run error branch here; it would immediately become an existence
+ * oracle across the org boundary (CLAUDE.md, Tenancy Rules #3).
  */
 export async function batchGetRunVerificationStatuses(
   runIds: string[],
-): Promise<Record<string, VerificationStatus>> {
-  if (runIds.length === 0) return {}
+): Promise<ServiceResult<{ statuses: Record<string, VerificationStatus> }>> {
+  // Nothing was asked for. Genuinely empty, and no query was needed to know it.
+  if (runIds.length === 0) {
+    return unavailableEmpty('No runs to check verification status for.')
+  }
 
   const { orgId: clerkOrgId } = auth()
-  if (!clerkOrgId) return {}
+  if (!clerkOrgId) return unavailableNoOrg(BATCH_STATUS_SUBJECT)
 
   try {
     const client = await getAuthedClient()
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
-    if (!org) return {}
+    if (!org) return unavailableOrgUnresolved(BATCH_STATUS_SUBJECT)
 
     const orgId = (org as Record<string, unknown>)._id as string
 
@@ -138,27 +172,54 @@ export async function batchGetRunVerificationStatuses(
       statuses[item.runId] = item.result ? mapResultToStatus(item.result) : UNVERIFIED_STATUS
     }
 
-    return statuses
-  } catch {
-    return {}
+    // The query succeeded, so 'ok' even if every run came back unverified:
+    // "these runs have not been verified" is a real, reportable finding. It is
+    // only a lie when we never got an answer, which is the branch below.
+    return { status: 'ok', statuses }
+  } catch (err) {
+    return unavailableError(BATCH_STATUS_SUBJECT, err, {
+      service: 'projection_verify',
+      fn: 'batchGetRunVerificationStatuses',
+      runCount: runIds.length,
+    })
   }
 }
 
 /**
  * Get the most recent failed verification results for the org.
  * Used by the dashboard to surface verification issues.
- * Non-fatal: returns an empty array on auth or network failure.
+ *
+ * THIS WAS THE MOST DAMAGING INSTANCE OF THE SWALLOWED-ERROR BUG IN THE REPO,
+ * and it is worth stating plainly so it is never reintroduced. The function
+ * used to `catch { return [] }`. The dashboard renders
+ * `failedVerifications.length === 0` as a green dot and the words "No recent
+ * verification issues". So when the verification query threw, the widget whose
+ * entire job is to tell an engineer their event log is intact rendered a clean
+ * bill of health. On a product whose core invariant is an immutable, VERIFIABLE
+ * event log (CLAUDE.md, Event Log Rules), asserting "verification is fine"
+ * because the verification query failed inverts the feature: the more broken
+ * the integrity checking is, the healthier the product claims to be.
+ *
+ * It was double-swallowed — `app/(app)/dashboard/page.tsx` also wrapped the
+ * call in `catch { /* Non-fatal *\/ }`. That outer catch is now redundant and
+ * should be removed when the call site is updated.
+ *
+ * An empty list from a SUCCESSFUL query is still good news and still reports
+ * `status: 'empty'` — the green dot is correct there. The point is only that
+ * 'empty' and 'error' must reach the widget as different values.
  */
-export async function getRecentFailedVerifications(limit = 5): Promise<FailedVerification[]> {
+export async function getRecentFailedVerifications(
+  limit = 5,
+): Promise<ServiceListResult<FailedVerification>> {
   const { orgId: clerkOrgId } = auth()
-  if (!clerkOrgId) return []
+  if (!clerkOrgId) return unavailableNoOrg(FAILED_VERIFICATIONS_SUBJECT)
 
   try {
     const client = await getAuthedClient()
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
-    if (!org) return []
+    if (!org) return unavailableOrgUnresolved(FAILED_VERIFICATIONS_SUBJECT)
 
     const orgId = (org as Record<string, unknown>)._id as string
 
@@ -169,7 +230,7 @@ export async function getRecentFailedVerifications(limit = 5): Promise<FailedVer
     })
 
     const items = raw as Array<Record<string, unknown>>
-    return items.map((r) => ({
+    const failures: FailedVerification[] = items.map((r) => ({
       runId: r.runId as string,
       verifiedAt: r.verifiedAt as number,
       isValid: r.isValid as boolean,
@@ -178,7 +239,15 @@ export async function getRecentFailedVerifications(limit = 5): Promise<FailedVer
       sequenceGaps: (r.sequenceGaps as number[]) ?? [],
       duplicateSeqNums: (r.duplicateSeqNums as number[]) ?? [],
     }))
-  } catch {
-    return []
+
+    // A successful query returning nothing IS the good news the green dot is
+    // for. `okList` maps that to 'empty', never to 'ok' with a hollow list.
+    return okList(failures, 'No recent verification issues.')
+  } catch (err) {
+    return unavailableError(FAILED_VERIFICATIONS_SUBJECT, err, {
+      service: 'projection_verify',
+      fn: 'getRecentFailedVerifications',
+      limit,
+    })
   }
 }

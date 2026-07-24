@@ -22,12 +22,20 @@ const TERMINAL_STATUSES = new Set<string>(['completed', 'failed', 'cancelled', '
 /** Run statuses eligible for the "why did this fail?" list preview. */
 const FAILED_STATUSES = new Set<string>(['failed', 'timed_out'])
 
-/** Table has 9 columns: checkbox, Run ID, Status, Integrity, Agent, Version, Started, Duration, Tags. */
-const COLUMN_COUNT = 9
+/** checkbox, Run ID, Status, [Integrity], Agent, Version, Started, Duration, Tags. */
+const COLUMN_COUNT_WITH_INTEGRITY = 9
+const COLUMN_COUNT_WITHOUT_INTEGRITY = 8
 
 interface SelectableRunListProps {
   runs?: Run[]
   agentVersionLabels?: Record<string, string>
+  /**
+   * Omit (not `{}`) when verification status could not be loaded. Passing an
+   * empty map would render an Integrity column of em-dashes, which reads as
+   * "checked, nothing to report" — a claim we cannot make when the batch
+   * lookup failed. Undefined hides the column instead, and the caller is
+   * expected to explain the absence above the table.
+   */
   verificationStatuses?: Record<string, VerificationStatus>
   /** "Why did this fail?" one-line preview, keyed by run ID — only meaningful for FAILED/timed_out rows. */
   explanationSummaries?: Record<string, RunExplanationSummaryState>
@@ -36,14 +44,16 @@ interface SelectableRunListProps {
 /**
  * Runs table with multi-select checkboxes and a bulk re-verify action bar.
  * Used exclusively on the /runs page (not the dashboard).
- * Always shows the Integrity column.
+ * Shows the Integrity column only when verification statuses were loaded.
  */
 export function SelectableRunList({
   runs,
   agentVersionLabels = {},
-  verificationStatuses = {},
+  verificationStatuses,
   explanationSummaries,
 }: SelectableRunListProps) {
+  const showIntegrity = verificationStatuses !== undefined
+  const columnCount = showIntegrity ? COLUMN_COUNT_WITH_INTEGRITY : COLUMN_COUNT_WITHOUT_INTEGRITY
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [bulkResult, setBulkResult] = useState<BulkReverifyResult | null>(null)
   const [isPending, startTransition] = useTransition()
@@ -193,9 +203,11 @@ export function SelectableRunList({
               <th className="w-28 px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
                 Status
               </th>
-              <th className="w-28 px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
-                Integrity
-              </th>
+              {showIntegrity && (
+                <th className="w-28 px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                  Integrity
+                </th>
+              )}
               <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
                 Agent
               </th>
@@ -215,7 +227,7 @@ export function SelectableRunList({
           </thead>
           <tbody className="bg-neutral-950">
             {runs.map((run) => {
-              const verificationStatus = verificationStatuses[run.id]
+              const verificationStatus = verificationStatuses?.[run.id]
               const isEligible = TERMINAL_STATUSES.has(run.status)
               const isSelected = selectedIds.has(run.id)
               const wasSucceeded = bulkResult?.succeeded.includes(run.id) ?? false
@@ -280,15 +292,17 @@ export function SelectableRunList({
                       {run.triageState && <TriageChip triageState={run.triageState} />}
                     </Link>
                   </td>
-                  <td className="px-4 py-3">
-                    {verificationStatus ? (
-                      <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
-                        <IntegrityBadge status={verificationStatus} />
-                      </Link>
-                    ) : (
-                      <span className="text-xs text-pewter">—</span>
-                    )}
-                  </td>
+                  {showIntegrity && (
+                    <td className="px-4 py-3">
+                      {verificationStatus ? (
+                        <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
+                          <IntegrityBadge status={verificationStatus} />
+                        </Link>
+                      ) : (
+                        <span className="text-xs text-pewter">—</span>
+                      )}
+                    </td>
+                  )}
                   <td className="px-4 py-3">
                     <Link
                       href={`/runs/${run.id}`}
@@ -348,7 +362,7 @@ export function SelectableRunList({
                 </tr>
                 {showPreview && previewState && (
                   <tr className="border-b border-neutral-800 bg-neutral-950">
-                    <td colSpan={COLUMN_COUNT} className="px-4 pb-2 pt-0">
+                    <td colSpan={columnCount} className="px-4 pb-2 pt-0">
                       <ExplanationPreview state={previewState} />
                     </td>
                   </tr>

@@ -3,6 +3,36 @@
 This runbook covers common operational issues and their resolutions. Each section
 describes a symptom, the likely cause, and the steps to diagnose and fix it.
 
+> ## :warning: Verification status of this runbook
+>
+> **No Convex deployment has ever existed for this project, and this application
+> has never been deployed to any environment.** Every procedure below was written
+> against the code, not against a running system. None of it has been executed
+> end-to-end.
+>
+> Treat each procedure as a *plausible* first attempt, not a proven one. In
+> particular, the following are **unverified**:
+>
+> - Every `npx convex deploy` / `npx convex export` / `npx convex env set`
+>   invocation. The commands and flags are correct per the Convex 1.42 CLI, but
+>   have not been run against a real deployment of this project.
+> - Every expected `GET /api/health` response body. The shapes come from reading
+>   `apps/web/src/lib/health.ts`, not from a live response.
+> - Every Convex-dashboard navigation path (table names, Settings → Backup/Export,
+>   the Logs tab) — Convex's dashboard UI may have moved since these were written.
+> - Every log-line format quoted below (artifact GC, stale-run expiry). These are
+>   transcribed from the source that emits them, but have never been observed in
+>   real deployment logs.
+> - The **Secret rotation** procedure, which involves a live Vercel deploy and a
+>   live Convex deployment in a specific interleaving. Its safety argument is
+>   sound on paper; the sequencing has never been exercised.
+>
+> Before the first production incident, walk this runbook against a staging
+> deployment and correct what does not match. See the **First-time bootstrap**
+> section of `docs/deployment_checklist.md` for standing up the first deployment,
+> including known issues (`node:` builtin imports in `convex/` with no
+> `"use node"` directive) that are expected to surface at first deploy.
+
 **Related ops docs:**
 - [`docs/ops/observability.md`](ops/observability.md) — the logging contract, where
   logs go on Vercel, request-ID correlation, health endpoint semantics, the CSP
@@ -168,6 +198,12 @@ Stale run expiry: batch=N expired=E errors=X
 ---
 
 ## Convex deployment issues
+
+> **Before the first deploy:** `npx convex deploy` assumes a Convex project
+> already exists and that `convex/_generated` holds real codegen output. Neither
+> is true yet — see **First-time bootstrap** in `docs/deployment_checklist.md`.
+> Running `convex deploy` against a project that has never been created will fail
+> at authentication (`401 MissingAccessToken`), not at the schema step.
 
 **Push schema and functions:**
 ```

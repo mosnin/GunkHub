@@ -18,10 +18,21 @@
 
 import { auth } from '@clerk/nextjs/server'
 
+import {
+  unavailableEmpty,
+  unavailableError,
+  unavailableNoOrg,
+  unavailableOrgUnresolved,
+} from './serviceResult'
+
 import type { DashboardRange } from './dashboard'
+import type { ServiceResult } from './serviceResult'
+
 
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient } from '@/lib/convexServer'
+
+const SUBJECT = 'cost stats'
 
 
 export interface CostByModel {
@@ -33,8 +44,7 @@ export interface CostByModel {
   matched: boolean
 }
 
-export interface AgentCostStatsAvailable {
-  available: true
+export interface AgentCostStatsData {
   range: DashboardRange
   sampleSize: number
   truncated: boolean
@@ -46,24 +56,20 @@ export interface AgentCostStatsAvailable {
   unmatchedModels: string[]
 }
 
-export interface AgentCostStatsUnavailable {
-  available: false
-}
-
-export type AgentCostStats = AgentCostStatsAvailable | AgentCostStatsUnavailable
+export type AgentCostStats = ServiceResult<AgentCostStatsData>
 
 export async function getAgentCostStats(
   agentId: string,
   range: DashboardRange = '7d',
 ): Promise<AgentCostStats> {
   const { orgId: clerkOrgId } = auth()
-  if (!clerkOrgId) return { available: false }
+  if (!clerkOrgId) return unavailableNoOrg(SUBJECT)
 
   try {
     const client = await getAuthedClient()
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
-    if (!org) return { available: false }
+    if (!org) return unavailableOrgUnresolved(SUBJECT)
     const orgDoc = org as Record<string, unknown>
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -72,7 +78,14 @@ export async function getAgentCostStats(
       agentId,
       range,
     })
-    if (!result) return { available: false }
+    // The query returned. A null/absent result here genuinely means no cost
+    // rollups have been computed for this agent and range — this is the one
+    // branch entitled to say "nothing yet".
+    if (!result) {
+      return unavailableEmpty(
+        'No cost data for this range yet. Cost is derived from token usage on recorded runs.',
+      )
+    }
 
     const r = result as {
       sampleSize: number
@@ -84,7 +97,7 @@ export async function getAgentCostStats(
       unmatchedModels: string[]
     }
     return {
-      available: true,
+      status: 'ok',
       range,
       sampleSize: r.sampleSize ?? 0,
       truncated: r.truncated ?? false,
@@ -94,7 +107,9 @@ export async function getAgentCostStats(
       tokensOut: r.tokensOut ?? 0,
       unmatchedModels: r.unmatchedModels ?? [],
     }
-  } catch {
-    return { available: false }
+  } catch (err) {
+    // We do not know whether cost data exists. Say so — do not render the
+    // empty state over a swallowed exception.
+    return unavailableError(SUBJECT, err, { service: 'cost', agentId, range })
   }
 }

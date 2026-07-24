@@ -33,11 +33,16 @@ export const getProject = query({
     projectId: v.id("projects"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the project is observed only afterwards, so a project in another org and
+    // a project that does not exist are indistinguishable.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
     const project = await ctx.db.get(args.projectId);
-    if (!project) {
+    if (!project || project.orgId !== orgId) {
       throw new Error("Project not found");
     }
-    await requireOrgMembership(ctx, project.orgId);
     return project;
   },
 });
@@ -107,13 +112,18 @@ export const updateProject = mutation({
     description: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.projectId — this is a WRITE path. Mutating a project
+    // requires "admin" (matches createProject); the gate is applied to the
+    // caller's OWN org, so its "Forbidden" is projectId-independent.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
+
+    // Cross-org project and nonexistent project collapse to one outcome.
     const project = await ctx.db.get(args.projectId);
-    if (!project) {
+    if (!project || project.orgId !== orgId) {
       throw new Error("Project not found");
     }
-    // Mutating a project requires "admin" (matches createProject).
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, project.orgId, { minimumRole: "admin" });
 
     const patch: { name?: string; description?: string; updatedAt: number } = {
       updatedAt: Date.now(),

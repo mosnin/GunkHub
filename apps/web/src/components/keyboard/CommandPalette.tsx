@@ -166,7 +166,7 @@ export function CommandPalette({ isOpen, onClose, onShowShortcuts }: CommandPale
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleInputKeyDown}
-            className="flex-1 bg-transparent py-3 text-sm text-neutral-100 placeholder-neutral-500 outline-none font-mono"
+            className="flex-1 bg-transparent py-3 text-sm text-neutral-100 placeholder-pewter outline-none font-mono"
           />
         </div>
 

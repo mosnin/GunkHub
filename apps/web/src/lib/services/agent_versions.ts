@@ -1,8 +1,14 @@
+import { unavailableEmpty, unavailableError } from './serviceResult'
+
+import type { ServiceResult } from './serviceResult'
 import type { VersionNarrativeResult as VersionCompareNarrative } from '@/lib/versionNarrative'
 import type { AgentVersion } from '@agent-flight-recorder/contracts'
 
+
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient } from '@/lib/convexServer'
+
+const COMPARE_SUBJECT = 'the version comparison'
 
 function mapAgentVersion(doc: Record<string, unknown>): AgentVersion {
   return {
@@ -153,8 +159,7 @@ export interface CohortComparison {
   [key: string]: unknown
 }
 
-export interface VersionCompareResultAvailable {
-  available: true
+export interface VersionCompareResultData {
   agentId: string
   versionA: VersionCohortStats
   versionB: VersionCohortStats
@@ -166,11 +171,7 @@ export interface VersionCompareResultAvailable {
   narrative?: VersionCompareNarrative | null
 }
 
-export interface VersionCompareResultUnavailable {
-  available: false
-}
-
-export type VersionCompareResult = VersionCompareResultAvailable | VersionCompareResultUnavailable
+export type VersionCompareResult = ServiceResult<VersionCompareResultData>
 
 export async function compareVersions(
   orgId: string,
@@ -185,11 +186,20 @@ export async function compareVersions(
       agentVersionIdA,
       agentVersionIdB,
     })
-    if (!result) return { available: false }
-    const r = result as Omit<VersionCompareResultAvailable, 'available'>
-    return { available: true, ...r }
-  } catch {
-    return { available: false }
+    // Query succeeded with no comparison: these two versions have no
+    // overlapping run cohorts to compare yet.
+    if (!result) {
+      return unavailableEmpty('Not enough recorded runs on these two versions to compare them yet.')
+    }
+    const r = result as VersionCompareResultData
+    return { status: 'ok', ...r }
+  } catch (err) {
+    return unavailableError(COMPARE_SUBJECT, err, {
+      service: 'agent_versions',
+      fn: 'compareVersions',
+      agentVersionIdA,
+      agentVersionIdB,
+    })
   }
 }
 

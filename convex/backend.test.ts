@@ -44,7 +44,9 @@ describe('Tenancy isolation (CLAUDE.md Tenancy Rules)', () => {
     const t = convexTest(schema, modules)
     const { runA } = await seed(t)
     const asB = t.withIdentity({ subject: 'user_b', org_id: 'clerk_org_b' })
-    await expect(asB.query(api.runs.getRun, { runId: runA })).rejects.toThrow(/Unauthorized|not a member/)
+    // See note in tenancy_oracle.test.ts: cross-org now collapses onto the
+    // same "Run not found" as a nonexistent run, closing the existence oracle.
+    await expect(asB.query(api.runs.getRun, { runId: runA })).rejects.toThrow(/Run not found/)
   })
 
   it("org A's admin CAN read org A's run", async () => {
@@ -72,7 +74,7 @@ describe('Tenancy isolation (CLAUDE.md Tenancy Rules)', () => {
       events: [{ runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} }],
     })
     const asB = t.withIdentity({ subject: 'user_b', org_id: 'clerk_org_b' })
-    await expect(asB.query(api.events.listEvents, { runId: runA })).rejects.toThrow(/Unauthorized|not a member/)
+    await expect(asB.query(api.events.listEvents, { runId: runA })).rejects.toThrow(/Run not found/)
   })
 
   it("org B's VALID key cannot write events into org A's run (cross-org branch)", async () => {
@@ -85,7 +87,12 @@ describe('Tenancy isolation (CLAUDE.md Tenancy Rules)', () => {
         apiKeyHash: 'hash_b',
         events: [{ runId: runA, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {} }],
       }),
-    ).rejects.toThrow(/Unauthorized/)
+      // Cross-org rejection is unchanged; only the MESSAGE changed. It is now
+      // the same error raised for a run/agent that does not exist, so this
+      // entry point cannot be used as an existence oracle over another org's
+      // ids (CLAUDE.md Tenancy Rule 3). convex/tenancy_oracle.test.ts asserts
+      // the cross-org and nonexistent outcomes are deep-equal.
+    ).rejects.toThrow(/Run not found/)
     // ...and org A's own key CAN, proving the rejection is org-scoped, not blanket.
     const ok = await t.mutation(api.sdk_ingest.sdkCreateEvents, {
       apiKeyHash: 'hash_a',
@@ -99,7 +106,12 @@ describe('Tenancy isolation (CLAUDE.md Tenancy Rules)', () => {
     const { agentA } = await seed(t)
     await expect(
       t.mutation(api.sdk_ingest.sdkCreateRun, { apiKeyHash: 'hash_b', agentId: agentA }),
-    ).rejects.toThrow(/Unauthorized/)
+      // Cross-org rejection is unchanged; only the MESSAGE changed. It is now
+      // the same error raised for a run/agent that does not exist, so this
+      // entry point cannot be used as an existence oracle over another org's
+      // ids (CLAUDE.md Tenancy Rule 3). convex/tenancy_oracle.test.ts asserts
+      // the cross-org and nonexistent outcomes are deep-equal.
+    ).rejects.toThrow(/Agent not found/)
   })
 
   it('createRun rejects a project/agent from another org (cross-org reference)', async () => {
@@ -602,7 +614,12 @@ describe('Role-based write authorization on createEvent (P0 gate)', () => {
       asOther.mutation(api.events.createEvent, {
         runId: run, type: 'run.started', sequenceNumber: 1, timestamp: Date.now(), payload: {},
       }),
-    ).rejects.toThrow(/Unauthorized|not a member/i)
+      // Cross-org rejection is unchanged; only the MESSAGE changed. It is now
+      // the same error raised for a run/agent that does not exist, so this
+      // entry point cannot be used as an existence oracle over another org's
+      // ids (CLAUDE.md Tenancy Rule 3). convex/tenancy_oracle.test.ts asserts
+      // the cross-org and nonexistent outcomes are deep-equal.
+    ).rejects.toThrow(/Run not found/)
   })
 })
 

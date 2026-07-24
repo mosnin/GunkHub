@@ -185,13 +185,20 @@ export const revokeApiKey = mutation({
     keyId: v.id("api_keys"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.keyId — this is a privileged WRITE path. The admin
+    // gate is applied to the caller's OWN org, so its "Forbidden" is
+    // keyId-independent and cannot be used to probe for other orgs' key IDs.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
+
+    // Cross-org key and nonexistent key collapse to one outcome. The
+    // "already revoked" check below is reachable only for a key the caller can
+    // see, so it cannot leak another org's key state either.
     const key = await ctx.db.get(args.keyId);
-    if (!key) {
+    if (!key || key.orgId !== orgId) {
       throw new Error("API key not found");
     }
-
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, key.orgId, { minimumRole: "admin" });
 
     if (key.revokedAt !== undefined) {
       throw new Error("API key is already revoked");

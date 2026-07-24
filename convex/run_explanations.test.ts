@@ -334,7 +334,12 @@ describe('getRunExplanation', () => {
     const { orgA, projectA, agentA } = await seedTwoOrgs(t)
     const runId = await seedRun(t, orgA, projectA, agentA, 'failed')
     const asAdminB = t.withIdentity(identity('admin', 'b'))
-    await expect(asAdminB.query(api.run_explanations.getRunExplanation, { runId })).rejects.toThrow(/Unauthorized/)
+    // Cross-org rejection is unchanged; only the MESSAGE changed. It is now the
+    // same NOT_FOUND raised for a run that does not exist, so this query cannot
+    // be used as an existence oracle over another org's run ids (CLAUDE.md
+    // Tenancy Rule 3). convex/tenancy_oracle.test.ts asserts the two outcomes
+    // are deep-equal.
+    await expect(asAdminB.query(api.run_explanations.getRunExplanation, { runId })).rejects.toThrow(/Run not found/)
   })
 
   it("returns status \"ready\" with the generated explanation, scoped to the run's org", async () => {

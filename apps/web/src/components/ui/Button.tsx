@@ -21,7 +21,12 @@ const variantClasses: Record<ButtonVariant, string> = {
   ghost:
     'bg-transparent hover:bg-graphite text-whiteout border-graphite-light hover:border-neutral-600 focus-visible:ring-neon-glow',
   destructive:
-    'bg-transparent hover:bg-destructive-900 text-destructive-500 border-destructive-700 focus-visible:ring-destructive-500',
+    // Label is destructive-400 (#ff6a5a), not System Warning #ff3621: the red
+    // must survive its own hover ground. #ff3621 on the destructive-900 hover
+    // fill is 4.12:1 — sub-AA — while #ff6a5a clears 5.30:1 there and ≥4.56:1
+    // on every sanctioned surface. The red is kept, not dropped (design.md:
+    // "System Warning ... Never Text On: Graphite, Graphite Light").
+    'bg-transparent hover:bg-destructive-900 text-destructive-400 border-destructive-700 focus-visible:ring-destructive-500',
 }
 
 const sizeClasses: Record<ButtonSize, string> = {

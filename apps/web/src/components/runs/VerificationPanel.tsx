@@ -39,7 +39,12 @@ function CheckPill({ label, ran, passed }: CheckPillProps) {
       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-pewter border border-neutral-800">
         <span className="w-1.5 h-1.5 rounded-full bg-neutral-800" aria-hidden="true" />
         {label}
-        <span className="text-neutral-800">skipped</span>
+        {/* Was text-neutral-800 — Graphite used as TEXT, 1.38:1 on Blackout.
+            That is not "dim", it is invisible, and "skipped" is content: it is
+            the whole reason this badge renders. Ash is the dimmest token that
+            still clears AA on Blackout (5.09:1), so it stays quieter than the
+            Pewter label beside it without disappearing. */}
+        <span className="text-ash">skipped</span>
       </span>
     )
   }

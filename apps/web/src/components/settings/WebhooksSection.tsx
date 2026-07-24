@@ -106,7 +106,7 @@ function DeliveryHistory({ webhookId }: { webhookId: string }) {
 
   if (error) return <p className="text-xs text-destructive-400 px-3 py-2">{error}</p>
   if (deliveries === null) return <p className="text-xs text-pewter px-3 py-2">Loading delivery history…</p>
-  if (deliveries.length === 0) return <p className="text-xs text-neutral-500 px-3 py-2">No deliveries recorded yet.</p>
+  if (deliveries.length === 0) return <p className="text-xs text-pewter px-3 py-2">No deliveries recorded yet.</p>
 
   return (
     <div className="flex flex-col gap-1 px-3 py-2">
@@ -159,7 +159,7 @@ export function WebhooksSection({ initialWebhooks, isAdmin, loadError }: Webhook
           <h2 className="text-sm font-semibold text-neutral-200">Webhooks</h2>
         </div>
         <div className="px-5 py-4">
-          <p className="text-sm text-neutral-500">
+          <p className="text-sm text-pewter">
             Outbound webhook configuration is admin-only. Ask an org admin to make changes here.
           </p>
         </div>

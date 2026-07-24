@@ -118,14 +118,20 @@ export const resolveComment = mutation({
     commentId: v.id("comments"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.commentId. Resolving a comment mutates it; a
+    // read-only viewer must not be able to do it, and that role gate is applied
+    // to the caller's OWN org so its "Forbidden" is commentId-independent.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "member" });
+
+    // Cross-org comment and nonexistent comment collapse to one outcome. The
+    // "already resolved" check below is reachable only for a comment the caller
+    // can see, so it cannot leak another org's comment state either.
     const comment = await ctx.db.get(args.commentId);
-    if (!comment) {
+    if (!comment || comment.orgId !== orgId) {
       throw new Error("Comment not found");
     }
-
-    const { userId } = await getAuthContext(ctx);
-    // Resolving a comment mutates it; a read-only viewer must not be able to do it.
-    await requireOrgMembership(ctx, comment.orgId, { minimumRole: "member" });
 
     if (comment.resolvedAt !== undefined) {
       throw new Error("Comment is already resolved");

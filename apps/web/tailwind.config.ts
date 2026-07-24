@@ -27,8 +27,22 @@ const config: Config = {
         pewter: '#94979e',
         cloud: '#c9cbcf',
         whiteout: '#ffffff',
-        // Remapped legacy scales → Neon greys (dark-first). Existing classes like
-        // bg-neutral-900 / text-neutral-400 now render the Neon environment.
+        // Ember — the READABLE red. `system-warning`/`destructive-500` (#ff3621) is
+        // the SIGNAL red: icons, dots, borders only. Ember is the only red clearing
+        // AA on Graphite (5.40) and on the destructive fills (5.30 / 5.98), so all
+        // destructive/error *copy* uses `text-ember`. See design.md token table.
+        ember: '#ff6a5a',
+        'system-warning': '#ff3621',
+        // ⚠ ALIAS TRAP — these remapped scales are the SAME COLORS as the named
+        // tokens above, but the class names hide which token you picked. Prefer the
+        // named spelling in all new work; the numeric stops are kept only so
+        // pre-existing classes keep compiling.
+        //   text-neutral-500 === text-ash    → FAILS AA on cards (4.39 / 3.68)
+        //   text-neutral-400 === text-pewter → the correct secondary on surfaces
+        //   text-neutral-200 === text-cloud
+        //   text-neutral-300  = #a6a9af      → interpolated, NOT in design.md
+        //   border-neutral-600 = #4a4d53     → 2.48 on Blackout, never text
+        // Full mapping + ratios: design.md § "Tailwind alias trap".
         neutral: {
           50: '#ffffff',
           100: '#f4f5f6',
@@ -71,6 +85,8 @@ const config: Config = {
           DEFAULT: '#ff3621',
           50: '#3a0e0a',
           100: '#4d120c',
+          // 400 === `ember`. Use `text-ember` for destructive copy — it is the only
+          // stop in this ramp that clears AA on Graphite and on the -900 hover fill.
           400: '#ff6a5a',
           500: '#ff3621',
           600: '#e02a17',

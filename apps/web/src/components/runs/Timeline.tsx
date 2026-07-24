@@ -455,8 +455,13 @@ export function Timeline({ runId, events, initialNextCursor, loading, isLive = f
                     <span className="text-xs font-mono text-pewter w-10 shrink-0">
                       #{event.sequenceNumber}
                     </span>
+                    {/* Pewter, not Ash: Ash clears AA on the row's resting
+                        Depth ground (4.80:1) but the row button's
+                        hover:bg-neutral-800/60 blends to #1a1b1c, where Ash is
+                        4.18:1 and this text does not lighten to compensate.
+                        Pewter holds at 5.90:1 hovered. */}
                     {summary && (
-                      <span className="text-xs text-neutral-500 truncate flex-1">{summary}</span>
+                      <span className="text-xs text-pewter truncate flex-1">{summary}</span>
                     )}
                     <span className="ml-auto text-xs font-mono text-pewter shrink-0">
                       {new Date(event.timestamp).toISOString().slice(11, 23)}

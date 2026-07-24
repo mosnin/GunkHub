@@ -35,7 +35,7 @@ export function ExplanationPreview({ state }: ExplanationPreviewProps) {
 
   return (
     <div className="flex items-center gap-1.5 min-w-0">
-      <span className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-[4px] text-[11px] font-mono font-medium bg-destructive-900/40 text-destructive-400 border border-destructive-700/60">
+      <span className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-[4px] text-xs font-mono font-medium bg-destructive-900/40 text-destructive-400 border border-destructive-700/60">
         {state.failureClass.replace(/_/g, ' ')}
       </span>
       <span className="text-xs text-pewter truncate" title={state.summary}>

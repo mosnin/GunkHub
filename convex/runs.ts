@@ -388,18 +388,39 @@ export const listRunsByVerification = query({
 });
 
 /**
- * Get a single run by ID.  Throws if not found or caller lacks access.
+ * Get a single run by ID.
+ *
+ * Throws "Run not found" when the run does not exist AND when it belongs to
+ * another organization. Those two cases are deliberately indistinguishable.
+ *
+ * TENANCY (CLAUDE.md Tenancy Rule 3). This previously threw "Run not found" for
+ * a missing run but "Unauthorized: not a member of this organization" for a run
+ * owned by another org, which made it an existence oracle: any authenticated
+ * caller could present well-formed run IDs and learn which ones were real in
+ * organizations they cannot see. apps/web's export route mapped that same
+ * distinction onto 404-vs-500, promoting the oracle to an HTTP status code.
+ *
+ * The caller's org is now resolved from auth ALONE, before args.runId is
+ * observed at all, so every authorization throw is a statement about the caller
+ * and reveals nothing about which runs exist.
+ *
+ * NOT swallowed: genuine failures (unauthenticated caller, no org context,
+ * caller not a member of their own active org) still throw as before.
  */
 export const getRun = query({
   args: {
     runId: v.id("runs"),
   },
   handler: async (ctx, args) => {
+    // Resolve and authorize the CALLER first. runId-independent throws only.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
+    // Cross-org run and nonexistent run collapse to one outcome on one path.
     const run = await ctx.db.get(args.runId);
-    if (!run) {
+    if (!run || run.orgId !== orgId) {
       throw new Error("Run not found");
     }
-    await requireOrgMembership(ctx, run.orgId);
     return run;
   },
 });
@@ -521,12 +542,16 @@ export const updateRunStatus = mutation({
     endedAt: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const run = await ctx.db.get(args.runId);
-    if (!run) throw new Error("Run not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.runId. Changing a run's lifecycle status requires
+    // "admin" (matches updateRunTags); the role gate is applied to the caller's
+    // OWN org, so a viewer's "Forbidden" is also runId-independent.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
 
-    // Changing a run's lifecycle status requires "admin" (matches updateRunTags).
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, run.orgId, { minimumRole: "admin" });
+    // Cross-org run and nonexistent run collapse to one outcome on one path.
+    const run = await ctx.db.get(args.runId);
+    if (!run || run.orgId !== orgId) throw new Error("Run not found");
 
     const TERMINAL_STATUSES = new Set([
       "completed",
@@ -591,11 +616,14 @@ export const updateRunTags = mutation({
     tags: v.array(v.string()),
   },
   handler: async (ctx, args) => {
-    const run = await ctx.db.get(args.runId);
-    if (!run) throw new Error("Run not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the run is observed only afterwards.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
 
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, run.orgId, { minimumRole: "admin" });
+    // Cross-org run and nonexistent run collapse to one outcome on one path.
+    const run = await ctx.db.get(args.runId);
+    if (!run || run.orgId !== orgId) throw new Error("Run not found");
 
     // Normalize: trim whitespace, deduplicate, discard empty strings
     const normalized = [...new Set(args.tags.map((t) => t.trim()).filter(Boolean))];
@@ -631,11 +659,14 @@ export const setRunLabels = mutation({
     labels: v.array(v.string()),
   },
   handler: async (ctx, args) => {
-    const run = await ctx.db.get(args.runId);
-    if (!run) throw new Error("Run not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the run is observed only afterwards.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "member" });
 
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, run.orgId, { minimumRole: "member" });
+    // Cross-org run and nonexistent run collapse to one outcome on one path.
+    const run = await ctx.db.get(args.runId);
+    if (!run || run.orgId !== orgId) throw new Error("Run not found");
 
     validateLabels(args.labels);
     await ctx.db.patch(args.runId, { labels: args.labels });
@@ -676,11 +707,16 @@ export const setRunTriage = mutation({
     ),
   },
   handler: async (ctx, args) => {
-    const run = await ctx.db.get(args.runId);
-    if (!run) throw new Error("Run not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the run is observed only afterwards. Note that the status/transition
+    // errors below are reachable ONLY after the run has been confirmed visible
+    // to the caller, so they cannot leak another org's run status either.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "member" });
 
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, run.orgId, { minimumRole: "member" });
+    // Cross-org run and nonexistent run collapse to one outcome on one path.
+    const run = await ctx.db.get(args.runId);
+    if (!run || run.orgId !== orgId) throw new Error("Run not found");
 
     if (run.status !== "failed" && run.status !== "timed_out") {
       throw afrError(
@@ -774,9 +810,14 @@ export const listChildRuns = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the parent run is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
+    // Cross-org parent and nonexistent parent collapse to one outcome.
     const parent = await ctx.db.get(args.parentRunId);
-    if (!parent) throw new Error("Run not found");
-    await requireOrgMembership(ctx, parent.orgId);
+    if (!parent || parent.orgId !== orgId) throw new Error("Run not found");
 
     const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
     const children = await ctx.db
@@ -784,6 +825,8 @@ export const listChildRuns = query({
       .withIndex("by_parent", (q) => q.eq("parentRunId", args.parentRunId))
       .take(limit);
 
-    return { runs: children };
+    // Defence in depth: a child stamped with a different org than its parent is
+    // a data defect, not something to hand back across the boundary.
+    return { runs: children.filter((c) => c.orgId === orgId) };
   },
 });

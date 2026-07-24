@@ -37,7 +37,7 @@ interface Fixture {
   readonly exemptions?: ReadonlyArray<{ ref: string; reason: string }>
 }
 
-function run(fixture: Fixture): string[] {
+function analyzeFixture(fixture: Fixture): ReturnType<typeof analyze> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'convex-refs-'))
   tmpDirs.push(root)
 
@@ -60,13 +60,25 @@ function run(fixture: Fixture): string[] {
     fs.writeFileSync(path.join(webSrc, name), body)
   }
 
-  const result = analyze({
+  return analyze({
     convexDir,
     refsFile,
     webSrc,
     exemptions: fixture.exemptions ?? [],
   })
-  return result.problems.map((p) => `${p.title}\n${p.lines.join('\n')}`)
+}
+
+function run(fixture: Fixture): string[] {
+  return analyzeFixture(fixture).problems.map((p) => `${p.title}\n${p.lines.join('\n')}`)
+}
+
+/** Residual gaps, rendered as `kind @ file:line — detail` for assertion. */
+function residuals(fixture: Fixture): string[] {
+  return analyzeFixture(fixture).residuals.map((r) => `${r.kind} @ ${r.file}:${r.line} — ${r.detail}`)
+}
+
+function notes(fixture: Fixture): string[] {
+  return analyzeFixture(fixture).notes.map((n) => `${n.file}:${n.line} — ${n.detail}`)
 }
 
 /** A convex module with one public query, one public mutation, one internal query. */
@@ -390,21 +402,26 @@ export async function f(client: any, orgId: string, runId: string, name: string)
     ).toEqual([])
   })
 
-  it('does not guess about call sites whose args object contains a spread', () => {
-    // Spreads are not statically enumerable — the checker must stay silent
-    // rather than emit a false positive.
-    expect(
-      run({
-        convex: { runs: RUNS_MODULE },
-        refs: FULL_REFS,
-        web: {
-          'service.ts': `import { convex } from './convexFunctions'
+  it('does not guess about call sites whose spread source is opaque — but says so', () => {
+    // `params` is a function parameter: its keys cannot be known. The checker
+    // must not invent a required-key failure...
+    const fixture: Fixture = {
+      convex: { runs: RUNS_MODULE },
+      refs: FULL_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
 export async function f(client: any, params: any) {
   return client.query(convex.runs.getRun, { ...params })
 }`,
-        },
-      }),
-    ).toEqual([])
+      },
+    }
+    expect(run(fixture)).toEqual([])
+    // ...and must not stay silent about it either.
+    const gaps = residuals(fixture)
+    expect(gaps).toHaveLength(1)
+    expect(gaps[0]).toContain('opaque-spread @ ')
+    expect(gaps[0]).toContain('service.ts:3')
+    expect(gaps[0]).toContain('params')
   })
 
   it('checks React hook call sites too (useQuery / useMutation)', () => {
@@ -426,11 +443,363 @@ export function Panel({ orgId, name }: { orgId: string; name: string }) {
 })
 
 // ---------------------------------------------------------------------------
+// B2. Indirection and spreads — the gaps the first version of the checker
+//     reported about itself and skipped. Each test plants a defect that ONLY
+//     the indirection/spread resolution can catch, and each is paired with the
+//     false-positive case that must stay silent.
+// ---------------------------------------------------------------------------
+
+/** Mirrors the real convex/runs.ts shape the ternary indirection selects between. */
+const LIST_MODULE = `
+import { v } from "convex/values";
+import { query, mutation } from "./_generated/server.js";
+
+export const listRuns = query({
+  args: {
+    orgId: v.id("organizations"),
+    environment: v.optional(v.string()),
+    limit: v.optional(v.number()),
+  },
+  handler: async () => null,
+});
+
+export const listRunsByVerification = query({
+  args: {
+    orgId: v.id("organizations"),
+    verifyFilter: v.union(v.literal("failed"), v.literal("passed")),
+    limit: v.optional(v.number()),
+  },
+  handler: async () => null,
+});
+
+export const touch = mutation({ args: { orgId: v.id("organizations") }, handler: async () => null });
+`
+
+const LIST_REFS = `  list: {
+    listRuns: makeFunctionReference<Q>('list:listRuns'),
+    listRunsByVerification: makeFunctionReference<Q>('list:listRunsByVerification'),
+    touch: makeFunctionReference<M>('list:touch'),
+  },`
+
+describe('ref indirection', () => {
+  it('follows a ref bound to a const and kind-checks the eventual call', () => {
+    const problems = run({
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string) {
+  const ref = convex.list.listRuns
+  return client.mutation(ref, { orgId })
+}`,
+      },
+    })
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('convex.list.listRuns — CALL-SITE KIND MISMATCH')
+    expect(problems[0]).toContain('ref reached this call through a variable')
+  })
+
+  it('follows a ref chosen by a ternary and checks BOTH branches independently', () => {
+    // `touch` is a mutation, `listRuns` is a query; calling either through
+    // `client.query` must flag exactly the mutation branch, named by branch.
+    const problems = run({
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string, write: boolean) {
+  const ref = write ? convex.list.touch : convex.list.listRuns
+  return client.query(ref, { orgId })
+}`,
+      },
+    })
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('convex.list.touch — CALL-SITE KIND MISMATCH')
+    expect(problems[0]).toContain('[on branch: write]')
+  })
+
+  it('reports an indirection it CANNOT resolve instead of silently skipping it', () => {
+    // A ref stored in an object literal is not traceable. The distinction
+    // between "checked and fine" and "could not check" is the whole point.
+    const fixture: Fixture = {
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+const table = { a: convex.list.touch }
+export async function f(client: any, orgId: string) {
+  return client.query(table.a, { orgId })
+}`,
+      },
+    }
+    // The kind mismatch is genuinely invisible, so no problem is invented...
+    expect(run(fixture)).toEqual([])
+    // ...but the blind spot is named, with file:line.
+    const gaps = residuals(fixture)
+    expect(gaps).toHaveLength(1)
+    expect(gaps[0]).toContain('ref-indirection @ ')
+    expect(gaps[0]).toContain('service.ts:2')
+    expect(gaps[0]).toContain('convex.list.touch')
+    expect(gaps[0]).toContain('outside a resolvable call site')
+  })
+
+  it('reports a ref reached through a function parameter as unresolvable', () => {
+    // `chosen` is a parameter, not a const anywhere in the file, so the call in
+    // `g` is uncheckable — and the ref usage in `f` reaches no checkable call.
+    const fixture: Fixture = {
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string) {
+  return g(client, convex.list.touch, orgId)
+}
+async function g(client: any, chosen: any, orgId: string) {
+  return client.query(chosen, { orgId })
+}`,
+      },
+    }
+    expect(run(fixture)).toEqual([])
+    const gaps = residuals(fixture)
+    expect(gaps.some((g) => g.includes('outside a resolvable call site'))).toBe(true)
+    expect(gaps.some((g) => g.includes('convex.list.touch'))).toBe(true)
+  })
+})
+
+describe('conditional and merged spreads', () => {
+  it("resolves the codebase's `...(x !== undefined && { x })` idiom instead of skipping it", () => {
+    const fixture: Fixture = {
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string, p: { limit?: number }) {
+  return client.query(convex.list.listRuns, {
+    orgId,
+    ...(p.limit !== undefined && { limit: p.limit }),
+  })
+}`,
+      },
+    }
+    expect(run(fixture)).toEqual([])
+    // Crucially: no residual either. The idiom is RESOLVED, not tolerated.
+    expect(residuals(fixture)).toEqual([])
+  })
+
+  it('catches an unknown key hidden inside a conditional spread', () => {
+    const problems = run({
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string, p: { limit?: number }) {
+  return client.query(convex.list.listRuns, {
+    orgId,
+    ...(p.limit !== undefined && { pageSize: p.limit }),
+  })
+}`,
+      },
+    })
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('UNKNOWN ARG: pageSize')
+  })
+
+  it('catches an unknown key inside a ternary spread, on the branch that supplies it', () => {
+    const problems = run({
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string, wide: boolean) {
+  return client.query(convex.list.listRuns, {
+    orgId,
+    ...(wide ? { limit: 100 } : { pageSize: 10 }),
+  })
+}`,
+      },
+    })
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('UNKNOWN ARG: pageSize')
+  })
+
+  it('merges a spread of a local const object, and catches a required key dropped from it', () => {
+    const base = (body: string): Fixture => ({
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string) {
+  ${body}
+  return client.query(convex.list.listRuns, { ...baseArgs, limit: 10 })
+}`,
+      },
+    })
+    // Merged spread supplies orgId -> clean, and NOT a residual.
+    const ok = base('const baseArgs = { orgId }')
+    expect(run(ok)).toEqual([])
+    expect(residuals(ok)).toEqual([])
+    // The same call with orgId dropped from the merged object is a real failure.
+    const broken = run(base('const baseArgs = { limit: 5 }'))
+    expect(broken).toHaveLength(1)
+    expect(broken[0]).toContain('MISSING REQUIRED ARG: orgId')
+  })
+
+  it('still checks EXPLICIT keys for unknown names when a spread source is opaque', () => {
+    // Required-key checking is impossible here, but an unknown key is rejected
+    // by Convex however it got there — so it is still an error.
+    const fixture: Fixture = {
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, rest: any) {
+  return client.query(convex.list.listRuns, { ...rest, pageSize: 10 })
+}`,
+      },
+    }
+    const problems = run(fixture)
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('UNKNOWN ARG: pageSize')
+    // orgId is required and not visibly passed, but MUST NOT be reported —
+    // `rest` could supply it. That is a residual, not a problem.
+    expect(problems.some((p) => p.includes('MISSING REQUIRED ARG'))).toBe(false)
+    const gaps = residuals(fixture)
+    expect(gaps).toHaveLength(1)
+    expect(gaps[0]).toContain('opaque-spread')
+  })
+
+  it('catches a required arg that is only ever passed under an unrelated guard', () => {
+    const problems = run({
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string, p: { limit?: number }) {
+  return client.query(convex.list.listRunsByVerification, {
+    orgId,
+    ...(p.limit !== undefined && { verifyFilter: 'failed' }),
+  })
+}`,
+      },
+    })
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('REQUIRED ARG PASSED CONDITIONALLY: verifyFilter')
+    expect(problems[0]).toContain('p.limit !== undefined')
+  })
+
+  it('does NOT flag a required arg guarded on its own definedness — it notes it', () => {
+    // `...(v !== undefined && { k: v })` on a REQUIRED k adds no failure mode:
+    // dropping the guard would pass `undefined`, which the validator rejects
+    // identically. Reporting it as a bug would be a false positive.
+    const fixture: Fixture = {
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string, p: { verifyFilter: string }) {
+  return client.query(convex.list.listRunsByVerification, {
+    orgId,
+    ...(p.verifyFilter !== undefined && { verifyFilter: p.verifyFilter }),
+  })
+}`,
+      },
+    }
+    expect(run(fixture)).toEqual([])
+    const ns = notes(fixture)
+    expect(ns).toHaveLength(1)
+    expect(ns[0]).toContain("REQUIRED arg 'verifyFilter' under its own definedness guard")
+  })
+})
+
+describe('correlation between a branched ref and conditionally spread args', () => {
+  // This is the exact shape of apps/web/src/lib/services/runs.ts `listRuns`:
+  // the ref is chosen by `verifyFilter !== undefined`, and the SAME condition
+  // gates the `verifyFilter` key, while its negation gates `environment`.
+  // Checking the two independently would produce two false positives; the
+  // checker must relate them.
+  const CORRELATED = (extra: string): Fixture => ({
+    convex: { list: LIST_MODULE },
+    refs: LIST_REFS,
+    web: {
+      'service.ts': `import { convex } from './convexFunctions'
+export async function f(
+  client: any,
+  orgId: string,
+  params: { verifyFilter?: string; environment?: string },
+) {
+  const queryRef =
+    params.verifyFilter !== undefined ? convex.list.listRunsByVerification : convex.list.listRuns
+  return client.query(queryRef, {
+    orgId,
+    ...(params.verifyFilter !== undefined && { verifyFilter: params.verifyFilter }),
+    ...(params.verifyFilter === undefined &&
+      params.environment !== undefined && { environment: params.environment }),${extra}
+  })
+}`,
+    },
+  })
+
+  it('is silent on the correct correlated shape (no false positives on either branch)', () => {
+    // listRunsByVerification REQUIRES verifyFilter and does NOT accept
+    // environment. Both facts are satisfied only because the guards correlate.
+    expect(run(CORRELATED(''))).toEqual([])
+    expect(residuals(CORRELATED(''))).toEqual([])
+  })
+
+  it('still catches a genuinely unknown key added to the correlated shape', () => {
+    const problems = run(CORRELATED('\n    ...(params.environment !== undefined && { region: 1 }),'))
+    // Unknown on BOTH branches — neither validator declares `region`.
+    expect(problems).toHaveLength(2)
+    expect(problems.every((p) => p.includes('UNKNOWN ARG: region'))).toBe(true)
+    expect(problems.some((p) => p.includes('convex.list.listRunsByVerification'))).toBe(true)
+    expect(problems.some((p) => p.includes('convex.list.listRuns'))).toBe(true)
+  })
+
+  it('catches a key that is legal on one branch but not the other', () => {
+    // `environment` is declared by listRuns but NOT by listRunsByVerification.
+    // Spreading it unconditionally breaks exactly the verification branch —
+    // which is why the correlated guard in the real code is load-bearing.
+    const problems = run(CORRELATED('\n    environment: "prod",'))
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('convex.list.listRunsByVerification — UNKNOWN ARG: environment')
+    expect(problems[0]).toContain('[on branch: params.verifyFilter !== undefined]')
+  })
+
+  it('catches the correlation being BROKEN — guard inverted on the ref, not the args', () => {
+    const problems = run({
+      convex: { list: LIST_MODULE },
+      refs: LIST_REFS,
+      web: {
+        'service.ts': `import { convex } from './convexFunctions'
+export async function f(client: any, orgId: string, params: { verifyFilter?: string }) {
+  const queryRef =
+    params.verifyFilter === undefined ? convex.list.listRunsByVerification : convex.list.listRuns
+  return client.query(queryRef, {
+    orgId,
+    ...(params.verifyFilter !== undefined && { verifyFilter: params.verifyFilter }),
+  })
+}`,
+      },
+    })
+    // Inverting the ref guard breaks BOTH branches, and the checker says so
+    // per branch: on the verification branch the key's guard is now provably
+    // false (required arg definitely absent), and on the listRuns branch it is
+    // provably true (a key listRuns does not declare).
+    expect(problems).toHaveLength(2)
+    expect(problems[0]).toContain('convex.list.listRunsByVerification — MISSING REQUIRED ARG: verifyFilter')
+    expect(problems[0]).toContain('[on branch: params.verifyFilter === undefined]')
+    expect(problems[1]).toContain('convex.list.listRuns — UNKNOWN ARG: verifyFilter')
+    expect(problems[1]).toContain('[on branch: params.verifyFilter !== undefined]')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // C. Standing regression test against the REAL repository
 // ---------------------------------------------------------------------------
 
 describe('the real convexFunctions.ts table', () => {
-  const problems = analyze().problems.map((p) => p.title)
+  const result = analyze()
+  const problems = result.problems.map((p) => p.title)
 
   it('has no ref pointing at a missing function or module', () => {
     expect(problems.filter((t) => /NO SUCH FUNCTION|WRONG MODULE PATH|malformed ref/.test(t))).toEqual([])
@@ -448,13 +817,36 @@ describe('the real convexFunctions.ts table', () => {
     expect(problems.filter((t) => /MISSING REF|STALE REVERSE-COVERAGE/.test(t))).toEqual([])
   })
 
+  it('has every convex ref usage resolving to a checkable call site (no residual gaps)', () => {
+    // This is the standing lock on the work that closed the indirection and
+    // spread gaps. If a future change reintroduces an untraceable ref or an
+    // opaque spread, this fails and the gap gets a name instead of a silence.
+    expect(result.residuals.map((r) => `${r.kind} @ ${r.file}:${r.line} — ${r.detail}`)).toEqual([])
+  })
+
   // NOTE — deliberately not asserted here yet: call-site ARG problems.
-  // `pnpm tsx scripts/check-convex-refs.ts` (the CI gate) currently reports one
-  // real defect it found on its first run — services/evals.ts calls
-  // convex.insights.getRunEvalSummary without the required `orgId`, so that
-  // query always fails ArgumentValidationError and the run-detail Evals header
-  // silently takes its catch-fallback path. That file is owned by the web team.
-  // Once the missing arg lands, add:
-  //   expect(problems.filter((t) => /UNKNOWN ARG|MISSING REQUIRED ARG/.test(t))).toEqual([])
+  //
+  // The previous cycle's defect (services/evals.ts calling
+  // convex.insights.getRunEvalSummary without the required `orgId`) is fixed.
+  // Resolving indirection and conditional spreads then exposed a SECOND real
+  // defect this direction had never been able to see, and it is still open:
+  //
+  //   apps/web/src/lib/services/runs.ts:145 — createRun MISSING REQUIRED ARG: projectId
+  //
+  //   convex/runs.ts `createRun` requires `projectId: v.id("projects")`, and
+  //   the web forwarding object never passes it, because `CreateRunRequest`
+  //   (packages/contracts/src/api.ts) has no `projectId` field at all. Every
+  //   Clerk-authed run creation from the web app therefore fails with
+  //   ArgumentValidationError. It was invisible before because the call site's
+  //   conditional spreads made the whole args object unenumerable.
+  //
+  //   The fix spans two boundaries and is NOT the platform team's to make:
+  //     1. packages/contracts/src/api.ts — add `projectId: string` to
+  //        `CreateRunRequest` (bump the contracts version per CLAUDE.md).
+  //     2. apps/web/src/lib/services/runs.ts:145 — add `projectId: req.projectId,`
+  //        to the object passed to convex.runs.createRun.
+  //
+  // Once that lands, add:
+  //   expect(problems.filter((t) => /UNKNOWN ARG|MISSING REQUIRED ARG|CONDITIONALLY/.test(t))).toEqual([])
   // so the whole class is locked down here as well as in the CI gate.
 })

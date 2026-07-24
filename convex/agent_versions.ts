@@ -24,11 +24,16 @@ export const createAgentVersion = mutation({
     evalRules: v.optional(v.array(v.any())),
   },
   handler: async (ctx, args) => {
-    const agent = await ctx.db.get(args.agentId);
-    if (!agent) throw new Error("Agent not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.agentId. This is a WRITE path, so the collapse must
+    // also precede the uniqueness scan below — otherwise a cross-org caller
+    // could learn which version strings exist on another org's agent.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
 
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, agent.orgId, { minimumRole: "admin" });
+    // Cross-org agent and nonexistent agent collapse to one outcome.
+    const agent = await ctx.db.get(args.agentId);
+    if (!agent || agent.orgId !== orgId) throw new Error("Agent not found");
 
     const trimmedVersion = args.version.trim();
     if (!trimmedVersion) throw new Error("version is required");
@@ -84,17 +89,25 @@ export const listAgentVersions = query({
     agentId: v.id("agents"),
   },
   handler: async (ctx, args) => {
-    const agent = await ctx.db.get(args.agentId);
-    if (!agent) throw new Error("Agent not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the agent is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
 
-    await requireOrgMembership(ctx, agent.orgId);
+    // Cross-org agent and nonexistent agent collapse to one outcome.
+    const agent = await ctx.db.get(args.agentId);
+    if (!agent || agent.orgId !== orgId) throw new Error("Agent not found");
 
     // Bounded: at most MAX_PAGE_SIZE versions returned (no unbounded .collect()).
-    return await ctx.db
+    const versions = await ctx.db
       .query("agent_versions")
       .withIndex("by_agent", (q) => q.eq("agentId", args.agentId))
       .order("desc")
       .take(MAX_PAGE_SIZE);
+
+    // Defence in depth: a version stamped with a different org than its agent is
+    // a data defect, not something to hand back across the boundary.
+    return versions.filter((v) => v.orgId === orgId);
   },
 });
 
@@ -109,9 +122,14 @@ export const paginateAgentVersions = query({
     cursor: v.union(v.string(), v.null()),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the agent is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
+    // Cross-org agent and nonexistent agent collapse to one outcome.
     const agent = await ctx.db.get(args.agentId);
-    if (!agent) throw new Error("Agent not found");
-    await requireOrgMembership(ctx, agent.orgId);
+    if (!agent || agent.orgId !== orgId) throw new Error("Agent not found");
 
     const numItems = Math.min(args.numItems ?? 20, 100);
     const page = await ctx.db
@@ -121,7 +139,8 @@ export const paginateAgentVersions = query({
       .paginate({ numItems, cursor: args.cursor });
 
     return {
-      versions: page.page,
+      // Defence in depth, as in listAgentVersions.
+      versions: page.page.filter((v) => v.orgId === orgId),
       nextCursor: page.isDone ? null : page.continueCursor,
     };
   },
@@ -135,10 +154,18 @@ export const getAgentVersion = query({
     versionId: v.id("agent_versions"),
   },
   handler: async (ctx, args) => {
-    const version = await ctx.db.get(args.versionId);
-    if (!version) return null;
+    // TENANCY (CLAUDE.md Tenancy Rule 3). This previously returned null for a
+    // missing version but THREW for a version owned by another org, which made
+    // it an existence oracle. The caller is resolved from auth alone, before
+    // args.versionId is observed; both cases now collapse to the same null.
+    //
+    // NOT swallowed: unauthenticated callers, callers with no org context, and
+    // callers who are not members of their own active org still throw.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
 
-    await requireOrgMembership(ctx, version.orgId);
+    const version = await ctx.db.get(args.versionId);
+    if (!version || version.orgId !== orgId) return null;
 
     return version;
   },

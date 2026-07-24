@@ -1,8 +1,17 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ES2022", "DOM"],
-    "types": ["node", "vitest/globals"],
+    // DOM.Iterable is what makes `for (const el of node.querySelectorAll(…))`
+    // and `[...nodeList]` typecheck — NodeListOf is only iterable under it.
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    // `@testing-library/jest-dom/vitest` augments vitest's `Assertion` with
+    // `toHaveAccessibleName`, `toBeVisible`, etc. Listing it here (rather than
+    // relying on the setup file's side-effect import being seen by every
+    // project member) is what makes those matchers typecheck.
+    "types": ["node", "vitest/globals", "@testing-library/jest-dom/vitest"],
+    // DOM tests are `.tsx` and use the automatic runtime, matching
+    // `esbuild.jsx: 'automatic'` in tests/vitest.config.ts. No `import React`.
+    "jsx": "react-jsx",
     "noEmit": true,
     "declaration": false,
     "declarationMap": false,
@@ -23,10 +32,13 @@
     // time, so typecheck fails on modules vitest happily loads.
     "baseUrl": ".",
     "paths": {
-      "@/*": ["../apps/web/src/*"]
+      "@/*": ["../apps/web/src/*"],
+      // Mirrors the `@app` alias in tests/vitest.config.ts — Next route files
+      // (`loading.tsx`, `page.tsx`) live in `apps/web/app`, not `src`.
+      "@app/*": ["../apps/web/app/*"]
     }
   },
-  "include": ["**/*.ts"],
+  "include": ["**/*.ts", "**/*.tsx"],
   "exclude": [
     "node_modules",
     // Seam tests that type-import a `convex/` module. They are NOT unchecked —
@@ -38,6 +50,14 @@
     // check for every test in the package; see that file's header.
     // `pnpm --filter @agent-flight-recorder/tests typecheck` runs both projects,
     // so nothing listed here escapes CI.
-    "unit/fix_confidence_vocab.test.ts"
+    "unit/fix_confidence_vocab.test.ts",
+    // DOM tests that import apps/web React components. Same situation, one
+    // boundary over: `apps/web/tsconfig.json` deliberately disables
+    // `exactOptionalPropertyTypes`, so pulling a component into THIS project
+    // fails on web code that is correct under its own config. Checked by
+    // tests/tsconfig.dom.json — see that file's header.
+    "unit/patterns_a11y.test.tsx",
+    "stubs/next-link.tsx",
+    "setup/dom.ts"
   ]
 }

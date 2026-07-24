@@ -8,7 +8,7 @@ import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
 import { action, internalAction, internalMutation, internalQuery, query } from "./_generated/server.js";
-import { requireOrgMembership } from "./auth.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
 
 // Internal function references (typed by name, matches the stale_runs.ts pattern).
 const _getRecentTerminalRunsRef = makeFunctionReference<"query">("projection_verify:_getRecentTerminalRuns");
@@ -16,7 +16,7 @@ const _listEventSeqNumsRef = makeFunctionReference<"query">("projection_verify:_
 const _listEventsFullRef = makeFunctionReference<"query">("projection_verify:_listEventsFull");
 const _upsertVerificationResultRef = makeFunctionReference<"mutation">("projection_verify:_upsertVerificationResult");
 const _getRunForVerifyRef = makeFunctionReference<"query">("projection_verify:_getRunForVerify");
-const _requireMembershipForReverifyRef = makeFunctionReference<"query">("projection_verify:_requireMembershipForReverify");
+const _resolveReverifyAccessRef = makeFunctionReference<"query">("projection_verify:_resolveReverifyAccess");
 
 
 // ---------------------------------------------------------------------------
@@ -368,29 +368,45 @@ export const _getRunForVerify = internalQuery({
 });
 
 /**
- * Check that a Clerk user is a member (or admin) of the given organization.
- * Throws "Unauthorized" or "Forbidden" on failure. Internal only.
+ * Resolve the CALLER's own organization and role from their Clerk claims.
+ *
+ * Deliberately takes no runId and knows nothing about any run: every throw here
+ * is a statement about the caller alone, so none of them can be used to probe
+ * for the existence of a run in another org. reverifyRun compares the resolved
+ * orgId against the run's orgId itself and collapses any mismatch into the same
+ * "Run not found" it raises for a run that does not exist.
+ *
+ * Throws "Unauthorized" when the caller has no org context or is not a member
+ * of the org they are acting in. Internal only.
  */
-export const _requireMembershipForReverify = internalQuery({
+export const _resolveReverifyAccess = internalQuery({
   args: {
     clerkUserId: v.string(),
-    orgId: v.id("organizations"),
+    clerkOrgId: v.string(),
   },
   handler: async (ctx, args) => {
     const ROLE_RANK: Record<string, number> = { viewer: 0, member: 1, admin: 2 };
 
+    const org = await ctx.db
+      .query("organizations")
+      .withIndex("by_clerk_org_id", (q) => q.eq("clerkOrgId", args.clerkOrgId))
+      .unique();
+
+    if (!org) throw new Error("Unauthorized: organization not found");
+
     const membership = await ctx.db
       .query("user_memberships")
       .withIndex("by_clerk_user", (q) => q.eq("clerkUserId", args.clerkUserId))
-      .filter((q) => q.eq(q.field("orgId"), args.orgId))
+      .filter((q) => q.eq(q.field("orgId"), org._id))
       .unique();
 
     if (!membership) throw new Error("Unauthorized: not a member of this organization");
 
     const actualRank = ROLE_RANK[membership.role] ?? 0;
-    if (actualRank < (ROLE_RANK['member'] ?? 0)) {
-      throw new Error("Forbidden: member or admin role required to re-run verification");
-    }
+    return {
+      orgId: org._id,
+      hasRequiredRole: actualRank >= (ROLE_RANK['member'] ?? 0),
+    };
   },
 });
 
@@ -422,22 +438,38 @@ export const reverifyRun = action({
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) throw new Error("Unauthorized");
     const clerkUserId = identity.subject;
+    const clerkOrgId = (identity as unknown as Record<string, unknown>)["org_id"] as
+      | string
+      | undefined;
+    if (!clerkOrgId) throw new Error("Unauthorized: no organization context");
+
+    // Resolve the caller's own org and role FIRST. Everything above and in this
+    // call is independent of args.runId, so its throws reveal nothing about
+    // which runs exist. Role is enforced here too, before the run is observed.
+    const access: { orgId: string; hasRequiredRole: boolean } = await ctx.runQuery(
+      _resolveReverifyAccessRef,
+      { clerkUserId, clerkOrgId },
+    );
+    if (!access.hasRequiredRole) {
+      throw new Error("Forbidden: member or admin role required to re-run verification");
+    }
 
     // Fetch the run — action cannot use ctx.db directly
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const run: Record<string, unknown> | null = await ctx.runQuery(_getRunForVerifyRef,
       { runId: args.runId },
     );
-    if (!run) throw new Error("Run not found");
+
+    // TENANCY (CLAUDE.md Tenancy Rule 3). A run owned by another org must be
+    // indistinguishable from a run that does not exist: same error, same code
+    // path, same work done. Previously the first case threw "Unauthorized: not
+    // a member of this organization" and the second threw "Run not found",
+    // which made this action an existence oracle across the org boundary.
+    if (!run || String(run['orgId']) !== String(access.orgId)) {
+      throw new Error("Run not found");
+    }
 
     const orgId = run['orgId'] as string;
-
-    // Role check: member+ required
-    await ctx.runQuery(_requireMembershipForReverifyRef, {
-      clerkUserId,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      orgId: orgId as any,
-    });
 
     // Collect all sequence numbers
     const seqNums: number[] = [];
@@ -631,22 +663,48 @@ export const listRecentFailedVerifications = query({
 
 /**
  * Get the most recent verification result for a run.
- * Returns null if the run has never been verified.
- * Enforces org membership before returning.
+ *
+ * Returns null when the run has never been verified, when the run does not
+ * exist, AND when the run belongs to another organization. Those three cases
+ * are deliberately indistinguishable to the caller.
+ *
+ * TENANCY (CLAUDE.md Tenancy Rule 3). This previously returned null for a
+ * missing run but threw for a run owned by another org, which made it an
+ * existence oracle: any authenticated caller could enumerate run IDs and learn
+ * which ones were real in organizations they cannot see. The auth work is now
+ * done up front and is entirely independent of args.runId; everything that
+ * depends on args.runId collapses to the same `null` on the same code path,
+ * having done the same amount of work. This matches the filter that
+ * batchGetVerificationResults already applies (`result.orgId === args.orgId`)
+ * rather than introducing a second tenancy pattern in this file.
+ *
+ * NOT swallowed: genuine failures (unauthenticated caller, no org context,
+ * caller is not a member of their own active org, or any db error) still throw.
+ * A null from this query means "nothing to show for a run you can see" — it
+ * never means "something broke".
  */
 export const getVerificationResult = query({
   args: {
     runId: v.id("runs"),
   },
   handler: async (ctx, args) => {
-    const run = await ctx.db.get(args.runId);
-    if (!run) return null;
-    await requireOrgMembership(ctx, run.orgId);
+    // Resolve and authorize the caller BEFORE observing anything about the
+    // runId. These throws are runId-independent, so they leak nothing.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
 
-    return await ctx.db
+    const run = await ctx.db.get(args.runId);
+    // Cross-org run and nonexistent run must be byte-identical to the caller.
+    if (!run || run.orgId !== orgId) return null;
+
+    const result = await ctx.db
       .query("verification_results")
       .withIndex("by_run", (q) => q.eq("runId", args.runId))
       .order("desc")
       .first();
+
+    // Defence in depth: a verification row whose orgId disagrees with the run's
+    // is a data defect, not something to hand back across the boundary.
+    return result?.orgId === orgId ? result : null;
   },
 });

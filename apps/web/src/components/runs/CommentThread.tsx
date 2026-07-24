@@ -50,7 +50,7 @@ function CommentItem({
         </span>
         <div className="flex items-center gap-2 shrink-0">
           {isResolved ? (
-            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">
+            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-neutral-800 text-pewter border border-neutral-700">
               Resolved
             </span>
           ) : (

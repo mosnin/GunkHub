@@ -151,11 +151,14 @@ export const updateAlertRule = mutation({
     enabled: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    const rule = await ctx.db.get(args.ruleId);
-    if (!rule) throw new Error("Alert rule not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.ruleId — this is an admin-gated WRITE path.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
 
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, rule.orgId, { minimumRole: "admin" });
+    // Cross-org rule and nonexistent rule collapse to one outcome.
+    const rule = await ctx.db.get(args.ruleId);
+    if (!rule || rule.orgId !== orgId) throw new Error("Alert rule not found");
 
     if (args.channels !== undefined) validateChannels(args.channels);
     validateRuleThresholds(args);
@@ -192,11 +195,15 @@ export const updateAlertRule = mutation({
 export const deleteAlertRule = mutation({
   args: { ruleId: v.id("alert_rules") },
   handler: async (ctx, args) => {
-    const rule = await ctx.db.get(args.ruleId);
-    if (!rule) throw new Error("Alert rule not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.ruleId — this is a destructive WRITE path, so the
+    // collapse must precede the delete, not follow it.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
 
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, rule.orgId, { minimumRole: "admin" });
+    // Cross-org rule and nonexistent rule collapse to one outcome.
+    const rule = await ctx.db.get(args.ruleId);
+    if (!rule || rule.orgId !== orgId) throw new Error("Alert rule not found");
 
     await ctx.db.delete(args.ruleId);
 
@@ -230,15 +237,25 @@ export const listAlertEvents = query({
 export const listAlertEventsForRule = query({
   args: { ruleId: v.id("alert_rules"), limit: v.optional(v.number()) },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the rule is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
+    // Cross-org rule and nonexistent rule collapse to one outcome.
     const rule = await ctx.db.get(args.ruleId);
-    if (!rule) throw new Error("Alert rule not found");
-    await requireOrgMembership(ctx, rule.orgId);
+    if (!rule || rule.orgId !== orgId) throw new Error("Alert rule not found");
+
     const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
-    return await ctx.db
+    const rows = await ctx.db
       .query("alert_events")
       .withIndex("by_rule", (q) => q.eq("ruleId", args.ruleId))
       .order("desc")
       .take(limit);
+
+    // Defence in depth: an alert event stamped with a different org than its
+    // rule is a data defect, not something to hand back across the boundary.
+    return rows.filter((e) => e.orgId === orgId);
   },
 });
 

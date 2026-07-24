@@ -33,7 +33,7 @@ export function ErrorState({ title, message, retry }: ErrorStateProps) {
       </div>
       <h3 className="text-sm font-semibold text-neutral-300">{title}</h3>
       {message && (
-        <p className="mt-1.5 text-sm text-neutral-500 max-w-sm leading-relaxed">{message}</p>
+        <p className="mt-1.5 text-sm text-pewter max-w-sm leading-relaxed">{message}</p>
       )}
       {retry && (
         <button

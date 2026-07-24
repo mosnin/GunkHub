@@ -462,7 +462,7 @@ export function AlertsSection({ initialRules, initialEvents, isAdmin, loadError 
           <h2 className="text-sm font-semibold text-neutral-200">Alerts</h2>
         </div>
         <div className="px-5 py-4">
-          <p className="text-sm text-neutral-500">
+          <p className="text-sm text-pewter">
             Alert rule configuration is admin-only. Ask an org admin to make changes here.
           </p>
           {initialEvents.length > 0 && (
@@ -542,7 +542,7 @@ function FiringHistory({ events }: { events: AlertEvent[] }) {
     <div>
       <p className="text-xs font-medium text-pewter uppercase tracking-wider mb-2">Recent firing history</p>
       {events.length === 0 ? (
-        <p className="text-sm text-neutral-500">No alerts have fired yet.</p>
+        <p className="text-sm text-pewter">No alerts have fired yet.</p>
       ) : (
         <div className="flex flex-col gap-1">
           {events.map((e) => {
@@ -561,7 +561,7 @@ function FiringHistory({ events }: { events: AlertEvent[] }) {
                 />
                 {spike ? (
                   <>
-                    <span className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-[4px] text-[11px] font-mono font-medium border bg-graphite text-neon-glow border-graphite-light whitespace-nowrap">
+                    <span className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-[4px] text-xs font-mono font-medium border bg-graphite text-neon-glow border-graphite-light whitespace-nowrap">
                       pattern spike
                     </span>
                     <Link

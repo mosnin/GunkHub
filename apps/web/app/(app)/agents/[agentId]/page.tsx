@@ -14,6 +14,7 @@ import { getAgentVersionEvalRules } from '@/lib/services/agent_versions'
 import { getAgentCostStats } from '@/lib/services/cost'
 import { getEvalRollupForVersion } from '@/lib/services/evals'
 import { getProject } from '@/lib/services/projects'
+import { unavailableEmpty } from '@/lib/services/serviceResult'
 
 export const metadata: Metadata = { title: 'Agent' }
 
@@ -94,16 +95,20 @@ export default async function AgentPage({ params }: Props) {
 
   const sdkSnippet = buildSdkSnippet(agent.id, versions[0]?.id)
 
-  // Cost + eval-rollup panels are additive — a failure here must not blank
-  // the whole agent page, so both use the honest `available: false` shape
-  // rather than throwing.
+  // Cost + eval-rollup panels are additive — a failure here must not blank the
+  // whole agent page, so both return an explained ServiceResult rather than
+  // throwing, and each panel renders 'empty' and 'error' differently.
   const costStats = await getAgentCostStats(agent.id, '7d')
 
   const latestVersion = versions[0]
   let evalRules: Record<string, unknown>[] = []
+  // No version means there is genuinely nothing to roll up — a real 'empty',
+  // not a fabricated absence. (The panel below only renders when a version
+  // exists, so this is belt-and-braces, but it must still be honest: the old
+  // `{ available: false }` literal claimed "no data" without asking anyone.)
   const evalRollup = latestVersion
     ? await getEvalRollupForVersion(latestVersion.id, '7d')
-    : { available: false as const }
+    : unavailableEmpty('This agent has no versions yet, so there is no eval rollup to show.')
   if (latestVersion) {
     try {
       evalRules = await getAgentVersionEvalRules(latestVersion.id)
@@ -183,7 +188,7 @@ export default async function AgentPage({ params }: Props) {
       <Card>
         <div className="px-5 py-4 border-b border-neutral-800">
           <h2 className="text-sm font-semibold text-neutral-200">SDK Setup</h2>
-          <p className="mt-0.5 text-xs text-neutral-500">
+          <p className="mt-0.5 text-xs text-pewter">
             Use this snippet to record runs for this agent.
           </p>
         </div>

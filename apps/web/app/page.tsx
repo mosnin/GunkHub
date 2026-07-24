@@ -24,7 +24,7 @@ function Logo() {
 
 function TerminalMock() {
   return (
-    <div className="neon-surface relative overflow-hidden font-mono text-[13px] leading-[1.65]">
+    <div className="neon-surface relative overflow-hidden font-mono text-sm leading-[1.65]">
       <div className="scanline" aria-hidden="true" />
       <div className="flex items-center gap-1.5 border-b border-graphite px-4 py-2.5">
         <span className="w-2.5 h-2.5 rounded-full bg-graphite-light" />
@@ -38,7 +38,7 @@ function TerminalMock() {
         <div className="text-cloud"><span className="text-neon-glow">LLM_REQUEST</span> model=claude-opus tokens=1,204</div>
         <div className="text-cloud"><span className="text-neon-glow">TOOL_CALL</span> search_docs("refund policy")</div>
         <div className="text-cloud"><span className="text-neon-glow">TOOL_RESULT</span> 3 matches · 412ms</div>
-        <div className="text-[#ff6a5a]"><span className="text-[#ff3621]">RUN_FAILED</span> timeout after 30s · seq 41</div>
+        <div className="text-ember"><span className="text-system-warning">RUN_FAILED</span> timeout after 30s · seq 41</div>
         <div className="text-ash">→ replay reconstructed 41 events · <span className="text-neon-glow">integrity ok</span></div>
       </div>
     </div>

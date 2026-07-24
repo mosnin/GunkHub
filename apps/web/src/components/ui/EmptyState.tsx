@@ -38,7 +38,7 @@ export function EmptyState({ title, description, action }: EmptyStateProps) {
       </div>
       <h3 className="text-sm font-semibold text-neutral-300">{title}</h3>
       {description && (
-        <p className="mt-1.5 text-sm text-neutral-500 max-w-sm leading-relaxed">{description}</p>
+        <p className="mt-1.5 text-sm text-pewter max-w-sm leading-relaxed">{description}</p>
       )}
       {action && action.href ? (
         <Link href={action.href} className={ACTION_CLASSES}>

@@ -19,7 +19,7 @@ interface MembersSectionProps {
 const ROLE_STYLES: Record<MembershipRole, string> = {
   admin: 'bg-graphite-light text-whiteout border-graphite-light',
   member: 'bg-graphite text-cloud border-graphite-light',
-  viewer: 'bg-graphite-deep text-ash border-graphite',
+  viewer: 'bg-graphite-deep text-pewter border-graphite',
 }
 
 function RoleBadge({ role }: { role: MembershipRole }) {

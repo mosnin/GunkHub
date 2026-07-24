@@ -111,7 +111,7 @@ export function RetentionSection({
             <div className="flex items-end gap-2">
               <div>
                 <label
-                  className="block text-xs font-medium text-neutral-500 mb-1.5"
+                  className="block text-xs font-medium text-pewter mb-1.5"
                   htmlFor="retention-days"
                 >
                   Retention window (days)

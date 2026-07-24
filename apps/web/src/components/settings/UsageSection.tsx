@@ -1,7 +1,8 @@
 import type { UsageData } from '@/lib/services/usage'
 
 import { Card } from '@/components/ui/Card'
-import { EmptyState } from '@/components/ui/EmptyState'
+import { ErrorState } from '@/components/ui/ErrorState'
+import { isOk } from '@/lib/services/serviceResult'
 import { formatBytes } from '@/lib/utils'
 
 interface UsageSectionProps {
@@ -48,14 +49,14 @@ function DailyBars({
           return (
             <div
               key={d.date}
-              className="flex-1 min-w-[3px] bg-neon-muted hover:bg-neon-glow transition-colors duration-100 rounded-t-[2px]"
+              className="flex-1 min-w-[3px] bg-neon-muted hover:bg-neon-glow transition-colors duration-100 rounded-t-[4px]"
               style={{ height: `${String(heightPct)}%` }}
               title={`${d.date}: ${String(d.events)} events, ${String(d.runs)} runs`}
             />
           )
         })}
       </div>
-      <div className="flex justify-between text-[10px] font-mono text-pewter">
+      <div className="flex justify-between text-xs font-mono text-pewter">
         <span>{dailyCounts[0]?.date}</span>
         <span>{dailyCounts[dailyCounts.length - 1]?.date}</span>
       </div>
@@ -74,11 +75,13 @@ export function UsageSection({ data }: UsageSectionProps) {
       </div>
 
       <div className="px-5 py-4">
-        {!data.available ? (
-          <EmptyState
-            title="Usage metering is not yet available"
-            description="Usage metering activates with the next data-platform update, which introduces per-org event and run counters. This page is wired and ready — it will start showing real numbers as soon as that data lands, with no further UI changes needed."
-          />
+        {/* usage.ts has no 'empty' branch by design: for a quiet org a
+            zero-filled series IS the answer, so it returns status 'ok' with
+            zeros rather than an absence. That leaves only 'ok' and 'error'
+            reachable here, which is why there is no EmptyState — the only
+            non-ok outcome is a genuine failure and it says so. */}
+        {!isOk(data) ? (
+          <ErrorState title="Couldn't load usage data" message={data.message} />
         ) : (
           <div className="flex flex-col gap-5">
             <dl className="flex flex-wrap gap-3">

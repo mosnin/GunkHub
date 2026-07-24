@@ -1,4 +1,6 @@
-import { describe, it, expect } from 'vitest'
+import { appendFileSync } from 'node:fs'
+
+import { describe, it, expect, beforeAll } from 'vitest'
 
 import {
   mockRun,
@@ -277,6 +279,123 @@ const API_KEY = process.env['TEST_API_KEY']
 const AGENT_ID = process.env['TEST_AGENT_ID']
 
 const hasTestEnv = !!(BASE_URL && API_KEY && AGENT_ID)
+
+// ---------------------------------------------------------------------------
+// Coverage gate — ALWAYS RUNS.
+//
+// Everything above this line is a type/shape test over local fixtures. It runs
+// with no backend and proves nothing about a real deployment. Everything below
+// is the only real-Convex coverage in the repo, and it is gated behind
+// `describe.skipIf(!hasTestEnv)` — so on any run without CONVEX_TEST_URL /
+// TEST_API_KEY / TEST_AGENT_ID it contributes ZERO assertions while the suite
+// still reports green.
+//
+// This block exists so that outcome can never again be mistaken for coverage.
+// It does NOT fail when unconfigured — that would block every CI run and every
+// local `pnpm test` forever, which is not the goal. Instead it makes the
+// absence impossible to miss:
+//
+//   1. The TEST NAME ITSELF carries the state, so the reporter line a human
+//      actually reads says "ZERO REAL-CONVEX COVERAGE" rather than a generic
+//      pass. Vitest test names are evaluated at collection time, which is what
+//      makes this possible.
+//   2. A banner naming each missing variable goes to stderr.
+//   3. Under GitHub Actions it also writes a warning annotation and a job
+//      summary block, so the gap is visible on the PR checks page and not only
+//      in scrolled-past log output.
+// ---------------------------------------------------------------------------
+
+const MISSING_TEST_VARS = (
+  [
+    ['CONVEX_TEST_URL', BASE_URL],
+    ['TEST_API_KEY', API_KEY],
+    ['TEST_AGENT_ID', AGENT_ID],
+  ] as const
+)
+  .filter(([, value]) => !value)
+  .map(([name]) => name)
+
+/** Count of tests inside the gated `describe` below. Keep in sync when adding tests. */
+const REAL_CONVEX_TEST_COUNT = 5
+
+function reportZeroCoverage(): void {
+  const banner = [
+    '',
+    '='.repeat(78),
+    '  REAL-CONVEX INTEGRATION COVERAGE: ZERO',
+    '='.repeat(78),
+    '',
+    `  ${REAL_CONVEX_TEST_COUNT} integration tests in tests/integration/api.test.ts were SKIPPED.`,
+    '  They did not run. Nothing in this suite exercised a real Convex deployment,',
+    '  a real API route, real auth, or real persistence.',
+    '',
+    `  Missing environment variables: ${MISSING_TEST_VARS.join(', ')}`,
+    '',
+    '  Everything that DID run in this file is a type/shape assertion over local',
+    '  fixtures in tests/fixtures/runs.ts. Fixtures cannot detect a broken route,',
+    '  a wrong Convex argument, a tenancy leak, or a regression in ingest.',
+    '',
+    '  A green run of this file is NOT evidence that the API works.',
+    '',
+    '  To provision: docs/ops/ci_setup.md and the "Integration Tests" section of',
+    '  .env.example.',
+    '='.repeat(78),
+    '',
+  ].join('\n')
+
+  // eslint-disable-next-line no-console -- this report is the entire point of
+  // this test; suppressing it would recreate the silent-skip it exists to end.
+  console.error(banner)
+
+  const summaryPath = process.env['GITHUB_STEP_SUMMARY']
+  if (process.env['GITHUB_ACTIONS'] === 'true') {
+    // eslint-disable-next-line no-console -- workflow command, must reach stdout.
+    console.log(
+      `::warning title=ZERO Real-Convex Integration Coverage::${REAL_CONVEX_TEST_COUNT} integration tests were skipped because ${MISSING_TEST_VARS.join(', ')} ${MISSING_TEST_VARS.length === 1 ? 'is' : 'are'} not set. No real deployment, route, auth, or persistence was exercised. A green suite here is not evidence the API works.`,
+    )
+    if (summaryPath) {
+      try {
+        appendFileSync(
+          summaryPath,
+          [
+            '## :rotating_light: Real-Convex integration coverage: ZERO',
+            '',
+            `**${REAL_CONVEX_TEST_COUNT} integration tests were skipped, not run.**`,
+            '',
+            `Missing: ${MISSING_TEST_VARS.map((v) => `\`${v}\``).join(', ')}`,
+            '',
+            'No real Convex deployment, API route, auth path, or persistence was exercised.',
+            'The tests that did run assert only the shape of local fixtures.',
+            '',
+            'See `docs/ops/ci_setup.md` to provision the secrets.',
+            '',
+          ].join('\n'),
+        )
+      } catch {
+        // A summary-file write failure must never fail the suite; the stderr
+        // banner and the ::warning annotation above already carry the report.
+      }
+    }
+  }
+}
+
+describe('Real-Convex integration coverage (always runs)', () => {
+  it(
+    hasTestEnv
+      ? `is CONFIGURED — ${REAL_CONVEX_TEST_COUNT} real-Convex tests will run`
+      : `>>> ZERO REAL-CONVEX COVERAGE — ${REAL_CONVEX_TEST_COUNT} tests SKIPPED (missing ${MISSING_TEST_VARS.join(', ')}) — a green suite here does NOT mean the API works <<<`,
+    () => {
+      if (hasTestEnv) {
+        expect(MISSING_TEST_VARS).toEqual([])
+        return
+      }
+      reportZeroCoverage()
+      // Deliberately not a failure: an unconditional red would block every CI
+      // run and every local `pnpm test`. The assertion records the fact instead.
+      expect(MISSING_TEST_VARS.length).toBeGreaterThan(0)
+    },
+  )
+})
 
 describe.skipIf(!hasTestEnv)('Real Convex integration tests', () => {
   // Shared run ID created in beforeAll and used by subsequent tests.

@@ -1,5 +1,7 @@
 import { auth } from '@clerk/nextjs/server'
 
+import { getAgent } from './agents'
+
 import type {
   CreateRunRequest,
   CreateRunResponse,
@@ -8,6 +10,7 @@ import type {
   ListRunsResponse,
   Run,
 } from '@agent-flight-recorder/contracts'
+
 
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient } from '@/lib/convexServer'
@@ -129,6 +132,25 @@ export async function getRun(id: string): Promise<GetRunResponse> {
 /**
  * Create a new run. Used by the web UI (Clerk auth).
  * For SDK-initiated runs use the /api/runs ingestion route with x-api-key.
+ *
+ * PROJECT ID IS DERIVED, NOT SUPPLIED. `convex/runs.ts` `createRun` declares
+ * `projectId: v.id("projects")` as REQUIRED, but `CreateRunRequest` in
+ * @agent-flight-recorder/contracts does not carry one — and must not start
+ * carrying one, because the same request type is the SDK's transport shape
+ * and the SDK's ingest path deliberately derives projectId server-side from
+ * the agent (convex/sdk_ingest.ts, `projectId: agent.projectId`). Adding a
+ * required field to the shared type to fix a web-only defect would break
+ * every SDK consumer.
+ *
+ * So this path mirrors sdk_ingest: resolve the agent, take its projectId.
+ * Convex re-validates that both the project and the agent belong to the
+ * caller's org and that the agent belongs to the project, so this derivation
+ * is a convenience, never the tenancy check.
+ *
+ * Until this cycle the argument was simply omitted, so every Clerk-authed run
+ * creation from the web app failed with ArgumentValidationError. TypeScript
+ * could not see it: the args cross the hand-maintained `makeFunctionReference`
+ * string-ref seam in convexFunctions.ts. Found by scripts/check-convex-refs.ts.
  */
 export async function createRun(req: CreateRunRequest): Promise<CreateRunResponse> {
   const { orgId: clerkOrgId } = auth()
@@ -140,10 +162,21 @@ export async function createRun(req: CreateRunRequest): Promise<CreateRunRespons
   const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
   if (!org) throw new Error('Organization not found')
 
+  // TENANCY: `getAgent` (services/agents.ts) returns null for BOTH a
+  // nonexistent agentId and one belonging to another org — the underlying
+  // Convex query throws "Agent not found" in the first case and a membership
+  // Forbidden in the second, and collapsing them here is deliberate. A caller
+  // probing agent IDs must not be able to tell "does not exist" from "exists,
+  // but not yours"; that distinction is an existence oracle across the org
+  // boundary (CLAUDE.md, Tenancy Rules #3). One message covers both.
+  const agent = await getAgent(req.agentId)
+  if (!agent) throw new Error('Agent not found in this organization')
+
   const orgDoc = org as Record<string, unknown>
   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const doc = await client.mutation(convex.runs.createRun, {
     orgId: orgDoc._id,
+    projectId: agent.projectId,
     agentId: req.agentId,
     ...(req.agentVersionId !== undefined && { agentVersionId: req.agentVersionId }),
     ...(req.metadata !== undefined && { metadata: req.metadata }),

@@ -3,8 +3,7 @@ import Link from 'next/link'
 import type { Metadata } from 'next'
 
 import { UsageSection } from '@/components/settings/UsageSection'
-import { ErrorState } from '@/components/ui/ErrorState'
-import { getUsageData, type UsageData } from '@/lib/services/usage'
+import { getUsageData } from '@/lib/services/usage'
 
 export const metadata: Metadata = { title: 'Usage — Settings' }
 
@@ -15,23 +14,21 @@ interface SettingsUsagePageProps {
 export default async function SettingsUsagePage({ searchParams }: SettingsUsagePageProps) {
   const rangeDays: 7 | 30 = searchParams.range === '30' ? 30 : 7
 
-  // getUsageData() is a real Convex-backed read as of this cycle (Team A's
-  // usage_counters table + getUsageForDay/listRecentUsage queries) — see
-  // lib/services/usage.ts. It can still legitimately return
-  // `{ available: false }` if the org can't be resolved; UsageSection renders
-  // an honest empty state for that case rather than fake numbers. The
-  // try/catch below guards against a live query failure blanking the page.
-  let usage: UsageData = { available: false }
-  let loadError: string | null = null
-  try {
-    usage = await getUsageData(rangeDays)
-  } catch (err) {
-    loadError = err instanceof Error ? err.message : 'Failed to load usage data'
-  }
-
-  if (loadError) {
-    return <ErrorState title="Could not load usage data" message={loadError} />
-  }
+  // getUsageData() catches internally and returns an explained ServiceResult,
+  // so this is a direct assignment. Two things were deleted here on purpose:
+  //
+  //  - the fabricated `{ available: false }` seed, which asserted "no usage
+  //    data" before a single query had run. That literal was the page-level
+  //    form of the exact bug ServiceResult exists to kill.
+  //  - the try/catch, which piped a raw `err.message` into ErrorState. Convex
+  //    error prose can carry document IDs and function paths, and this app
+  //    deliberately keeps a cross-org lookup indistinguishable from a missing
+  //    record (CLAUDE.md, Tenancy Rules #3) — echoing it to the UI hands back
+  //    exactly that oracle. The service's `message` is safe by construction.
+  //
+  // A non-'ok' result now reaches UsageSection, which explains it in place
+  // rather than replacing the whole page (and its range toggle) with an error.
+  const usage = await getUsageData(rangeDays)
 
   return (
     <div className="flex flex-col gap-3">

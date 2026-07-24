@@ -14,12 +14,14 @@ import { RunList } from '@/components/runs/RunList'
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
 import { ErrorState } from '@/components/ui/ErrorState'
+import { InlineError } from '@/components/ui/InlineError'
 import { Reveal, RevealGroup, RevealItem } from '@/components/ui/Motion'
 import { getDashboardStats, getPerAgentDashboardStats, type DashboardRange } from '@/lib/services/dashboard'
 import { getRunExplanationSummaries, withAnalyzingGracePeriod } from '@/lib/services/explanations'
 import { listFailurePatterns } from '@/lib/services/failurePatterns'
 import { getRecentFailedVerifications } from '@/lib/services/projection_verify'
 import { listRuns } from '@/lib/services/runs'
+import { isEmpty, isOk } from '@/lib/services/serviceResult'
 import { truncateId, formatRelativeTime } from '@/lib/utils'
 
 const TOP_PATTERNS_LIMIT = 10
@@ -49,7 +51,7 @@ function StatTile({
       <div className="scanline opacity-60" aria-hidden="true" />
       <div className="flex items-center gap-2">
         <span className={`w-1.5 h-1.5 rounded-full ${dot}`} aria-hidden="true" />
-        <p className="font-mono text-[11px] uppercase tracking-wider text-pewter">{label}</p>
+        <p className="font-mono text-xs uppercase tracking-wider text-pewter">{label}</p>
       </div>
       <p className={`mt-3 font-mono text-[40px] leading-none font-medium tabular-nums ${valueColor}`}>{value}</p>
       {hint && <p className="mt-2 text-xs text-pewter">{hint}</p>}
@@ -83,7 +85,6 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
 
   let runs: Run[] = []
   let error: string | null = null
-  let failedVerifications: FailedVerification[] = []
 
   try {
     const result = await listRuns({ limit: 20 })
@@ -113,12 +114,12 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
     explanationSummaries = withAnalyzingGracePeriod(raw, runs)
   }
 
-  // Non-fatal: verification issues section is hidden if fetch fails
-  try {
-    failedVerifications = await getRecentFailedVerifications(5)
-  } catch {
-    // Non-fatal
-  }
+  // Non-fatal, and now self-explaining: getRecentFailedVerifications catches
+  // internally and returns an explained result, so the section can tell
+  // "nothing failed verification" apart from "we could not find out". The old
+  // try/catch left an empty array behind on failure, which rendered the
+  // reassuring "No recent verification issues" over a thrown query.
+  const failedVerifications = await getRecentFailedVerifications(5)
 
   // "Top recurring failures" widget (PREVENTION, cycle 2) — org-wide, not
   // scoped to the recent-runs window above, so it fetches independently and
@@ -188,14 +189,24 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
                   </Link>
                 </div>
 
-                {failedVerifications.length === 0 ? (
-                  <div className="flex items-center gap-2 px-3 py-2.5 rounded-[4px] border border-graphite text-xs text-ash font-mono">
-                    <span className="w-1.5 h-1.5 rounded-full bg-neon-muted shrink-0" aria-hidden="true" />
-                    No recent verification issues
-                  </div>
+                {/* The calm "No recent verification issues" line is now
+                    reachable ONLY from status 'empty' — i.e. the query ran and
+                    genuinely found none. On 'error' we say so instead. This is
+                    the exact string serviceResult.ts cites as the motivating
+                    bug. okList() maps an empty list to 'empty', so an 'ok'
+                    result always has at least one row. */}
+                {!isOk(failedVerifications) ? (
+                  isEmpty(failedVerifications) ? (
+                    <div className="flex items-center gap-2 px-3 py-2.5 rounded-[4px] border border-graphite text-xs text-ash font-mono">
+                      <span className="w-1.5 h-1.5 rounded-full bg-neon-muted shrink-0" aria-hidden="true" />
+                      No recent verification issues
+                    </div>
+                  ) : (
+                    <InlineError message={failedVerifications.message} />
+                  )
                 ) : (
                   <div className="rounded-md border border-neutral-800 divide-y divide-neutral-800">
-                    {failedVerifications.map((fv) => (
+                    {failedVerifications.items.map((fv) => (
                       <Link
                         key={fv.runId}
                         href={`/runs/${fv.runId}`}
