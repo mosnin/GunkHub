@@ -493,8 +493,24 @@ See `examples/read_back.ts` for the full runnable version.
 | `iterateEvents(runId, { pageSize? })` | (pages `getRunEvents` transparently) | `AsyncGenerator<Event>` |
 | `getReplay(runId)` | `GET /api/v1/runs/:id/replay` | `{ projection, failureSummary }` |
 | `getExplanation(runId)` | `GET /api/v1/runs/:id/explanation` | `{ explanation: RunExplanation \| null }` |
+| `getFailurePatterns(filters?)` | `GET /api/v1/patterns` | `{ patterns, nextCursor? }` |
 
 `filters` for `listRuns`: `status`, `agentId`, `environment`, `sessionId`, `limit`, `cursor` (all optional).
+
+`filters` for `getFailurePatterns`: `agentId`, `limit`, `cursor` (all optional).
+
+### `getFailurePatterns(filters?)` — recurring failure patterns (PREVENTION cycle 1, ADR-005)
+
+Lists recurring failure fingerprints for the key's organization, most-recently-seen first — a durable memory of failures that keep recurring across runs, derived from `RunExplanation`s. Each `FailurePattern` carries `class`, `label`, `count`, `firstSeenAt`/`lastSeenAt`, a bounded sample of `representativeRunIds`, the `affectedAgentVersionIds` it's been seen on, and an optional `lastSpikeAssessment` (`isSpiking`, `recentCount`, `baselineMean`, `z`) from the periodic spike-rollup cron.
+
+```typescript
+const { patterns } = await reader.getFailurePatterns({ agentId: 'agent_123', limit: 20 })
+for (const pattern of patterns) {
+  console.log(`${pattern.label} — seen ${pattern.count}x, last at ${new Date(pattern.lastSeenAt).toISOString()}`)
+}
+```
+
+Like every other query surface in this system (CLAUDE.md), this is **observability-grade derived data, never source of truth** — the event log and each run's own `RunExplanation` remain the only facts about what happened on any single run. `@agent-flight-recorder/cli`'s `afr patterns` is a thin wrapper over this method.
 
 ### `getExplanation(runId)` — the "explainability layer" root-cause read (ADR-004)
 
@@ -668,6 +684,8 @@ this pattern (including the tool-error path).
 ---
 
 ## Version
+
+v0.8.0 — `FlightReader.getFailurePatterns(filters?)`: a typed read method over the Failure Patterns endpoint (`GET /api/v1/patterns`, PREVENTION cycle 1 / ADR-005) — lists recurring failure fingerprints for the key's org, most-recently-seen first, optionally narrowed by `agentId`. New exports: `V1ListFailurePatternsData`, `ListFailurePatternsParams`, `FailurePattern`, `FailurePatternClass` (re-exported from contracts). Backs `@agent-flight-recorder/cli`'s new `afr patterns` command.
 
 v0.7.0 — `FlightReader.getExplanation(runId)`: a typed read method over the "explainability layer" root-cause endpoint (`GET /api/v1/runs/:id/explanation`, ADR-004), resolving `{ explanation: RunExplanation | null }` — mirrors the already-shipped Clerk-authed `GET /api/runs/:id/explanation` exactly, including its documented coarse-null gap (`null` means either "not failed" or "not explained yet"; pair with `getRun` to disambiguate, as `afr explain` does). New exports: `V1GetExplanationData`, `RunExplanation`, `RunExplanationKind` (re-exported from contracts). The v1 route itself does not exist yet — see the method's JSDoc for the expected contract, pending platform/data team follow-up to wire it as a thin proxy over `convex/run_explanations.ts`.
 

@@ -66,6 +66,15 @@ function ShieldIcon() {
   )
 }
 
+function TrendIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M2 12.5L6 7l3 3 5-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="14" cy="4" r="1.25" fill="currentColor" />
+    </svg>
+  )
+}
+
 function SearchIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -89,6 +98,7 @@ const navItems: NavItem[] = [
   { label: 'Projects', href: '/projects', icon: <FolderIcon /> },
   { label: 'Agents', href: '/agents', icon: <CpuIcon /> },
   { label: 'Runs', href: '/runs', icon: <PlayIcon /> },
+  { label: 'Patterns', href: '/patterns', icon: <TrendIcon /> },
   { label: 'Search', href: '/search', icon: <SearchIcon /> },
   { label: 'Compare', href: '/diff', icon: <ColumnsIcon /> },
   { label: 'Audit', href: '/audit', icon: <ShieldIcon /> },

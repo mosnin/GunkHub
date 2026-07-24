@@ -4,8 +4,9 @@
 // action 500s. See ADR-0023.
 //
 // Auth model per route class:
-//   - App pages under /projects, /agents, /runs, /dashboard, /settings, /diff
-//     require a signed-in Clerk session (redirected to sign-in otherwise).
+//   - App pages under /projects, /agents, /runs, /patterns, /dashboard,
+//     /settings, /diff require a signed-in Clerk session (redirected to
+//     sign-in otherwise).
 //   - SDK ingest routes (/api/events, /api/runs, /api/artifacts, ...) authenticate
 //     via x-api-key, NOT a Clerk session, so they are left public here.
 //   - The Clerk webhook (/api/webhooks/clerk) authenticates via Svix signature.
@@ -18,6 +19,7 @@ const isProtectedPage = createRouteMatcher([
   '/projects(.*)',
   '/agents(.*)',
   '/runs(.*)',
+  '/patterns(.*)',
   '/dashboard(.*)',
   '/settings(.*)',
   '/diff(.*)',

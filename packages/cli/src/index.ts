@@ -14,6 +14,7 @@ import { printConfigCheck, runConfigCheck } from './commands/config-check.js'
 import { EXPLAIN_HELP, parseExplainArgs, printExplain, runExplain } from './commands/explain.js'
 import { EXPORT_HELP, parseExportArgs, printExport, runExport } from './commands/export.js'
 import { INIT_HELP, parseInitArgs, printInit, runInit } from './commands/init.js'
+import { PATTERNS_HELP, parsePatternsArgs, printPatterns, runPatterns } from './commands/patterns.js'
 import { printRecordDemo, runRecordDemo } from './commands/record-demo.js'
 import { REPLAY_HELP, parseReplayArgs, printReplay, runReplay } from './commands/replay.js'
 import { RUNS_GET_HELP, parseRunsGetArgs, printRunsGet, runRunsGet } from './commands/runs-get.js'
@@ -33,6 +34,8 @@ export { parseInitArgs, runInit, printInit, quickstartFileContents, DEFAULT_QUIC
 export type { InitArgs, InitResult, FileExistsLike, WriteFileLike as InitWriteFileLike } from './commands/init.js'
 export { parseExplainArgs, runExplain, printExplain } from './commands/explain.js'
 export type { ExplainArgs, ExplainResult } from './commands/explain.js'
+export { parsePatternsArgs, runPatterns, printPatterns } from './commands/patterns.js'
+export type { PatternsArgs, PatternsResult } from './commands/patterns.js'
 export * from './apiClient.js'
 export { parseRunsListArgs, runRunsList, printRunsList } from './commands/runs-list.js'
 export type { RunsListArgs, RunsListResult } from './commands/runs-list.js'
@@ -63,6 +66,7 @@ Commands:
   afr tail <runId>               Tail a run's events live
   afr export <runId>             Export a run's run/events/replay bundle
   afr explain <runId>            Root-cause explanation for a run — failure class, summary, root cause, suggested fix
+  afr patterns [options]         List recurring failure patterns for your organization
 
 Run 'afr <command> --help' for command-specific options.
 
@@ -135,6 +139,17 @@ export async function main(argv: string[], log: (line: string) => void = console
       }
       const result = await runExplain(args.runId)
       printExplain(args, result, log)
+      return result.ok ? 0 : result.exitCode
+    }
+
+    case 'patterns': {
+      const args = parsePatternsArgs(afterCommand)
+      if (args.help) {
+        log(PATTERNS_HELP)
+        return 0
+      }
+      const result = await runPatterns(args)
+      printPatterns(args, result, log)
       return result.ok ? 0 : result.exitCode
     }
 

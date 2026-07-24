@@ -244,6 +244,64 @@ describe('FlightReader.getExplanation', () => {
 })
 
 // ---------------------------------------------------------------------------
+// FlightReader.getFailurePatterns — Failure Patterns (PREVENTION cycle 1)
+// ---------------------------------------------------------------------------
+
+describe('FlightReader.getFailurePatterns', () => {
+  function makePattern(overrides: Partial<import('@agent-flight-recorder/contracts').FailurePattern> = {}) {
+    return {
+      id: 'fp_1',
+      orgId: 'org_1',
+      fingerprintHash: 'hash_1',
+      class: 'tool_error',
+      label: 'lookup_order tool call times out',
+      salientKey: 'lookup_order',
+      count: 12,
+      firstSeenAt: 1_700_000_000_000,
+      lastSeenAt: 1_700_000_500_000,
+      representativeRunIds: ['run_1', 'run_2'],
+      affectedAgentVersionIds: ['av_1'],
+      ...overrides,
+    }
+  }
+
+  it('hits GET /api/v1/patterns with x-api-key auth, no filters', async () => {
+    const data = { patterns: [makePattern()] }
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data }))
+    const reader = new FlightReader(config, fetchImpl)
+    const result = await reader.getFailurePatterns()
+    expect(result).toEqual(data)
+    expect(fetchImpl).toHaveBeenCalledWith(expect.stringContaining('/api/v1/patterns'), {
+      headers: { 'x-api-key': 'k' },
+    })
+  })
+
+  it('sends agentId/limit/cursor as query params', async () => {
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    const reader = new FlightReader(config, fetchImpl)
+    await reader.getFailurePatterns({ agentId: 'agent_1', limit: 10, cursor: 'cur-1' })
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('/api/v1/patterns')
+    expect(url).toContain('agentId=agent_1')
+    expect(url).toContain('limit=10')
+    expect(url).toContain('cursor=cur-1')
+  })
+
+  it('resolves an empty list without throwing when the org has no patterns', async () => {
+    const data = { patterns: [] }
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data }))
+    const reader = new FlightReader(config, fetchImpl)
+    await expect(reader.getFailurePatterns()).resolves.toEqual(data)
+  })
+
+  it('still throws V1ApiError for a genuine failure', async () => {
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(500, {}))
+    const reader = new FlightReader(config, fetchImpl)
+    await expect(reader.getFailurePatterns()).rejects.toMatchObject({ kind: 'server' })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // FlightReader — error classes (mirrors the CLI's apiClient error mapping —
 // both share fetchV1/V1ApiError under the hood)
 // ---------------------------------------------------------------------------

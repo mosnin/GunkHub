@@ -23,7 +23,15 @@ import { warnIfInsecureEndpoint } from './transport.js'
 import { fetchV1, V1ApiError } from './v1-client.js'
 
 import type { V1ApiConfig, V1FetchLike } from './v1-client.js'
-import type { Event, FailureSummary, ReplayProjection, Run, RunExplanation, RunStatus } from '@agent-flight-recorder/contracts'
+import type {
+  Event,
+  FailurePattern,
+  FailureSummary,
+  ReplayProjection,
+  Run,
+  RunExplanation,
+  RunStatus,
+} from '@agent-flight-recorder/contracts'
 
 // ---------------------------------------------------------------------------
 // v1 response data shapes (entity types reused from contracts — read-only)
@@ -75,6 +83,24 @@ export interface V1ReplayData {
  */
 export interface V1GetExplanationData {
   explanation: RunExplanation | null
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/patterns — Failure Patterns (PREVENTION cycle 1, ADR-005): a
+// durable, org-scoped memory of recurring failure fingerprints, ranked by
+// recency. See `getFailurePatterns()` below for the full contract.
+// ---------------------------------------------------------------------------
+
+export interface V1ListFailurePatternsData {
+  patterns: FailurePattern[]
+  nextCursor?: string
+}
+
+export interface ListFailurePatternsParams {
+  /** Narrow to patterns that have been seen on at least one version of this agent. */
+  agentId?: string
+  limit?: number
+  cursor?: string
 }
 
 export interface ListRunsParams {
@@ -282,6 +308,31 @@ export class FlightReader {
       this.config,
       `/api/v1/runs/${encodeURIComponent(runId)}/explanation`,
       {},
+      this.fetchImpl
+    )
+  }
+
+  /**
+   * List recurring failure patterns for the key's organization, most-
+   * recently-seen first — the "Failure Patterns" durable memory (ADR-005):
+   * a rollup of fingerprinted, recurring failures derived from failed runs'
+   * explanations, never source of truth on its own (the event log + each
+   * run's own `RunExplanation` remain that).
+   *
+   * @param filters - optional `agentId` (narrows to patterns seen on at
+   *   least one version of that agent) plus `limit`/`cursor` pagination.
+   * @returns `{ patterns, nextCursor }` — pass `nextCursor` back as `cursor` to page.
+   * @throws {@link V1ApiError} on any auth/rate-limit/server/network failure.
+   */
+  getFailurePatterns(filters: ListFailurePatternsParams = {}): Promise<V1ListFailurePatternsData> {
+    return fetchV1<V1ListFailurePatternsData>(
+      this.config,
+      '/api/v1/patterns',
+      {
+        agentId: filters.agentId,
+        limit: filters.limit,
+        cursor: filters.cursor,
+      },
       this.fetchImpl
     )
   }

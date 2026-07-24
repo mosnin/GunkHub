@@ -1653,3 +1653,254 @@ describe('buildHeuristicExplanation / classifyFailure', () => {
     assertCitedSeqNumsAreReal(result.citedSeqNums, events)
   })
 })
+
+// ---------------------------------------------------------------------------
+// deriveFailureFingerprint / assessPatternSpike — PURE, DETERMINISTIC (Team A
+// depends on these exact signatures from convex/failure_patterns.ts). No ctx,
+// no convex-test harness needed.
+// ---------------------------------------------------------------------------
+import { deriveFailureFingerprint, assessPatternSpike } from './insights'
+import type { FailureFingerprintInput, FailureFingerprint, PatternTrendPoint, SpikeAssessment } from './insights'
+
+describe('deriveFailureFingerprint', () => {
+  it('is stable: the exact same input produces the exact same hash every time', () => {
+    const input: FailureFingerprintInput = {
+      heuristicClass: 'tool_timeout',
+      failingToolName: 'search_web',
+      errorSignature: 'Timeout after 3021ms calling search_web',
+    }
+    const a = deriveFailureFingerprint(input)
+    const b = deriveFailureFingerprint({ ...input })
+    expect(a.hash).toBe(b.hash)
+    expect(a.hash).toMatch(/^[0-9a-f]{16}$/)
+  })
+
+  it('is stable across repeated calls in a loop (no hidden state, no randomness)', () => {
+    const input: FailureFingerprintInput = { heuristicClass: 'llm_error', errorSignature: 'rate limited: 429 too many requests' }
+    const hashes = new Set<string>()
+    for (let i = 0; i < 25; i++) hashes.add(deriveFailureFingerprint(input).hash)
+    expect(hashes.size).toBe(1)
+  })
+
+  it('KEY PROPERTY: two tool-timeout errors differing ONLY in latency collapse to the SAME fingerprint', () => {
+    const a = deriveFailureFingerprint({
+      heuristicClass: 'tool_timeout',
+      failingToolName: 'search_web',
+      errorSignature: 'Timeout after 3021ms calling search_web',
+    })
+    const b = deriveFailureFingerprint({
+      heuristicClass: 'tool_timeout',
+      failingToolName: 'search_web',
+      errorSignature: 'Timeout after 118ms calling search_web',
+    })
+    expect(a.hash).toBe(b.hash)
+    expect(a.salientKey).toBe(b.salientKey)
+  })
+
+  it('KEY PROPERTY: two llm_error errors differing ONLY in a request uuid collapse to the SAME fingerprint', () => {
+    const a = deriveFailureFingerprint({
+      heuristicClass: 'llm_error',
+      errorSignature: 'request 3f29a1c4-8b2d-4e11-9c3a-7d6f5e4b3a21 was rate limited (429)',
+    })
+    const b = deriveFailureFingerprint({
+      heuristicClass: 'llm_error',
+      errorSignature: 'request 00000000-0000-4000-8000-000000000000 was rate limited (429)',
+    })
+    expect(a.hash).toBe(b.hash)
+    expect(a.salientKey).toBe('rate_limited')
+  })
+
+  it('KEY PROPERTY: two terminal errors differing only in a timestamp and a hex request id collapse to the same fingerprint', () => {
+    const a = deriveFailureFingerprint({
+      heuristicClass: 'terminal_error',
+      errorSignature: 'run aborted at 2026-07-24T12:03:00.123Z for request 1a2b3c4d5e',
+    })
+    const b = deriveFailureFingerprint({
+      heuristicClass: 'terminal_error',
+      errorSignature: 'run aborted at 2026-01-01T00:00:00.000Z for request ffffff0011',
+    })
+    expect(a.hash).toBe(b.hash)
+  })
+
+  it('COLLISION AVOIDANCE: different failing tools produce different fingerprints for the same class', () => {
+    const a = deriveFailureFingerprint({ heuristicClass: 'tool_timeout', failingToolName: 'search_web' })
+    const b = deriveFailureFingerprint({ heuristicClass: 'tool_timeout', failingToolName: 'read_file' })
+    expect(a.hash).not.toBe(b.hash)
+    expect(a.salientKey).toBe('search_web')
+    expect(b.salientKey).toBe('read_file')
+  })
+
+  it('COLLISION AVOIDANCE: different heuristic classes with the same salient text produce different fingerprints', () => {
+    const a = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'timed out' })
+    const b = deriveFailureFingerprint({ heuristicClass: 'tool_error', errorSignature: 'timed out' })
+    expect(a.hash).not.toBe(b.hash)
+  })
+
+  it('COLLISION AVOIDANCE: different error classes (rate limit vs auth) produce different fingerprints', () => {
+    const a = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'rate limited, 429' })
+    const b = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'unauthorized, 401 invalid api key' })
+    expect(a.hash).not.toBe(b.hash)
+  })
+
+  it('prefers failingToolName over errorSignature for tool-shaped classes', () => {
+    const fp = deriveFailureFingerprint({
+      heuristicClass: 'tool_error',
+      failingToolName: 'search_web',
+      errorSignature: 'connection reset by peer',
+    })
+    expect(fp.salientKey).toBe('search_web')
+    expect(fp.label).toBe('Tool error: search_web')
+  })
+
+  it('falls back to terminalEventType when no tool name or error signature is available', () => {
+    const fp = deriveFailureFingerprint({ heuristicClass: 'terminal_error', terminalEventType: 'run.failed' })
+    expect(fp.salientKey).toBe('run.failed')
+  })
+
+  it('falls back to the class name itself when nothing else is available', () => {
+    const fp = deriveFailureFingerprint({ heuristicClass: 'unknown' })
+    expect(fp.salientKey).toBe('unknown')
+    expect(fp.label).toBe('Unknown failure')
+  })
+
+  it('produces a human-readable label per class', () => {
+    expect(deriveFailureFingerprint({ heuristicClass: 'tool_timeout', failingToolName: 'search_web' }).label).toBe('Tool timeout: search_web')
+    expect(deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'rate limited (429)' }).label).toBe('LLM error: rate_limited')
+    expect(deriveFailureFingerprint({ heuristicClass: 'incomplete' }).label).toBe('Incomplete run')
+  })
+
+  it('ADVERSARIAL: empty/undefined optional fields never throw and still produce a valid fingerprint', () => {
+    expect(() => deriveFailureFingerprint({ heuristicClass: 'unknown' })).not.toThrow()
+    expect(() => deriveFailureFingerprint({ heuristicClass: 'tool_error', failingToolName: null, errorSignature: null, terminalEventType: null })).not.toThrow()
+    expect(() => deriveFailureFingerprint({ heuristicClass: 'tool_error', failingToolName: '', errorSignature: '   ' })).not.toThrow()
+    const fp = deriveFailureFingerprint({ heuristicClass: 'tool_error', failingToolName: '', errorSignature: '   ' })
+    expect(fp.hash).toMatch(/^[0-9a-f]{16}$/)
+    expect(fp.salientKey.length).toBeGreaterThan(0)
+  })
+
+  it('ADVERSARIAL: a very long error signature never throws and produces a bounded label/salientKey', () => {
+    const huge = 'timeout after ' + '9'.repeat(50000) + 'ms calling search_web ' + 'x'.repeat(50000)
+    expect(() => deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: huge })).not.toThrow()
+    const fp = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: huge })
+    expect(fp.hash).toMatch(/^[0-9a-f]{16}$/)
+    expect(fp.salientKey.length).toBeLessThanOrEqual(100)
+    expect(fp.label.length).toBeLessThan(300)
+  })
+
+  it('ADVERSARIAL: unicode error text never throws and is still deterministic', () => {
+    const input: FailureFingerprintInput = { heuristicClass: 'llm_error', errorSignature: '请求超时 — 该工具 🔥 无法访问 (código: 42)' }
+    expect(() => deriveFailureFingerprint(input)).not.toThrow()
+    const a = deriveFailureFingerprint(input)
+    const b = deriveFailureFingerprint({ ...input })
+    expect(a.hash).toBe(b.hash)
+    expect(a.hash).toMatch(/^[0-9a-f]{16}$/)
+  })
+
+  it('ADVERSARIAL: unicode tool names still discriminate from one another', () => {
+    const a = deriveFailureFingerprint({ heuristicClass: 'tool_error', failingToolName: '搜索工具' })
+    const b = deriveFailureFingerprint({ heuristicClass: 'tool_error', failingToolName: '阅读工具' })
+    expect(a.hash).not.toBe(b.hash)
+  })
+})
+
+describe('assessPatternSpike', () => {
+  function trend(counts: number[], startDate = '2026-07-01'): PatternTrendPoint[] {
+    const start = Date.parse(`${startDate}T00:00:00.000Z`)
+    return counts.map((count, i) => {
+      const d = new Date(start + i * 24 * 60 * 60 * 1000)
+      return { day: d.toISOString().slice(0, 10), count }
+    })
+  }
+
+  it('a flat trend is not spiking', () => {
+    const t = trend([2, 2, 2, 2, 2, 2, 2])
+    const result = assessPatternSpike(t)
+    expect(result.isSpiking).toBe(false)
+  })
+
+  it('a clear step-up in the recent window is flagged as spiking', () => {
+    // 5 baseline days at ~1/day, then 3 recent days at 10/day.
+    const t = trend([1, 1, 1, 1, 1, 10, 10, 10])
+    const result = assessPatternSpike(t)
+    expect(result.isSpiking).toBe(true)
+    expect(result.recentCount).toBe(30)
+    expect(result.baselineMean).toBeCloseTo(1, 5)
+    expect(result.z).toBeGreaterThanOrEqual(2)
+  })
+
+  it('insufficient baseline data (fewer than minBaselineDays) is never flagged as spiking, z pinned to 0', () => {
+    // Only 2 baseline days available (need 4 by default) plus 3 recent days.
+    const t = trend([1, 1, 50, 50, 50])
+    const result = assessPatternSpike(t)
+    expect(result.isSpiking).toBe(false)
+    expect(result.z).toBe(0)
+  })
+
+  it('an empty trend never throws and is not spiking', () => {
+    expect(() => assessPatternSpike([])).not.toThrow()
+    const result = assessPatternSpike([])
+    expect(result.isSpiking).toBe(false)
+    expect(result.z).toBe(0)
+    expect(result.recentCount).toBe(0)
+  })
+
+  it('recentCount below minRecentCount is never flagged, even with a large z', () => {
+    // Baseline of 0s, recent window has a single failure (count=1 < default minRecentCount=3).
+    const t = trend([0, 0, 0, 0, 0, 0, 1])
+    const result = assessPatternSpike(t)
+    expect(result.isSpiking).toBe(false)
+  })
+
+  it('is deterministic — same input always yields the same assessment (no wall clock)', () => {
+    const t = trend([1, 1, 1, 1, 1, 10, 10, 10])
+    const a = assessPatternSpike(t)
+    const b = assessPatternSpike(t.slice())
+    expect(a).toEqual(b)
+  })
+
+  it('sorts an out-of-order trend defensively before slicing recent/baseline windows', () => {
+    const ordered = trend([1, 1, 1, 1, 1, 10, 10, 10])
+    const shuffled = [ordered[5]!, ordered[0]!, ordered[6]!, ordered[2]!, ordered[7]!, ordered[1]!, ordered[3]!, ordered[4]!]
+    const a = assessPatternSpike(ordered)
+    const b = assessPatternSpike(shuffled)
+    expect(b).toEqual(a)
+  })
+
+  it('respects custom opts (recentDays, minBaselineDays, zThreshold, minRecentCount)', () => {
+    const t = trend([1, 1, 10, 10])
+    const strict = assessPatternSpike(t, { recentDays: 2, minBaselineDays: 2, zThreshold: 100 })
+    expect(strict.isSpiking).toBe(false) // z threshold impossible to hit
+    const lenient = assessPatternSpike(t, { recentDays: 2, minBaselineDays: 2, zThreshold: 1, minRecentCount: 1 })
+    expect(lenient.isSpiking).toBe(true)
+  })
+
+  it('ADVERSARIAL: malformed points (missing/non-numeric count, non-string day) are dropped, not throw', () => {
+    const malformed = [
+      { day: '2026-07-01', count: 1 },
+      // @ts-expect-error intentionally malformed for the adversarial test
+      { day: '2026-07-02', count: 'oops' },
+      // @ts-expect-error intentionally malformed for the adversarial test
+      { day: 123, count: 5 },
+      null as unknown as PatternTrendPoint,
+      undefined as unknown as PatternTrendPoint,
+      { day: '2026-07-03', count: 2 },
+    ]
+    expect(() => assessPatternSpike(malformed)).not.toThrow()
+  })
+
+  it('a fingerprint from deriveFailureFingerprint has the exact shape callers (Team A) depend on', () => {
+    const fp: FailureFingerprint = deriveFailureFingerprint({ heuristicClass: 'tool_error', failingToolName: 'search_web' })
+    expect(typeof fp.hash).toBe('string')
+    expect(typeof fp.class).toBe('string')
+    expect(typeof fp.label).toBe('string')
+    expect(typeof fp.salientKey).toBe('string')
+  })
+
+  it('a spike assessment has the exact shape callers (Team A) depend on', () => {
+    const result: SpikeAssessment = assessPatternSpike([{ day: '2026-07-01', count: 1 }])
+    expect(typeof result.isSpiking).toBe('boolean')
+    expect(typeof result.recentCount).toBe('number')
+    expect(typeof result.baselineMean).toBe('number')
+    expect(typeof result.z).toBe('number')
+  })
+})

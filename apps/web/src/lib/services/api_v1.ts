@@ -154,3 +154,37 @@ export async function apiGetExplanation(
   }
   return { explanation: null }
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/patterns -> apiListFailurePatterns
+// ---------------------------------------------------------------------------
+
+/**
+ * v1 read-API: recurring failure patterns for the key's org (PREVENTION
+ * cycle 1, ADR-005) — a durable memory of fingerprinted, recurring failures
+ * derived from failed runs. Powers the SDK's `FlightReader.getFailurePatterns`
+ * and `afr patterns`. Returns `{ patterns, nextCursor }`, most-recently-seen
+ * first, optionally narrowed by `agentId`.
+ */
+export interface ApiV1ListFailurePatternsParams {
+  agentId?: string
+  limit?: number
+  cursor?: string
+}
+
+export async function apiListFailurePatterns(
+  apiKeyHash: string,
+  params: ApiV1ListFailurePatternsParams,
+): Promise<{ patterns: unknown[]; nextCursor?: string }> {
+  const client = getPublicClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await withConvexTimeout(
+    client.mutation(convex.read_api.apiListFailurePatterns, {
+      apiKeyHash,
+      ...(params.agentId !== undefined && { agentId: params.agentId }),
+      ...(params.limit !== undefined && { limit: params.limit }),
+      ...(params.cursor !== undefined && { cursor: params.cursor }),
+    }),
+  )
+  return result as { patterns: unknown[]; nextCursor?: string }
+}

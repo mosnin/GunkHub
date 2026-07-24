@@ -127,3 +127,124 @@ describe('read_api.apiGetExplanation', () => {
     expect(result.runStatus).toBe('failed')
   })
 })
+
+// Tests for apiListFailurePatterns — the key-authed (read scope) counterpart
+// to the Failure Patterns rollup (PREVENTION cycle 1). Covers: read-scope
+// enforcement (implicitly, via resolveReadApiKey being shared code already
+// covered above), org scoping (cross-org patterns never leak), the empty
+// case, and the --agent filter narrowing by affectedAgentVersionIds.
+describe('read_api.apiListFailurePatterns', () => {
+  async function seedPattern(
+    t: ReturnType<typeof convexTest>,
+    orgId: any,
+    fingerprintHash: string,
+    opts: { affectedAgentVersionIds?: any[]; lastSeenAt?: number } = {},
+  ) {
+    return await t.run(async (ctx) => {
+      const now = Date.now();
+      return await ctx.db.insert('failure_patterns', {
+        orgId,
+        fingerprintHash,
+        class: 'tool_error',
+        label: `Pattern ${fingerprintHash}`,
+        salientKey: 'some_tool',
+        count: 3,
+        firstSeenAt: now - 10_000,
+        lastSeenAt: opts.lastSeenAt ?? now,
+        representativeRunIds: [],
+        affectedAgentVersionIds: opts.affectedAgentVersionIds ?? [],
+      });
+    });
+  }
+
+  it('a read-scoped key gets its own org\'s patterns, most-recently-seen first', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_old', { lastSeenAt: Date.now() - 5000 });
+    await seedPattern(t, orgA, 'fp_new', { lastSeenAt: Date.now() });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key' });
+    expect(result.patterns).toHaveLength(2);
+    expect(result.patterns[0].fingerprintHash).toBe('fp_new');
+    expect(result.patterns[1].fingerprintHash).toBe('fp_old');
+  });
+
+  it('an ingest-only key (no "read" scope) is rejected', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'ingest_only', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['ingest:write'] });
+    });
+    await seedPattern(t, orgA, 'fp_1');
+
+    await expect(
+      t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'ingest_only' }),
+    ).rejects.toThrow(/Forbidden/);
+  });
+
+  it('never returns another org\'s patterns', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA, orgB } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key_a', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgB, 'fp_org_b_secret');
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key_a' });
+    expect(result.patterns).toHaveLength(0);
+  });
+
+  it('returns an empty list (not an error) when the org has no patterns yet', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key' });
+    expect(result.patterns).toEqual([]);
+    expect(result.nextCursor).toBeUndefined();
+  });
+
+  it('--agent filter narrows to patterns affecting that agent\'s versions only', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t);
+    const otherAgent = await t.run(async (ctx) => {
+      const now = Date.now();
+      return await ctx.db.insert('agents', { orgId: orgA, projectId: projectA, name: 'Other Agent', slug: 'other', createdAt: now, updatedAt: now });
+    });
+    const [versionForAgentA, versionForOtherAgent] = await t.run(async (ctx) => {
+      const now = Date.now();
+      const v1 = await ctx.db.insert('agent_versions', { agentId: agentA, orgId: orgA, version: '1', createdAt: now });
+      const v2 = await ctx.db.insert('agent_versions', { agentId: otherAgent, orgId: orgA, version: '1', createdAt: now });
+      return [v1, v2];
+    });
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_agent_a', { affectedAgentVersionIds: [versionForAgentA] });
+    await seedPattern(t, orgA, 'fp_other_agent', { affectedAgentVersionIds: [versionForOtherAgent] });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, {
+      apiKeyHash: 'read_key',
+      agentId: String(agentA),
+    });
+    expect(result.patterns).toHaveLength(1);
+    expect(result.patterns[0].fingerprintHash).toBe('fp_agent_a');
+  });
+
+  it('rejects an --agent filter naming an agent from a different org', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA, orgB, projectB, agentB } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key_a', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+
+    await expect(
+      t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key_a', agentId: String(agentB) }),
+    ).rejects.toThrow(/not found/i);
+  });
+})

@@ -72,4 +72,18 @@ crons.interval(
   {},
 );
 
+// Failure Patterns (PREVENTION, cycle 1) — periodic spike-rollup. Runs every
+// 15 minutes: recomputes each of the most recently active patterns' 14-day
+// daily trend and stores a fresh spike assessment on the rollup. Cheap,
+// bounded (SPIKE_ROLLUP_MAX_PATTERNS_PER_RUN patterns/tick, each a bounded
+// occurrences read) — see convex/failure_patterns.ts's
+// assessPatternSpikesCron for the read bounds and the "no alert-firing seam
+// yet" handoff note.
+crons.interval(
+  "assess-failure-pattern-spikes",
+  { minutes: 15 },
+  makeFunctionReference<"mutation">("failure_patterns:assessPatternSpikesCron"),
+  {},
+);
+
 export default crons;

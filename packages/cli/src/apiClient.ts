@@ -17,12 +17,14 @@ import { FlightReader, V1ApiError } from '@agent-flight-recorder/sdk'
 
 import type {
   ListEventsParams,
+  ListFailurePatternsParams,
   ListRunsParams,
   V1ApiErrorKind,
   V1FetchLike,
   V1GetExplanationData,
   V1GetRunData,
   V1ListEventsData,
+  V1ListFailurePatternsData,
   V1ListRunsData,
   V1ReplayData,
 } from '@agent-flight-recorder/sdk'
@@ -100,7 +102,17 @@ function toApiClientError(err: unknown): never {
 // v1 response data shapes — re-exported from the SDK reader, the source of truth
 // ---------------------------------------------------------------------------
 
-export type { V1ListRunsData, V1GetRunData, V1ListEventsData, V1ReplayData, V1GetExplanationData, ListRunsParams, ListEventsParams }
+export type {
+  V1ListRunsData,
+  V1GetRunData,
+  V1ListEventsData,
+  V1ReplayData,
+  V1GetExplanationData,
+  V1ListFailurePatternsData,
+  ListRunsParams,
+  ListEventsParams,
+  ListFailurePatternsParams,
+}
 
 // ---------------------------------------------------------------------------
 // Public API — thin FlightReader wrappers
@@ -154,6 +166,18 @@ export async function getRunExplanation(
 ): Promise<V1GetExplanationData> {
   try {
     return await new FlightReader(config, fetchImpl).getExplanation(runId)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+export async function listFailurePatterns(
+  config: ApiClientConfig,
+  params: ListFailurePatternsParams = {},
+  fetchImpl?: ApiFetchLike
+): Promise<V1ListFailurePatternsData> {
+  try {
+    return await new FlightReader(config, fetchImpl).getFailurePatterns(params)
   } catch (err) {
     toApiClientError(err)
   }

@@ -101,6 +101,27 @@ Options: `--json` (prints the raw, derived `{ ok, status, ... }` result).
 
 **Backend status (as of this cycle):** `GET /api/v1/runs/:id/explanation` (the key-authed v1 counterpart of the Clerk-authed route above) does not exist server-side yet. Until it ships, `afr explain` surfaces a "not found" error for every run.
 
+### `afr patterns`
+
+Lists recurring failure patterns for your organization — a durable memory of fingerprinted, recurring failures derived from failed runs (PREVENTION cycle 1, ADR-005). Each row is a rollup: a class, a human label, how many times it has recurred, first/last seen timestamps, and whether the periodic spike-rollup cron currently flags it as spiking.
+
+```bash
+$ afr patterns
+ID            CLASS        LABEL                                  COUNT  FIRST SEEN                LAST SEEN                 SPIKING
+fp_a1b2c3d4e…  tool_error   lookup_order tool call times out       12     2026-07-10T09:00:00.000Z  2026-07-24T14:32:00.000Z  yes
+
+$ afr patterns --agent agent_support --limit 10 --json
+{
+  "ok": true,
+  "patterns": [ ... ],
+  "nextCursor": null
+}
+```
+
+Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--limit <n>`, `--json` (prints the raw API response).
+
+Like every other read here, this is derived, observability-grade data (CLAUDE.md) — never a substitute for a single run's own event log or `afr explain <runId>`.
+
 ### `afr config check`
 
 Validates that `AFR_API_KEY` / `AFR_BASE_URL` are set and pings `GET {AFR_BASE_URL}/api/health`. Exits `0` if everything checks out, `1` otherwise.
@@ -139,8 +160,8 @@ Prints the CLI and SDK versions.
 
 ```bash
 $ afr version
-afr (Agent Flight Recorder CLI) v0.3.0
-sdk: v0.7.0
+afr (Agent Flight Recorder CLI) v0.4.0
+sdk: v0.8.0
 ```
 
 ### `afr --help` / `afr help`

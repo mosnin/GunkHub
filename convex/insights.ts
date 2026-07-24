@@ -2175,3 +2175,303 @@ export function explanationQualityScore(result: ExplanationResult, input: Heuris
   const passed = checks.filter(Boolean).length;
   return checks.length > 0 ? passed / checks.length : 0;
 }
+
+// ---------------------------------------------------------------------------
+// 8. deriveFailureFingerprint / assessPatternSpike — PURE, DETERMINISTIC
+//    building blocks for "Failure Patterns" (Team A's convex/failure_patterns.ts
+//    calls these directly; the signatures below are load-bearing — do not
+//    change them without coordinating with Team A).
+//
+// Both functions take no `ctx`, touch no table, and never read the wall clock
+// or any source of randomness — same input always produces the same output,
+// forever. That determinism is the entire point: a fingerprint's hash is
+// used as a stable grouping key across runs recorded minutes, days, or years
+// apart, and a spike assessment must be reproducible from a given trend
+// series for tests/debugging.
+// ---------------------------------------------------------------------------
+
+export interface FailureFingerprintInput {
+  heuristicClass: HeuristicFailureClass;
+  failingToolName?: string | null;
+  terminalEventType?: string | null;
+  /** Raw error message/class text (unnormalized) — this function normalizes it. */
+  errorSignature?: string | null;
+}
+
+export interface FailureFingerprint {
+  /** Stable, deterministic, 16-hex-char hash. NEVER derived from Date.now()/Math.random()/a random salt. */
+  hash: string;
+  class: HeuristicFailureClass;
+  /** Human summary, e.g. "Tool timeout: search_web" / "LLM error: rate_limited". */
+  label: string;
+  /** The single discriminating token this fingerprint's hash was computed from. */
+  salientKey: string;
+}
+
+/** Bound on any string fed into the hash/label, so one adversarially huge input can't blow up memory/label length. */
+const FINGERPRINT_MAX_INPUT_CHARS = 4000;
+/** Bound on the rendered salientKey/label — generous for a human summary, small enough to stay a "key," not a paragraph. */
+const FINGERPRINT_MAX_KEY_CHARS = 100;
+
+const TOOL_FAILURE_CLASSES = new Set<HeuristicFailureClass>(["tool_timeout", "tool_error", "cascading_tool_failure"]);
+
+const FINGERPRINT_CLASS_LABEL: Record<HeuristicFailureClass, string> = {
+  tool_timeout: "Tool timeout",
+  tool_error: "Tool error",
+  llm_error: "LLM error",
+  assertion_failed: "Assertion failure",
+  terminal_error: "Terminal error",
+  cascading_tool_failure: "Cascading tool failure",
+  incomplete: "Incomplete run",
+  unknown: "Unknown failure",
+};
+
+/**
+ * Deterministic 64-bit FNV-1a hash, rendered as 16 lowercase hex chars.
+ * Hashed over the UTF-8 bytes of `input` so unicode text hashes stably
+ * regardless of runtime/encoding quirks. FNV-1a is a plain arithmetic
+ * (non-cryptographic) hash — exactly what's wanted here: fast, deterministic,
+ * NO randomness, NO wall-clock input, same string forever produces the same
+ * digest across process restarts and across machines.
+ */
+function fnv1a64Hex(input: string): string {
+  const FNV_OFFSET_BASIS = 14695981039346656037n;
+  const FNV_PRIME = 1099511628211n;
+  const MASK_64 = 0xffffffffffffffffn;
+
+  let hash = FNV_OFFSET_BASIS;
+  const bytes = new TextEncoder().encode(input);
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = (hash * FNV_PRIME) & MASK_64;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+/**
+ * Normalize a raw error message/class string so that two errors differing
+ * only in their VARIABLE parts (a latency in ms, a uuid, a hex request id, a
+ * timestamp, a quoted value, a filesystem path, or any other digit run)
+ * collapse to the same normalized text. This is the key property tested in
+ * insights.test.ts: "Timeout after 3021ms calling search_web" and "Timeout
+ * after 118ms calling search_web" must normalize identically.
+ *
+ * Order matters: quoted-string/uuid/hex/path stripping runs BEFORE the
+ * trailing catch-all digit-run stripping, so (e.g.) a uuid's hyphenated
+ * digit-and-letter groups collapse to a single `<uuid>` token rather than a
+ * scattering of `<n>` tokens with the letters left behind.
+ */
+function normalizeErrorSignature(raw: string): string {
+  let s = truncateText(raw, FINGERPRINT_MAX_INPUT_CHARS).toLowerCase();
+
+  // Quoted strings (single or double) — collapse the whole literal.
+  s = s.replace(/"[^"]*"/g, "<str>").replace(/'[^']*'/g, "<str>");
+  // UUIDs (with or without hyphens already normalized away by the time we'd
+  // see them; match the standard hyphenated form explicitly).
+  s = s.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, "<uuid>");
+  // Explicit 0x-prefixed hex.
+  s = s.replace(/\b0x[0-9a-f]+\b/g, "<hex>");
+  // ISO-8601-ish timestamps, e.g. 2026-07-24t12:03:00.123z (already lowercased above).
+  s = s.replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z?\b/g, "<ts>");
+  // Filesystem paths (unix-style with >=2 segments, or windows drive-letter paths).
+  s = s.replace(/(?:\/[\w.-]+){2,}/g, "<path>");
+  s = s.replace(/[a-z]:\\(?:[\w.-]+\\)*[\w.-]+/g, "<path>");
+  // Bare hex-looking runs (request ids, short hashes) of 6+ hex chars.
+  s = s.replace(/\b[0-9a-f]{6,}\b/g, "<hex>");
+  // Catch-all: any remaining digit run (latencies, ports, counts, ids).
+  s = s.replace(/\d+/g, "<n>");
+  // Collapse whitespace introduced by the substitutions above.
+  s = s.replace(/\s+/g, " ").trim();
+
+  return s;
+}
+
+/**
+ * Extract a stable error CLASS token from an already-normalized error
+ * string. Recognized keyword patterns (rate limiting, context-window
+ * overflow, auth failures, timeouts, provider overload) are checked FIRST so
+ * that semantically-equivalent wording ("rate limited", "429 too many
+ * requests") collapses to the same token; anything unrecognized falls back
+ * to the first word-ish token of the normalized text, which — because the
+ * text was already normalized — is still stable across runs that only
+ * differ in their variable parts.
+ */
+function errorClassToken(normalized: string): string {
+  if (/rate[\s-]?limit|\b429\b/.test(normalized)) return "rate_limited";
+  if (/context (?:length|window)|maximum context|too many tokens/.test(normalized)) return "context_exceeded";
+  if (/\bauth|api key|\b401\b|\b403\b|forbidden|unauthorized/.test(normalized)) return "auth_error";
+  if (/time(?:d)?[\s-]?out/.test(normalized)) return "timeout";
+  if (/overloaded|\b529\b|\b503\b|unavailable/.test(normalized)) return "provider_unavailable";
+  if (/connection reset|econnreset|network/.test(normalized)) return "network_error";
+  if (/assert/.test(normalized)) return "assertion_error";
+
+  const m = /[a-z][a-z_]*/.exec(normalized);
+  const token = m ? m[0] : normalized;
+  return truncateText(token, 32).replace(/\s+/g, "_") || "error";
+}
+
+function clampKey(s: string): string {
+  return truncateText(s.trim(), FINGERPRINT_MAX_KEY_CHARS) || "unknown";
+}
+
+/**
+ * Turn a failed run's heuristic classification into a stable, deterministic
+ * fingerprint keyed on the single most discriminating fact available:
+ *
+ *   1. `failingToolName`, for the tool-shaped classes (tool_timeout,
+ *      tool_error, cascading_tool_failure) — two runs where DIFFERENT tools
+ *      timed out must NOT collide, so the tool name wins over any error text
+ *      whenever the class is tool-shaped and a tool name is available.
+ *   2. Otherwise, the normalized error CLASS token (see errorClassToken) —
+ *      this is what makes "Timeout after 3021ms..." and "Timeout after
+ *      118ms..." fingerprint identically: only the stable class token
+ *      ("timeout"), not the raw variable-laden text, feeds the hash.
+ *   3. Otherwise, `terminalEventType` (e.g. "run.failed") as a last-resort
+ *      discriminator.
+ *   4. Otherwise, the classification's own class name — every input at
+ *      minimum has this, so this function always returns a fingerprint.
+ *
+ * `hash` is computed ONLY from `${class}|${salientKey}` via fnv1a64Hex — a
+ * pure arithmetic hash with no randomness and no wall-clock input, so the
+ * same (class, salientKey) pair produces the same hash on every process,
+ * forever.
+ */
+export function deriveFailureFingerprint(input: FailureFingerprintInput): FailureFingerprint {
+  const heuristicClass = input?.heuristicClass ?? "unknown";
+
+  const toolName =
+    typeof input?.failingToolName === "string" && input.failingToolName.trim().length > 0
+      ? input.failingToolName.trim()
+      : undefined;
+  const rawSignature =
+    typeof input?.errorSignature === "string" && input.errorSignature.trim().length > 0
+      ? input.errorSignature
+      : undefined;
+  const errorClass = rawSignature ? errorClassToken(normalizeErrorSignature(rawSignature)) : undefined;
+  const terminalType =
+    typeof input?.terminalEventType === "string" && input.terminalEventType.trim().length > 0
+      ? input.terminalEventType.trim()
+      : undefined;
+
+  const isToolClass = TOOL_FAILURE_CLASSES.has(heuristicClass);
+
+  let salientKey: string;
+  if (isToolClass && toolName) {
+    salientKey = toolName;
+  } else if (errorClass) {
+    salientKey = errorClass;
+  } else if (toolName) {
+    salientKey = toolName;
+  } else if (terminalType) {
+    salientKey = terminalType;
+  } else {
+    salientKey = heuristicClass;
+  }
+  salientKey = clampKey(salientKey);
+
+  const hash = fnv1a64Hex(`${heuristicClass}|${salientKey}`);
+
+  const classLabel = FINGERPRINT_CLASS_LABEL[heuristicClass] ?? "Unknown failure";
+  const label =
+    heuristicClass === "incomplete" || heuristicClass === "unknown"
+      ? classLabel
+      : truncateText(`${classLabel}: ${isToolClass && toolName ? toolName : salientKey}`, FINGERPRINT_MAX_KEY_CHARS + 32);
+
+  return { hash, class: heuristicClass, label, salientKey };
+}
+
+// ---------------------------------------------------------------------------
+// 9. assessPatternSpike — pure spike/trend scoring over a pre-bucketed daily
+//    trend series. Never reads Date.now(): "today" and the day-bucketing are
+//    entirely the caller's (Team A's) responsibility; this function only
+//    does arithmetic over the `{ day, count }` points it's handed.
+// ---------------------------------------------------------------------------
+
+export interface PatternTrendPoint {
+  /** "YYYY-MM-DD", pre-computed by the caller. */
+  day: string;
+  count: number;
+}
+
+export interface SpikeAssessment {
+  isSpiking: boolean;
+  /** Sum of `count` over the recent window (default: last 3 days of `trend`). */
+  recentCount: number;
+  /** Mean daily count over the baseline window preceding the recent window. */
+  baselineMean: number;
+  /** (recentMeanDaily - baselineMean) / max(baselineStd, 1). 0 if there isn't enough baseline data. */
+  z: number;
+}
+
+export interface AssessPatternSpikeOpts {
+  recentDays?: number;
+  minBaselineDays?: number;
+  zThreshold?: number;
+  minRecentCount?: number;
+}
+
+const SPIKE_DEFAULT_RECENT_DAYS = 3;
+const SPIKE_DEFAULT_MIN_BASELINE_DAYS = 4;
+const SPIKE_DEFAULT_Z_THRESHOLD = 2;
+const SPIKE_DEFAULT_MIN_RECENT_COUNT = 3;
+
+/**
+ * Assess whether a pre-bucketed daily failure-count trend is currently
+ * SPIKING relative to its own recent history.
+ *
+ * `trend` is sorted defensively by `day` (ascending, lexicographic — which is
+ * correct for "YYYY-MM-DD" strings) before slicing, so callers do not need to
+ * guarantee ordering. Points with a non-string `day` or non-finite `count`
+ * are dropped rather than corrupting the arithmetic.
+ *
+ * The trailing `recentDays` (default 3) entries form the recent window; every
+ * entry strictly before that forms the baseline window. If the baseline
+ * window has fewer than `minBaselineDays` (default 4) points, there isn't
+ * enough history to judge a spike honestly: returns `isSpiking: false, z: 0`
+ * (recentCount/baselineMean are still reported as a best-effort readout, but
+ * `z` is pinned to 0 rather than computed from too little data).
+ *
+ * Otherwise: `z = (recentMeanDaily - baselineMean) / max(baselineStd, 1)`
+ * (the `max(..., 1)` guards a near-zero-variance baseline from producing a
+ * wild z off a tiny denominator). `isSpiking` requires BOTH `recentCount >=
+ * minRecentCount` (default 3 — a "spike" of one extra failure isn't a
+ * pattern) AND `z >= zThreshold` (default 2).
+ *
+ * Deterministic and side-effect-free: no Date.now(), no randomness — the
+ * same `trend` array always produces the same assessment.
+ */
+export function assessPatternSpike(trend: PatternTrendPoint[], opts?: AssessPatternSpikeOpts): SpikeAssessment {
+  const recentDays = opts?.recentDays ?? SPIKE_DEFAULT_RECENT_DAYS;
+  const minBaselineDays = opts?.minBaselineDays ?? SPIKE_DEFAULT_MIN_BASELINE_DAYS;
+  const zThreshold = opts?.zThreshold ?? SPIKE_DEFAULT_Z_THRESHOLD;
+  const minRecentCount = opts?.minRecentCount ?? SPIKE_DEFAULT_MIN_RECENT_COUNT;
+
+  const sorted = (Array.isArray(trend) ? trend : [])
+    .filter(
+      (p): p is PatternTrendPoint =>
+        !!p && typeof p.day === "string" && typeof p.count === "number" && Number.isFinite(p.count),
+    )
+    .slice()
+    .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+
+  const n = sorted.length;
+  const recentSlice = recentDays > 0 ? sorted.slice(Math.max(0, n - recentDays)) : [];
+  const recentCount = recentSlice.reduce((sum, p) => sum + p.count, 0);
+
+  const baselineSlice = sorted.slice(0, Math.max(0, n - recentDays));
+  if (baselineSlice.length < minBaselineDays || recentSlice.length === 0) {
+    return { isSpiking: false, recentCount, baselineMean: 0, z: 0 };
+  }
+
+  const baselineDays = baselineSlice.length;
+  const baselineMean = baselineSlice.reduce((sum, p) => sum + p.count, 0) / baselineDays;
+  const variance = baselineSlice.reduce((sum, p) => sum + (p.count - baselineMean) ** 2, 0) / baselineDays;
+  const baselineStd = Math.sqrt(variance);
+
+  const recentMeanDaily = recentCount / recentSlice.length;
+  const z = (recentMeanDaily - baselineMean) / Math.max(baselineStd, 1);
+
+  const isSpiking = recentCount >= minRecentCount && z >= zThreshold;
+
+  return { isSpiking, recentCount, baselineMean, z };
+}

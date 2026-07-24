@@ -95,6 +95,7 @@ export const convex = {
     apiGetRunEvents: makeFunctionReference<M>('read_api:apiGetRunEvents'),
     apiGetReplay: makeFunctionReference<M>('read_api:apiGetReplay'),
     apiGetExplanation: makeFunctionReference<M>('read_api:apiGetExplanation'),
+    apiListFailurePatterns: makeFunctionReference<M>('read_api:apiListFailurePatterns'),
   },
   // convex/alerts.ts already exists (data agent, ADR-002/003) — the management
   // API routes wrap these directly.
@@ -171,5 +172,20 @@ export const convex = {
     // Added this cycle by Team B — pass/fail/score summary for one run's
     // evals, used by the run-detail Evals panel header.
     getRunEvalSummary: makeFunctionReference<Q>('insights:getRunEvalSummary'),
+  },
+  // "Failure Patterns" (PREVENTION) feature, cycle 1 — convex/failure_patterns.ts
+  // (Team A: durable org-scoped failure-fingerprint rollups; fingerprinting +
+  // spike math lives in convex/insights.ts per Team B). Both queries are
+  // member-gated and org-scoped like the rest of this file's Clerk-authed
+  // surface — services/failurePatterns.ts (Team C) resolves the Clerk org to
+  // a Convex orgId and passes it explicitly, same convention as convex.alerts.
+  // NOTE: as of this cycle convex/failure_patterns.ts has not landed yet on
+  // this branch — these refs are string-based (this file's existing
+  // convention for not-yet-generated api.* bindings) and will 404/throw at
+  // runtime until Team A's file ships. Do not rename without checking with
+  // Team A first.
+  failure_patterns: {
+    listFailurePatterns: makeFunctionReference<Q>('failure_patterns:listFailurePatterns'),
+    getFailurePattern: makeFunctionReference<Q>('failure_patterns:getFailurePattern'),
   },
 } as const

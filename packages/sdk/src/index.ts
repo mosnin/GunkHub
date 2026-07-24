@@ -65,6 +65,8 @@ export type {
   ListRunsParams,
   ListEventsParams,
   V1GetExplanationData,
+  V1ListFailurePatternsData,
+  ListFailurePatternsParams,
 } from './reader.js'
 export type { V1ApiConfig, V1FetchLike, V1ApiErrorKind, V1Envelope } from './v1-client.js'
 
@@ -76,4 +78,6 @@ export type {
   Event,
   RunExplanation,
   RunExplanationKind,
+  FailurePattern,
+  FailurePatternClass,
 } from '@agent-flight-recorder/contracts'

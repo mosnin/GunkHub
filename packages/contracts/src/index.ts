@@ -13,3 +13,4 @@ export * from "./alerts.js";
 export * from "./webhooks.js";
 export * from "./usage.js";
 export * from "./run_explanations.js";
+export * from "./failure_patterns.js";

@@ -36,6 +36,7 @@ import { v } from "convex/values";
 import { action, internalAction, internalMutation, internalQuery, query } from "./_generated/server.js";
 import { recordAuditEvent } from "./audit.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { _recordFailurePatternOccurrenceRef, fingerprintExplanation } from "./failure_patterns.js";
 import { afrError } from "./helpers/errors.js";
 import {
   buildFailureSummary,
@@ -568,6 +569,22 @@ export const generateRunExplanation = internalAction({
       failureClass,
       model,
       generationMs,
+    });
+
+    // Failure Patterns (PREVENTION, cycle 1, docs/adr/005-failure-patterns.md)
+    // — the ONE line this cycle adds to Team A's own terminal-failure seam:
+    // derive a fingerprint from this same classification + event window and
+    // schedule the (idempotent-per-run) occurrence record, non-blocking.
+    const fingerprint = fingerprintExplanation({ failureClass, citedSequenceNumbers, events: heuristicEvents });
+    await ctx.scheduler.runAfter(0, _recordFailurePatternOccurrenceRef, {
+      orgId: run.orgId,
+      runId: args.runId,
+      agentId: run.agentId,
+      agentVersionId: run.agentVersionId,
+      fingerprintHash: fingerprint.hash,
+      class: fingerprint.class,
+      label: fingerprint.label,
+      salientKey: fingerprint.salientKey,
     });
 
     return { skipped: false, kind, failureClass };

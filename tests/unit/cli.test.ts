@@ -82,7 +82,7 @@ describe('afr CLI — arg parsing / dispatch', () => {
       process.env = { ...originalEnv }
     })
 
-    for (const cmd of [['runs', 'list'], ['runs', 'get', 'run_1'], ['replay', 'run_1'], ['tail', 'run_1'], ['export', 'run_1']]) {
+    for (const cmd of [['runs', 'list'], ['runs', 'get', 'run_1'], ['replay', 'run_1'], ['tail', 'run_1'], ['export', 'run_1'], ['patterns']]) {
       it(`'afr ${cmd.join(' ')}' exits 1 and points at 'afr config check'`, async () => {
         const log = vi.fn()
         const code = await main(cmd, log)
@@ -92,7 +92,7 @@ describe('afr CLI — arg parsing / dispatch', () => {
     }
   })
 
-  for (const cmd of [['runs', 'list'], ['runs', 'get'], ['replay'], ['tail'], ['export']]) {
+  for (const cmd of [['runs', 'list'], ['runs', 'get'], ['replay'], ['tail'], ['export'], ['patterns']]) {
     it(`'afr ${cmd.join(' ')} --help' prints usage and exits 0`, async () => {
       const log = vi.fn()
       const code = await main([...cmd, '--help'], log)

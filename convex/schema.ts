@@ -543,6 +543,90 @@ export default defineSchema({
     // (Convex has none) — see upsertRunExplanation.
     .index("by_run", ["runId"]),
 
+  // ---------------------------------------------------------------------------
+  // Failure Patterns (PREVENTION, cycle 1) — a durable, org-scoped memory of
+  // recurring failure fingerprints derived from failed runs. OBSERVABILITY-
+  // GRADE DERIVED DATA, never source of truth (mirrors ADR-002's constraint
+  // language for daily_rollups/usage_counters): the event log + run_explanations
+  // remain the only facts about what happened on any single run. See
+  // docs/adr/005-failure-patterns.md.
+  // ---------------------------------------------------------------------------
+
+  // APPEND-ONLY, like events/evals/audit_log: one row per (runId) recording
+  // that a fingerprinted failure was observed on that run. Never patched or
+  // deleted. Idempotency (at most one occurrence per runId) is enforced at
+  // write time (recordFailurePatternOccurrence, convex/failure_patterns.ts)
+  // via the by_run index below, the same "write-time discipline, not a
+  // unique constraint" pattern run_explanations.by_run and
+  // verification_results.by_run already use.
+  failure_pattern_occurrences: defineTable({
+    orgId: v.id("organizations"),
+    fingerprintHash: v.string(),
+    runId: v.id("runs"),
+    agentId: v.id("agents"),
+    agentVersionId: v.optional(v.id("agent_versions")),
+    occurredAt: v.number(),
+    // Free-form classifier label (mirrors run_explanations.failureClass) —
+    // not a closed enum here since the classifier vocabulary can grow
+    // without a schema change.
+    heuristicClass: v.string(),
+    // The salient discriminator that fed the fingerprint hash (a tool name,
+    // terminal event type, or normalized error signature) — stored
+    // alongside the hash for display/debugging without recomputation.
+    salientKey: v.string(),
+  })
+    // Every occurrence for a given fingerprint, org-scoped — the source rows
+    // getFailurePattern's recent-occurrences + trend-bucket views read from.
+    .index("by_org_fingerprint", ["orgId", "fingerprintHash"])
+    // Idempotency: recordFailurePatternOccurrence checks this index first and
+    // skips (no-op) if a row for this runId already exists — "unique-ish" by
+    // write-time discipline, same as run_explanations.by_run.
+    .index("by_run", ["runId"])
+    .index("by_org_occurredAt", ["orgId", "occurredAt"]),
+
+  // Rollup: exactly one row per (orgId, fingerprintHash), upserted by
+  // recordFailurePatternOccurrence. NOT append-only — a generated/derived
+  // aggregate over the occurrences above (same category as daily_rollups /
+  // run_explanations), regeneratable in principle, never a fact about any
+  // single run on its own.
+  failure_patterns: defineTable({
+    orgId: v.id("organizations"),
+    fingerprintHash: v.string(),
+    class: v.string(),
+    label: v.string(),
+    salientKey: v.string(),
+    count: v.number(),
+    firstSeenAt: v.number(),
+    lastSeenAt: v.number(),
+    // Bounded, deduped, most-recent-first sample of runIds that produced
+    // this fingerprint — cap 5 (MAX_REPRESENTATIVE_RUN_IDS).
+    representativeRunIds: v.array(v.id("runs")),
+    // Bounded, deduped set of agent versions this fingerprint has been seen
+    // on — cap 20 (MAX_AFFECTED_AGENT_VERSION_IDS).
+    affectedAgentVersionIds: v.array(v.id("agent_versions")),
+    // Written by the periodic spike-rollup cron (convex/failure_patterns.ts /
+    // convex/crons.ts) — the most recent spike assessment over this
+    // pattern's daily trend. Absent until the cron has run at least once
+    // since this pattern was created.
+    lastSpikeAssessment: v.optional(
+      v.object({
+        assessedAt: v.number(),
+        isSpiking: v.boolean(),
+        recentCount: v.number(),
+        baselineMean: v.number(),
+        z: v.number(),
+      }),
+    ),
+  })
+    // One row per (orgId, fingerprintHash): recordFailurePatternOccurrence
+    // always resolves the existing rollup (if any) via this index before
+    // deciding insert-vs-patch — "unique" by write-time discipline, not a
+    // Convex constraint, mirroring run_explanations.by_run.
+    .index("by_org_fingerprint", ["orgId", "fingerprintHash"])
+    // listFailurePatterns' ranked-by-recency read, and the spike-rollup
+    // cron's "active patterns" scan.
+    .index("by_org_lastSeenAt", ["orgId", "lastSeenAt"]),
+
   daily_rollups: defineTable({
     orgId: v.id("organizations"),
     agentId: v.id("agents"),

@@ -270,3 +270,64 @@ export const apiGetExplanation = mutation({
     return { status: "ready" as const, explanation, runStatus: run.status, runEndedAt: run.endedAt };
   },
 });
+
+// Key-authed (read scope) counterpart to the Failure Patterns rollup
+// (PREVENTION, cycle 1 — docs/adr/005-failure-patterns.md, schema.ts's
+// `failure_patterns` table). Powers `afr patterns` / the SDK's read client:
+// a durable, org-scoped memory of recurring failure fingerprints, ranked by
+// recency. This queries the `failure_patterns` rollup table directly (same
+// "mirror the shape, don't cross-import an in-progress owner's function"
+// approach apiListRuns/apiGetRun/apiGetReplay already take here) rather than
+// depending on convex/failure_patterns.ts, which is a separate team's
+// same-cycle deliverable and may not exist yet.
+//
+// `agentId`, when supplied, is validated org-scoped exactly like apiListRuns'
+// `agentId` filter, then resolved to that agent's `agent_versions` ids so the
+// (already org-scoped, already paginated) page of patterns can be narrowed to
+// ones whose `affectedAgentVersionIds` intersects — an in-memory filter over
+// the fetched page, same overfetch-then-filter pattern apiListRuns uses for
+// its own secondary filters.
+export const apiListFailurePatterns = mutation({
+  args: {
+    apiKeyHash: v.string(),
+    agentId: v.optional(v.string()),
+    limit: v.optional(v.number()),
+    cursor: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+    const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+
+    let agentVersionIds: Set<string> | undefined;
+    if (args.agentId !== undefined) {
+      const agentId = args.agentId as Id<"agents">;
+      const agent = await ctx.db.get(agentId);
+      if (!agent || agent.orgId !== apiKey.orgId) {
+        throw new Error("Agent not found in this organization");
+      }
+      const versions = await ctx.db
+        .query("agent_versions")
+        .withIndex("by_agent", (q) => q.eq("agentId", agentId))
+        .collect();
+      agentVersionIds = new Set(versions.map((version) => String(version._id)));
+    }
+
+    const page = await ctx.db
+      .query("failure_patterns")
+      .withIndex("by_org_lastSeenAt", (q) => q.eq("orgId", apiKey.orgId))
+      .order("desc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+
+    const patterns =
+      agentVersionIds === undefined
+        ? page.page
+        : page.page.filter((pattern) =>
+            pattern.affectedAgentVersionIds.some((versionId) => agentVersionIds.has(String(versionId))),
+          );
+
+    return {
+      patterns,
+      nextCursor: page.isDone ? undefined : page.continueCursor,
+    };
+  },
+});
