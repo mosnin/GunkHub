@@ -14,6 +14,7 @@ import { getAuthContext, requireOrgMembership } from "./auth.js";
 import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from "./helpers/delivery.js";
 import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_ALERT_CHANNELS, MAX_PAGE_SIZE } from "./helpers/pagination.js";
+import { randomHex } from "./helpers/random.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
 import type { MutationCtx } from "./_generated/server.js";
@@ -344,8 +345,11 @@ async function findOrCreateAlertWebhookTarget(
     .first();
   if (existing) return existing._id;
 
-  const { randomBytes } = await import("node:crypto");
-  const secret = randomBytes(32).toString("hex");
+  // Web Crypto, not node:crypto. The Convex isolate has no Node builtins, and a
+  // dynamic import with a static specifier is resolved by esbuild at build time —
+  // so this failed the deploy exactly as a static import would, while being
+  // invisible to a grep for `from "node:`.
+  const secret = randomHex(32);
   return await ctx.db.insert("webhook_targets", {
     orgId,
     url,
