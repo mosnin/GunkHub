@@ -34,13 +34,24 @@ import { mutation } from "./_generated/server.js";
 // door you came in, which is a silent correctness bug of exactly the kind
 // this cycle exists to eliminate. Importing the constants makes that drift
 // impossible; duplicating them would only make it invisible.
+//
+// ADR-006 CYCLE 3 goes further and imports the COMPUTATION, not just its
+// bounds. Cycle 2 mirrored the two exposure helpers here because they were
+// module-private over there; matching bounds kept the row COUNTS aligned but
+// not the VERDICT, and the two doors had in fact drifted — this surface
+// omitted `exposureVersionId` (so a pattern could read `mismatched`/0-exposure
+// on one door and `unknown`/real-exposure on the other) while the Clerk-authed
+// query lacked this surface's `recurredAt` fallback. Both mirrors are gone:
+// `computePatternFixConfidence` is now the single canonical implementation
+// that this endpoint, `getPatternResolutionEvidence`, and the snapshot writer
+// all call.
 import {
-  MAX_AFFECTED_AGENT_IDS,
-  MAX_AGENT_SET_OCCURRENCE_SCAN,
+  computePatternFixConfidence,
+  FIX_CONFIDENCE_SNAPSHOT_STALE_AFTER_MS,
+  isFixConfidenceSnapshotStale,
+  isFixConfidenceSnapshotUsable,
   MAX_PATTERN_LIFECYCLE_TRANSITIONS,
-  RESOLUTION_RUN_SCAN_CAP,
 } from "./failure_patterns.js";
-import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_EVENTS_PER_REPLAY, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 import { buildReplayProjectionMirror } from "./helpers/replay_projection.js";
 import { fixConfidence } from "./insights.js";
@@ -353,33 +364,62 @@ function patternStatus(pattern: Doc<"failure_patterns">): string {
 // from `status`: `status` is what a human ASSERTED, `state` is what the
 // evidence SUPPORTS. Both are exposed, and they are deliberately not merged.
 //
-// WHY ONLY "regressed" IS ACCEPTED HERE, AND WHY THE REST THROW:
+// ALL FOUR VALUES ARE NOW ANSWERABLE (ADR-006 cycle 3). They were not
+// before, and the reason is worth keeping because it shaped the design:
+// "unproven"/"proving"/"confirmed" are functions of POST-RESOLUTION EXPOSURE
+// — how many runs have executed since the fix — which costs a bounded scan of
+// up to RESOLUTION_RUN_SCAN_CAP (2000) run rows across up to
+// MAX_AFFECTED_AGENT_IDS agents PER PATTERN. Across a page of up to
+// MAX_PAGE_SIZE patterns that is a six-figure row read on one request: not a
+// slow endpoint, an endpoint that cannot exist. Cycle 2 therefore rejected
+// those three loudly with a 422 rather than either silently dropping the
+// filter or answering it without exposure (which would grade every unrecurred
+// pattern "unproven" regardless of how well-tested it actually was — a wrong
+// answer dressed as a real one).
 //
-// Three of the four states ("unproven" / "proving" / "confirmed") are
-// functions of POST-RESOLUTION EXPOSURE — how many runs have executed since
-// the fix. Computing that for one pattern is a bounded scan of up to
-// RESOLUTION_RUN_SCAN_CAP (2000) run rows across up to MAX_AFFECTED_AGENT_IDS
-// agents. Doing it for a whole page of up to MAX_PAGE_SIZE patterns is a
-// six-figure row read on a single request — not a slow endpoint, an endpoint
-// that cannot exist. So this surface cannot answer those three, and it says
-// so with a 422 (INVALID_ARGUMENT) that names the endpoint which CAN:
-// apiGetFailurePatternEvidence, one pattern at a time.
+// Cycle 3 does not make the scan cheaper; it moves it OFF the read path.
+// `failure_patterns.lastFixConfidence` is a periodically-refreshed snapshot of
+// the same canonical verdict, so the filter is served from a stored value.
+// Three rules keep that from re-introducing the lie the rejection was
+// protecting against:
 //
-// "regressed" is the exception because it is exposure-INDEPENDENT: it falls
-// out of `recurred` alone, which is decided by two timestamps already on the
-// rollup. Exact, O(1) per pattern, no scan.
+//   1. SAME COMPUTATION. The snapshot is produced by
+//      `computePatternFixConfidence` — the identical function this file's
+//      evidence endpoint and the Clerk-authed detail query call. There is no
+//      second implementation that could drift, and a test asserts the stored
+//      snapshot equals a live computation for the same fixture.
+//   2. SUPERSEDED SNAPSHOTS ARE DISCARDED, NOT SERVED.
+//      `isFixConfidenceSnapshotUsable` requires the snapshot's
+//      `basisResolvedAt` to match the rollup's current `resolvedAt`, so a
+//      verdict about a PREVIOUS resolution episode (reopened and re-resolved
+//      since) can never answer for the current one.
+//   3. AGE IS REPORTED, NEVER HIDDEN. A snapshot older than
+//      FIX_CONFIDENCE_SNAPSHOT_STALE_AFTER_MS is still served — it remains the
+//      best available answer — but it is flagged `stale: true` in the
+//      response's `fixConfidence` envelope, alongside the bound itself so a
+//      client never has to hardcode it. Dropping stale rows from the filter
+//      instead would be a silent lie by omission, which is strictly worse.
+//      Serving a stale snapshot is safe in the one direction that matters:
+//      soak and exposure only accumulate, so an aging snapshot can UNDER-report
+//      (say "proving" where live says "confirmed") but not over-report, and
+//      the single downgrade a verdict can take — `regressed` — is written
+//      EAGERLY by the regression guard and never waits for a cron tick.
 //
-// The alternative designs were both worse, and both are the failure mode this
-// project keeps hitting:
-//   - Accept all four and quietly return nothing for the expensive three:
-//     that is a silently-dropped filter, the exact class of bug that shipped
-//     unnoticed for weeks last cycle.
-//   - Accept all four and compute them without exposure: every unrecurred
-//     pattern reads "unproven" regardless of how well-tested it actually is —
-//     a wrong answer dressed as a real one.
-// Rejecting loudly is the only option that never lies. When a future cycle
-// snapshots confidence onto the rollup, this restriction lifts without the
-// param changing name or meaning.
+// PATTERNS WITH NO USABLE SNAPSHOT ARE NAMED, NOT DISAPPEARED. A rollup that
+// has a live resolution but no usable snapshot yet (resolved before this cycle
+// shipped and untouched since) cannot be graded. It is excluded from the
+// filtered result — it genuinely does not match a known state — but its
+// fingerprint is returned in `fixConfidence.unevaluated`, so a caller can say
+// "3 patterns on this page have no confidence snapshot yet" instead of
+// silently treating "unknown" as "no". `state=regressed` is exempt: see below.
+//
+// `state=regressed` KEEPS ITS EXACT, SNAPSHOT-FREE PATH as well as reading the
+// snapshot, and matches if EITHER says so. `regressed` is the one
+// exposure-INDEPENDENT verdict — it falls out of `recurred` alone, decided by
+// two timestamps already on the rollup — so it is exactly computable per
+// pattern at O(1) with no scan. Keeping that path means this filter is never
+// weaker than it was before snapshots existed, and never depends on cron
+// liveness for the one state a CI gate is built on.
 //
 // This is ALSO why `state=regressed` is not redundant with the existing
 // `regressed` boolean, and why a CI job should prefer it: `regressed: true`
@@ -391,8 +431,51 @@ function patternStatus(pattern: Doc<"failure_patterns">): string {
 // for "fail the build if a confirmed-fixed pattern regressed" would fail
 // builds on patterns that were already fixed again.
 // ---------------------------------------------------------------------------
-const EXPOSURE_DEPENDENT_STATE_MESSAGE =
-  'state filter supports only "regressed" on this endpoint; "unproven"/"proving"/"confirmed" depend on post-resolution run exposure, which is measured per pattern by apiGetFailurePatternEvidence';
+
+/** Per-pattern confidence view returned alongside every listed pattern. */
+interface ApiPatternConfidenceEntry {
+  fingerprintHash: string;
+  /** Null when the pattern has no usable snapshot (never resolved, reopened, superseded, or not yet snapshotted). */
+  state: string | null;
+  score: number | null;
+  /** When the served verdict was computed. Null when there is no snapshot. */
+  computedAt: number | null;
+  /** `now - computedAt`. Null when there is no snapshot. */
+  ageMs: number | null;
+  /** True when `ageMs` exceeds the staleness bound. Always false when there is no snapshot — absent is not stale, it is unknown. */
+  stale: boolean;
+  /**
+   * `"snapshot"` — served from a usable stored verdict.
+   * `"none"` — no usable snapshot; `state`/`score` are null and the pattern
+   * was NOT evaluated against a `state` filter (except `regressed`, which has
+   * its own exact path).
+   */
+  basis: "snapshot" | "none";
+}
+
+function confidenceEntryFor(pattern: Doc<"failure_patterns">, now: number): ApiPatternConfidenceEntry {
+  const snapshot = isFixConfidenceSnapshotUsable(pattern) ? pattern.lastFixConfidence : undefined;
+  if (!snapshot) {
+    return {
+      fingerprintHash: pattern.fingerprintHash,
+      state: null,
+      score: null,
+      computedAt: null,
+      ageMs: null,
+      stale: false,
+      basis: "none",
+    };
+  }
+  return {
+    fingerprintHash: pattern.fingerprintHash,
+    state: snapshot.state,
+    score: snapshot.score,
+    computedAt: snapshot.computedAt,
+    ageMs: Math.max(0, now - snapshot.computedAt),
+    stale: isFixConfidenceSnapshotStale(snapshot, now),
+    basis: "snapshot",
+  };
+}
 
 /**
  * The evidence state of a rollup, computed WITHOUT measuring exposure.
@@ -424,10 +507,10 @@ export const apiListFailurePatterns = mutation({
     muted: v.optional(v.boolean()),
     status: v.optional(v.union(v.literal("open"), v.literal("acknowledged"), v.literal("resolved"))),
     regressed: v.optional(v.boolean()),
-    // Declared with Team B's FULL four-literal vocabulary (never a parallel
-    // one), so the accepted values are self-documenting and the three this
-    // endpoint cannot answer are rejected explicitly rather than by an
-    // opaque validator error.
+    // Team B's FULL four-literal vocabulary (never a parallel one). All four
+    // are answerable as of ADR-006 cycle 3 — the arg's name, type and meaning
+    // are unchanged from cycle 2, exactly as that cycle's rejection comment
+    // promised they would be.
     state: v.optional(
       v.union(
         v.literal("unproven"),
@@ -440,13 +523,6 @@ export const apiListFailurePatterns = mutation({
     cursor: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    // Rejected BEFORE the key is resolved and the rate-limit unit is spent: an
-    // argument this endpoint structurally cannot honor is a malformed request,
-    // and it should not cost the caller a token of their per-minute budget.
-    if (args.state !== undefined && args.state !== "regressed") {
-      throw afrError("INVALID_ARGUMENT", EXPOSURE_DEPENDENT_STATE_MESSAGE);
-    }
-
     const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
     // AUDIT FIX (cycle 3): clamp below 1 as well as above MAX_PAGE_SIZE — an
     // unclamped non-positive `limit` (e.g. `--limit -5`, or `0`) used to be
@@ -501,14 +577,59 @@ export const apiListFailurePatterns = mutation({
       patterns = patterns.filter((pattern) => pattern.regressedAt !== undefined);
     }
 
-    if (args.state === "regressed") {
-      const now = Date.now();
-      patterns = patterns.filter((pattern) => recurredSinceResolution(pattern, now));
+    // SERVER clock, read once so every entry in one response is aged against
+    // the same instant.
+    const now = Date.now();
+
+    // Candidates that HAVE something to grade but no usable snapshot to grade
+    // it with. Computed BEFORE the state filter runs, so the caller learns
+    // about them even though they cannot match — "we could not evaluate these
+    // three" is a materially different answer from "these three are not
+    // confirmed", and collapsing the two is precisely the silent lie cycle 2
+    // refused to ship.
+    const unevaluated = patterns
+      .filter((pattern) => pattern.resolvedAt !== undefined && !isFixConfidenceSnapshotUsable(pattern))
+      .map((pattern) => pattern.fingerprintHash);
+
+    if (args.state !== undefined) {
+      const wanted = args.state;
+      patterns = patterns.filter((pattern) => {
+        const snapshot = isFixConfidenceSnapshotUsable(pattern) ? pattern.lastFixConfidence : undefined;
+        // `regressed` additionally keeps its exact, snapshot-independent path,
+        // so this filter is never weaker than it was before snapshots existed
+        // and never depends on the cron having run. The two can only ever
+        // agree — `recurred` short-circuits the engine before exposure is
+        // consulted — so OR-ing them cannot manufacture a false positive; it
+        // only refuses to lose a true one.
+        if (wanted === "regressed" && recurredSinceResolution(pattern, now)) return true;
+        return snapshot?.state === wanted;
+      });
     }
 
     return {
       patterns,
       nextCursor: page.isDone ? undefined : page.continueCursor,
+      // Honesty envelope (ADR-006 cycle 3). Always present, filtered or not,
+      // so a client can render a staleness marker next to a verdict without
+      // having to ask for it — and so the bound itself is transported rather
+      // than hardcoded on three separate surfaces.
+      fixConfidence: {
+        stalenessBoundMs: FIX_CONFIDENCE_SNAPSHOT_STALE_AFTER_MS,
+        /** One entry per RETURNED pattern, in the same order. */
+        entries: patterns.map((pattern) => confidenceEntryFor(pattern, now)),
+        /** How many returned entries are served from a snapshot older than the bound. */
+        staleCount: patterns.filter((pattern) => {
+          const snapshot = isFixConfidenceSnapshotUsable(pattern) ? pattern.lastFixConfidence : undefined;
+          return snapshot !== undefined && isFixConfidenceSnapshotStale(snapshot, now);
+        }).length,
+        /**
+         * Fingerprints on this page that have a live resolution but no usable
+         * snapshot, and so could not be graded at all. Never silently dropped
+         * — a caller filtering by `state` must be able to tell "not matching"
+         * from "not evaluated".
+         */
+        unevaluated,
+      },
     };
   },
 });
@@ -536,66 +657,6 @@ export const apiListFailurePatterns = mutation({
 // it held does. That asymmetry is why this endpoint exists and a key-authed
 // `resolve` does not.
 // ---------------------------------------------------------------------------
-
-/** Mirror of failure_patterns.ts's private `resolveAgentIdsForPattern` — same sources, same bounds. */
-async function resolveAgentIdsForPatternMirror(
-  ctx: MutationCtx,
-  pattern: Doc<"failure_patterns">,
-): Promise<Id<"agents">[]> {
-  if (pattern.affectedAgentIds && pattern.affectedAgentIds.length > 0) {
-    return pattern.affectedAgentIds;
-  }
-
-  // Fallback for rollups written before `affectedAgentIds` existed. Org-scoped
-  // by construction: reached only via this fingerprint's own org-scoped index.
-  const occurrences = await ctx.db
-    .query("failure_pattern_occurrences")
-    .withIndex("by_org_fingerprint", (q) =>
-      q.eq("orgId", pattern.orgId).eq("fingerprintHash", pattern.fingerprintHash),
-    )
-    .order("desc")
-    .take(MAX_AGENT_SET_OCCURRENCE_SCAN);
-
-  const seen: Id<"agents">[] = [];
-  for (const occurrence of occurrences) {
-    if (!seen.includes(occurrence.agentId)) seen.push(occurrence.agentId);
-    if (seen.length >= MAX_AFFECTED_AGENT_IDS) break;
-  }
-  return seen;
-}
-
-/**
- * Mirror of failure_patterns.ts's private `countRunsStartedInWindow`, in the
- * open-ended ("runs since resolution") form this caller needs.
- *
- * Deliberately NOT clamped to `Date.now()`: SDK-supplied `startedAt` values
- * and clock skew mean a run can legitimately sit marginally ahead of the
- * reader's clock, and dropping it would UNDERCOUNT exposure — the one
- * direction this number must never err in, because undercounted exposure
- * makes an untested fix look better tested than it is.
- */
-async function countRunsStartedSinceMirror(
-  ctx: MutationCtx,
-  agentIds: Id<"agents">[],
-  afterExclusive: number,
-): Promise<{ count: number; truncated: boolean }> {
-  let count = 0;
-  for (const agentId of agentIds) {
-    const remaining = RESOLUTION_RUN_SCAN_CAP - count;
-    if (remaining <= 0) return { count, truncated: true };
-
-    // take(remaining + 1) so hitting the ceiling is DETECTABLE (a full page
-    // plus one) rather than indistinguishable from "exactly `remaining` runs".
-    const rows = await ctx.db
-      .query("runs")
-      .withIndex("by_agent_started", (q) => q.eq("agentId", agentId).gt("startedAt", afterExclusive))
-      .take(remaining + 1);
-
-    if (rows.length > remaining) return { count: RESOLUTION_RUN_SCAN_CAP, truncated: true };
-    count += rows.length;
-  }
-  return { count, truncated: false };
-}
 
 export interface ApiPatternResolutionEvidence {
   pattern: Doc<"failure_patterns">;
@@ -678,63 +739,33 @@ export const apiGetFailurePatternEvidence = mutation({
       resolvedAtRunCount: pattern.resolvedAtRunCount,
     };
 
-    const agentIds = await resolveAgentIdsForPatternMirror(ctx, pattern);
-    const exposureRuns = await countRunsStartedSinceMirror(ctx, agentIds, pattern.resolvedAt);
-
-    // EXACT when the snapshot exists. When it does not (a row resolved before
-    // this cycle shipped), 0 — NOT the all-time `count`, which would claim
-    // every occurrence the pattern ever had as a post-resolution recurrence.
-    const recurrenceCount =
-      pattern.resolvedAtOccurrenceCount !== undefined
-        ? Math.max(0, pattern.count - pattern.resolvedAtOccurrenceCount)
-        : 0;
+    // THE CANONICAL COMPUTATION — literally the same function
+    // `getPatternResolutionEvidence` and the snapshot writer call. This
+    // endpoint no longer has an opinion of its own about how a verdict is
+    // derived, which is the only durable way for two doors onto the same
+    // pattern to agree.
+    const computation = await computePatternFixConfidence(ctx, pattern, Date.now());
+    // Unreachable: null is returned only for an absent `resolvedAt`, which the
+    // guard above already handled.
+    if (!computation) {
+      return { pattern, resolution: null, exposure: null, transitions, confidence: null };
+    }
 
     const exposure: PatternResolutionExposure = {
       since: pattern.resolvedAt,
-      runCount: exposureRuns.count,
-      runCountTruncated: exposureRuns.truncated,
-      recurrenceCount,
+      runCount: computation.exposure.count,
+      runCountTruncated: computation.exposure.truncated,
+      recurrenceCount: computation.recurrenceCount,
       baselineRunCount: pattern.resolvedAtRunCount,
-      agentIds,
+      agentIds: computation.agentIds,
       // "Held SO FAR" — zero recurrences since resolution. NOT a claim the fix
       // is correct: `runCount` is what says whether this is meaningful
       // evidence. `heldSoFar: true` with `runCount: 0` means simply untested,
-      // which is why `confidence.state` below reads "unproven" there and never
+      // which is why `confidence.state` reads "unproven" there and never
       // "confirmed".
-      heldSoFar: recurrenceCount === 0,
+      heldSoFar: computation.recurrenceCount === 0,
     };
 
-    // `recurredAt` prefers the regression guard's own stamp. The fallback
-    // matters: a pattern can carry recurrences (count > resolvedAtOccurrence-
-    // Count) while `regressedAt` is absent or stale — e.g. a rollup resolved
-    // before the guard shipped. Without the fallback, fixConfidence would see
-    // no counter-example and could grade a demonstrably-recurring pattern
-    // "proving" or even "confirmed" while `exposure.heldSoFar` said false in
-    // the very same response. `lastSeenAt` is the best available timestamp for
-    // that most recent occurrence, and when recurrenceCount > 0 it is by
-    // construction after `resolvedAt`.
-    const recurredAt =
-      pattern.regressedAt ?? (recurrenceCount > 0 ? pattern.lastSeenAt : undefined);
-
-    const confidence = fixConfidence(
-      {
-        resolvedAt: pattern.resolvedAt,
-        ...(pattern.resolvedInVersionId !== undefined && {
-          resolvedInVersionId: pattern.resolvedInVersionId,
-        }),
-        // `exposureVersionId` is deliberately NOT supplied: exposure here is
-        // counted per AGENT (runs started for the pattern's affected agents),
-        // not per agent VERSION, so there is no single version the count can
-        // honestly be attributed to. Omitting it yields
-        // `versionAttribution: "unknown"`, which is the truth. Supplying
-        // `resolvedInVersionId` for both sides would manufacture a "matched"
-        // verdict out of nothing.
-        postResolutionRuns: exposure.runCount,
-        ...(recurredAt !== undefined && { recurredAt }),
-      },
-      Date.now(),
-    );
-
-    return { pattern, resolution, exposure, transitions, confidence };
+    return { pattern, resolution, exposure, transitions, confidence: computation.confidence };
   },
 });

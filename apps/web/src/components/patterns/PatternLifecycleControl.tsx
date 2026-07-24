@@ -30,6 +30,13 @@ interface LifecycleApiResult extends LifecycleFields {
 const MAX_NOTE_LENGTH = 2000
 const MAX_REF_LENGTH = 500
 
+/** Spoken form of each status, for the polite live region below. */
+const STATUS_ANNOUNCEMENT: Record<FailurePatternStatus, string> = {
+  open: 'open',
+  acknowledged: 'acknowledged',
+  resolved: 'resolved',
+}
+
 /** Route responds `{ pattern: FailurePattern }` (same envelope as the mute route) — read lifecycle fields off the nested pattern doc. */
 function readLifecycleFields(body: Record<string, unknown>): LifecycleFields {
   const pattern = body['pattern']
@@ -106,18 +113,21 @@ export function PatternLifecycleControl({
   const [formOpen, setFormOpen] = useState(false)
   const [noteInput, setNoteInput] = useState('')
   const [refInput, setRefInput] = useState('')
+  const [announcement, setAnnouncement] = useState('')
 
   const noteFieldRef = useRef<HTMLTextAreaElement>(null)
   const noteId = useId()
   const refId = useId()
 
   function applyResult(result: LifecycleApiResult, fallbackStatus: FailurePatternStatus) {
-    setStatus(result.status ?? fallbackStatus)
+    const nextStatus = result.status ?? fallbackStatus
+    setStatus(nextStatus)
+    setAnnouncement(`Pattern status is now ${STATUS_ANNOUNCEMENT[nextStatus]}.`)
     // A successful acknowledge/resolve/reopen always clears the regressed
     // flag server-side (reopen resets it explicitly; resolve/acknowledge
     // only apply from a state where it wasn't set) — but reconcile from
     // whatever the server actually echoed back rather than assuming.
-    setRegressed(typeof result.regressedAt === 'number' && (result.status ?? fallbackStatus) === 'open')
+    setRegressed(typeof result.regressedAt === 'number' && nextStatus === 'open')
     setResolutionNote(result.resolutionNote)
     setResolutionRef(result.resolutionRef)
   }
@@ -184,6 +194,16 @@ export function PatternLifecycleControl({
 
   return (
     <div className="flex flex-col items-end gap-2">
+      {/* The badge below is deliberately NOT a live region (it also renders
+          once per row in the patterns list, where that would announce N
+          times). This control, however, MUTATES the status on click, and a
+          silently-swapped badge is invisible to a screen reader — so the
+          confirmation lives here, in one polite region owned by the thing
+          that caused the change. `announcement` is set only by a successful
+          transition, never on first render. */}
+      <span aria-live="polite" className="sr-only">
+        {announcement}
+      </span>
       <div className="flex items-center gap-2">
         <PatternStatusBadge status={status} regressed={regressed} />
         {status === 'open' && !formOpen && (

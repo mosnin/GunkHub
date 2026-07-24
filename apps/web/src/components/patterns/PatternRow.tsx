@@ -34,10 +34,17 @@ function formatFailureClass(cls: string): string {
 }
 
 /**
- * One row in the Patterns list. Keyboard nav follows the same convention as
- * SelectableRunList: the label is a real, focusable Link; other cells wrap a
- * `tabIndex={-1} aria-hidden` Link so clicking anywhere in the row navigates
- * without duplicating focus stops.
+ * One row in the Patterns list. Keyboard nav: the label is the row's single
+ * real, focusable Link; the other cells wrap a `tabIndex={-1}` Link so
+ * clicking anywhere in the row navigates without duplicating tab stops.
+ *
+ * Those secondary Links deliberately do NOT carry `aria-hidden`. They used
+ * to, which meant every cell except the label — failure class, occurrence
+ * count, first/last seen, affected versions, status, fix confidence, spike
+ * state — was removed from the accessibility tree. A screen-reader user got
+ * a table of bare labels with none of the data the table exists to show.
+ * `tabIndex={-1}` alone is what keeps the tab order to one stop per row;
+ * hiding the content was never what did that.
  */
 export function PatternRow({ pattern, confidence }: PatternRowProps) {
   const href = `/patterns/${encodeURIComponent(pattern.fingerprintHash)}`
@@ -45,7 +52,7 @@ export function PatternRow({ pattern, confidence }: PatternRowProps) {
   const regressed = isRegressedPattern(pattern)
 
   return (
-    <tr className="hover:bg-neutral-900 transition-colors duration-100 group border-b border-graphite last:border-b-0">
+    <tr className="hover:bg-graphite transition-colors duration-100 group border-b border-graphite last:border-b-0">
       <td className="px-4 py-3 max-w-[320px]">
         <Link
           href={href}
@@ -66,34 +73,34 @@ export function PatternRow({ pattern, confidence }: PatternRowProps) {
         </div>
       </td>
       <td className="px-4 py-3">
-        <Link href={href} tabIndex={-1} aria-hidden>
+        <Link href={href} tabIndex={-1}>
           <span className="inline-flex items-center px-2 py-0.5 rounded-[4px] text-xs font-mono font-medium border bg-graphite text-cloud border-graphite-light whitespace-nowrap">
             {formatFailureClass(pattern.class)}
           </span>
         </Link>
       </td>
       <td className="px-4 py-3 text-right">
-        <Link href={href} tabIndex={-1} aria-hidden className="font-mono text-sm text-neutral-200">
+        <Link href={href} tabIndex={-1} className="font-mono text-sm text-neutral-200">
           {pattern.count.toLocaleString()}
         </Link>
       </td>
       <td className="px-4 py-3 whitespace-nowrap">
-        <Link href={href} tabIndex={-1} aria-hidden className="font-mono text-xs text-neutral-400" title={new Date(pattern.firstSeenAt).toISOString()}>
+        <Link href={href} tabIndex={-1} className="font-mono text-xs text-neutral-400" title={new Date(pattern.firstSeenAt).toISOString()}>
           {formatRelativeTime(pattern.firstSeenAt)}
         </Link>
       </td>
       <td className="px-4 py-3 whitespace-nowrap">
-        <Link href={href} tabIndex={-1} aria-hidden className="font-mono text-xs text-neutral-300" title={new Date(pattern.lastSeenAt).toISOString()}>
+        <Link href={href} tabIndex={-1} className="font-mono text-xs text-neutral-300" title={new Date(pattern.lastSeenAt).toISOString()}>
           {formatRelativeTime(pattern.lastSeenAt)}
         </Link>
       </td>
       <td className="px-4 py-3 text-right">
-        <Link href={href} tabIndex={-1} aria-hidden className="font-mono text-sm text-neutral-300">
+        <Link href={href} tabIndex={-1} className="font-mono text-sm text-neutral-300">
           {pattern.hasAffectedVersions ? pattern.affectedAgentVersionIds.length.toLocaleString() : '—'}
         </Link>
       </td>
       <td className="px-4 py-3">
-        <Link href={href} tabIndex={-1} aria-hidden className="inline-flex items-center gap-1.5 flex-wrap">
+        <Link href={href} tabIndex={-1} className="inline-flex items-center gap-1.5 flex-wrap">
           <PatternStatusBadge status={pattern.status} regressed={regressed} />
           {/* A resolved row and a PROVEN resolved row must not read the same.
               Suppressed on regressed rows, where the status badge already
@@ -102,7 +109,7 @@ export function PatternRow({ pattern, confidence }: PatternRowProps) {
         </Link>
       </td>
       <td className="px-4 py-3">
-        <Link href={href} tabIndex={-1} aria-hidden className="inline-flex items-center gap-1.5">
+        <Link href={href} tabIndex={-1} className="inline-flex items-center gap-1.5">
           <SpikeBadge isSpiking={isSpiking} assessed={pattern.hasSpikeAssessment} mutedAlerts={pattern.muted} />
           {pattern.muted && !isSpiking && <MutedBadge mutedAt={pattern.mutedAt} />}
         </Link>

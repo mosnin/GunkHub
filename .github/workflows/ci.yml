@@ -176,9 +176,60 @@ jobs:
       - name: Check Convex schema drift
         run: pnpm tsx scripts/check-schema-drift.ts
 
+  convex-refs:
+    # Gates the apps/web/src/lib/convexFunctions.ts seam: those
+    # `makeFunctionReference('module:fn')` strings are invisible to TypeScript
+    # (convex/_generated/api.ts is an `anyApi` stub), so a wrong module, a wrong
+    # function name, a query/mutation kind mismatch, or a call site passing the
+    # wrong args all typecheck and fail only at runtime. This job cross-checks
+    # every ref and call site against the real convex/*.ts registrations by
+    # static parse — no Convex deployment, no network, no build needed, which is
+    # why it runs standalone alongside typecheck/lint rather than after build.
+    name: Convex Function Refs
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 9
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Convex function references
+        run: pnpm tsx scripts/check-convex-refs.ts
+
   build:
     name: Build
     runs-on: ubuntu-latest
+    # `convex-refs` is deliberately NOT in this list. It is a correctness gate on
+    # the ref table, not a precondition for compiling anything — a ref pointing at
+    # the wrong Convex function builds fine. Keeping it out of `needs` means a red
+    # convex-refs still fails the PR on its own without also suppressing the
+    # build/test/e2e feedback the rest of the tree depends on.
     needs: [typecheck, lint, schema-drift]
     steps:
       - name: Checkout

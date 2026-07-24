@@ -217,7 +217,7 @@ export interface ApiV1ListFailurePatternsParams {
 export async function apiListFailurePatterns(
   apiKeyHash: string,
   params: ApiV1ListFailurePatternsParams,
-): Promise<{ patterns: unknown[]; nextCursor?: string }> {
+): Promise<{ patterns: unknown[]; nextCursor?: string; fixConfidence?: unknown }> {
   const client = getPublicClient()
   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const result = await withConvexTimeout(
@@ -233,7 +233,13 @@ export async function apiListFailurePatterns(
       ...(params.cursor !== undefined && { cursor: params.cursor }),
     }),
   )
-  return result as { patterns: unknown[]; nextCursor?: string }
+  // `fixConfidence` (the staleness envelope, ADR-006 cycle 3) is declared on
+  // the return type rather than merely surviving the cast. It used to reach the
+  // CLI only because this cast was wider than the annotation — tidying the cast
+  // into a structural pick would have silently dropped the envelope, and the
+  // CLI would have gone back to printing stale verdicts as current with nothing
+  // objecting.
+  return result as { patterns: unknown[]; nextCursor?: string; fixConfidence?: unknown }
 }
 
 // ---------------------------------------------------------------------------

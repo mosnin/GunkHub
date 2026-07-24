@@ -128,11 +128,24 @@ $ afr patterns --status resolved   # only patterns whose lifecycle status is exa
 $ afr patterns --regressed         # only patterns with regressedAt set — a resolved pattern that recurred
 
 $ afr patterns --state regressed   # only fixes that demonstrably did NOT hold (see below)
+$ afr patterns --state confirmed   # only fixes with enough clean exposure to trust
 ```
 
 Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--spiking` (only patterns currently flagged as spiking), `--muted` / `--active` (mute-aware filter — mutually exclusive, passing both is a usage error, exit 1), `--status <open|acknowledged|resolved>` (exact lifecycle-status filter — an invalid value is a usage error, exit 1), `--regressed` (only patterns with `regressedAt` set), `--state <unproven|proving|confirmed|regressed>` (fix-confidence filter — see below), `--limit <n>`, `--json` (prints the raw API response, including `muted`/`mutedAt` and the full resolution-lifecycle and evidence fields).
 
-**`--state` vs `--status`, and why CI should use `--state regressed`.** `--status` is what a human *asserted*; `--state` is what the *evidence supports* (ADR-006 cycle 2). Only `--state regressed` is answerable on this command — the other three states depend on per-pattern post-resolution run exposure, which cannot be measured across a whole page, so passing them is a usage error (exit 1) that points you at `afr patterns evidence`. It is deliberately not silently ignored.
+**`--state` vs `--status`, and why CI should use `--state regressed`.** `--status` is what a human *asserted*; `--state` is what the *evidence supports* (ADR-006). All four values are answerable — verdicts are served from a periodically refreshed per-pattern snapshot rather than a per-request exposure scan. An invalid value is still a usage error (exit 1), never silently ignored.
+
+**Verdicts carry their age.** The `CONFIDENCE` column renders three distinct outcomes, and they must not be read as the same thing:
+
+| Cell | Meaning |
+|---|---|
+| `confirmed 82%` | a fresh verdict |
+| `confirmed 82% [stale 9h]` | a real verdict that has aged past the staleness bound |
+| `-` | no usable snapshot — nothing has been graded yet |
+
+A stale verdict is *shown*, not hidden: it is the best available answer, and it can only under-report (soak and exposure only accumulate, and `regressed` is written eagerly by the regression guard rather than waiting for a refresh). But it is never shown as though it were current — the marker sits inline with the number it qualifies rather than in a footnote a reader can skip. `-` is deliberately **not** rendered as `unproven`: "we have not graded this" and "we graded this and found no evidence" are different claims.
+
+Patterns with a live resolution but no usable snapshot cannot match any `--state` filter. They are reported in a footnote with their count and fingerprints rather than silently vanishing — "could not evaluate these" is a materially different answer from "these do not match", and conflating them lets a reader conclude that a page which could not evaluate part of its input found nothing to worry about.
 
 Prefer `--state regressed` over `--regressed` in a build gate: `--regressed` matches any pattern with `regressedAt` set, **including one whose regression predates its current resolution** (it regressed, was genuinely re-fixed, and was re-resolved — `regressedAt` is kept as history). `--state regressed` matches only a recurrence strictly after the live `resolvedAt`, i.e. a fix that actually did not hold.
 
@@ -362,6 +375,10 @@ Options: `--out <file>` (default: print to stdout), `--format ndjson|json`
 (default: `ndjson`).
 
 ## Version
+
+v0.9.0 — **`--state` accepts all four values** (ADR-006 cycle 3). `afr patterns --state unproven|proving|confirmed|regressed` all work now: the backend serves verdicts from a periodically refreshed snapshot rather than a per-request exposure scan, so cycle 2's client-side rejection of the three exposure-dependent values is gone. An invalid value is still a usage error (exit 1). New `CONFIDENCE` column rendering three distinct outcomes — `confirmed 82%` (fresh), `confirmed 82% [stale 9h]` (a real verdict that has aged past the bound), and `-` (no verdict yet, deliberately NOT shown as `unproven`). Two new footnotes: how many verdicts are stale, and which patterns have a resolution but no usable snapshot and so could not be graded at all. `--json` carries the full `fixConfidence` envelope (`stalenessBoundMs`, `entries[]`, `staleCount`, `unevaluated[]`). Requires `@agent-flight-recorder/sdk` >= 0.13.0.
+
+`--state regressed` is unchanged and still the right CI gate: it keeps an exact, snapshot-free path alongside the snapshot and matches if either says so, so it is never weaker than before snapshots existed and never depends on the refresh cron having run.
 
 v0.8.0 — **Prove the fix held** (ADR-006 cycle 2). New command: `afr patterns evidence <fingerprintHash>` — the resolution claim, the run exposure accumulated since it, a graded fix-confidence verdict (`score` 0-0.95, `state` one of `unproven`/`proving`/`confirmed`/`regressed`, plus every driver that produced them), and the pattern's lifecycle transition history from the append-only audit log; `--json` carries the whole envelope so a CI job can gate on `confidence.state`. `afr patterns` gains `--state <unproven|proving|confirmed|regressed>`; only `--state regressed` is answerable there (the other three need per-pattern exposure and are a usage error pointing at `afr patterns evidence`, never a silently unfiltered list). New exports: `parsePatternsEvidenceArgs`, `runPatternsEvidence`, `printPatternsEvidence`, `PatternsEvidenceArgs`, `PatternsEvidenceResult`, and `getFailurePatternEvidence` from the API client. Requires `@agent-flight-recorder/sdk` >= 0.12.0. Read-only and additive — no existing command, flag, or exit code changed.
 

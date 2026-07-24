@@ -84,7 +84,7 @@ export function ResolutionEvidencePanel({ pattern, state }: ResolutionEvidencePa
   if (state.kind === 'unavailable') {
     return (
       <Shell>
-        <p className="text-sm text-neutral-500 leading-relaxed">
+        <p className="text-sm text-pewter leading-relaxed">
           Resolution evidence isn&apos;t available for this pattern yet. Until it is, a resolution here is an
           unverified assertion — treat it as a claim, not a proven fix.
         </p>
@@ -101,7 +101,7 @@ export function ResolutionEvidencePanel({ pattern, state }: ResolutionEvidencePa
     const withdrawn = transitions.some((t) => t.action === 'failure_pattern.reopened')
     return (
       <Shell>
-        <p className="text-sm text-neutral-500 leading-relaxed">
+        <p className="text-sm text-pewter leading-relaxed">
           {withdrawn
             ? 'This pattern was reopened manually, which withdrew the previous resolution. There is no active fix to evidence — the earlier claim no longer stands.'
             : 'This pattern has never been resolved, so there is no fix to prove. This is not an unproven fix; it is the absence of one.'}
@@ -178,7 +178,7 @@ export function ResolutionEvidencePanel({ pattern, state }: ResolutionEvidencePa
               {...(resolvedInVersion !== undefined && { resolvedInVersion })}
             />
           ) : (
-            <p className="text-sm text-neutral-500 leading-relaxed">
+            <p className="text-sm text-pewter leading-relaxed">
               No confidence score has been computed for this resolution. The exposure figures above are the evidence;
               read them directly rather than inferring a verdict.
             </p>

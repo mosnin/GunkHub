@@ -141,6 +141,77 @@ export const MAX_PATTERN_LIFECYCLE_TRANSITIONS = 100;
 /** Bounded occurrence read used ONLY to derive a pre-cycle-2 rollup's agent set (rows written before `affectedAgentIds` existed). */
 export const MAX_AGENT_SET_OCCURRENCE_SCAN = 200;
 
+// ---------------------------------------------------------------------------
+// Fix-confidence SNAPSHOT constants (ADR-006 cycle 3 — "make the honest
+// answer cheap"). See `failure_patterns.lastFixConfidence` in schema.ts for
+// what is stored and why it is a subset of FixConfidenceResult.
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a snapshot stays scheduled-fresh: once recomputed, a pattern is
+ * not due again for an hour.
+ *
+ * WHY ONE HOUR: the only two things that move a verdict on their own are soak
+ * time (a 7-day scale — FIX_CONFIDENCE_SOAK_MS_FOR_FULL_CREDIT) and new
+ * exposure runs. Neither is hour-sensitive: an hour is at most 0.6% of the
+ * soak bar. Every change that CAN move a verdict discontinuously — resolve,
+ * manual reopen, and the regression guard's auto-reopen — recomputes eagerly
+ * and does not wait for this interval at all, which is what keeps a
+ * regression from ever sitting stale in a list view between ticks.
+ */
+export const FIX_CONFIDENCE_SNAPSHOT_REFRESH_MS = 60 * 60 * 1000;
+
+/**
+ * THE STALENESS BOUND. A snapshot whose `computedAt` is older than this is
+ * surfaced to callers as `stale: true` — it is still the best available
+ * answer and is still served, but it is never presented as current.
+ *
+ * WHY SIX HOURS (6x the refresh interval): a snapshot is only labelled stale
+ * after the cron has had six separate opportunities to refresh it, so the
+ * label means "this deployment is genuinely behind on snapshot work", not
+ * "you asked between two ticks". Anything tighter would flag healthy steady
+ * state as degraded, which trains readers to ignore the flag — the exact
+ * failure mode an honesty marker cannot afford.
+ *
+ * WHY SERVING A STALE SNAPSHOT IS SAFE IN THE ONE DIRECTION THAT MATTERS: of
+ * the four states, only `regressed` is a DOWNGRADE, and it is the one state
+ * that can never arrive silently — it is produced exclusively by a new
+ * occurrence landing on a resolved pattern, which is precisely the path that
+ * recomputes eagerly (see upsertRollup's regression guard). Everything else a
+ * stale snapshot can be wrong about is an UNDER-report: soak and exposure
+ * only ever accumulate, so an aging snapshot can say `unproven`/`proving`
+ * when the live answer has since reached `confirmed`, never the reverse. A
+ * stale snapshot therefore under-claims; it does not over-claim.
+ */
+export const FIX_CONFIDENCE_SNAPSHOT_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Hard ceiling on patterns the snapshot cron will recompute in a single tick.
+ * Small on purpose — unlike the spike cron (whose per-pattern read is at most
+ * TREND_WINDOW_DAYS rows), each pattern here costs a real exposure scan of up
+ * to RESOLUTION_RUN_SCAN_CAP run rows.
+ */
+export const FIX_CONFIDENCE_SNAPSHOT_MAX_PATTERNS_PER_RUN = 25;
+
+/**
+ * Cumulative run-row budget for one tick, checked BETWEEN patterns.
+ *
+ * WHY A ROW BUDGET AND NOT JUST A PATTERN COUNT: 25 patterns x
+ * RESOLUTION_RUN_SCAN_CAP is a 50,000-row worst case, which is not a bounded
+ * job in any useful sense and would sit uncomfortably close to a Convex
+ * transaction's read ceiling. Budgeting the actual rows read makes the tick's
+ * cost bounded by the thing that is expensive rather than by a proxy for it.
+ *
+ * WHY IT IS CHECKED BETWEEN PATTERNS AND NEVER WITHIN ONE: a partially
+ * scanned pattern would produce a lower exposure count than the live
+ * computation does, i.e. a snapshot that DISAGREES with the detail page. The
+ * per-pattern scan therefore always runs to the same RESOLUTION_RUN_SCAN_CAP
+ * every other caller uses; the budget only decides whether to start the NEXT
+ * pattern. Whatever is skipped keeps its old (already-past) refresh time and
+ * is the first work the next tick picks up.
+ */
+export const FIX_CONFIDENCE_SNAPSHOT_RUN_ROW_BUDGET = 4000;
+
 /**
  * The ONE message every rejected `resolvePattern` `versionId` produces —
  * whether the id is unknown, belongs to another org, or belongs to an agent
@@ -539,6 +610,22 @@ export const recordFailurePatternOccurrence = internalMutation({
       });
     }
 
+    // EAGER FIX-CONFIDENCE RECOMPUTE (ADR-006 cycle 3). A regression is the
+    // only DOWNGRADE a verdict can take, and it is exactly the case a list
+    // view must never show stale: "the fix held" sitting next to a pattern
+    // that demonstrably came back is worse than showing nothing. Every other
+    // way a verdict moves (soak accumulating, new exposure) is an
+    // under-report that the cron corrects on its next tick, so only this
+    // branch pays for an immediate recompute — and it is a rare one, fired at
+    // most once per resolution episode (the guard is idempotent by
+    // construction: status is "open" again the moment it fires).
+    //
+    // Deliberately OUTSIDE the mute check below, like the audit row above:
+    // muting suppresses ALERTS, never observability.
+    if (rollupResult.regressedFire && rollupResult.patternId) {
+      await writeFixConfidenceSnapshot(ctx, rollupResult.patternId, Date.now());
+    }
+
     if (rollupResult.regressedFire && !rollupResult.regressedFire.muted) {
       await ctx.runMutation(_firePatternRegressionAlertRef, {
         orgId: rollupResult.regressedFire.orgId,
@@ -588,6 +675,8 @@ async function incrementDailyCount(
 
 /** What recordFailurePatternOccurrence needs from upsertRollup to (maybe) fire a regression alert, outside the DB transaction's own concerns. */
 interface RollupUpsertResult {
+  /** The rollup row this occurrence landed on — needed for the eager fix-confidence recompute (ADR-006 cycle 3). */
+  patternId?: Id<"failure_patterns">;
   regressedFire?: {
     orgId: Id<"organizations">;
     fingerprintHash: string;
@@ -683,6 +772,24 @@ async function upsertRollup(
     affectedAgentIds,
   };
 
+  // FIX-CONFIDENCE RE-ENROLMENT (ADR-006 cycle 3). Any occurrence landing on a
+  // pattern that currently has a live resolution can move its verdict, so mark
+  // it due for the snapshot cron immediately (0 = "overdue", which sorts to
+  // the front of by_fix_confidence_refresh). Deliberately NOT a full recompute
+  // on this path: that would put a bounded-but-real exposure scan of up to
+  // RESOLUTION_RUN_SCAN_CAP run rows on the ingest hot path for every recorded
+  // failure. The one transition that genuinely cannot wait — the regression
+  // guard below, the only DOWNGRADE a verdict can take — does recompute
+  // eagerly; everything else this path can change is an under-report that the
+  // next tick corrects.
+  //
+  // This is also the self-heal for rollups resolved before this cycle shipped:
+  // they have no `fixConfidenceRefreshAt`, so the cron cannot see them until
+  // something enrols them, and this is that something.
+  if (existing.resolvedAt !== undefined) {
+    patch.fixConfidenceRefreshAt = 0;
+  }
+
   let regressedFire: RollupUpsertResult["regressedFire"];
   if (isRegression) {
     patch.status = "open";
@@ -700,7 +807,7 @@ async function upsertRollup(
   }
 
   await ctx.db.patch(existing._id, patch);
-  return { regressedFire };
+  return { patternId: existing._id, regressedFire };
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,6 +1210,217 @@ function exposureVersionIdFor(versionIds: Id<"agent_versions">[]): Id<"agent_ver
   return versionIds.length === 1 ? versionIds[0] : undefined;
 }
 
+// ---------------------------------------------------------------------------
+// THE CANONICAL FIX-CONFIDENCE COMPUTATION (ADR-006 cycle 3).
+//
+// Every surface that reports a fix-confidence verdict for a rollup goes
+// through the one function below: `getPatternResolutionEvidence` (Clerk-authed
+// detail), `read_api.apiGetFailurePatternEvidence` (key-authed detail), and
+// the snapshot writer that feeds `read_api.apiListFailurePatterns`' `state`
+// filter. There is no second implementation to drift.
+//
+// This consolidation is itself a bug fix. Before cycle 3 the two evidence
+// endpoints computed the verdict SEPARATELY and did not agree:
+//   - The Clerk-authed query forwarded `exposureVersionId` (from
+//     `exposureVersionIdFor`); the key-authed mirror deliberately omitted it,
+//     so the same pattern could read `versionAttribution: "mismatched"` with
+//     `exposureRuns: 0` on one door and `"unknown"` with real exposure on the
+//     other — different states, different scores, same pattern.
+//   - The key-authed mirror had a `recurredAt` fallback for a rollup carrying
+//     recurrences without a `regressedAt` stamp; the Clerk-authed query had
+//     none, so it could grade a demonstrably-recurring pattern `proving`
+//     while its own `exposure.heldSoFar` said `false` in the same response.
+// Both behaviours are kept — the version attribution (it is the more
+// informative of the two, and `exposureVersionIdFor` only ever forwards an
+// unambiguous singleton) and the recurrence fallback (it prevents a
+// self-contradictory response) — and now both apply everywhere.
+// ---------------------------------------------------------------------------
+
+/** Everything a caller needs from one canonical confidence computation: the verdict plus the measurements behind it. */
+export interface PatternFixConfidenceComputation {
+  confidence: FixConfidenceResult;
+  /** The agents exposure was measured across. */
+  agentIds: Id<"agents">[];
+  exposure: RunExposureCount;
+  /** EXACT post-resolution recurrences: `count - resolvedAtOccurrenceCount`, or 0 when no snapshot was taken at resolve time. */
+  recurrenceCount: number;
+  /** The `regressedAt`/`lastSeenAt` stamp forwarded to the engine, if any. */
+  recurredAt: number | undefined;
+}
+
+/**
+ * Compute the LIVE fix-confidence verdict for one rollup. THE source of truth
+ * for what any surface reports; the stored snapshot is only ever a cached
+ * output of this function.
+ *
+ * Returns `null` exactly when there is nothing to grade — no live
+ * `resolvedAt`, i.e. never resolved or manually reopened. Note this is NOT
+ * the case after the regression guard's auto-reopen, which deliberately keeps
+ * `resolvedAt` so the "your fix didn't hold" verdict stays computable.
+ *
+ * Org-scoped by construction: every read is reached through the pattern's own
+ * `orgId` (the occurrence index) or through agent ids that came from this
+ * pattern's own org-scoped occurrence/rollup data. No caller can widen it.
+ *
+ * `nowMs` is a parameter, never `Date.now()` read inside, so the snapshot
+ * writer and a test can pin the same instant the live path would have used —
+ * this is what makes "snapshot equals live" an assertable equality rather
+ * than an approximate one. Callers on a request path MUST pass the SERVER
+ * clock and must never accept it from a client: soak credit grows with
+ * elapsed time, so a client-supplied clock is forgeable into a `confirmed`
+ * verdict.
+ */
+export async function computePatternFixConfidence(
+  ctx: QueryCtx | MutationCtx,
+  pattern: Doc<"failure_patterns">,
+  nowMs: number,
+): Promise<PatternFixConfidenceComputation | null> {
+  if (pattern.resolvedAt === undefined) return null;
+
+  const agentIds = await resolveAgentIdsForPattern(ctx, pattern);
+  // No upper bound: "runs since resolution" is open-ended — see
+  // countRunsStartedInWindow's doc comment for why clamping to the reader's
+  // clock would only ever undercount exposure.
+  const exposure = await countRunsStartedInWindow(ctx, agentIds, pattern.resolvedAt);
+
+  // EXACT when the resolve-time snapshot exists. When it does not (a row
+  // resolved before ADR-006 cycle 2 shipped), 0 — never the all-time `count`,
+  // which would claim every occurrence the pattern ever had as a
+  // post-resolution recurrence.
+  const recurrenceCount =
+    pattern.resolvedAtOccurrenceCount !== undefined
+      ? Math.max(0, pattern.count - pattern.resolvedAtOccurrenceCount)
+      : 0;
+
+  // Prefer the regression guard's own stamp. The fallback matters: a rollup
+  // can carry recurrences while `regressedAt` is absent (e.g. resolved before
+  // the guard shipped). Without it the engine would see no counter-example
+  // and could grade a demonstrably-recurring pattern `proving` — or even
+  // `confirmed` — while `heldSoFar` said false in the very same response.
+  // `lastSeenAt` is the best available timestamp for that most recent
+  // occurrence, and when recurrenceCount > 0 it is by construction after
+  // `resolvedAt`. The ENGINE, not this file, decides whether a stamp counts.
+  const recurredAt = pattern.regressedAt ?? (recurrenceCount > 0 ? pattern.lastSeenAt : undefined);
+  const exposureVersionId = exposureVersionIdFor(exposure.versionIds);
+
+  const confidence = fixConfidence(
+    {
+      resolvedAt: pattern.resolvedAt,
+      ...(pattern.resolvedInVersionId !== undefined && {
+        resolvedInVersionId: pattern.resolvedInVersionId,
+      }),
+      // Only ever a version every counted run agreed on — see
+      // exposureVersionIdFor for why a mismatch must never be guessed.
+      ...(exposureVersionId !== undefined && { exposureVersionId }),
+      postResolutionRuns: exposure.count,
+      ...(recurredAt !== undefined && { recurredAt }),
+    },
+    nowMs,
+  );
+
+  return { confidence, agentIds, exposure, recurrenceCount, recurredAt };
+}
+
+/** The stored shape of `failure_patterns.lastFixConfidence`. */
+export type FixConfidenceSnapshot = NonNullable<Doc<"failure_patterns">["lastFixConfidence"]>;
+
+/**
+ * Project a canonical computation into the stored snapshot subset. Pure — the
+ * only place the schema's field set is assembled, so the snapshot can never
+ * silently diverge from the verdict it was derived from.
+ */
+export function buildFixConfidenceSnapshot(
+  basisResolvedAt: number,
+  computation: PatternFixConfidenceComputation,
+  computedAt: number,
+): FixConfidenceSnapshot {
+  const { confidence, exposure } = computation;
+  return {
+    computedAt,
+    basisResolvedAt,
+    state: confidence.state,
+    score: confidence.score,
+    exposureRuns: confidence.exposureRuns,
+    observedRuns: confidence.observedRuns,
+    exposureTruncated: exposure.truncated,
+    versionAttribution: confidence.versionAttribution,
+    recurred: confidence.recurred,
+    limitingFactor: confidence.limitingFactor,
+  };
+}
+
+/**
+ * Whether a stored snapshot may be used to answer for this rollup RIGHT NOW.
+ *
+ * Two independent gates, and the second is the correctness-critical one:
+ *   1. The rollup must currently have something to grade (`resolvedAt`).
+ *   2. The snapshot's `basisResolvedAt` must match that `resolvedAt`. A
+ *      reopen + re-resolve begins a NEW evidence episode; a snapshot from the
+ *      previous one is not stale, it is about a different question, and
+ *      serving it is exactly the list-says-`confirmed`/detail-says-`regressed`
+ *      disagreement this whole design exists to prevent. Note the eager
+ *      recompute on resolve already refreshes it — this gate is the
+ *      belt-and-braces that holds even if that write is ever missed.
+ *
+ * STALENESS IS DELIBERATELY NOT A GATE HERE. A stale snapshot is still the
+ * best available answer and is still served; it is LABELLED (see
+ * `fixConfidenceSnapshotAgeMs` / read_api's response envelope), because
+ * dropping a row from a filter for being stale is a silent lie by omission,
+ * which is strictly worse than an answer marked as possibly-behind.
+ */
+export function isFixConfidenceSnapshotUsable(pattern: Doc<"failure_patterns">): boolean {
+  const snapshot = pattern.lastFixConfidence;
+  if (!snapshot) return false;
+  if (pattern.resolvedAt === undefined) return false;
+  return snapshot.basisResolvedAt === pattern.resolvedAt;
+}
+
+/** True when a snapshot is older than the documented staleness bound. Pure. */
+export function isFixConfidenceSnapshotStale(snapshot: FixConfidenceSnapshot, nowMs: number): boolean {
+  return nowMs - snapshot.computedAt > FIX_CONFIDENCE_SNAPSHOT_STALE_AFTER_MS;
+}
+
+/**
+ * Recompute and store one pattern's snapshot. The ONLY writer of
+ * `lastFixConfidence`/`fixConfidenceRefreshAt`.
+ *
+ * Idempotent: it derives everything from current stored state, so running it
+ * twice at the same `nowMs` writes byte-identical values. Called eagerly on
+ * every transition that can change a verdict (resolve, manual reopen, the
+ * regression guard's auto-reopen) and periodically by
+ * `snapshotFixConfidenceCron`.
+ *
+ * When there is nothing to grade, it CLEARS both fields rather than leaving a
+ * verdict about a resolution that no longer exists — and clearing
+ * `fixConfidenceRefreshAt` is also what removes the pattern from the cron's
+ * index range entirely, so a pattern whose confidence cannot change is never
+ * read again on any tick.
+ */
+async function writeFixConfidenceSnapshot(
+  ctx: MutationCtx,
+  patternId: Id<"failure_patterns">,
+  nowMs: number,
+): Promise<{ snapshot: FixConfidenceSnapshot | null; runRowsScanned: number }> {
+  const pattern = await ctx.db.get(patternId);
+  if (!pattern) return { snapshot: null, runRowsScanned: 0 };
+
+  const computation = await computePatternFixConfidence(ctx, pattern, nowMs);
+  if (!computation || pattern.resolvedAt === undefined) {
+    await ctx.db.patch(patternId, {
+      lastFixConfidence: undefined,
+      fixConfidenceRefreshAt: undefined,
+    });
+    return { snapshot: null, runRowsScanned: 0 };
+  }
+
+  const snapshot = buildFixConfidenceSnapshot(pattern.resolvedAt, computation, nowMs);
+  await ctx.db.patch(patternId, {
+    lastFixConfidence: snapshot,
+    fixConfidenceRefreshAt: nowMs + FIX_CONFIDENCE_SNAPSHOT_REFRESH_MS,
+  });
+  return { snapshot, runRowsScanned: computation.exposure.count };
+}
+
 /**
  * Validate an operator-supplied `resolvedInVersionId`. Throws
  * INVALID_ARGUMENT — with ONE message for every rejection reason, see
@@ -1239,6 +1557,16 @@ export const resolvePattern = mutation({
       resolvedAtRunCount: baseline.count,
     });
 
+    // EAGER FIX-CONFIDENCE SNAPSHOT (ADR-006 cycle 3). Written against the
+    // SAME `resolvedAt` instant the patch above used, so the snapshot's
+    // `basisResolvedAt` matches the row's `resolvedAt` exactly and the
+    // verdict is live from the first read — a freshly-resolved pattern shows
+    // `unproven` immediately rather than "no snapshot yet". Cheap here by
+    // construction: exposure is measured strictly AFTER `resolvedAt`, which
+    // is now, so the scan reads ~0 rows. This also ENROLS the pattern in the
+    // snapshot cron's index (it sets `fixConfidenceRefreshAt`).
+    await writeFixConfidenceSnapshot(ctx, pattern._id, resolvedAt);
+
     await recordAuditEvent(ctx, {
       orgId: args.orgId,
       actorClerkUserId: userId,
@@ -1293,6 +1621,16 @@ export const reopenPattern = mutation({
       resolvedAt: undefined,
       regressedAt: undefined,
     });
+
+    // EAGER FIX-CONFIDENCE CLEAR (ADR-006 cycle 3). With `resolvedAt` gone
+    // there is nothing to grade, so `writeFixConfidenceSnapshot` clears both
+    // `lastFixConfidence` and `fixConfidenceRefreshAt`. Leaving the old
+    // verdict behind would let a list view keep answering `--state confirmed`
+    // for a pattern a human has explicitly reopened — a stale answer to a
+    // question that no longer has one. Clearing the refresh stamp also
+    // REMOVES the pattern from the cron's index range, which is how a pattern
+    // whose confidence can no longer change stops being rescanned.
+    await writeFixConfidenceSnapshot(ctx, pattern._id, Date.now());
 
     await recordAuditEvent(ctx, {
       orgId: args.orgId,
@@ -1469,56 +1807,34 @@ export const getPatternResolutionEvidence = query({
       resolvedAtRunCount: pattern.resolvedAtRunCount,
     };
 
-    const agentIds = await resolveAgentIdsForPattern(ctx, pattern);
-    // No upper bound: "runs since resolution" is open-ended — see
-    // countRunsStartedInWindow's doc comment for why clamping to Date.now()
-    // would only ever undercount exposure.
-    const exposureRuns = await countRunsStartedInWindow(ctx, agentIds, pattern.resolvedAt);
-
-    // EXACT when the snapshot exists. When it does not (a row resolved before
-    // this cycle shipped), fall back to 0 rather than inventing a number from
-    // the all-time `count` — a pre-cycle resolution genuinely has no baseline
-    // to subtract, and reporting `count` here would claim every occurrence
-    // the pattern ever had as a post-resolution recurrence.
-    const recurrenceCount =
-      pattern.resolvedAtOccurrenceCount !== undefined
-        ? Math.max(0, pattern.count - pattern.resolvedAtOccurrenceCount)
-        : 0;
-
-    const exposure: PatternResolutionExposure = {
-      since: pattern.resolvedAt,
-      runCount: exposureRuns.count,
-      runCountTruncated: exposureRuns.truncated,
-      recurrenceCount,
-      baselineRunCount: pattern.resolvedAtRunCount,
-      agentIds,
-      heldSoFar: recurrenceCount === 0,
-    };
-
+    // THE CANONICAL COMPUTATION — the same helper the key-authed evidence
+    // endpoint and the snapshot writer use. This detail view is one of the
+    // three surfaces that must never disagree, and sharing the function is
+    // what makes that structural rather than aspirational.
+    //
     // SERVER CLOCK, never a client-supplied one. Confidence is time-dependent
     // (soak credit grows with `nowMs - resolvedAt`), so accepting `nowMs` as
     // an argument would let any caller mint a `confirmed` verdict by claiming
     // a date far in the future. This query takes no time argument at all —
     // that is the enforcement, not a validation rule that could be relaxed.
-    const confidence = fixConfidence(
-      {
-        resolvedAt: pattern.resolvedAt,
-        resolvedInVersionId: pattern.resolvedInVersionId,
-        // Only ever a version every counted run agreed on — see
-        // exposureVersionIdFor for why a mismatch must never be guessed.
-        exposureVersionId: exposureVersionIdFor(exposureRuns.versionIds),
-        postResolutionRuns: exposureRuns.count,
-        // Team B's own `fixConfidenceInputFor` maps `recurredAt` onto the
-        // lifecycle's `regressedAt`; this is the same wiring from the rollup.
-        // The engine — not this file — decides whether the stamp counts
-        // (a `regressedAt` at or before `resolvedAt` is the occurrence that
-        // PROMPTED the fix, not a recurrence of it).
-        recurredAt: pattern.regressedAt,
-      },
-      Date.now(),
-    );
+    const computation = await computePatternFixConfidence(ctx, pattern, Date.now());
+    // Unreachable: `computePatternFixConfidence` returns null only when
+    // `resolvedAt` is undefined, which the guard above already returned on.
+    if (!computation) {
+      return { pattern, resolution: null, exposure: null, confidence: null, transitions };
+    }
 
-    return { pattern, resolution, exposure, confidence, transitions };
+    const exposure: PatternResolutionExposure = {
+      since: pattern.resolvedAt,
+      runCount: computation.exposure.count,
+      runCountTruncated: computation.exposure.truncated,
+      recurrenceCount: computation.recurrenceCount,
+      baselineRunCount: pattern.resolvedAtRunCount,
+      agentIds: computation.agentIds,
+      heldSoFar: computation.recurrenceCount === 0,
+    };
+
+    return { pattern, resolution, exposure, confidence: computation.confidence, transitions };
   },
 });
 
@@ -1655,12 +1971,117 @@ export const assessPatternSpikesCron = internalMutation({
   },
 });
 
+// ---------------------------------------------------------------------------
+// Fix-confidence snapshot cron (ADR-006 cycle 3) — internalMutation,
+// scheduled from convex/crons.ts. Follows the SAME shape as
+// assessPatternSpikesCron above (internalQuery for the bounded read +
+// internalMutation for the read-then-patch loop, injectable `now`, function
+// references by name), per docs/architecture.md §8/§9.
+// ---------------------------------------------------------------------------
+
+/**
+ * The bounded, oldest-due-first read that drives the snapshot cron.
+ *
+ * WHY THIS IS NOT A SWEEP, and why the lower bound is load-bearing: Convex
+ * sorts a MISSING index field before every number, so a bare
+ * `lte("fixConfidenceRefreshAt", now)` would match every never-resolved
+ * pattern in the deployment — i.e. almost all of them. The `gte(..., 0)` lower
+ * bound excludes absent-field rows entirely, so the range contains EXACTLY the
+ * patterns that currently have something to grade. A pattern whose confidence
+ * cannot change (never resolved, or manually reopened — `reopenPattern` clears
+ * the field) is not filtered out after being read; it is never read.
+ *
+ * Ascending order makes the cron resumable and starvation-free without any
+ * cursor or checkpoint table: whatever a budget-bounded tick could not reach
+ * keeps its already-past refresh stamp, which is by definition the oldest due
+ * work, which is the first thing the next tick sees.
+ *
+ * Cross-org by necessity, like stale_runs.ts / webhook_engine.ts /
+ * assessPatternSpikesCron: a cron has no single org to scope to. Every
+ * DOWNSTREAM read is org-scoped — `computePatternFixConfidence` reaches
+ * occurrences through the pattern's own `orgId` and runs through agent ids
+ * derived from that same org-scoped data — so no cross-org join is possible
+ * and no row is ever written outside its own org.
+ */
+export const _listDueFixConfidencePatterns = internalQuery({
+  args: { now: v.number() },
+  handler: async (ctx, args): Promise<Doc<"failure_patterns">[]> => {
+    return await ctx.db
+      .query("failure_patterns")
+      .withIndex("by_fix_confidence_refresh", (q) =>
+        q.gte("fixConfidenceRefreshAt", 0).lte("fixConfidenceRefreshAt", args.now),
+      )
+      .order("asc")
+      .take(FIX_CONFIDENCE_SNAPSHOT_MAX_PATTERNS_PER_RUN);
+  },
+});
+
+/**
+ * Recompute the fix-confidence snapshot for the patterns that are due,
+ * bounded twice over: at most FIX_CONFIDENCE_SNAPSHOT_MAX_PATTERNS_PER_RUN
+ * patterns, and at most FIX_CONFIDENCE_SNAPSHOT_RUN_ROW_BUDGET run rows
+ * scanned in total.
+ *
+ * IDEMPOTENT: every value written is derived from current stored state, so
+ * re-running at the same `now` writes byte-identical snapshots. Re-running
+ * immediately afterwards is additionally a no-op, because each processed
+ * pattern's refresh stamp has been pushed FIX_CONFIDENCE_SNAPSHOT_REFRESH_MS
+ * into the future and has left the due range.
+ *
+ * RESUMABLE: the row budget is checked BETWEEN patterns, never within one — a
+ * partially-scanned pattern would produce a lower exposure count than the live
+ * computation and therefore a snapshot that disagrees with the detail page,
+ * which is the one outcome this feature must never produce. Patterns skipped
+ * for budget keep their past-due stamp and lead the next tick.
+ *
+ * SELF-HEALING: a pattern whose `resolvedAt` has gone away since it was
+ * enrolled (a race with `reopenPattern`) is cleared rather than snapshotted,
+ * which also unenrols it from this index.
+ */
+export const snapshotFixConfidenceCron = internalMutation({
+  // Injectable `now` (default Date.now()) — same de-flake pattern as
+  // assessPatternSpikesCron / webhook_engine.ts's deliverPendingWebhooks, so
+  // a test can pin one wall-clock reading per invocation and assert
+  // snapshot-equals-live exactly rather than approximately.
+  args: { now: v.optional(v.number()) },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ due: number; snapshotted: number; cleared: number; deferred: number; runRowsScanned: number }> => {
+    const now = args.now ?? Date.now();
+    const due = await ctx.runQuery(_listDueFixConfidencePatternsRef, { now });
+
+    let snapshotted = 0;
+    let cleared = 0;
+    let processed = 0;
+    let runRowsScanned = 0;
+
+    for (const pattern of due) {
+      // Budget check BETWEEN patterns only — see the doc comment above for
+      // why a mid-pattern cutoff would be a correctness bug, not just a
+      // partial result.
+      if (runRowsScanned >= FIX_CONFIDENCE_SNAPSHOT_RUN_ROW_BUDGET) break;
+
+      const result = await writeFixConfidenceSnapshot(ctx, pattern._id, now);
+      processed += 1;
+      runRowsScanned += result.runRowsScanned;
+      if (result.snapshot) snapshotted += 1;
+      else cleared += 1;
+    }
+
+    return { due: due.length, snapshotted, cleared, deferred: due.length - processed, runRowsScanned };
+  },
+});
+
 // Function references by name (not bare value imports) — same established
 // pattern as convex/alert_engine.ts / convex/projection_verify.ts /
 // convex/run_explanations.ts (this repo's convex/_generated/api.ts is not a
 // live codegen output).
 const _listActivePatternsForSpikeAssessmentRef = makeFunctionReference<"query">(
   "failure_patterns:_listActivePatternsForSpikeAssessment",
+);
+const _listDueFixConfidencePatternsRef = makeFunctionReference<"query">(
+  "failure_patterns:_listDueFixConfidencePatterns",
 );
 const _firePatternSpikeAlertRef = makeFunctionReference<"mutation">("alerts:firePatternSpikeAlert");
 const _firePatternRegressionAlertRef = makeFunctionReference<"mutation">("alerts:firePatternRegressionAlert");

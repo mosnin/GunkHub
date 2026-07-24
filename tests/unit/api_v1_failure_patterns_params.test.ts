@@ -124,6 +124,47 @@ describe('apiListFailurePatterns — every declared param reaches the Convex mut
    * Pinned explicitly because collapsing them — or forwarding one under the
    * other's key — would be invisible to TypeScript across the string ref.
    */
+  /**
+   * The `fixConfidence` envelope (ADR-006 cycle 3) travels on the RESPONSE,
+   * not as a param, so the param table above cannot cover it — but it crosses
+   * the same untyped seam in the other direction. The forwarder's declared
+   * return type (`{ patterns, nextCursor }`) deliberately understates the
+   * payload and passes the object through by cast, so the envelope survives at
+   * runtime. If that cast were ever "tidied" into a structural pick, the
+   * envelope would be silently dropped and the CLI would lose its staleness
+   * marker — reverting to printing stale verdicts as current, with nothing in
+   * the type system objecting.
+   */
+  it('passes the fixConfidence response envelope through untouched', async () => {
+    const envelope = {
+      stalenessBoundMs: 86_400_000,
+      entries: [
+        {
+          fingerprintHash: 'hash_1',
+          state: 'confirmed',
+          score: 0.82,
+          computedAt: 1_700_000_000_000,
+          ageMs: 7_200_000,
+          stale: true,
+          basis: 'snapshot',
+        },
+      ],
+      staleCount: 1,
+      unevaluated: ['deadbeef1234'],
+    }
+    mutationMock.mockResolvedValueOnce({
+      patterns: [{ fingerprintHash: 'hash_1' }],
+      nextCursor: undefined,
+      fixConfidence: envelope,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any)
+
+    const result = (await apiListFailurePatterns('hashed_key', {})) as unknown as {
+      fixConfidence?: typeof envelope
+    }
+    expect(result.fixConfidence).toEqual(envelope)
+  })
+
   it('forwards status and state as independent params', async () => {
     await apiListFailurePatterns('hashed_key', { status: 'open', state: 'regressed' })
     const [, args] = mutationMock.mock.calls[0]!

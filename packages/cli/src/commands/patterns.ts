@@ -9,20 +9,25 @@ import type { CommandFailure } from './shared.js'
 import type { ApiFetchLike, V1ListFailurePatternsData } from '../apiClient.js'
 import type { CliEnv } from '../env.js'
 import type { FailurePatternStatus } from '@agent-flight-recorder/contracts'
-import type { FixConfidenceState } from '@agent-flight-recorder/sdk'
+import type { FixConfidenceEntry, FixConfidenceState } from '@agent-flight-recorder/sdk'
 
 const VALID_STATUSES: readonly FailurePatternStatus[] = ['open', 'acknowledged', 'resolved']
+
+/** How many ungraded fingerprints to name before collapsing the rest into a count. */
+const MAX_UNEVALUATED_LISTED = 5
 
 /** Team B's fix-confidence vocabulary (convex/insights.ts §12), verbatim — never a parallel one. */
 const VALID_STATES: readonly FixConfidenceState[] = ['unproven', 'proving', 'confirmed', 'regressed']
 
 /**
- * The only `--state` value `afr patterns` can answer. The other three depend
- * on per-pattern post-resolution run exposure, which the list endpoint cannot
- * measure across a whole page; `afr patterns evidence <fingerprint>` answers
- * those one pattern at a time.
+ * ADR-006 cycle 3 removed the exposure scan from the read path (verdicts are
+ * served from a periodically refreshed per-pattern snapshot), so all four
+ * states are answerable here now. Cycle 2's client-side allow-list is gone
+ * with it: rejecting a value the backend can answer would be the same
+ * silent-wrongness failure in the opposite direction.
+ *
+ * A genuinely invalid value is still a usage error — see `resolveStateFilter`.
  */
-const LIST_ANSWERABLE_STATES: readonly FixConfidenceState[] = ['regressed']
 
 export const PATTERNS_HELP = `Usage: afr patterns [options]
 
@@ -50,12 +55,19 @@ Options:
   --regressed         Only patterns that have regressedAt set — a RESOLVED
                        pattern that received a new occurrence after it was
                        resolved ("your fix didn't hold").
-  --state <s>         Only patterns whose FIX-CONFIDENCE state is <s>
-                       (ADR-006 cycle 2). A different axis from --status:
-                       --status is what a human ASSERTED, --state is what the
-                       EVIDENCE supports. Only 'regressed' is answerable here;
-                       'unproven'/'proving'/'confirmed' need per-pattern run
-                       exposure — use 'afr patterns evidence <fingerprint>'.
+  --state <s>         Only patterns whose FIX-CONFIDENCE state is <s> — one of
+                       'unproven', 'proving', 'confirmed', 'regressed'. A
+                       different axis from --status: --status is what a human
+                       ASSERTED, --state is what the EVIDENCE supports.
+
+                       Verdicts are served from a periodically refreshed
+                       snapshot. One older than the staleness bound is still
+                       shown (it is the best available answer, and it can only
+                       under-report) but is marked [stale] in the CONFIDENCE
+                       column — a stale verdict is never printed as current.
+                       Patterns with a live resolution but no usable snapshot
+                       cannot be graded; they are reported as "not evaluated"
+                       rather than silently dropped from a filtered page.
 
                        PREFER --state regressed OVER --regressed IN CI:
                        --regressed also matches a pattern whose regression
@@ -63,7 +75,9 @@ Options:
                        genuinely re-fixed, and was re-resolved — regressedAt
                        is kept as history). --state regressed matches only a
                        recurrence strictly after the live resolvedAt, i.e. a
-                       fix that actually did not hold.
+                       fix that actually did not hold. --state regressed also
+                       keeps an exact, snapshot-free path, so it never depends
+                       on the refresh cron having run.
   --limit <n>         Max number of patterns to return
   --json              Print the raw API response as JSON
   --help              Show this message
@@ -169,18 +183,12 @@ function resolveStatusFilter(args: PatternsArgs): { status?: FailurePatternStatu
 }
 
 /**
- * Validate `--state` against Team B's closed fix-confidence vocabulary, and
- * then against the narrower set this endpoint can actually answer.
+ * Validate `--state` against Team B's closed fix-confidence vocabulary.
  *
- * TWO DISTINCT REJECTIONS, deliberately worded differently:
- *   - an unknown value ("regresed") is a typo — same posture as
- *     `resolveStatusFilter`, since silently ignoring it would return an
- *     unfiltered list that looks like a match.
- *   - a KNOWN but unanswerable value ('confirmed') is a real question this
- *     command cannot answer, so it names the command that can rather than
- *     pretending the filter applied. Both are caught locally, before any
- *     network round trip; the server rejects them too (defence in depth), but
- *     the CLI should not spend a rate-limit unit to learn this.
+ * An unknown value ("regresed") is a usage error, same posture as
+ * `resolveStatusFilter` — silently ignoring a typo would return an unfiltered
+ * list that looks like a match. Caught locally, before any network round trip,
+ * so a typo does not spend a rate-limit unit.
  */
 function resolveStateFilter(args: PatternsArgs): { state?: FixConfidenceState } | CommandFailure {
   if (args.state === undefined) return {}
@@ -189,13 +197,6 @@ function resolveStateFilter(args: PatternsArgs): { state?: FixConfidenceState } 
       ok: false,
       exitCode: 1,
       message: `--state must be one of ${VALID_STATES.join(', ')} — got "${args.state}".`,
-    }
-  }
-  if (!(LIST_ANSWERABLE_STATES as readonly string[]).includes(args.state)) {
-    return {
-      ok: false,
-      exitCode: 1,
-      message: `--state ${args.state} is not available on 'afr patterns' — it depends on per-pattern post-resolution run exposure, which cannot be measured across a whole page. Use 'afr patterns evidence <fingerprint>' for ${VALID_STATES.filter((s) => !LIST_ANSWERABLE_STATES.includes(s)).join('/')}.`,
     }
   }
   return { state: args.state as FixConfidenceState }
@@ -241,6 +242,76 @@ export async function runPatterns(
   }
 }
 
+/** Human-scale age, for annotating a stale verdict with HOW stale it is. */
+function formatAge(ms: number): string {
+  const hours = ms / (60 * 60 * 1000)
+  if (hours < 1) return `${String(Math.max(1, Math.round(ms / 60_000)))}m`
+  if (hours < 48) return `${hours.toFixed(0)}h`
+  return `${(hours / 24).toFixed(0)}d`
+}
+
+/**
+ * Render one pattern's confidence verdict.
+ *
+ * THREE OUTCOMES, THREE DISTINCT RENDERINGS — the whole point of the envelope:
+ *
+ *   confirmed 82%           a fresh verdict
+ *   confirmed 82% [stale 9h]  a real verdict that has aged past the bound
+ *   -                       no usable snapshot; nothing has been graded
+ *
+ * A stale verdict is SHOWN, not hidden: it is the best available answer, and
+ * it can only under-report (soak and exposure accumulate, and the one
+ * downgrade a verdict can take — `regressed` — is written eagerly and never
+ * waits for a refresh). But it is never shown as though it were current. A
+ * stale `confirmed` rendered identically to a fresh one would put unearned
+ * confidence back on the screen at the very last step of a feature built to
+ * remove it, which is why the marker is inline in the cell rather than a
+ * footnote a reader can skip — it travels with the number it qualifies.
+ *
+ * `-` (no snapshot) is deliberately NOT rendered as `unproven`. "We have not
+ * graded this" and "we graded this and found no evidence" are different
+ * claims, and the second is a verdict this row has not earned.
+ */
+function formatConfidenceCell(entry: FixConfidenceEntry | undefined): string {
+  if (!entry || entry.basis === 'none' || entry.state === null) return '-'
+  const score = entry.score !== null ? ` ${(entry.score * 100).toFixed(0)}%` : ''
+  const staleness = entry.stale ? ` [stale${entry.ageMs !== null ? ` ${formatAge(entry.ageMs)}` : ''}]` : ''
+  return `${entry.state}${score}${staleness}`
+}
+
+/**
+ * Footnotes that cannot be expressed per-row: how many verdicts are stale, and
+ * which patterns could not be graded at all.
+ *
+ * `unevaluated` is printed even though those patterns are ABSENT from a
+ * filtered page — that is exactly why it must be printed. A pattern with a
+ * live resolution and no usable snapshot does not match `--state confirmed`,
+ * but it is not evidence that it is unconfirmed either; letting it vanish
+ * silently would let a reader conclude "nothing else needs attention" from a
+ * page that simply could not evaluate part of its input.
+ */
+function printConfidenceFootnotes(result: V1ListFailurePatternsData, log: (line: string) => void): void {
+  const envelope = result.fixConfidence
+  if (!envelope) return
+
+  if (envelope.staleCount > 0) {
+    log(
+      `\n${String(envelope.staleCount)} verdict(s) marked [stale] — older than ${formatAge(envelope.stalenessBoundMs)} and awaiting refresh. A stale verdict can under-report, never over-report.`
+    )
+  }
+
+  if (envelope.unevaluated.length > 0) {
+    const shown = envelope.unevaluated.slice(0, MAX_UNEVALUATED_LISTED)
+    const remainder = envelope.unevaluated.length - shown.length
+    log(
+      `\n${String(envelope.unevaluated.length)} pattern(s) on this page have a resolution but NO confidence verdict yet, so they could not be graded${
+        result.patterns.length === 0 ? '' : ' and cannot match a --state filter'
+      }: ${shown.map((hash) => truncateId(hash)).join(', ')}${remainder > 0 ? `, +${String(remainder)} more` : ''}`
+    )
+    log("  (not the same as 'no evidence' — run 'afr patterns evidence <fingerprint>' to grade one now)")
+  }
+}
+
 export function printPatterns(
   args: PatternsArgs,
   result: PatternsResult,
@@ -260,6 +331,14 @@ export function printPatterns(
     log('No recurring failure patterns found.')
     return
   }
+
+  // Keyed by fingerprint rather than by array position. The envelope
+  // documents `entries` as parallel to `patterns`, and it is — but a verdict
+  // rendered against the WRONG pattern is the most damaging way this display
+  // could fail, and a map costs nothing to be certain.
+  const confidenceByFingerprint = new Map(
+    (result.fixConfidence?.entries ?? []).map((entry) => [entry.fingerprintHash, entry])
+  )
 
   const rows = result.patterns.map((pattern) => {
     const isSpiking = pattern.lastSpikeAssessment?.isSpiking === true
@@ -293,11 +372,17 @@ export function printPatterns(
       spikingCell,
       isMuted ? 'yes' : '-',
       statusCell,
+      formatConfidenceCell(confidenceByFingerprint.get(pattern.fingerprintHash)),
     ]
   })
   log(
-    renderTable(['ID', 'CLASS', 'LABEL', 'COUNT', 'FIRST SEEN', 'LAST SEEN', 'SPIKING', 'MUTED', 'STATUS'], rows)
+    renderTable(
+      ['ID', 'CLASS', 'LABEL', 'COUNT', 'FIRST SEEN', 'LAST SEEN', 'SPIKING', 'MUTED', 'STATUS', 'CONFIDENCE'],
+      rows
+    )
   )
+
+  printConfidenceFootnotes(result, log)
   if (result.nextCursor) {
     log(
       '\n(more results available — narrow with --agent/--spiking/--muted/--active/--status/--regressed/--state/--limit to see fewer pages)'

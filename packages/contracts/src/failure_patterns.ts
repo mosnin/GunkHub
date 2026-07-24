@@ -139,6 +139,64 @@ export interface FailurePattern {
   resolvedAtRunCount?: number;
   /** The rollup's own `count` at the instant of resolution. Post-resolution recurrences are exactly `count - resolvedAtOccurrenceCount`. */
   resolvedAtOccurrenceCount?: number;
+
+  // ---------------------------------------------------------------------
+  // FIX-CONFIDENCE SNAPSHOT (docs/adr/006-failure-resolution.md cycle 3 —
+  // "make the honest answer cheap"). The live verdict needs a bounded but
+  // real post-resolution run-exposure scan per pattern, which is affordable
+  // on a detail page and impossible across a list page. These two fields
+  // are the periodically-refreshed snapshot that lets a list FILTER on the
+  // verdict without re-measuring it.
+  //
+  // OBSERVABILITY-GRADE, like every other field on this rollup: the LIVE
+  // computation stays the source of truth (both evidence endpoints still
+  // compute it), and the event log remains the only fact about what
+  // happened. Never render one of these as "current" without checking
+  // `computedAt` against the documented staleness bound.
+  // ---------------------------------------------------------------------
+
+  /** Last computed fix-confidence verdict. Absent when the pattern has never been resolved, was manually reopened, or has not yet been snapshotted. */
+  lastFixConfidence?: FixConfidenceSnapshot;
+  /** Scheduling state for the snapshot cron: epoch ms at or after which this pattern is due for recomputation. Absent when there is nothing to grade. */
+  fixConfidenceRefreshAt?: number;
+}
+
+/**
+ * The stored subset of `FixConfidenceResult` (below).
+ *
+ * DELIBERATELY NOT THE FULL RESULT. `elapsedMs`, `soakCredit` and
+ * `exposureCredit` are omitted because they are exactly recomputable from
+ * what is stored here, and the first two are "as of now" quantities that
+ * would be definitionally wrong the moment the snapshot aged — storing them
+ * would invite a consumer to render a stale duration as a live one.
+ * `hasResolution`/`exposureMeasured` are omitted as trivially derivable. What
+ * IS stored is precisely the measurement that cannot be recovered without
+ * redoing the expensive exposure scan, so the snapshot stays inspectable
+ * rather than being a bare number to trust.
+ */
+export interface FixConfidenceSnapshot {
+  /** Server clock at the moment this verdict was computed. The input to the staleness bound. */
+  computedAt: number;
+  /**
+   * The `resolvedAt` this verdict was computed against. Readers MUST compare
+   * it to the rollup's current `resolvedAt` and discard the snapshot when
+   * they differ — a reopen + re-resolve begins a new evidence episode, and
+   * grading it with the previous episode's verdict is exactly the
+   * list-says-`confirmed`/detail-says-`regressed` disagreement this snapshot
+   * design exists to make impossible.
+   */
+  basisResolvedAt: number;
+  state: FixConfidenceState;
+  score: number;
+  /** Runs credited as exposure (zeroed on version mismatch) as measured at `computedAt`. */
+  exposureRuns: number;
+  /** Runs measured before version attribution was applied. */
+  observedRuns: number;
+  /** True when the exposure scan hit its ceiling — the counts above are floors, not exact totals. */
+  exposureTruncated: boolean;
+  versionAttribution: FixVersionAttribution;
+  recurred: boolean;
+  limitingFactor: FixConfidenceLimit;
 }
 
 /** Failure pattern lifecycle state (docs/adr/006-failure-resolution.md). Absent on the rollup means "open". */

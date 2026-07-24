@@ -29,7 +29,7 @@ function StatTile({
     <RevealItem className="neon-surface relative overflow-hidden p-4">
       <div className="flex items-center gap-2">
         <span className={`w-1.5 h-1.5 rounded-full ${dot}`} aria-hidden="true" />
-        <p className="font-mono text-[11px] uppercase tracking-wider text-pewter">{label}</p>
+        <p className="font-mono text-xs uppercase tracking-wider text-pewter">{label}</p>
       </div>
       <p className={`mt-2 font-mono text-2xl leading-none font-medium tabular-nums ${valueColor}`}>{value}</p>
     </RevealItem>
@@ -50,7 +50,7 @@ export function DashboardStats({ stats, perAgent, range }: DashboardStatsProps) 
               'px-2 py-1 rounded text-xs font-mono font-medium border transition-colors duration-100',
               range === r
                 ? 'bg-primary-900 text-primary-300 border-primary-700'
-                : 'bg-transparent text-neutral-500 border-neutral-800 hover:text-neutral-300 hover:border-neutral-700',
+                : 'bg-transparent text-pewter border-neutral-800 hover:text-neutral-300 hover:border-neutral-700',
             ].join(' ')}
           >
             {r}
@@ -104,7 +104,7 @@ export function DashboardStats({ stats, perAgent, range }: DashboardStatsProps) 
                   )
                 })}
               </div>
-              <div className="flex justify-between text-[10px] font-mono text-pewter">
+              <div className="flex justify-between text-xs font-mono text-pewter">
                 <span>{stats.series[0]?.date}</span>
                 <span>{stats.series[stats.series.length - 1]?.date}</span>
               </div>
@@ -121,25 +121,25 @@ export function DashboardStats({ stats, perAgent, range }: DashboardStatsProps) 
               Per-agent breakdown
             </p>
             {perAgent.length === 0 ? (
-              <p className="text-sm text-neutral-500">No per-agent data available for this range.</p>
+              <p className="text-sm text-pewter">No per-agent data available for this range.</p>
             ) : (
               <div className="overflow-x-auto rounded-md border border-neutral-800">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-neutral-800 bg-neutral-900">
-                      <th className="px-4 py-2 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                      <th className="px-4 py-2 text-left text-xs font-medium text-pewter uppercase tracking-wider">
                         Agent
                       </th>
-                      <th className="px-4 py-2 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                      <th className="px-4 py-2 text-left text-xs font-medium text-pewter uppercase tracking-wider">
                         Runs
                       </th>
-                      <th className="px-4 py-2 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                      <th className="px-4 py-2 text-left text-xs font-medium text-pewter uppercase tracking-wider">
                         Failure rate
                       </th>
-                      <th className="px-4 py-2 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                      <th className="px-4 py-2 text-left text-xs font-medium text-pewter uppercase tracking-wider">
                         Tokens in
                       </th>
-                      <th className="px-4 py-2 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                      <th className="px-4 py-2 text-left text-xs font-medium text-pewter uppercase tracking-wider">
                         Tokens out
                       </th>
                     </tr>

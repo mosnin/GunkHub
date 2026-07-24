@@ -15,7 +15,7 @@ The design feels like a high-end server room after dark — a pure black void wh
 | System Warning | `#ff3621` | `--color-system-warning` | Used sparingly for icons or highlights requiring urgent attention. |
 | Whiteout | `#ffffff` | `--color-whiteout` | Primary text, primary CTA button backgrounds, icons. |
 | Ash | `#797d86` | `--color-ash` | Secondary text, descriptive copy, inactive navigation links. |
-| Pewter | `#94979` | `--color-pewter` | Tertiary text, metadata, placeholder text. |
+| Pewter | `#94979e` | `--color-pewter` | Tertiary text, metadata, placeholder text. |
 | Cloud | `#c9cbcf` | `--color-cloud` | Hover states on dark elements, subtle highlights. |
 | Graphite Light | `#303236` | `--color-graphite-light` | Borders, dividers, subtle UI structure. |
 | Graphite | `#242628` | `--color-graphite` | Secondary surfaces floating on the background. |
@@ -228,7 +228,7 @@ The page structure is full-bleed black, creating an immersive, infinite canvas. 
   --color-system-warning: #ff3621;
   --color-whiteout: #ffffff;
   --color-ash: #797d86;
-  --color-pewter: #94979;
+  --color-pewter: #94979e;
   --color-cloud: #c9cbcf;
   --color-graphite-light: #303236;
   --color-graphite: #242628;
@@ -325,7 +325,7 @@ The page structure is full-bleed black, creating an immersive, infinite canvas. 
   --color-system-warning: #ff3621;
   --color-whiteout: #ffffff;
   --color-ash: #797d86;
-  --color-pewter: #94979;
+  --color-pewter: #94979e;
   --color-cloud: #c9cbcf;
   --color-graphite-light: #303236;
   --color-graphite: #242628;

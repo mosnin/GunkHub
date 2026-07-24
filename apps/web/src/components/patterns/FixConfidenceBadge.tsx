@@ -60,9 +60,13 @@ export function FixConfidenceBadge({ state, score, compact = false, className }:
   const showScore = !compact && typeof score === 'number' && Number.isFinite(score) && state !== 'regressed'
 
   return (
+    // NOT a live region. This badge renders once per row in the patterns
+    // list; `role="status"` turned a static table into N simultaneous
+    // announcements on every render. The four states are distinguished by
+    // their WORD (so the distinction survives greyscale, forced colors, and
+    // a screen reader alike) — the sr-only sentence only adds the nuance a
+    // sighted user gets from the tooltip.
     <span
-      role="status"
-      aria-label={STATE_TITLE[state]}
       title={STATE_TITLE[state]}
       className={cn(
         'inline-flex items-center gap-1.5 px-2 py-0.5 rounded-[4px] text-xs font-mono font-medium border whitespace-nowrap',
@@ -77,7 +81,13 @@ export function FixConfidenceBadge({ state, score, compact = false, className }:
         />
       )}
       {STATE_LABEL[state]}
-      {showScore && <span className="text-pewter font-normal">{score.toFixed(2)}</span>}
+      <span className="sr-only"> fix confidence — {STATE_TITLE[state]}</span>
+      {showScore && (
+        <span className="text-pewter font-normal">
+          <span className="sr-only">score </span>
+          {score.toFixed(2)}
+        </span>
+      )}
     </span>
   )
 }

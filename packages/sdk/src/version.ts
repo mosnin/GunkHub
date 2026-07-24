@@ -7,4 +7,4 @@
  * filesystem. A unit test asserts this stays in sync with package.json —
  * update BOTH when bumping the version.
  */
-export const SDK_VERSION = '0.12.0'
+export const SDK_VERSION = '0.13.0'

@@ -37,6 +37,17 @@ const STATUS_CLASSES: Record<FailurePatternStatus, string> = {
 }
 
 /**
+ * Screen-reader-only expansion of each status word. The visible word already
+ * carries the distinction (so the signal survives greyscale and forced
+ * colors); this only adds the nuance a sighted user gets from the tooltip.
+ */
+const STATUS_DESCRIPTION: Record<FailurePatternStatus, string> = {
+  open: 'status: open — this pattern is unacknowledged',
+  acknowledged: 'status: acknowledged — someone is aware of this pattern, it is not yet resolved',
+  resolved: 'status: resolved — a fix has been asserted for this pattern',
+}
+
+/**
  * Lifecycle status badge for a failure pattern (docs/adr/006-failure-
  * resolution.md) — Open / Acknowledged / Resolved, plus a distinct
  * "Regressed" treatment for a resolved pattern the automatic regression
@@ -47,9 +58,12 @@ const STATUS_CLASSES: Record<FailurePatternStatus, string> = {
 export function PatternStatusBadge({ status, regressed = false, className }: PatternStatusBadgeProps) {
   if (regressed) {
     return (
+      // NOT a live region. This badge renders once per row in the patterns
+      // list and on the dashboard card; `role="status"` here made every list
+      // render fire one announcement per regressed row. The urgency is
+      // carried by the visible word plus the sr-only expansion below, which
+      // announce in document order like any other content.
       <span
-        role="status"
-        aria-label="Regressed — this pattern was resolved but has failed again"
         className={cn(
           'inline-flex items-center gap-1.5 px-2 py-0.5 rounded-[4px] text-xs font-mono font-semibold whitespace-nowrap',
           'bg-neon-glow text-graphite-deep border border-neon-glow',
@@ -62,6 +76,10 @@ export function PatternStatusBadge({ status, regressed = false, className }: Pat
           aria-hidden="true"
         />
         REGRESSED
+        <span className="sr-only">
+          {' '}
+          — this pattern was resolved but has failed again; the regression guard reopened it
+        </span>
       </span>
     )
   }
@@ -73,8 +91,10 @@ export function PatternStatusBadge({ status, regressed = false, className }: Pat
         STATUS_CLASSES[status],
         className,
       )}
+      title={STATUS_DESCRIPTION[status]}
     >
       {STATUS_LABEL[status].toUpperCase()}
+      <span className="sr-only"> ({STATUS_DESCRIPTION[status]})</span>
     </span>
   )
 }

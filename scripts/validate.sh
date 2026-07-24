@@ -6,6 +6,7 @@
 #   ./scripts/validate.sh typecheck # run only typecheck
 #   ./scripts/validate.sh build     # run only build
 #   ./scripts/validate.sh lint      # run only lint
+#   ./scripts/validate.sh convex-refs # run only the convex ref/call-site check
 
 set -euo pipefail
 
@@ -63,7 +64,7 @@ print_summary() {
   log_header "Validation Summary"
   echo ""
 
-  for check in typecheck build lint schema-drift; do
+  for check in typecheck build lint schema-drift convex-refs; do
     if [[ -v RESULTS[$check] ]]; then
       local result="${RESULTS[$check]}"
       if [[ "$result" == "PASS" ]]; then
@@ -105,7 +106,7 @@ fi
 
 # ─── Determine which checks to run ───────────────────────────────────────────
 
-CHECKS_TO_RUN=("typecheck" "build" "lint" "schema-drift")
+CHECKS_TO_RUN=("typecheck" "build" "lint" "schema-drift" "convex-refs")
 
 if [[ $# -gt 0 ]]; then
   CHECKS_TO_RUN=("$@")
@@ -127,8 +128,14 @@ for check in "${CHECKS_TO_RUN[@]}"; do
     schema-drift)
       run_check "schema-drift" "pnpm tsx scripts/check-schema-drift.ts"
       ;;
+    convex-refs)
+      # Cross-checks the hand-maintained makeFunctionReference string refs in
+      # apps/web/src/lib/convexFunctions.ts against the real convex/*.ts
+      # registrations. TypeScript cannot see this seam; see the script header.
+      run_check "convex-refs" "pnpm tsx scripts/check-convex-refs.ts"
+      ;;
     *)
-      echo -e "${RED}Unknown check: ${check}. Valid options: typecheck, build, lint, schema-drift${RESET}"
+      echo -e "${RED}Unknown check: ${check}. Valid options: typecheck, build, lint, schema-drift, convex-refs${RESET}"
       exit 1
       ;;
   esac

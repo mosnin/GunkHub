@@ -117,9 +117,73 @@ export interface V1GetExplanationData {
 // log — same reasoning as the no-CLI-mute decision, see
 // `packages/cli/src/commands/patterns.ts` for the full writeup.
 
+/**
+ * One confidence view per returned pattern (ADR-006 cycle 3), in the same
+ * order as `patterns`.
+ *
+ * `stale` and `basis: 'none'` mean DIFFERENT things and must not be collapsed:
+ * a stale entry has a real verdict that has simply aged, while `basis: 'none'`
+ * has no verdict at all. Rendering either one identically to a fresh verdict
+ * reintroduces exactly the false confidence this whole feature exists to
+ * remove.
+ */
+export interface FixConfidenceEntry {
+  fingerprintHash: string
+  /** Null when there is no usable snapshot (never resolved, reopened, superseded, or not yet snapshotted). */
+  state: FixConfidenceState | null
+  score: number | null
+  /** When the served verdict was computed. Null when there is no snapshot. */
+  computedAt: number | null
+  /** `now - computedAt`, per the SERVER clock. Null when there is no snapshot. */
+  ageMs: number | null
+  /**
+   * True when `ageMs` exceeds `stalenessBoundMs`. Always false when there is
+   * no snapshot — absent is not stale, it is unknown.
+   *
+   * A stale verdict is still the best available answer and is served rather
+   * than dropped: soak and exposure only accumulate, so an aging snapshot can
+   * UNDER-report (say `proving` where live says `confirmed`) but never
+   * over-report, and the one downgrade a verdict can take — `regressed` — is
+   * written eagerly by the regression guard and never waits for a cron tick.
+   */
+  stale: boolean
+  /** `'snapshot'` — served from a stored verdict. `'none'` — no usable snapshot. */
+  basis: 'snapshot' | 'none'
+}
+
+/**
+ * Honesty envelope accompanying every pattern list, filtered or not, so a
+ * client can mark a stale verdict without asking for it and without
+ * hardcoding the bound.
+ */
+export interface V1ListFixConfidenceEnvelope {
+  /** Age at which a snapshot is considered stale. Transported, never hardcoded by the client. */
+  stalenessBoundMs: number
+  /** One entry per returned pattern, in the same order as `patterns`. */
+  entries: FixConfidenceEntry[]
+  /** How many returned entries are served from a snapshot older than the bound. */
+  staleCount: number
+  /**
+   * Fingerprints on this page that have a live resolution but NO usable
+   * snapshot, so they could not be graded at all.
+   *
+   * These are excluded from a `state`-filtered result because they genuinely
+   * do not match a known state — but they are named here rather than silently
+   * dropped, because "we could not evaluate these" is a materially different
+   * answer from "these do not match", and a caller that conflates the two is
+   * treating unknown as no.
+   */
+  unevaluated: string[]
+}
+
 export interface V1ListFailurePatternsData {
   patterns: FailurePattern[]
   nextCursor?: string
+  /**
+   * Present since ADR-006 cycle 3. Optional on this type so a consumer
+   * pinned to an older deployment still typechecks.
+   */
+  fixConfidence?: V1ListFixConfidenceEnvelope
 }
 
 // ---------------------------------------------------------------------------
@@ -193,13 +257,22 @@ export interface ListFailurePatternsParams {
    * {@link ListFailurePatternsParams.status}: `status` is what a human
    * ASSERTED about a pattern, `state` is what the EVIDENCE supports.
    *
-   * Only `'regressed'` is answerable on the list endpoint. The other three
-   * states depend on per-pattern post-resolution run exposure, which cannot
-   * be measured across a whole page of patterns; passing them raises a
-   * `V1ApiError` (`kind: 'server'`, HTTP 422) rather than silently returning
-   * an unfiltered or empty page. Use
-   * {@link FlightReader.getFailurePatternEvidence} for those, one pattern at
-   * a time.
+   * ALL FOUR STATES are answerable as of ADR-006 cycle 3. The three that
+   * depend on post-resolution run exposure are served from a periodically
+   * refreshed per-pattern snapshot rather than a per-request scan, so the
+   * filter no longer needs a scan it cannot afford. (Cycle 2 rejected those
+   * three outright rather than answer them wrongly; the param's name, type
+   * and meaning are unchanged by the widening.)
+   *
+   * Snapshot-backed answers come with their age: read
+   * {@link V1ListFixConfidenceEnvelope} on the response for per-pattern
+   * `stale` flags, and for `unevaluated` — patterns with a live resolution
+   * but no usable snapshot, which cannot match any state and are named rather
+   * than silently dropped.
+   *
+   * `'regressed'` additionally keeps an exact, snapshot-independent path and
+   * matches if EITHER that or the snapshot says so, so it is never weaker
+   * than before snapshots existed and never depends on cron liveness.
    *
    * PREFER THIS OVER `regressed` FOR CI. `regressed: true` matches any
    * pattern with `regressedAt` set — including one whose regression PREDATES

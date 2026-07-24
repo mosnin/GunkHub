@@ -482,21 +482,21 @@ describe('afr patterns --state — filter validation and forwarding', () => {
   })
 
   /**
-   * The three exposure-dependent states are REJECTED here rather than
-   * forwarded and silently answered wrong. The error must name the command
-   * that can answer them, so the user is redirected rather than stuck.
+   * ADR-006 cycle 3: all four states are answerable from the snapshot, so the
+   * three that cycle 2 rejected client-side must now be FORWARDED. Rejecting
+   * a value the backend can answer is the same silent-wrongness failure in
+   * the opposite direction.
    */
-  it.each(['unproven', 'proving', 'confirmed'])(
-    'rejects the exposure-dependent state %s and points at the evidence command',
+  it.each(['unproven', 'proving', 'confirmed', 'regressed'])(
+    'forwards the now-answerable state %s instead of rejecting it',
     async (state) => {
-      const fetchImpl = vi.fn(async () => jsonResponse(200, { data: {}, requestId: 'r' })) as unknown as ApiFetchLike
+      const fetchImpl = vi.fn(async () =>
+        jsonResponse(200, { data: { patterns: [], nextCursor: undefined }, requestId: 'r' })
+      ) as unknown as ApiFetchLike
       const result = await runPatterns({ state }, env, fetchImpl)
 
-      expect(result.ok).toBe(false)
-      if (result.ok) return
-      expect(result.exitCode).toBe(1)
-      expect(result.message).toContain('afr patterns evidence')
-      expect(fetchImpl).not.toHaveBeenCalled()
+      expect(result.ok).toBe(true)
+      expect(String(vi.mocked(fetchImpl).mock.calls[0]![0])).toContain(`state=${state}`)
     }
   )
 
@@ -673,5 +673,168 @@ describe('afr patterns evidence — fix-confidence evidence', () => {
     const code = await main(['patterns', 'evidence'], (line) => lines.push(line))
     expect(code).toBe(1)
     expect(lines.join('\n')).toContain('Usage: afr patterns evidence')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ADR-006 cycle 3 — the fixConfidence honesty envelope: staleness must be
+// visible, and ungraded patterns must never silently vanish.
+// ---------------------------------------------------------------------------
+
+const HOUR = 60 * 60 * 1000
+
+function confidenceEntry(overrides: Record<string, unknown> = {}) {
+  return {
+    fingerprintHash: 'hash_1',
+    state: 'confirmed',
+    score: 0.82,
+    computedAt: 1_700_000_000_000,
+    ageMs: 2 * HOUR,
+    stale: false,
+    basis: 'snapshot',
+    ...overrides,
+  }
+}
+
+function listWithEnvelope(patterns: FailurePattern[], envelope: Record<string, unknown> = {}) {
+  return {
+    patterns,
+    nextCursor: undefined,
+    fixConfidence: {
+      stalenessBoundMs: 24 * HOUR,
+      entries: patterns.map((p) => confidenceEntry({ fingerprintHash: p.fingerprintHash })),
+      staleCount: 0,
+      unevaluated: [],
+      ...envelope,
+    },
+  }
+}
+
+async function renderList(data: unknown, args: Record<string, unknown> = {}): Promise<string> {
+  const fetchImpl = vi.fn(async () => jsonResponse(200, { data, requestId: 'r1' })) as unknown as ApiFetchLike
+  const result = await runPatterns(args, env, fetchImpl)
+  const lines: string[] = []
+  printPatterns(args, result, (line) => lines.push(line))
+  return lines.join('\n')
+}
+
+describe('afr patterns — fix-confidence column', () => {
+  it('renders a fresh verdict with its score', async () => {
+    const output = await renderList(listWithEnvelope([makePattern()]))
+    expect(output).toContain('CONFIDENCE')
+    expect(output).toContain('confirmed 82%')
+    expect(output).not.toContain('[stale')
+  })
+
+  /**
+   * The load-bearing assertion of this cycle at the CLI: a stale verdict must
+   * NOT render identically to a fresh one. That would put unearned confidence
+   * back on the screen at the last step of a feature built to remove it.
+   */
+  it('marks a stale verdict inline, distinctly from a fresh one', async () => {
+    const output = await renderList(
+      listWithEnvelope([makePattern()], {
+        entries: [confidenceEntry({ stale: true, ageMs: 9 * HOUR })],
+        staleCount: 1,
+      })
+    )
+    expect(output).toContain('confirmed 82% [stale 9h]')
+    expect(output).toContain('1 verdict(s) marked [stale]')
+  })
+
+  /**
+   * "Not graded" is not a verdict. Rendering it as `unproven` would assert
+   * something the row has not earned.
+   */
+  it('renders an ungraded pattern as "-", never as unproven', async () => {
+    const output = await renderList(
+      listWithEnvelope([makePattern()], {
+        entries: [
+          confidenceEntry({ state: null, score: null, computedAt: null, ageMs: null, basis: 'none' }),
+        ],
+      })
+    )
+    const row = output.split('\n').find((line) => line.includes('lookup_order'))!
+    expect(row).not.toContain('unproven')
+    expect(row.trimEnd().endsWith('-')).toBe(true)
+  })
+
+  /**
+   * Patterns that could not be graded are ABSENT from a filtered page — which
+   * is exactly why their count has to be stated. Otherwise a reader concludes
+   * "nothing else needs attention" from a page that could not evaluate part
+   * of its input.
+   */
+  it('names unevaluated patterns even though they are absent from the filtered page', async () => {
+    const output = await renderList(
+      listWithEnvelope([makePattern()], { unevaluated: ['deadbeef1234', 'cafebabe5678'] }),
+      { state: 'confirmed' }
+    )
+    expect(output).toContain('2 pattern(s)')
+    expect(output).toContain('could not be graded')
+    expect(output).toContain('deadbeef1234')
+    expect(output).toContain("not the same as 'no evidence'")
+  })
+
+  it('collapses a long unevaluated list into a count', async () => {
+    const many = Array.from({ length: 9 }, (_, i) => `fingerprint${String(i)}aaaa`)
+    const output = await renderList(listWithEnvelope([makePattern()], { unevaluated: many }))
+    expect(output).toContain('9 pattern(s)')
+    expect(output).toContain('+4 more')
+  })
+
+  it('matches each verdict to its own pattern, not to a row position', async () => {
+    const patterns = [
+      makePattern({ id: 'fp_1', fingerprintHash: 'hash_a', label: 'first pattern' }),
+      makePattern({ id: 'fp_2', fingerprintHash: 'hash_b', label: 'second pattern' }),
+    ]
+    // Entries deliberately supplied in the OPPOSITE order to `patterns`.
+    const output = await renderList({
+      patterns,
+      nextCursor: undefined,
+      fixConfidence: {
+        stalenessBoundMs: 24 * HOUR,
+        entries: [
+          confidenceEntry({ fingerprintHash: 'hash_b', state: 'regressed', score: 0 }),
+          confidenceEntry({ fingerprintHash: 'hash_a', state: 'confirmed', score: 0.82 }),
+        ],
+        staleCount: 0,
+        unevaluated: [],
+      },
+    })
+    const firstRow = output.split('\n').find((line) => line.includes('first pattern'))!
+    const secondRow = output.split('\n').find((line) => line.includes('second pattern'))!
+    expect(firstRow).toContain('confirmed')
+    expect(secondRow).toContain('regressed')
+  })
+
+  it('still renders when the deployment sends no envelope at all', async () => {
+    const output = await renderList({ patterns: [makePattern()], nextCursor: undefined })
+    expect(output).toContain('lookup_order')
+    expect(output).not.toContain('[stale')
+  })
+
+  it('--json carries the whole envelope for CI', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, {
+        data: listWithEnvelope([makePattern()], {
+          entries: [confidenceEntry({ stale: true, ageMs: 30 * HOUR })],
+          staleCount: 1,
+          unevaluated: ['deadbeef1234'],
+        }),
+        requestId: 'r1',
+      })
+    ) as unknown as ApiFetchLike
+    const result = await runPatterns({ json: true }, env, fetchImpl)
+    const lines: string[] = []
+    printPatterns({ json: true }, result, (line) => lines.push(line))
+    const parsed = JSON.parse(lines.join('\n')) as {
+      fixConfidence: { staleCount: number; unevaluated: string[]; stalenessBoundMs: number; entries: unknown[] }
+    }
+    expect(parsed.fixConfidence.staleCount).toBe(1)
+    expect(parsed.fixConfidence.unevaluated).toEqual(['deadbeef1234'])
+    // The bound is transported so no CI script has to hardcode it.
+    expect(parsed.fixConfidence.stalenessBoundMs).toBe(24 * HOUR)
+    expect(parsed.fixConfidence.entries).toHaveLength(1)
   })
 })

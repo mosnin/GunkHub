@@ -27,5 +27,17 @@
     }
   },
   "include": ["**/*.ts"],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules",
+    // Seam tests that type-import a `convex/` module. They are NOT unchecked —
+    // they are checked by tests/tsconfig.convex-seam.json, under the backend's
+    // own compiler options, because convex/tsconfig.json deliberately disables
+    // `exactOptionalPropertyTypes` and pulling a Convex module into THIS
+    // project would fail on backend code that is correct under its own config.
+    // The alternative (relaxing the flag here) would disarm the fixture-drift
+    // check for every test in the package; see that file's header.
+    // `pnpm --filter @agent-flight-recorder/tests typecheck` runs both projects,
+    // so nothing listed here escapes CI.
+    "unit/fix_confidence_vocab.test.ts"
+  ]
 }

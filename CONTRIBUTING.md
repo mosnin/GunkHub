@@ -51,6 +51,40 @@ CI (`.github/workflows/ci.yml`) runs: typecheck, lint, dependency-audit,
 schema-drift, build, test, and integration-test, on every push to `main`/`feature/**`/
 `fix/**`/`claude/**` and every PR into `main`.
 
+### The `tests/` package has two typecheck projects
+
+`pnpm --filter @agent-flight-recorder/tests typecheck` runs **two** `tsc` invocations,
+not one. Nothing extra to remember day to day — `pnpm typecheck` and `validate.sh` both
+pick this up — but it matters if you add a test that imports backend code.
+
+| Project | Covers | Notable option |
+|---------|--------|----------------|
+| `tests/tsconfig.json` | every test **except** the seam files listed in its `exclude` | `exactOptionalPropertyTypes: true` (inherited from `tsconfig.base.json`) |
+| `tests/tsconfig.convex-seam.json` | only the seam files, plus whatever `convex/` code they pull in | extends `convex/tsconfig.json`, so `exactOptionalPropertyTypes: false` |
+
+**Why the split.** `convex/tsconfig.json` deliberately turns
+`exactOptionalPropertyTypes` off: Convex's generated document types declare optional
+fields as `field?: T` while `ctx.db.insert()`/`patch()` accept an explicit `undefined`,
+so the flag errors on essentially every insert (47 errors across 19 files at last count).
+`tests/` inherits the flag as `true`. A test that type-imports a `convex/` module
+therefore fails typecheck on backend code that is perfectly correct under its own
+config — which is why `tests/unit/fix_confidence_vocab.test.ts` used to compare the
+fix-confidence vocabulary by running a `RegExp` over `convex/insights.ts`'s source text.
+
+Relaxing the flag in `tests/tsconfig.json` was rejected: that strictness is what makes
+fixture drift against `packages/contracts` fail CI, and one seam test is not worth
+disarming it for all ~65 suites. Instead the seam file is compiled under the backend's
+own options, by extending `convex/tsconfig.json` rather than restating its flags — so if
+`convex/` ever re-enables the flag, the seam project follows and the divergence
+disappears with no edit.
+
+**If you add a test that type-imports `convex/`:** add it to `include` in
+`tests/tsconfig.convex-seam.json` and to `exclude` in `tests/tsconfig.json`. Keep that
+list short — every file on it trades `exactOptionalPropertyTypes` for visibility of
+Convex types, which is only the right trade for a file whose entire job is pinning a
+cross-boundary seam. An ordinary test that just needs a shape should import it from
+`@agent-flight-recorder/contracts` and stay in the strict project.
+
 ---
 
 ## Boundary Ownership Map

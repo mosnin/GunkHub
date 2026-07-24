@@ -89,4 +89,32 @@ crons.interval(
   {},
 );
 
+// Failure Patterns (ADR-006 cycle 3) — fix-confidence snapshot refresh. Runs
+// every 5 minutes and recomputes the stored `lastFixConfidence` verdict for
+// the patterns that are DUE, so `read_api.apiListFailurePatterns`' `--state`
+// filter can be answered from stored values instead of a per-pattern
+// post-resolution exposure scan (which is affordable on one detail page and
+// impossible across a 50-pattern list page).
+//
+// BOUNDED TWICE, never a sweep: at most
+// FIX_CONFIDENCE_SNAPSHOT_MAX_PATTERNS_PER_RUN (25) patterns per tick AND at
+// most FIX_CONFIDENCE_SNAPSHOT_RUN_ROW_BUDGET (4000) run rows scanned in
+// total, whichever binds first. Its index range
+// (`by_fix_confidence_refresh`, lower-bounded at 0) contains ONLY patterns
+// with a live resolution, so a pattern whose confidence cannot change is
+// never read on any tick. Ascending oldest-due-first ordering makes it
+// resumable and starvation-free with no cursor: work a bounded tick could not
+// reach is by definition the oldest due work next tick.
+//
+// Transitions that can change a verdict discontinuously — resolve, manual
+// reopen, and the regression guard's auto-reopen — recompute EAGERLY and do
+// not wait for this cron, so a regression is never stale in the UI between
+// ticks. See convex/failure_patterns.ts's snapshotFixConfidenceCron.
+crons.interval(
+  "snapshot-fix-confidence",
+  { minutes: 5 },
+  makeFunctionReference<"mutation">("failure_patterns:snapshotFixConfidenceCron"),
+  {},
+);
+
 export default crons;

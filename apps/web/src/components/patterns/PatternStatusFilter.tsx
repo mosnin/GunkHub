@@ -38,10 +38,14 @@ export function PatternStatusFilter({ active, counts }: PatternStatusFilterProps
           <Link
             key={opt.value}
             href={href}
-            aria-current={isActive ? 'true' : undefined}
+            // `page` rather than `true`: each pill IS the current view when
+            // selected, and it is what a screen reader announces as the only
+            // non-visual signal that this pill is the active one — the
+            // Whiteout fill alone is invisible to AT.
+            aria-current={isActive ? 'page' : undefined}
             className={cn(
               'inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-mono border transition-colors duration-100',
-              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neon-glow',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neon-glow focus-visible:ring-offset-2 focus-visible:ring-offset-blackout',
               isActive
                 ? 'bg-whiteout text-graphite-deep border-transparent'
                 : 'bg-transparent text-cloud border-graphite-light hover:border-neutral-600',
@@ -50,6 +54,12 @@ export function PatternStatusFilter({ active, counts }: PatternStatusFilterProps
             {opt.label}
             <span className={cn('tabular-nums', isActive ? 'text-graphite-deep' : 'text-pewter')}>
               {counts[opt.value]}
+              {/* Without this the link announces as e.g. "Open 3" — a bare
+                  number whose meaning is carried purely by its position. */}
+              <span className="sr-only">
+                {' '}
+                {counts[opt.value] === 1 ? 'pattern' : 'patterns'}
+              </span>
             </span>
           </Link>
         )

@@ -42,9 +42,10 @@ export function SpikeBadge({ isSpiking, assessed = true, mutedAlerts = false, cl
   if (!isSpiking) return null
 
   return (
+    // NOT a live region — see PatternStatusBadge. One badge per list row
+    // meant `role="status"` announced once per row on every render.
     <span
-      role="status"
-      aria-label={
+      title={
         mutedAlerts
           ? 'This failure pattern is spiking — recent occurrences are well above its baseline rate. Alerts are muted for this pattern.'
           : 'This failure pattern is spiking — recent occurrences are well above its baseline rate'
@@ -59,7 +60,12 @@ export function SpikeBadge({ isSpiking, assessed = true, mutedAlerts = false, cl
         aria-hidden="true"
       />
       SPIKING
-      {mutedAlerts && <span className="text-pewter">· MUTED</span>}
+      <span className="sr-only"> — recent occurrences are well above this pattern&apos;s baseline rate</span>
+      {mutedAlerts && (
+        <span className="text-pewter">
+          · MUTED<span className="sr-only"> — alerts are muted for this pattern</span>
+        </span>
+      )}
     </span>
   )
 }

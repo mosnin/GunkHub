@@ -67,11 +67,19 @@ function CreditBar({ label, credit, value, earned }: CreditBarProps) {
     <div>
       <div className="flex items-baseline justify-between gap-3">
         <span className="text-xs font-mono uppercase tracking-wider text-pewter">{label}</span>
-        <span className="font-mono text-xs text-neutral-300">{value}</span>
+        <span className="font-mono text-xs text-neutral-300">
+          {value}
+          {/* The bar below is aria-hidden, so the FRACTION it encodes has to
+              live in text or it does not exist for a screen reader — and
+              whether the credit was actually earned is otherwise conveyed
+              only by the fill color, which is exactly the color-alone
+              encoding this palette makes tempting. Both are stated here. */}
+          <span className="text-pewter">
+            {' '}
+            · {pct}%<span className="sr-only"> of this driver&apos;s available credit, {earned ? 'earned' : 'not yet earned'}</span>
+          </span>
+        </span>
       </div>
-      {/* The bar is decoration over the text above it, which carries the
-          actual data — so it is aria-hidden rather than duplicating the value
-          into a second, competing announcement. */}
       <div className="mt-1 h-1.5 w-full rounded-[4px] bg-graphite overflow-hidden" aria-hidden="true">
         <div
           className={cn('h-full rounded-[4px]', earned ? 'bg-neon-glow' : 'bg-neutral-600')}

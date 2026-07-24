@@ -52,26 +52,40 @@ function rankForDashboard(patterns: AdaptedFailurePattern[]): AdaptedFailurePatt
  * shape as the Patterns list/detail pages. Every row deep-links to
  * `/patterns/[fingerprint]`.
  *
- * Three states, same convention as the rest of this page: `error` renders
- * ErrorState, an empty (but successfully fetched) list renders a calm
- * EmptyState ("No recurring failures — nice"), otherwise the ranked rows.
+ * Four states, all distinguishable: `error` renders ErrorState; a `null`
+ * list with no error message renders a DIFFERENT ErrorState ("unavailable —
+ * unknown, not empty"), because collapsing an unloaded widget into the calm
+ * empty state tells an engineer their org is healthy on data nobody fetched;
+ * an empty (but successfully fetched) list renders the calm EmptyState;
+ * otherwise the ranked rows. Loading is the page's `loading.tsx`.
  */
 export function TopFailurePatternsCard({ patterns, error }: TopFailurePatternsCardProps) {
   return (
     <div className="neon-surface relative overflow-hidden p-4">
       <div className="flex items-center justify-between mb-3">
-        <h2 className="font-mono text-[11px] uppercase tracking-wider text-pewter">Top recurring failures</h2>
+        <h2 className="font-mono text-xs uppercase tracking-wider text-pewter">Top recurring failures</h2>
         <Link
           href="/patterns"
-          className="text-xs font-mono text-pewter hover:text-cloud transition-colors duration-100"
+          className="text-xs font-mono text-pewter hover:text-cloud transition-colors duration-100 rounded-[4px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neon-glow focus-visible:ring-offset-2 focus-visible:ring-offset-blackout"
         >
-          view all →
+          view all <span aria-hidden="true">→</span>
         </Link>
       </div>
 
       {error ? (
         <ErrorState title="Failed to load failure patterns" message={error} />
-      ) : !patterns || patterns.length === 0 ? (
+      ) : patterns === null ? (
+        // `null` with no error message means the fetch did not succeed but
+        // gave us nothing to say about why. This previously fell through to
+        // the empty state, which told an engineer "No recurring failures —
+        // nice" about data we never loaded. A reassuring message is the
+        // single worst thing to render for an unknown state on a debugging
+        // tool, so it now says plainly that it does not know.
+        <ErrorState
+          title="Failure patterns unavailable"
+          message="This widget could not load recurring failure patterns. Its contents are unknown — not empty."
+        />
+      ) : patterns.length === 0 ? (
         <EmptyState
           title="No recurring failures — nice"
           description="Patterns appear here once the same failure fingerprint recurs across more than one run."
@@ -92,7 +106,7 @@ export function TopFailurePatternsCard({ patterns, error }: TopFailurePatternsCa
                     {pattern.label}
                   </p>
                   <div className="flex items-center gap-2 mt-0.5">
-                    <span className="inline-flex items-center px-1.5 py-0.5 rounded-[4px] text-[11px] font-mono font-medium border bg-graphite text-cloud border-graphite-light whitespace-nowrap">
+                    <span className="inline-flex items-center px-1.5 py-0.5 rounded-[4px] text-xs font-mono font-medium border bg-graphite text-cloud border-graphite-light whitespace-nowrap">
                       {formatFailureClass(pattern.class)}
                     </span>
                     <span className="text-xs font-mono text-pewter whitespace-nowrap">
@@ -102,6 +116,7 @@ export function TopFailurePatternsCard({ patterns, error }: TopFailurePatternsCa
                 </div>
                 <span className="font-mono text-sm text-neutral-300 shrink-0 tabular-nums">
                   {pattern.count.toLocaleString()}
+                  <span className="sr-only"> occurrences</span>
                 </span>
                 {isRegressedPattern(pattern) && (
                   <PatternStatusBadge status={pattern.status} regressed className="shrink-0" />

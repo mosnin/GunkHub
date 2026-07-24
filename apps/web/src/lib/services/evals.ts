@@ -131,9 +131,28 @@ export interface RunEvalSummary {
 
 export async function getRunEvalSummary(runId: string): Promise<RunEvalSummary> {
   try {
+    const { orgId: clerkOrgId } = auth()
+    if (!clerkOrgId) return { available: false, total: 0, passed: 0, failed: 0, passRatePct: null }
+
     const client = await getAuthedClient()
+
+    // `insights:getRunEvalSummary` requires { orgId, runId }. This call omitted
+    // orgId, so every invocation threw ArgumentValidationError and the catch
+    // below silently served the fallback summary — the panel header has never
+    // once used this query since it shipped. Found by scripts/check-convex-refs.ts
+    // on its first run; TypeScript cannot see it, because the args cross a
+    // hand-maintained makeFunctionReference string ref. Resolve the org first,
+    // exactly as listEvalsForVersion below already does.
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const result = await client.query(convex.insights.getRunEvalSummary, { runId })
+    const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
+    if (!org) return { available: false, total: 0, passed: 0, failed: 0, passRatePct: null }
+    const orgDoc = org as Record<string, unknown>
+
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const result = await client.query(convex.insights.getRunEvalSummary, {
+      orgId: orgDoc._id,
+      runId,
+    })
     if (!result) return { available: false, total: 0, passed: 0, failed: 0, passRatePct: null }
     const r = result as Partial<RunEvalSummary>
     return {

@@ -23,12 +23,13 @@ import { apiListFailurePatterns } from '@/lib/services/api_v1'
 // `muted`. Setting mute state is an admin-only, Clerk-authed, audited action
 // on a separate route; this key-authed v1 surface can only reflect it.
 //
-// `status`/`regressed` (Resolution cycle 1, ADR-006, "resolution
-// reflection"): same READ-side-only posture as `muted` — no mutation here
-// sets `status`/`resolvedAt`/`regressedAt`/etc. Acknowledging, resolving, or
-// reopening a pattern is a member-gated, audited, Clerk-authed action on a
-// separate route; this surface only ever reflects the resulting lifecycle
-// state. Powers `afr patterns --status`/`--regressed` and the STATUS column.
+// `status`/`regressed`/`state` (ADR-006): same READ-side-only posture as
+// `muted` — no mutation here sets `status`/`resolvedAt`/`regressedAt`/etc.
+// Acknowledging, resolving, or reopening a pattern is a member-gated,
+// audited, Clerk-authed action on a separate route; this surface only ever
+// reflects the resulting lifecycle state. Powers `afr patterns
+// --status`/`--regressed`/`--state`, the STATUS column, and the CONFIDENCE
+// column with its staleness marker.
 // ---------------------------------------------------------------------------
 export const GET = withApiHandler(
   '/api/v1/patterns',
@@ -60,20 +61,25 @@ export const GET = withApiHandler(
       rawStatus === 'open' || rawStatus === 'acknowledged' || rawStatus === 'resolved' ? rawStatus : undefined
     // --regressed: same "true" opts in, anything else unset pattern as --spiking.
     const regressed = sp.get('regressed') === 'true' ? true : undefined
-    // --state (ADR-006 cycle 2): the FIX-CONFIDENCE grade, Team B's
-    // `FixConfidenceState` vocabulary verbatim. Parsed permissively like every
-    // other filter here — only the four known literals opt in, anything else
-    // is treated as unset rather than rejected at this layer.
+    // --state: the FIX-CONFIDENCE grade, Team B's `FixConfidenceState`
+    // vocabulary verbatim. Parsed permissively like every other filter here —
+    // only the four known literals opt in, anything else is treated as unset
+    // rather than rejected at this layer.
     //
-    // NOTE the deliberate asymmetry with that permissiveness: a RECOGNIZED but
-    // unanswerable value ('unproven'/'proving'/'confirmed') is forwarded and
-    // then rejected by Convex with INVALID_ARGUMENT -> 422. That is the point.
-    // Those three depend on per-pattern post-resolution run exposure, which
-    // cannot be measured across a whole page, and silently returning an
-    // unfiltered page for them would be precisely the silent-filter-drop bug
-    // this route family has already shipped once. Only 'regressed' is
-    // exposure-independent and therefore answerable here; the per-pattern
-    // evidence endpoint answers the rest.
+    // ALL FOUR are answerable as of ADR-006 cycle 3: verdicts are served from
+    // a periodically refreshed per-pattern snapshot instead of a per-request
+    // exposure scan. Cycle 2 forwarded the three exposure-dependent values and
+    // let Convex reject them with a 422 — deliberately loud, because silently
+    // returning an unfiltered page is the silent-filter-drop bug this route
+    // family has already shipped once. That rejection is gone now that the
+    // computation is affordable; the param's name, type and meaning are
+    // unchanged.
+    //
+    // The response carries a `fixConfidence` envelope alongside the patterns
+    // (staleness bound, per-pattern verdict age, and the fingerprints that
+    // could not be graded at all), passed through untouched by this route so a
+    // client can distinguish a fresh verdict from a stale one, and "not
+    // matching" from "not evaluated".
     const rawState = sp.get('state')
     const state =
       rawState === 'unproven' || rawState === 'proving' || rawState === 'confirmed' || rawState === 'regressed'

@@ -60,7 +60,7 @@ export function PatternLifecycleTimeline({
   className,
 }: PatternLifecycleTimelineProps) {
   if (transitions.length === 0 && typeof firstSeenAt !== 'number') {
-    return <p className="text-sm text-neutral-500">No lifecycle history has been recorded for this pattern yet.</p>
+    return <p className="text-sm text-pewter">No lifecycle history has been recorded for this pattern yet.</p>
   }
 
   // Only the LAST resolution carries the version annotation — annotating every
@@ -72,7 +72,7 @@ export function PatternLifecycleTimeline({
   )
 
   return (
-    <ol className={cn('flex flex-col', className)}>
+    <ol aria-label="Lifecycle history for this failure pattern" className={cn('flex flex-col', className)}>
       {typeof firstSeenAt === 'number' && (
         <li className="relative pl-5 pb-3">
           <span className="absolute left-0 top-[7px] w-1.5 h-1.5 rounded-full bg-neutral-600" aria-hidden="true" />
@@ -81,9 +81,13 @@ export function PatternLifecycleTimeline({
           )}
           <div className="flex items-baseline justify-between gap-3 flex-wrap">
             <span className="text-sm text-neutral-300">First seen</span>
-            <span className="font-mono text-xs text-pewter" title={new Date(firstSeenAt).toISOString()}>
+            <time
+              className="font-mono text-xs text-pewter"
+              dateTime={new Date(firstSeenAt).toISOString()}
+              title={new Date(firstSeenAt).toISOString()}
+            >
               {formatRelativeTime(firstSeenAt)}
-            </span>
+            </time>
           </div>
         </li>
       )}
@@ -109,11 +113,16 @@ export function PatternLifecycleTimeline({
               <span className={cn('text-sm', regression ? 'text-neon-glow font-medium' : 'text-neutral-300')}>
                 {labelFor(t.action)}
               </span>
-              <span className="font-mono text-xs text-pewter" title={new Date(t.timestamp).toISOString()}>
+              <time
+                className="font-mono text-xs text-pewter"
+                dateTime={new Date(t.timestamp).toISOString()}
+                title={new Date(t.timestamp).toISOString()}
+              >
                 {formatRelativeTime(t.timestamp)}
-              </span>
+              </time>
             </div>
             <p className="text-xs text-pewter font-mono mt-0.5">
+              <span className="sr-only">by </span>
               {actorLabel(t.actorClerkUserId)}
               {i === lastResolvedIndex && resolvedInVersion && (
                 <span className="text-cloud"> · in {resolvedInVersion}</span>

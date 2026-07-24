@@ -766,6 +766,90 @@ export default defineSchema({
     // with no extra scan — this is why the recurrence half of the evidence
     // is derivable rather than stored.
     resolvedAtOccurrenceCount: v.optional(v.number()),
+    // ---------------------------------------------------------------------
+    // FIX-CONFIDENCE SNAPSHOT (ADR-006 cycle 3, "make the honest answer
+    // cheap"). The LIVE fix-confidence verdict
+    // (convex/failure_patterns.ts's computePatternFixConfidence, backed by
+    // convex/insights.ts §12) needs a bounded-but-real post-resolution run
+    // exposure scan — up to RESOLUTION_RUN_SCAN_CAP rows across
+    // MAX_AFFECTED_AGENT_IDS agents, PER PATTERN. That is affordable once
+    // (a detail page) and impossible across a 50-pattern list page, which
+    // is exactly why `read_api.apiListFailurePatterns`'s `--state` filter
+    // could previously only answer the one exposure-INDEPENDENT value.
+    //
+    // These two fields are the periodically-refreshed SNAPSHOT of that
+    // verdict, so the list filter can be served from stored values instead
+    // of a six-figure row read. OBSERVABILITY-GRADE, exactly like
+    // lastSpikeAssessment above and every other field on this rollup: the
+    // LIVE computation remains the source of truth (and both evidence
+    // endpoints still compute it live), the event log remains the only fact
+    // about what happened, and discarding every snapshot here would only
+    // mean "the list filter goes quiet until the cron refills it", never
+    // that anything about what happened changed.
+    //
+    // AGREEMENT WITH THE LIVE COMPUTATION is a hard invariant, not a hope:
+    // the snapshot is produced by the SAME `computePatternFixConfidence`
+    // helper both evidence endpoints call, never by a parallel
+    // reimplementation, and it carries `basisResolvedAt` so a snapshot
+    // describing a SUPERSEDED resolution episode is detected and discarded
+    // by readers rather than served as current. See
+    // convex/failure_patterns.test.ts's live-vs-snapshot equality test.
+    //
+    // DELIBERATE SUBSET of `FixConfidenceResult`: the time-derived
+    // presentation fields (`elapsedMs`, `soakCredit`, `exposureCredit`) and
+    // the trivially-derivable flags (`hasResolution`, `exposureMeasured`)
+    // are NOT stored — they are exactly recomputable from what IS stored,
+    // and two of them are "as of now" quantities that would be definitionally
+    // wrong the moment the snapshot aged. What is stored is precisely the
+    // MEASUREMENT that cannot be recovered without redoing the expensive
+    // scan, so the snapshot stays auditable ("0.42 because 21 matched-version
+    // runs, no recurrence") rather than being a bare number to trust.
+    lastFixConfidence: v.optional(
+      v.object({
+        /** Server clock at the moment this snapshot was computed. The input to the staleness bound. */
+        computedAt: v.number(),
+        /**
+         * The `resolvedAt` this verdict was computed against. A reader MUST
+         * compare it to the rollup's current `resolvedAt` and discard the
+         * snapshot when they differ: a reopen+re-resolve starts a brand new
+         * evidence episode, and grading the new one with the old one's
+         * verdict is precisely the list-says-confirmed/detail-says-regressed
+         * disagreement this design exists to make impossible.
+         */
+        basisResolvedAt: v.number(),
+        state: v.union(
+          v.literal("unproven"),
+          v.literal("proving"),
+          v.literal("confirmed"),
+          v.literal("regressed"),
+        ),
+        score: v.number(),
+        /** Runs credited as exposure (zeroed on version mismatch), as measured at `computedAt`. */
+        exposureRuns: v.number(),
+        /** Runs measured BEFORE version attribution was applied. */
+        observedRuns: v.number(),
+        /** True when the exposure scan hit RESOLUTION_RUN_SCAN_CAP — the counts above are floors. */
+        exposureTruncated: v.boolean(),
+        versionAttribution: v.union(v.literal("matched"), v.literal("mismatched"), v.literal("unknown")),
+        recurred: v.boolean(),
+        limitingFactor: v.union(
+          v.literal("recurrence"),
+          v.literal("no-resolution"),
+          v.literal("version-mismatch"),
+          v.literal("no-exposure"),
+          v.literal("accumulating"),
+          v.literal("none"),
+        ),
+      }),
+    ),
+    // SCHEDULING STATE for the snapshot cron: the epoch ms at or after which
+    // this pattern's snapshot should be recomputed. Present ONLY on patterns
+    // that currently have something to grade (a live `resolvedAt`); ABSENT on
+    // every never-resolved pattern and cleared by `reopenPattern`. That
+    // absence is the whole point — the cron's index range is lower-bounded at
+    // 0, so a pattern whose confidence cannot change is not merely skipped,
+    // it is never READ, on any tick, forever.
+    fixConfidenceRefreshAt: v.optional(v.number()),
   })
     // One row per (orgId, fingerprintHash): recordFailurePatternOccurrence
     // always resolves the existing rollup (if any) via this index before
@@ -774,7 +858,25 @@ export default defineSchema({
     .index("by_org_fingerprint", ["orgId", "fingerprintHash"])
     // listFailurePatterns' ranked-by-recency read, and the spike-rollup
     // cron's "active patterns" scan.
-    .index("by_org_lastSeenAt", ["orgId", "lastSeenAt"]),
+    .index("by_org_lastSeenAt", ["orgId", "lastSeenAt"])
+    // ADR-006 cycle 3 — the fix-confidence snapshot cron's ONLY access
+    // pattern, and the reason it is bounded rather than a sweep:
+    // `snapshotFixConfidenceCron` reads
+    // `gte("fixConfidenceRefreshAt", 0).lte("fixConfidenceRefreshAt", now)`
+    // ascending and takes at most
+    // FIX_CONFIDENCE_SNAPSHOT_MAX_PATTERNS_PER_RUN rows. Two properties fall
+    // out of that range, and both are load-bearing:
+    //   - The `gte(0)` lower bound EXCLUDES documents where the field is
+    //     absent (Convex sorts a missing field before every number), so
+    //     never-resolved patterns — the overwhelming majority — are never
+    //     read by this cron at all.
+    //   - Ascending order is oldest-due-first, which makes the cron
+    //     naturally resumable and starvation-free without a cursor: whatever
+    //     a bounded tick could not reach stays the oldest-due work and is
+    //     the first thing the next tick sees.
+    // NOT a speculative index: it has exactly one query, written in the same
+    // commit, and no other read pattern in this codebase can use it.
+    .index("by_fix_confidence_refresh", ["fixConfidenceRefreshAt"]),
 
   // Cycle 2 (docs/adr/005-failure-patterns.md addendum): ACCURATE per-day
   // occurrence counters, replacing the cycle-1 trend (which bucketed a

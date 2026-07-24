@@ -32,6 +32,7 @@ export function MutedBadge({ mutedAt, className }: MutedBadgeProps) {
       }
     >
       MUTED
+      <span className="sr-only"> — alerts are muted for this pattern</span>
     </span>
   )
 }

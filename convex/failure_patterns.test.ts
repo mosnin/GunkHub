@@ -18,6 +18,8 @@ import {
   buildTrendFromOccurrences,
   extractFingerprintSignals,
   fingerprintExplanation,
+  computePatternFixConfidence,
+  FIX_CONFIDENCE_SNAPSHOT_MAX_PATTERNS_PER_RUN,
 } from './failure_patterns'
 // Team B's engine — imported directly so the wiring test pins this file's
 // mapping against the real scorer, not a reimplementation of it.
@@ -1653,5 +1655,300 @@ describe('getPatternResolutionEvidence — fix confidence', () => {
         orgId: orgA, fingerprintHash: 'server-clock', nowMs: Date.now() + 365 * 24 * 60 * 60 * 1000,
       } as any),
     ).rejects.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ADR-006 cycle 3 — fix-confidence SNAPSHOTS. The snapshot exists so
+// `read_api.apiListFailurePatterns` can filter on a verdict without paying for
+// a per-pattern exposure scan. Its entire value depends on one property: it
+// must never disagree with the live computation in a way a user can see. A
+// list saying `confirmed` next to a detail page saying `regressed` is strictly
+// worse than the honest rejection cycle 2 shipped.
+// ---------------------------------------------------------------------------
+
+describe('fix confidence snapshots (ADR-006 cycle 3)', () => {
+  /** Resolve a pattern that has REAL post-resolution exposure on `agentA`. */
+  async function seedResolvedWithExposure(
+    t: ReturnType<typeof convexTest>,
+    orgA: any, projectA: any, agentA: any, hash: string,
+    opts: { exposureRuns?: number; versionId?: any } = {},
+  ) {
+    const occurredAt = 1_000_000
+    const seedRunId = await seedRun(t, orgA, projectA, agentA, opts.versionId)
+    await t.run((ctx) => ctx.db.patch(seedRunId, { startedAt: occurredAt }))
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: seedRunId, agentId: agentA, agentVersionId: opts.versionId,
+      fingerprintHash: hash, class: 'tool_error', label: 'L', salientKey: 'a', occurredAt,
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, {
+      orgId: orgA, fingerprintHash: hash, ...(opts.versionId ? { versionId: opts.versionId } : {}),
+    })
+
+    // Exposure runs, started strictly AFTER the resolution.
+    const after = resolved!.resolvedAt! + 1000
+    for (let i = 0; i < (opts.exposureRuns ?? 0); i++) {
+      const runId = await seedRun(t, orgA, projectA, agentA, opts.versionId)
+      await t.run((ctx) => ctx.db.patch(runId, { startedAt: after + i }))
+    }
+    return resolved!
+  }
+
+  const readPattern = (t: ReturnType<typeof convexTest>, orgA: any, hash: string) =>
+    t.run((ctx) =>
+      ctx.db.query('failure_patterns')
+        .withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', hash))
+        .first(),
+    )
+
+  // =========================================================================
+  // THE LOAD-BEARING TEST. Computes confidence LIVE and asserts it equals the
+  // stored snapshot for the same fixture, field by field.
+  // =========================================================================
+  it('the stored snapshot EQUALS a live computation over the same fixture', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+    await seedResolvedWithExposure(t, orgA, projectA, agentA, 'agree', { exposureRuns: 40, versionId: versionA })
+
+    // Force the pattern due and run the cron at a pinned instant.
+    const now = Date.now() + 5 * 60 * 60 * 1000
+    await t.run(async (ctx) => {
+      const p = await ctx.db.query('failure_patterns')
+        .withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'agree')).first()
+      await ctx.db.patch(p!._id, { fixConfidenceRefreshAt: 0 })
+    })
+    const cronResult = await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, { now })
+    expect(cronResult.snapshotted).toBe(1)
+
+    const pattern = await readPattern(t, orgA, 'agree')
+    const stored = pattern!.lastFixConfidence!
+
+    // 1. EXACT equality against the canonical computation at the SAME instant.
+    const live = await t.run((ctx) => computePatternFixConfidence(ctx, pattern as any, now))
+    expect(live).not.toBeNull()
+    expect(stored.state).toBe(live!.confidence.state)
+    expect(stored.score).toBe(live!.confidence.score)
+    expect(stored.exposureRuns).toBe(live!.confidence.exposureRuns)
+    expect(stored.observedRuns).toBe(live!.confidence.observedRuns)
+    expect(stored.versionAttribution).toBe(live!.confidence.versionAttribution)
+    expect(stored.recurred).toBe(live!.confidence.recurred)
+    expect(stored.limitingFactor).toBe(live!.confidence.limitingFactor)
+    expect(stored.exposureTruncated).toBe(live!.exposure.truncated)
+    expect(stored.basisResolvedAt).toBe(pattern!.resolvedAt)
+    expect(stored.computedAt).toBe(now)
+
+    // 2. And the snapshot is not a fixture artifact: real exposure was measured.
+    expect(stored.exposureRuns).toBe(40)
+    expect(stored.state).toBe('proving')
+  })
+
+  it('the snapshot agrees with what the DETAIL endpoint reports (list and detail cannot disagree)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedResolvedWithExposure(t, orgA, projectA, agentA, 'both-doors', { exposureRuns: 12 })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, {
+      orgId: orgA, fingerprintHash: 'both-doors',
+    })
+    const pattern = await readPattern(t, orgA, 'both-doors')
+
+    // The eager snapshot from resolvePattern is the "0 exposure yet" verdict;
+    // refresh it at the same instant the detail query is reading at.
+    await t.run(async (ctx) => ctx.db.patch(pattern!._id, { fixConfidenceRefreshAt: 0 }))
+    await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, {})
+    const refreshed = await readPattern(t, orgA, 'both-doors')
+
+    expect(refreshed!.lastFixConfidence!.state).toBe(evidence!.confidence!.state)
+    expect(refreshed!.lastFixConfidence!.exposureRuns).toBe(evidence!.confidence!.exposureRuns)
+    expect(refreshed!.lastFixConfidence!.score).toBeCloseTo(evidence!.confidence!.score, 3)
+  })
+
+  // ------------------------------------------------------------------
+  // Eager recompute on the transitions that can change a verdict.
+  // ------------------------------------------------------------------
+
+  it('resolvePattern writes the snapshot eagerly, keyed to that exact resolvedAt', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const resolved = await seedResolvedWithExposure(t, orgA, projectA, agentA, 'eager-resolve')
+
+    const pattern = await readPattern(t, orgA, 'eager-resolve')
+    const snap = pattern!.lastFixConfidence
+    expect(snap).toBeDefined()
+    expect(snap!.basisResolvedAt).toBe(resolved.resolvedAt)
+    // Nothing has run since the fix, so it is untested — never "confirmed".
+    expect(snap!.state).toBe('unproven')
+    expect(snap!.exposureRuns).toBe(0)
+    // Enrolled in the cron's index.
+    expect(typeof pattern!.fixConfidenceRefreshAt).toBe('number')
+  })
+
+  it('the regression guard recomputes EAGERLY — a regression is never stale between cron ticks', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const resolved = await seedResolvedWithExposure(t, orgA, projectA, agentA, 'eager-regress', { exposureRuns: 5 })
+    expect((await readPattern(t, orgA, 'eager-regress'))!.lastFixConfidence!.state).not.toBe('regressed')
+
+    // A new occurrence dated after the resolution: the fix did not hold.
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'eager-regress',
+      class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: resolved.resolvedAt! + 5000,
+    })
+
+    // No cron run in between — the verdict must already be correct.
+    const pattern = await readPattern(t, orgA, 'eager-regress')
+    expect(pattern!.lastFixConfidence!.state).toBe('regressed')
+    expect(pattern!.lastFixConfidence!.score).toBe(0)
+    expect(pattern!.lastFixConfidence!.recurred).toBe(true)
+    expect(pattern!.lastFixConfidence!.basisResolvedAt).toBe(pattern!.resolvedAt)
+  })
+
+  it('reopenPattern CLEARS the snapshot and unenrols the pattern from the cron', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedResolvedWithExposure(t, orgA, projectA, agentA, 'reopen-clears')
+    expect((await readPattern(t, orgA, 'reopen-clears'))!.lastFixConfidence).toBeDefined()
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    await asMember.mutation(api.failure_patterns.reopenPattern, { orgId: orgA, fingerprintHash: 'reopen-clears' })
+
+    const pattern = await readPattern(t, orgA, 'reopen-clears')
+    expect(pattern!.lastFixConfidence).toBeUndefined()
+    expect(pattern!.fixConfidenceRefreshAt).toBeUndefined()
+    // And it is no longer visible to the cron at all.
+    const due = await t.query(internal.failure_patterns._listDueFixConfidencePatterns, { now: Date.now() + 1e9 })
+    expect(due).toHaveLength(0)
+  })
+
+  // ------------------------------------------------------------------
+  // Cron bounds, idempotency, resumability, scoping.
+  // ------------------------------------------------------------------
+
+  it('never reads a pattern whose confidence cannot change (never resolved)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    for (let i = 0; i < 5; i++) {
+      const runId = await seedRun(t, orgA, projectA, agentA)
+      await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+        orgId: orgA, runId, agentId: agentA, fingerprintHash: `never-resolved-${String(i)}`,
+        class: 'tool_error', label: 'L', salientKey: 'a',
+      })
+    }
+
+    // Far-future `now`: everything that COULD be due, is. Still nothing.
+    const due = await t.query(internal.failure_patterns._listDueFixConfidencePatterns, { now: Date.now() + 1e9 })
+    expect(due).toHaveLength(0)
+    const result = await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, { now: Date.now() + 1e9 })
+    expect(result).toEqual({ due: 0, snapshotted: 0, cleared: 0, deferred: 0, runRowsScanned: 0 })
+  })
+
+  it('is idempotent: a second immediate tick is a no-op, and re-running at the same instant rewrites identical values', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedResolvedWithExposure(t, orgA, projectA, agentA, 'idem', { exposureRuns: 3 })
+    await t.run(async (ctx) => {
+      const p = await ctx.db.query('failure_patterns')
+        .withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'idem')).first()
+      await ctx.db.patch(p!._id, { fixConfidenceRefreshAt: 0 })
+    })
+
+    const now = Date.now()
+    const first = await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, { now })
+    expect(first.snapshotted).toBe(1)
+    const afterFirst = (await readPattern(t, orgA, 'idem'))!.lastFixConfidence
+
+    // Second tick at the same instant: the pattern has left the due range.
+    const second = await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, { now })
+    expect(second.due).toBe(0)
+
+    // Forcing it due again and recomputing at the same instant is byte-identical.
+    await t.run(async (ctx) => {
+      const p = await ctx.db.query('failure_patterns')
+        .withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'idem')).first()
+      await ctx.db.patch(p!._id, { fixConfidenceRefreshAt: 0 })
+    })
+    await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, { now })
+    expect((await readPattern(t, orgA, 'idem'))!.lastFixConfidence).toEqual(afterFirst)
+  })
+
+  it('is bounded per tick and resumable: overflow work stays due and leads the next tick', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const total = FIX_CONFIDENCE_SNAPSHOT_MAX_PATTERNS_PER_RUN + 7
+    for (let i = 0; i < total; i++) {
+      await seedResolvedWithExposure(t, orgA, projectA, agentA, `bulk-${String(i)}`)
+    }
+    // All due.
+    await t.run(async (ctx) => {
+      for (const p of await ctx.db.query('failure_patterns').collect()) {
+        await ctx.db.patch(p._id, { fixConfidenceRefreshAt: 0 })
+      }
+    })
+
+    const now = Date.now()
+    const first = await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, { now })
+    expect(first.due).toBe(FIX_CONFIDENCE_SNAPSHOT_MAX_PATTERNS_PER_RUN)
+    expect(first.snapshotted).toBe(FIX_CONFIDENCE_SNAPSHOT_MAX_PATTERNS_PER_RUN)
+
+    // The remainder is still due and is picked up next tick — no starvation,
+    // no cursor, no checkpoint table.
+    const second = await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, { now })
+    expect(second.due).toBe(7)
+    expect(second.snapshotted).toBe(7)
+
+    const third = await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, { now })
+    expect(third.due).toBe(0)
+  })
+
+  it('org-scopes exposure: one org\'s runs never count toward another org\'s snapshot', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, orgB, projectB, agentB } = await seedTwoOrgs(t)
+    await seedResolvedWithExposure(t, orgA, projectA, agentA, 'scoped', { exposureRuns: 4 })
+
+    // Org B gets a pile of runs for its OWN agent, after org A's resolution.
+    const resolvedAt = (await readPattern(t, orgA, 'scoped'))!.resolvedAt!
+    for (let i = 0; i < 30; i++) {
+      const runId = await seedRun(t, orgB, projectB, agentB)
+      await t.run((ctx) => ctx.db.patch(runId, { startedAt: resolvedAt + 1000 + i }))
+    }
+
+    await t.run(async (ctx) => {
+      const p = await ctx.db.query('failure_patterns')
+        .withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'scoped')).first()
+      await ctx.db.patch(p!._id, { fixConfidenceRefreshAt: 0 })
+    })
+    await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, {})
+
+    // Exactly org A's 4 runs — org B's 30 are invisible.
+    expect((await readPattern(t, orgA, 'scoped'))!.lastFixConfidence!.exposureRuns).toBe(4)
+  })
+
+  it('self-heals a rollup resolved before this cycle: a new occurrence enrols it', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedResolvedWithExposure(t, orgA, projectA, agentA, 'legacy')
+    // Simulate a pre-cycle-3 row: resolved, but never snapshotted or enrolled.
+    await t.run(async (ctx) => {
+      const p = await ctx.db.query('failure_patterns')
+        .withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'legacy')).first()
+      await ctx.db.patch(p!._id, { lastFixConfidence: undefined, fixConfidenceRefreshAt: undefined })
+    })
+    expect(await t.query(internal.failure_patterns._listDueFixConfidencePatterns, { now: Date.now() + 1e9 })).toHaveLength(0)
+
+    // An occurrence lands (dated BEFORE the resolution, so not a regression).
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'legacy',
+      class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 1_000_001,
+    })
+
+    expect((await readPattern(t, orgA, 'legacy'))!.fixConfidenceRefreshAt).toBe(0)
+    const result = await t.mutation(internal.failure_patterns.snapshotFixConfidenceCron, {})
+    expect(result.snapshotted).toBe(1)
+    expect((await readPattern(t, orgA, 'legacy'))!.lastFixConfidence).toBeDefined()
   })
 })

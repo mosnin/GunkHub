@@ -145,6 +145,9 @@ describe('read_api.apiListFailurePatterns', () => {
       muted?: boolean;
       status?: 'open' | 'acknowledged' | 'resolved';
       regressedAt?: number;
+      resolvedAt?: number;
+      resolvedAtOccurrenceCount?: number;
+      lastFixConfidence?: any;
     } = {},
   ) {
     return await t.run(async (ctx) => {
@@ -164,8 +167,34 @@ describe('read_api.apiListFailurePatterns', () => {
         ...(opts.muted !== undefined && { muted: opts.muted }),
         ...(opts.status !== undefined && { status: opts.status }),
         ...(opts.regressedAt !== undefined && { regressedAt: opts.regressedAt }),
+        ...(opts.resolvedAt !== undefined && { resolvedAt: opts.resolvedAt }),
+        ...(opts.resolvedAtOccurrenceCount !== undefined && {
+          resolvedAtOccurrenceCount: opts.resolvedAtOccurrenceCount,
+        }),
+        ...(opts.lastFixConfidence !== undefined && { lastFixConfidence: opts.lastFixConfidence }),
       });
     });
+  }
+
+  /** A usable fix-confidence snapshot for a pattern resolved at `resolvedAt`. */
+  function snapshot(
+    state: 'unproven' | 'proving' | 'confirmed' | 'regressed',
+    resolvedAt: number,
+    computedAt: number,
+    score = 0.5,
+  ) {
+    return {
+      computedAt,
+      basisResolvedAt: resolvedAt,
+      state,
+      score,
+      exposureRuns: 20,
+      observedRuns: 20,
+      exposureTruncated: false,
+      versionAttribution: 'unknown' as const,
+      recurred: state === 'regressed',
+      limitingFactor: state === 'confirmed' ? ('none' as const) : ('accumulating' as const),
+    };
   }
 
   it('a read-scoped key gets its own org\'s patterns, most-recently-seen first', async () => {
@@ -415,5 +444,167 @@ describe('read_api.apiListFailurePatterns', () => {
     });
     expect(result.patterns).toHaveLength(1);
     expect(result.patterns[0].fingerprintHash).toBe('fp_agent_a_resolved');
+  });
+
+  // -------------------------------------------------------------------------
+  // ADR-006 cycle 3 — the `--state` filter, served off the stored
+  // `lastFixConfidence` snapshot. Cycle 2 could only answer "regressed";
+  // all four are answerable now.
+  // -------------------------------------------------------------------------
+
+  async function seedReadKey(t: ReturnType<typeof convexTest>, orgId: any) {
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+  }
+
+  it('--state confirmed is answered off the snapshot (no longer a 422)', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await seedReadKey(t, orgA);
+    const now = Date.now();
+    await seedPattern(t, orgA, 'fp_confirmed', {
+      status: 'resolved', resolvedAt: now - 1000, lastFixConfidence: snapshot('confirmed', now - 1000, now, 0.82),
+    });
+    await seedPattern(t, orgA, 'fp_proving', {
+      status: 'resolved', resolvedAt: now - 1000, lastFixConfidence: snapshot('proving', now - 1000, now, 0.31),
+    });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', state: 'confirmed' });
+    expect(result.patterns).toHaveLength(1);
+    expect(result.patterns[0].fingerprintHash).toBe('fp_confirmed');
+    expect(result.fixConfidence.entries[0].state).toBe('confirmed');
+    expect(result.fixConfidence.entries[0].basis).toBe('snapshot');
+    expect(result.fixConfidence.entries[0].stale).toBe(false);
+  });
+
+  it('--state unproven and --state proving each select only their own snapshot state', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await seedReadKey(t, orgA);
+    const now = Date.now();
+    const r = now - 1000;
+    await seedPattern(t, orgA, 'fp_unproven', { status: 'resolved', resolvedAt: r, lastFixConfidence: snapshot('unproven', r, now, 0) });
+    await seedPattern(t, orgA, 'fp_proving', { status: 'resolved', resolvedAt: r, lastFixConfidence: snapshot('proving', r, now, 0.3) });
+    await seedPattern(t, orgA, 'fp_confirmed', { status: 'resolved', resolvedAt: r, lastFixConfidence: snapshot('confirmed', r, now, 0.9) });
+
+    const unproven = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', state: 'unproven' });
+    expect(unproven.patterns.map((p: any) => p.fingerprintHash)).toEqual(['fp_unproven']);
+
+    const proving = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', state: 'proving' });
+    expect(proving.patterns.map((p: any) => p.fingerprintHash)).toEqual(['fp_proving']);
+  });
+
+  it('a never-resolved pattern matches no --state value and is not reported as unevaluated', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await seedReadKey(t, orgA);
+    await seedPattern(t, orgA, 'fp_never_resolved');
+
+    for (const state of ['unproven', 'proving', 'confirmed', 'regressed'] as const) {
+      const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', state });
+      expect(result.patterns).toHaveLength(0);
+      expect(result.fixConfidence.unevaluated).toEqual([]);
+    }
+  });
+
+  it('a resolved pattern with NO snapshot is reported in unevaluated, never silently treated as "not matching"', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await seedReadKey(t, orgA);
+    const now = Date.now();
+    await seedPattern(t, orgA, 'fp_legacy_resolved', { status: 'resolved', resolvedAt: now - 5000 });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', state: 'confirmed' });
+    expect(result.patterns).toHaveLength(0);
+    expect(result.fixConfidence.unevaluated).toEqual(['fp_legacy_resolved']);
+  });
+
+  it('a snapshot describing a SUPERSEDED resolution episode is discarded, not served', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await seedReadKey(t, orgA);
+    const now = Date.now();
+    // Snapshot says "confirmed", but it was computed against an EARLIER
+    // resolvedAt — the pattern has since been reopened and re-resolved. The
+    // old verdict is about a different question and must not answer this one.
+    await seedPattern(t, orgA, 'fp_re_resolved', {
+      status: 'resolved',
+      resolvedAt: now - 1000,
+      lastFixConfidence: snapshot('confirmed', now - 999_999, now, 0.9),
+    });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', state: 'confirmed' });
+    expect(result.patterns).toHaveLength(0);
+    expect(result.fixConfidence.unevaluated).toEqual(['fp_re_resolved']);
+  });
+
+  it('a snapshot older than the staleness bound is still SERVED but flagged stale', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await seedReadKey(t, orgA);
+    const now = Date.now();
+    const r = now - 100_000;
+    const staleComputedAt = now - (7 * 60 * 60 * 1000); // 7h > the 6h bound
+
+    await seedPattern(t, orgA, 'fp_stale_confirmed', {
+      status: 'resolved', resolvedAt: r, lastFixConfidence: snapshot('confirmed', r, staleComputedAt, 0.8),
+    });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', state: 'confirmed' });
+    // Served, not dropped — dropping would be a silent lie by omission.
+    expect(result.patterns).toHaveLength(1);
+    const entry = result.fixConfidence.entries[0];
+    expect(entry.stale).toBe(true);
+    expect(entry.ageMs).toBeGreaterThan(result.fixConfidence.stalenessBoundMs);
+    expect(result.fixConfidence.staleCount).toBe(1);
+  });
+
+  it('--state regressed keeps its exact, snapshot-free path (works with no snapshot at all)', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await seedReadKey(t, orgA);
+    const now = Date.now();
+    // Regressed strictly after the live resolution, and never snapshotted.
+    await seedPattern(t, orgA, 'fp_regressed_no_snapshot', {
+      status: 'open', resolvedAt: now - 10_000, regressedAt: now - 5000,
+    });
+    // regressedAt PREDATES the current resolution — re-fixed, so not regressed.
+    await seedPattern(t, orgA, 'fp_refixed', {
+      status: 'resolved', resolvedAt: now - 1000, regressedAt: now - 50_000,
+    });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', state: 'regressed' });
+    expect(result.patterns.map((p: any) => p.fingerprintHash)).toEqual(['fp_regressed_no_snapshot']);
+  });
+
+  it('omitting --state still returns every pattern, with a confidence entry for each', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await seedReadKey(t, orgA);
+    const now = Date.now();
+    await seedPattern(t, orgA, 'fp_a', { status: 'resolved', resolvedAt: now - 1, lastFixConfidence: snapshot('proving', now - 1, now) });
+    await seedPattern(t, orgA, 'fp_b');
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key' });
+    expect(result.patterns).toHaveLength(2);
+    expect(result.fixConfidence.entries).toHaveLength(2);
+    const byHash = Object.fromEntries(result.fixConfidence.entries.map((e: any) => [e.fingerprintHash, e]));
+    expect(byHash['fp_a'].basis).toBe('snapshot');
+    expect(byHash['fp_b'].basis).toBe('none');
+    expect(byHash['fp_b'].state).toBeNull();
+  });
+
+  it('the --state filter never crosses org boundaries', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA, orgB } = await seedTwoOrgs(t);
+    await seedReadKey(t, orgA);
+    const now = Date.now();
+    await seedPattern(t, orgB, 'fp_org_b_confirmed', {
+      status: 'resolved', resolvedAt: now - 1, lastFixConfidence: snapshot('confirmed', now - 1, now, 0.9),
+    });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', state: 'confirmed' });
+    expect(result.patterns).toHaveLength(0);
   });
 })

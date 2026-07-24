@@ -185,7 +185,7 @@ export function PatternDetail({
           14-day trend
         </h2>
         {trend.length === 0 ? (
-          <p className="text-sm text-neutral-500">No daily trend data available for this pattern yet.</p>
+          <p className="text-sm text-pewter">No daily trend data available for this pattern yet.</p>
         ) : (
           <div className="flex flex-col gap-3">
             <PatternTrendSparkline trend={trend} size="large" />
@@ -347,7 +347,7 @@ export function PatternDetail({
             </Link>
           </div>
           {topRunExplanation.state.status === 'unavailable' ? (
-            <p className="text-sm text-neutral-500">
+            <p className="text-sm text-pewter">
               No failure analysis is available yet for this pattern&apos;s most recent representative run.
             </p>
           ) : (
@@ -362,9 +362,9 @@ export function PatternDetail({
           Representative runs
         </h2>
         {!pattern.hasRepresentativeRuns ? (
-          <p className="text-sm text-neutral-500">Representative runs are not available for this pattern yet.</p>
+          <p className="text-sm text-pewter">Representative runs are not available for this pattern yet.</p>
         ) : pattern.representativeRunIds.length === 0 ? (
-          <p className="text-sm text-neutral-500">No representative runs recorded.</p>
+          <p className="text-sm text-pewter">No representative runs recorded.</p>
         ) : (
           <ul className="flex flex-col gap-1.5">
             {pattern.representativeRunIds.map((runId) => (
@@ -407,7 +407,7 @@ export function PatternDetail({
           Affected agent versions
         </h2>
         {!pattern.hasAffectedVersions ? (
-          <p className="text-sm text-neutral-500">Affected version data is not available for this pattern yet.</p>
+          <p className="text-sm text-pewter">Affected version data is not available for this pattern yet.</p>
         ) : pattern.affectedAgentVersionIds.length === 0 ? (
           <EmptyState
             title="No affected versions recorded"
