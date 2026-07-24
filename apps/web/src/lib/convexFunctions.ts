@@ -194,5 +194,17 @@ export const convex = {
     getFailurePattern: makeFunctionReference<Q>('failure_patterns:getFailurePattern'),
     mutePattern: makeFunctionReference<M>('failure_patterns:mutePattern'),
     unmutePattern: makeFunctionReference<M>('failure_patterns:unmutePattern'),
+    // Resolution lifecycle (docs/adr/006-failure-resolution.md, cycle 1):
+    // MEMBER-gated (not admin — this is normal triage, like commenting),
+    // audited mutations. Confirmed contract from Team A's landed
+    // convex/failure_patterns.ts:
+    //   acknowledgePattern({ orgId, fingerprintHash }) => Doc | null
+    //   resolvePattern({ orgId, fingerprintHash, note?, ref? }) => Doc | null
+    //   reopenPattern({ orgId, fingerprintHash }) => Doc | null
+    // All three collapse "never existed" / "different org" into the same
+    // `null`, exactly like mutePattern/unmutePattern above.
+    acknowledgePattern: makeFunctionReference<M>('failure_patterns:acknowledgePattern'),
+    resolvePattern: makeFunctionReference<M>('failure_patterns:resolvePattern'),
+    reopenPattern: makeFunctionReference<M>('failure_patterns:reopenPattern'),
   },
 } as const

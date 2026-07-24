@@ -28,9 +28,14 @@ import {
 } from '../../apps/web/src/lib/services/alertRules.js'
 
 describe('alert-rule kind validation — pattern_spike', () => {
-  it('ALERT_RULE_KINDS includes the pre-existing kinds plus pattern_spike', () => {
+  it('ALERT_RULE_KINDS includes the pre-existing kinds plus pattern_spike and pattern_regressed', () => {
+    // ADR-006 (docs/adr/006-failure-resolution.md) adds pattern_regressed
+    // alongside pattern_spike — same additive-kind convention, own rule kind,
+    // never a reuse of pattern_spike. See alerts_pattern_regressed.test.ts for
+    // the dedicated pattern_regressed coverage (isValidAlertRuleKind,
+    // mapAlertRule round-trip, mapAlertEvent metadata passthrough).
     expect([...ALERT_RULE_KINDS].sort()).toEqual(
-      ['eval_failed', 'failure_rate', 'pattern_spike', 'run_failed'].sort(),
+      ['eval_failed', 'failure_rate', 'pattern_regressed', 'pattern_spike', 'run_failed'].sort(),
     )
   })
 

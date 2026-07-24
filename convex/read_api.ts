@@ -308,12 +308,29 @@ function isPatternMuted(pattern: Doc<"failure_patterns">): boolean {
   return pattern.muted === true;
 }
 
+// `status`/`regressed` (Resolution cycle 1 — docs/adr/006-failure-resolution.md,
+// Team A's lifecycle fields on `failure_patterns`): same overfetch-then-filter,
+// in-memory approach as `spiking`/`muted` above — no secondary index on
+// `status`/`regressedAt`, both are read-side-only narrowings over the already
+// org-scoped page. `status`, when supplied, matches exactly against the
+// pattern's `status` field, treating an absent field as `"open"` (the
+// documented default for every pre-lifecycle row). `regressed: true` narrows
+// to patterns that currently have `regressedAt` set. Neither param sets
+// lifecycle state — that only changes via the member-gated, audited
+// acknowledge/resolve/reopen mutations (not owned by this file), exactly
+// like `muted` is never set here.
+function patternStatus(pattern: Doc<"failure_patterns">): string {
+  return pattern.status ?? "open";
+}
+
 export const apiListFailurePatterns = mutation({
   args: {
     apiKeyHash: v.string(),
     agentId: v.optional(v.string()),
     spiking: v.optional(v.boolean()),
     muted: v.optional(v.boolean()),
+    status: v.optional(v.union(v.literal("open"), v.literal("acknowledged"), v.literal("resolved"))),
+    regressed: v.optional(v.boolean()),
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
   },
@@ -362,6 +379,14 @@ export const apiListFailurePatterns = mutation({
 
     if (args.muted !== undefined) {
       patterns = patterns.filter((pattern) => isPatternMuted(pattern) === args.muted);
+    }
+
+    if (args.status !== undefined) {
+      patterns = patterns.filter((pattern) => patternStatus(pattern) === args.status);
+    }
+
+    if (args.regressed === true) {
+      patterns = patterns.filter((pattern) => pattern.regressedAt !== undefined);
     }
 
     return {

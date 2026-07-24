@@ -834,3 +834,269 @@ describe('mutePattern / unmutePattern', () => {
     expect(events.length).toBe(1)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Resolution lifecycle (docs/adr/006-failure-resolution.md) — acknowledge /
+// resolve / reopen, and the regression guard inside
+// recordFailurePatternOccurrence.
+// ---------------------------------------------------------------------------
+
+describe('acknowledgePattern / resolvePattern / reopenPattern', () => {
+  it('member can acknowledge, which sets status + acknowledgedAt/By and records an audit event; viewer cannot', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'ack-me', class: 'tool_error', label: 'L', salientKey: 'a',
+    })
+    await t.run(async (ctx) => {
+      await ctx.db.insert('user_memberships', { clerkUserId: 'viewer_a', orgId: orgA, role: 'viewer', joinedAt: Date.now() })
+    })
+
+    const asViewer = t.withIdentity(identity('viewer', 'a'))
+    await expect(asViewer.mutation(api.failure_patterns.acknowledgePattern, { orgId: orgA, fingerprintHash: 'ack-me' })).rejects.toThrow()
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const acked = await asMember.mutation(api.failure_patterns.acknowledgePattern, { orgId: orgA, fingerprintHash: 'ack-me' })
+    expect(acked!.status).toBe('acknowledged')
+    expect(typeof acked!.acknowledgedAt).toBe('number')
+    expect(acked!.acknowledgedByUserId).toBe('member_a')
+
+    const auditRows = await t.run((ctx) => ctx.db.query('audit_log').withIndex('by_org', (q) => q.eq('orgId', orgA)).collect())
+    expect(auditRows.some((r) => r.action === 'failure_pattern.acknowledged' && r.targetId === 'ack-me')).toBe(true)
+  })
+
+  it('member can resolve with a note/ref, which sets status/resolvedAt/By/resolutionNote/resolutionRef and records an audit event', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'resolve-me', class: 'tool_error', label: 'L', salientKey: 'a',
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, {
+      orgId: orgA, fingerprintHash: 'resolve-me', note: 'fixed in v2', ref: 'https://example.com/pr/1',
+    })
+    expect(resolved!.status).toBe('resolved')
+    expect(typeof resolved!.resolvedAt).toBe('number')
+    expect(resolved!.resolvedByUserId).toBe('member_a')
+    expect(resolved!.resolutionNote).toBe('fixed in v2')
+    expect(resolved!.resolutionRef).toBe('https://example.com/pr/1')
+
+    const auditRows = await t.run((ctx) => ctx.db.query('audit_log').withIndex('by_org', (q) => q.eq('orgId', orgA)).collect())
+    expect(auditRows.some((r) => r.action === 'failure_pattern.resolved' && r.targetId === 'resolve-me')).toBe(true)
+  })
+
+  it('resolvePattern rejects a note/ref exceeding the bounded length', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'too-long', class: 'tool_error', label: 'L', salientKey: 'a',
+    })
+    const asMember = t.withIdentity(identity('member', 'a'))
+    await expect(
+      asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'too-long', note: 'x'.repeat(3000) }),
+    ).rejects.toThrow()
+    await expect(
+      asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'too-long', ref: 'y'.repeat(3000) }),
+    ).rejects.toThrow()
+  })
+
+  it('reopenPattern resets status to "open" and clears resolvedAt/regressedAt, keeping resolutionNote/Ref/resolvedByUserId as history', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'reopen-me', class: 'tool_error', label: 'L', salientKey: 'a',
+    })
+    const asMember = t.withIdentity(identity('member', 'a'))
+    await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'reopen-me', note: 'thought it was fixed' })
+
+    const reopened = await asMember.mutation(api.failure_patterns.reopenPattern, { orgId: orgA, fingerprintHash: 'reopen-me' })
+    expect(reopened!.status).toBe('open')
+    expect(reopened!.resolvedAt).toBeUndefined()
+    expect(reopened!.regressedAt).toBeUndefined()
+    // History kept, not erased:
+    expect(reopened!.resolutionNote).toBe('thought it was fixed')
+    expect(reopened!.resolvedByUserId).toBe('member_a')
+
+    const auditRows = await t.run((ctx) => ctx.db.query('audit_log').withIndex('by_org', (q) => q.eq('orgId', orgA)).collect())
+    expect(auditRows.some((r) => r.action === 'failure_pattern.reopened' && r.targetId === 'reopen-me')).toBe(true)
+  })
+
+  it('returns null (not a thrown error) for an unknown fingerprint, and for a fingerprint in a different org', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectB, agentB } = await seedTwoOrgs(t)
+    const runB = await seedRun(t, orgB, projectB, agentB)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgB, runId: runB, agentId: agentB, fingerprintHash: 'org-b-only', class: 'tool_error', label: 'L', salientKey: 'a',
+    })
+
+    const asMemberA = t.withIdentity(identity('member', 'a'))
+    expect(await asMemberA.mutation(api.failure_patterns.acknowledgePattern, { orgId: orgA, fingerprintHash: 'does-not-exist' })).toBeNull()
+    expect(await asMemberA.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'does-not-exist' })).toBeNull()
+    expect(await asMemberA.mutation(api.failure_patterns.reopenPattern, { orgId: orgA, fingerprintHash: 'does-not-exist' })).toBeNull()
+    // Cross-org: org A member cannot touch org B's fingerprint.
+    expect(await asMemberA.mutation(api.failure_patterns.acknowledgePattern, { orgId: orgA, fingerprintHash: 'org-b-only' })).toBeNull()
+
+    const orgBPattern = await t.run((ctx) =>
+      ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgB).eq('fingerprintHash', 'org-b-only')).first(),
+    )
+    expect(orgBPattern!.status).toBeUndefined() // untouched
+  })
+})
+
+describe('regression guard — recordFailurePatternOccurrence auto-reopens a RESOLVED pattern and fires pattern_regressed', () => {
+  /** Seeds a pattern_regressed alert_rule directly (bypassing createAlertRule's admin-auth — irrelevant to these firing tests). */
+  async function createPatternRegressedRule(t: ReturnType<typeof convexTest>, orgId: any, enabled = true) {
+    return await t.run(async (ctx) => {
+      const now = Date.now()
+      return await ctx.db.insert('alert_rules', {
+        orgId, name: 'regressions', kind: 'pattern_regressed', channels: [{ type: 'webhook', target: 'https://example.com/hook' }],
+        enabled, createdAt: now, updatedAt: now,
+      })
+    })
+  }
+
+  it('a new occurrence dated AFTER resolvedAt on a RESOLVED pattern auto-reopens it, stamps regressedAt, and fires exactly one pattern_regressed alert', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await createPatternRegressedRule(t, orgA)
+
+    const run1 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run1, agentId: agentA, fingerprintHash: 'regress-me', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: 1_000_000,
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'regress-me' })
+    // Backdate resolvedAt directly so a later `occurredAt` unambiguously postdates it (the mutation itself stamps Date.now()).
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 2_000_000 }))
+
+    const run2 = await seedRun(t, orgA, projectA, agentA)
+    const result = await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run2, agentId: agentA, fingerprintHash: 'regress-me', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: 3_000_000,
+    })
+    expect(result).toEqual({ recorded: true })
+
+    const pattern = await t.run((ctx) =>
+      ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'regress-me')).first(),
+    )
+    expect(pattern!.status).toBe('open')
+    expect(pattern!.regressedAt).toBe(3_000_000)
+
+    const events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(1)
+    expect(events[0]!.patternFingerprintHash).toBe('regress-me')
+    expect(events[0]!.metadata).toMatchObject({ fingerprintHash: 'regress-me', resolvedAt: 2_000_000, regressedAt: 3_000_000 })
+
+    // IDEMPOTENCY: a THIRD occurrence, now that status is "open" again, must
+    // NOT re-fire — the resolved -> open transition already happened.
+    const run3 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run3, agentId: agentA, fingerprintHash: 'regress-me', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: 4_000_000,
+    })
+    const eventsAfter = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(eventsAfter.length).toBe(1)
+  })
+
+  it('a new occurrence dated BEFORE/AT resolvedAt does NOT reopen the pattern (e.g. a late-arriving occurrence for an already-fixed failure)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const run1 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run1, agentId: agentA, fingerprintHash: 'no-regress', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: 1_000_000,
+    })
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'no-regress' })
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 5_000_000 }))
+
+    const run2 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run2, agentId: agentA, fingerprintHash: 'no-regress', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: 5_000_000, // exactly equal, not strictly after — not a regression
+    })
+
+    const pattern = await t.run((ctx) =>
+      ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'no-regress')).first(),
+    )
+    expect(pattern!.status).toBe('resolved')
+    expect(pattern!.regressedAt).toBeUndefined()
+
+    const events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(0)
+  })
+
+  it('MUTE SUPPRESSION: a muted, resolved pattern still auto-reopens on regression, but fires NO alert', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await createPatternRegressedRule(t, orgA)
+    await t.run(async (ctx) => {
+      await ctx.db.insert('user_memberships', { clerkUserId: 'admin_a', orgId: orgA, role: 'admin', joinedAt: Date.now() })
+    })
+
+    const run1 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run1, agentId: agentA, fingerprintHash: 'muted-regress', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: 1_000_000,
+    })
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'muted-regress' })
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 2_000_000 }))
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    await asAdmin.mutation(api.failure_patterns.mutePattern, { orgId: orgA, fingerprintHash: 'muted-regress' })
+
+    const run2 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run2, agentId: agentA, fingerprintHash: 'muted-regress', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: 3_000_000,
+    })
+
+    const pattern = await t.run((ctx) =>
+      ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'muted-regress')).first(),
+    )
+    // Lifecycle unaffected by mute: still reopens + stamps regressedAt.
+    expect(pattern!.status).toBe('open')
+    expect(pattern!.regressedAt).toBe(3_000_000)
+
+    const events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(0)
+  })
+
+  it('fires no alert (but still reopens) when the org has no enabled pattern_regressed rule', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    // No pattern_regressed rule seeded.
+
+    const run1 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run1, agentId: agentA, fingerprintHash: 'no-rule-regress', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: 1_000_000,
+    })
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'no-rule-regress' })
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 2_000_000 }))
+
+    const run2 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run2, agentId: agentA, fingerprintHash: 'no-rule-regress', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: 3_000_000,
+    })
+
+    const pattern = await t.run((ctx) =>
+      ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'no-rule-regress')).first(),
+    )
+    expect(pattern!.status).toBe('open')
+    expect(pattern!.regressedAt).toBe(3_000_000)
+
+    const events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(0)
+  })
+})

@@ -56,6 +56,25 @@ export function truncateId(id: string, length = 8): string {
 }
 
 /**
+ * Parses `value` as a URL ONLY if it is `http:`/`https:` — used to decide
+ * whether a free-form, human-entered reference string (e.g.
+ * `FailurePattern.resolutionRef`, see docs/adr/006-failure-resolution.md) may
+ * be rendered as an external `<a>` link. Anything else (a bare agentVersionId,
+ * a `javascript:`/`data:`/`file:` URI, plain prose) returns `null` and must be
+ * rendered as plain text — this is the ONLY gate between untrusted free text
+ * and an anchor's `href`, so it fails closed on anything that doesn't parse
+ * cleanly as http(s).
+ */
+export function parseSafeHttpUrl(value: string): URL | null {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Format a byte count as a human-readable size string.
  * Examples: 512B | 3.4KB | 12.1MB | 2.0GB
  */

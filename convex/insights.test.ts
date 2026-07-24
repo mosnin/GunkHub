@@ -2430,3 +2430,407 @@ describe('classifyPatternEpisode', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// "Resolution" cycle 1 (Team B): isRegression / timeToResolutionMs /
+// summarizeResolutionHealth — pure lifecycle analytics over failure_patterns'
+// upcoming open/acknowledged/resolved status + regression guard.
+// ---------------------------------------------------------------------------
+import { isRegression, timeToResolutionMs, summarizeResolutionHealth } from './insights'
+import type { PatternLifecycleSnapshot } from './insights'
+
+describe('isRegression', () => {
+  const DAY_MS_LOCAL = 24 * HOUR_MS
+
+  it('true: resolved pattern, resolvedAt defined, new occurrence strictly after resolvedAt', () => {
+    const resolvedAt = 100 * DAY_MS_LOCAL
+    expect(isRegression('resolved', resolvedAt, resolvedAt + 1)).toBe(true)
+  })
+
+  it('false: prevStatus is "open" (never resolved, so cannot regress)', () => {
+    const resolvedAt = 100 * DAY_MS_LOCAL
+    expect(isRegression('open', resolvedAt, resolvedAt + 1)).toBe(false)
+  })
+
+  it('false: prevStatus is "acknowledged" (not yet resolved)', () => {
+    const resolvedAt = 100 * DAY_MS_LOCAL
+    expect(isRegression('acknowledged', resolvedAt, resolvedAt + 1)).toBe(false)
+  })
+
+  it('false: prevStatus is some unrecognized/malformed string', () => {
+    expect(isRegression('bogus', 100, 200)).toBe(false)
+  })
+
+  it('boundary: newOccurredAt exactly equal to resolvedAt is NOT a regression (strictly after, not >=)', () => {
+    const resolvedAt = 100 * DAY_MS_LOCAL
+    expect(isRegression('resolved', resolvedAt, resolvedAt)).toBe(false)
+  })
+
+  it('boundary: newOccurredAt one ms after resolvedAt IS a regression', () => {
+    const resolvedAt = 100 * DAY_MS_LOCAL
+    expect(isRegression('resolved', resolvedAt, resolvedAt + 1)).toBe(true)
+  })
+
+  it('false: newOccurredAt before resolvedAt (stale/racing occurrence)', () => {
+    const resolvedAt = 100 * DAY_MS_LOCAL
+    expect(isRegression('resolved', resolvedAt, resolvedAt - 1)).toBe(false)
+  })
+
+  it('false: resolvedAt is undefined even though prevStatus is "resolved" (malformed data)', () => {
+    expect(isRegression('resolved', undefined, 100 * DAY_MS_LOCAL)).toBe(false)
+  })
+
+  it('ADVERSARIAL: resolvedAt is NaN never throws and returns false', () => {
+    expect(() => isRegression('resolved', NaN, 100)).not.toThrow()
+    expect(isRegression('resolved', NaN, 100)).toBe(false)
+  })
+
+  it('ADVERSARIAL: resolvedAt is Infinity never throws and returns false (nothing is "strictly after" Infinity)', () => {
+    expect(() => isRegression('resolved', Infinity, 100)).not.toThrow()
+    expect(isRegression('resolved', Infinity, 100)).toBe(false)
+  })
+
+  it('ADVERSARIAL: newOccurredAt is NaN never throws and returns false', () => {
+    expect(() => isRegression('resolved', 100, NaN)).not.toThrow()
+    expect(isRegression('resolved', 100, NaN)).toBe(false)
+  })
+
+  it('ADVERSARIAL: newOccurredAt is -Infinity never throws and returns false', () => {
+    expect(isRegression('resolved', 100, -Infinity)).toBe(false)
+  })
+
+  it('ADVERSARIAL: newOccurredAt is +Infinity never throws and returns false (non-finite is rejected defensively, not treated as ">" everything)', () => {
+    expect(() => isRegression('resolved', 100, Infinity)).not.toThrow()
+    expect(isRegression('resolved', 100, Infinity)).toBe(false)
+  })
+
+  it('is deterministic: same inputs always produce the same result', () => {
+    const results = new Set<boolean>()
+    for (let i = 0; i < 10; i++) results.add(isRegression('resolved', 100, 200))
+    expect(results.size).toBe(1)
+  })
+})
+
+describe('timeToResolutionMs', () => {
+  const DAY_MS_LOCAL = 24 * HOUR_MS
+
+  it('correctness: returns resolvedAt - firstSeenAt when resolvedAt is after firstSeenAt', () => {
+    expect(timeToResolutionMs(0, 5 * DAY_MS_LOCAL)).toBe(5 * DAY_MS_LOCAL)
+  })
+
+  it('correctness: a realistic multi-day resolution window', () => {
+    const firstSeenAt = 1_000_000
+    const resolvedAt = firstSeenAt + 3 * HOUR_MS + 17
+    expect(timeToResolutionMs(firstSeenAt, resolvedAt)).toBe(3 * HOUR_MS + 17)
+  })
+
+  it('undefined: resolvedAt is undefined (pattern not resolved)', () => {
+    expect(timeToResolutionMs(0, undefined)).toBeUndefined()
+  })
+
+  it('boundary: resolvedAt === firstSeenAt -> 0 (resolved instantly)', () => {
+    expect(timeToResolutionMs(500, 500)).toBe(0)
+  })
+
+  it('ADVERSARIAL: resolvedAt < firstSeenAt (malformed) clamps to 0, never negative', () => {
+    expect(timeToResolutionMs(1000, 500)).toBe(0)
+  })
+
+  it('ADVERSARIAL: firstSeenAt is NaN -> undefined, never NaN leaks out', () => {
+    expect(timeToResolutionMs(NaN, 100)).toBeUndefined()
+  })
+
+  it('ADVERSARIAL: resolvedAt is NaN -> undefined (distinct from "not resolved" but same safe result)', () => {
+    expect(timeToResolutionMs(0, NaN)).toBeUndefined()
+  })
+
+  it('ADVERSARIAL: firstSeenAt is Infinity -> undefined, never Infinity/NaN leaks out', () => {
+    expect(timeToResolutionMs(Infinity, 100)).toBeUndefined()
+  })
+
+  it('ADVERSARIAL: resolvedAt is Infinity -> undefined', () => {
+    expect(timeToResolutionMs(0, Infinity)).toBeUndefined()
+  })
+
+  it('ADVERSARIAL: huge but finite timestamps never overflow to Infinity/NaN', () => {
+    const result = timeToResolutionMs(0, Number.MAX_SAFE_INTEGER)
+    expect(result).toBe(Number.MAX_SAFE_INTEGER)
+    expect(Number.isFinite(result)).toBe(true)
+  })
+
+  it('is deterministic: same inputs always produce the same result', () => {
+    const results = new Set<number | undefined>()
+    for (let i = 0; i < 10; i++) results.add(timeToResolutionMs(100, 5000))
+    expect(results.size).toBe(1)
+  })
+})
+
+describe('summarizeResolutionHealth', () => {
+  const DAY_MS_LOCAL = 24 * HOUR_MS
+  const nowMs = 1000 * DAY_MS_LOCAL
+
+  function snap(overrides: Partial<PatternLifecycleSnapshot>): PatternLifecycleSnapshot {
+    return {
+      status: 'open',
+      firstSeenAt: nowMs - 10 * DAY_MS_LOCAL,
+      lastSeenAt: nowMs - 5 * DAY_MS_LOCAL,
+      count: 1,
+      ...overrides,
+    }
+  }
+
+  it('empty input: total 0 -> all counts 0, regressionRate 0, TTRs null, healthScore is the documented neutral 100', () => {
+    const result = summarizeResolutionHealth([], nowMs)
+    expect(result).toEqual({
+      total: 0,
+      open: 0,
+      acknowledged: 0,
+      resolved: 0,
+      regressed: 0,
+      regressionRate: 0,
+      avgTimeToResolutionMs: null,
+      medianTimeToResolutionMs: null,
+      healthScore: 100,
+    })
+  })
+
+  it('single element, open: total 1, open 1, healthScore reflects 0% resolved fraction (0)', () => {
+    const result = summarizeResolutionHealth([snap({ status: 'open' })], nowMs)
+    expect(result.total).toBe(1)
+    expect(result.open).toBe(1)
+    expect(result.resolved).toBe(0)
+    expect(result.regressed).toBe(0)
+    expect(result.regressionRate).toBe(0)
+    expect(result.avgTimeToResolutionMs).toBeNull()
+    expect(result.medianTimeToResolutionMs).toBeNull()
+    expect(result.healthScore).toBe(0)
+  })
+
+  it('single element, resolved (no regression): healthScore is 100 (resolvedFraction=1, regressionRate=0)', () => {
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const resolvedAt = nowMs - 5 * DAY_MS_LOCAL
+    const result = summarizeResolutionHealth([snap({ status: 'resolved', firstSeenAt, resolvedAt })], nowMs)
+    expect(result.total).toBe(1)
+    expect(result.resolved).toBe(1)
+    expect(result.regressed).toBe(0)
+    expect(result.regressionRate).toBe(0)
+    expect(result.avgTimeToResolutionMs).toBe(5 * DAY_MS_LOCAL)
+    expect(result.medianTimeToResolutionMs).toBe(5 * DAY_MS_LOCAL)
+    expect(result.healthScore).toBe(100)
+  })
+
+  it('all-open: resolved fraction 0, no TTRs, healthScore 0', () => {
+    const snapshots = [snap({ status: 'open' }), snap({ status: 'open' }), snap({ status: 'acknowledged' })]
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.total).toBe(3)
+    expect(result.open).toBe(2)
+    expect(result.acknowledged).toBe(1)
+    expect(result.resolved).toBe(0)
+    expect(result.healthScore).toBe(0)
+    expect(result.avgTimeToResolutionMs).toBeNull()
+    expect(result.medianTimeToResolutionMs).toBeNull()
+  })
+
+  it('all-resolved, no regressions: healthScore 100, correct avg/median TTR', () => {
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const snapshots = [
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * DAY_MS_LOCAL }),
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 3 * DAY_MS_LOCAL }),
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 5 * DAY_MS_LOCAL }),
+    ]
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.total).toBe(3)
+    expect(result.resolved).toBe(3)
+    expect(result.regressed).toBe(0)
+    expect(result.regressionRate).toBe(0)
+    expect(result.avgTimeToResolutionMs).toBe(3 * DAY_MS_LOCAL) // (1+3+5)/3
+    expect(result.medianTimeToResolutionMs).toBe(3 * DAY_MS_LOCAL)
+    expect(result.healthScore).toBe(100)
+  })
+
+  it('regression rate denominator: only resolved-or-once-resolved patterns count, never-resolved open patterns are excluded', () => {
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const snapshots = [
+      // 1 resolved (no regression), 1 open that regressed-and-reopened (regressedAt set, status back to open),
+      // 2 plain open patterns that have NEVER been resolved (must NOT count in the regression-rate denominator).
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * DAY_MS_LOCAL }),
+      snap({ status: 'open', regressedAt: nowMs - 1 * DAY_MS_LOCAL }),
+      snap({ status: 'open' }),
+      snap({ status: 'open' }),
+    ]
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    // denominator = 2 (the resolved one + the regressed-and-reopened one); numerator (regressed) = 1.
+    expect(result.regressed).toBe(1)
+    expect(result.regressionRate).toBe(0.5)
+  })
+
+  it('a pattern that regressed still counts against health even if currently re-resolved', () => {
+    const firstSeenAt = nowMs - 20 * DAY_MS_LOCAL
+    const snapshots = [
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 2 * DAY_MS_LOCAL, regressedAt: firstSeenAt + 5 * DAY_MS_LOCAL }),
+    ]
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.resolved).toBe(1)
+    expect(result.regressed).toBe(1)
+    expect(result.regressionRate).toBe(1) // denom=1 (resolved), numerator=1 (regressed) -> 100% regression rate
+    expect(result.healthScore).toBeLessThan(100) // penalized despite resolvedFraction being 1
+  })
+
+  it('healthScore MONOTONICITY: adding another resolved pattern (holding regressions fixed) raises the score', () => {
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const base = [snap({ status: 'open' }), snap({ status: 'open' })]
+    const withOneResolved = [...base, snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * DAY_MS_LOCAL })]
+    const withTwoResolved = [
+      ...base,
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * DAY_MS_LOCAL }),
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * DAY_MS_LOCAL }),
+    ]
+    const scoreBase = summarizeResolutionHealth(base, nowMs).healthScore
+    const scoreOne = summarizeResolutionHealth(withOneResolved, nowMs).healthScore
+    const scoreTwo = summarizeResolutionHealth(withTwoResolved, nowMs).healthScore
+    expect(scoreOne).toBeGreaterThan(scoreBase)
+    expect(scoreTwo).toBeGreaterThan(scoreOne)
+  })
+
+  it('healthScore MONOTONICITY: more regressions (holding resolved-fraction fixed) lowers the score', () => {
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const resolvedOnly = snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * DAY_MS_LOCAL })
+    const resolvedRegressedOnce = snap({
+      status: 'resolved',
+      firstSeenAt,
+      resolvedAt: firstSeenAt + 1 * DAY_MS_LOCAL,
+      regressedAt: firstSeenAt + 2 * DAY_MS_LOCAL,
+    })
+    // Two independent patterns each resolved: zero vs one-of-two regressed.
+    const zeroRegressions = [resolvedOnly, resolvedOnly]
+    const oneRegression = [resolvedOnly, resolvedRegressedOnce]
+    const scoreZero = summarizeResolutionHealth(zeroRegressions, nowMs).healthScore
+    const scoreOne = summarizeResolutionHealth(oneRegression, nowMs).healthScore
+    expect(scoreOne).toBeLessThan(scoreZero)
+  })
+
+  it('healthScore is always clamped within [0, 100]', () => {
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    // Every pattern resolved AND regressed -> resolvedFraction=1, regressionRate=1 -> raw = 100 - 50 = 50, still in range.
+    const snapshots = Array.from({ length: 5 }, () =>
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1, regressedAt: firstSeenAt + 2 }),
+    )
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.healthScore).toBeGreaterThanOrEqual(0)
+    expect(result.healthScore).toBeLessThanOrEqual(100)
+  })
+
+  it('median vs average differ correctly for a skewed TTR distribution', () => {
+    const firstSeenAt = nowMs - 100 * DAY_MS_LOCAL
+    const snapshots = [
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * HOUR_MS }),
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 2 * HOUR_MS }),
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 100 * HOUR_MS }), // outlier
+    ]
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.medianTimeToResolutionMs).toBe(2 * HOUR_MS)
+    expect(result.avgTimeToResolutionMs).toBeCloseTo((1 + 2 + 100) * HOUR_MS / 3, 5)
+    expect(result.avgTimeToResolutionMs).not.toBe(result.medianTimeToResolutionMs)
+  })
+
+  it('median with an even number of resolved TTRs averages the two middle values', () => {
+    const firstSeenAt = nowMs - 100 * DAY_MS_LOCAL
+    const snapshots = [
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * HOUR_MS }),
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 3 * HOUR_MS }),
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 5 * HOUR_MS }),
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 7 * HOUR_MS }),
+    ]
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.medianTimeToResolutionMs).toBe(4 * HOUR_MS) // (3+5)/2
+  })
+
+  it('ADVERSARIAL: non-array input never throws, treated as empty', () => {
+    // @ts-expect-error deliberately malformed input for defensive-handling test
+    expect(() => summarizeResolutionHealth(null, nowMs)).not.toThrow()
+    // @ts-expect-error deliberately malformed input for defensive-handling test
+    expect(summarizeResolutionHealth(null, nowMs).total).toBe(0)
+    // @ts-expect-error deliberately malformed input for defensive-handling test
+    expect(summarizeResolutionHealth(undefined, nowMs).total).toBe(0)
+  })
+
+  it('ADVERSARIAL: array containing null/undefined entries never throws, malformed entries are dropped', () => {
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const snapshots = [
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * DAY_MS_LOCAL }),
+      null,
+      undefined,
+    ] as unknown as PatternLifecycleSnapshot[]
+    expect(() => summarizeResolutionHealth(snapshots, nowMs)).not.toThrow()
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.total).toBe(1)
+    expect(result.resolved).toBe(1)
+  })
+
+  it('ADVERSARIAL: unrecognized status string counted in total but not in any status bucket', () => {
+    const snapshots = [snap({ status: 'weird' as PatternLifecycleSnapshot['status'] })]
+    expect(() => summarizeResolutionHealth(snapshots, nowMs)).not.toThrow()
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.total).toBe(1)
+    expect(result.open + result.acknowledged + result.resolved).toBe(0)
+  })
+
+  it('ADVERSARIAL: resolvedAt < firstSeenAt on a resolved pattern is excluded from TTR average via the clamp-to-0 rule, not NaN', () => {
+    const firstSeenAt = nowMs - 5 * DAY_MS_LOCAL
+    const snapshots = [snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt - 1000 })]
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.avgTimeToResolutionMs).toBe(0)
+    expect(result.medianTimeToResolutionMs).toBe(0)
+    expect(Number.isNaN(result.avgTimeToResolutionMs)).toBe(false)
+  })
+
+  it('ADVERSARIAL: NaN/Infinity timestamps on individual snapshots never leak into aggregate output', () => {
+    const snapshots = [
+      snap({ status: 'resolved', firstSeenAt: NaN, resolvedAt: 100 }),
+      snap({ status: 'resolved', firstSeenAt: Infinity, resolvedAt: 100 }),
+      snap({ status: 'resolved', firstSeenAt: 0, resolvedAt: NaN }),
+      snap({ status: 'resolved', firstSeenAt: 0, resolvedAt: Infinity }),
+    ]
+    expect(() => summarizeResolutionHealth(snapshots, nowMs)).not.toThrow()
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    // All four TTRs are unusable (undefined) -> excluded -> null averages, not NaN.
+    expect(result.avgTimeToResolutionMs).toBeNull()
+    expect(result.medianTimeToResolutionMs).toBeNull()
+    expect(Number.isFinite(result.healthScore)).toBe(true)
+  })
+
+  it('ADVERSARIAL: huge count of snapshots (thousands) never throws and stays within bounds', () => {
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const snapshots = Array.from({ length: 5000 }, (_, i) =>
+      i % 3 === 0
+        ? snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + (i + 1) * 1000 })
+        : snap({ status: i % 3 === 1 ? 'open' : 'acknowledged' }),
+    )
+    expect(() => summarizeResolutionHealth(snapshots, nowMs)).not.toThrow()
+    const result = summarizeResolutionHealth(snapshots, nowMs)
+    expect(result.total).toBe(5000)
+    expect(result.healthScore).toBeGreaterThanOrEqual(0)
+    expect(result.healthScore).toBeLessThanOrEqual(100)
+  })
+
+  it('is deterministic: same inputs always produce the same output', () => {
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const snapshots = [
+      snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 1 * DAY_MS_LOCAL }),
+      snap({ status: 'open' }),
+      snap({ status: 'acknowledged', regressedAt: nowMs - 1 * DAY_MS_LOCAL }),
+    ]
+    const results = new Set<string>()
+    for (let i = 0; i < 10; i++) results.add(JSON.stringify(summarizeResolutionHealth(snapshots, nowMs)))
+    expect(results.size).toBe(1)
+  })
+
+  it('never reads Date.now(): identical outputs regardless of when the test runs, for the same nowMs argument', () => {
+    const firstSeenAt = 12345
+    const snapshots = [snap({ status: 'resolved', firstSeenAt, resolvedAt: firstSeenAt + 999 })]
+    const a = summarizeResolutionHealth(snapshots, 999999)
+    const b = summarizeResolutionHealth(snapshots, 999999)
+    expect(expect.getState().currentTestName, '').toBeDefined()
+    expect(a).toEqual(b)
+  })
+})

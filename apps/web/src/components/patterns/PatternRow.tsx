@@ -2,7 +2,9 @@ import Link from 'next/link'
 
 import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
 
+import { isRegressedPattern } from '@/components/patterns/adapt'
 import { MutedBadge } from '@/components/patterns/MutedBadge'
+import { PatternStatusBadge } from '@/components/patterns/PatternStatusBadge'
 import { SpikeBadge } from '@/components/patterns/SpikeBadge'
 import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { formatRelativeTime, truncateId } from '@/lib/utils'
@@ -24,6 +26,7 @@ function formatFailureClass(cls: string): string {
 export function PatternRow({ pattern }: PatternRowProps) {
   const href = `/patterns/${encodeURIComponent(pattern.fingerprintHash)}`
   const isSpiking = pattern.lastSpikeAssessment?.isSpiking === true
+  const regressed = isRegressedPattern(pattern)
 
   return (
     <tr className="hover:bg-neutral-900 transition-colors duration-100 group border-b border-graphite last:border-b-0">
@@ -71,6 +74,11 @@ export function PatternRow({ pattern }: PatternRowProps) {
       <td className="px-4 py-3 text-right">
         <Link href={href} tabIndex={-1} aria-hidden className="font-mono text-sm text-neutral-300">
           {pattern.hasAffectedVersions ? pattern.affectedAgentVersionIds.length.toLocaleString() : '—'}
+        </Link>
+      </td>
+      <td className="px-4 py-3">
+        <Link href={href} tabIndex={-1} aria-hidden className="inline-flex items-center gap-1.5 flex-wrap">
+          <PatternStatusBadge status={pattern.status} regressed={regressed} />
         </Link>
       </td>
       <td className="px-4 py-3">

@@ -25,6 +25,9 @@ const ALERT_RULE_KIND = v.union(
   // Failure Patterns cycle 2 (docs/adr/005-failure-patterns.md) — see
   // firePatternSpikeAlert below.
   v.literal("pattern_spike"),
+  // ADR-006 (docs/adr/006-failure-resolution.md) — see
+  // firePatternRegressionAlert below.
+  v.literal("pattern_regressed"),
 );
 
 const ALERT_CHANNEL = v.object({
@@ -493,6 +496,169 @@ export const firePatternSpikeAlert = internalMutation({
         orgName,
         label: args.label,
         recentCount: args.recentCount,
+        deepLink,
+        representativeRunId: args.representativeRunId,
+      });
+
+      fired++;
+    }
+
+    return { fired };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// ADR-006 (docs/adr/006-failure-resolution.md) — regression guard alert
+// firing. Called ONLY from convex/failure_patterns.ts's
+// recordFailurePatternOccurrence, exactly once per occurrence that lands for
+// a pattern whose stored `status` was "resolved" at occurrence time AND
+// whose `occurredAt` postdates the stored `resolvedAt` ("your fix didn't
+// hold"). Idempotency is structural, not cooldown-based (unlike
+// pattern_spike): once the caller flips the rollup's status away from
+// "resolved" (to "open"), the very condition that triggers this alert no
+// longer holds for any further occurrence on the same run of failures, until
+// a human resolves it again. This mutation itself performs no additional
+// idempotency check — see recordFailurePatternOccurrence's doc comment for
+// why the caller-side status transition is sufficient.
+// ---------------------------------------------------------------------------
+
+/** Plain-text email body for a fired pattern_regressed alert. */
+function renderPatternRegressionEmailText(args: {
+  orgName: string;
+  label: string;
+  resolvedAt: number;
+  regressedAt: number;
+  deepLink: string;
+}): string {
+  return [
+    `Agent Flight Recorder: a RESOLVED failure pattern regressed in ${args.orgName}.`,
+    "",
+    `Pattern: ${args.label}`,
+    `Resolved at: ${new Date(args.resolvedAt).toISOString()}`,
+    `Regressed at: ${new Date(args.regressedAt).toISOString()}`,
+    `Details: ${args.deepLink}`,
+  ].join("\n");
+}
+
+async function enqueuePatternRegressionDeliveries(
+  ctx: MutationCtx,
+  args: {
+    orgId: Id<"organizations">;
+    rule: Doc<"alert_rules">;
+    alertEventId: Id<"alert_events">;
+    orgName: string;
+    label: string;
+    resolvedAt: number;
+    regressedAt: number;
+    deepLink: string;
+    representativeRunId: Id<"runs"> | undefined;
+  },
+): Promise<void> {
+  for (const channel of args.rule.channels) {
+    if (channel.type === "webhook") {
+      const webhookId = await findOrCreateAlertWebhookTarget(ctx, args.orgId, channel.target);
+      await ctx.db.insert("webhook_deliveries", {
+        orgId: args.orgId,
+        webhookId,
+        event: "alert.fired",
+        runId: args.representativeRunId,
+        status: "pending",
+        attempts: 0,
+        createdAt: Date.now(),
+        alertEventId: args.alertEventId,
+        nextAttemptAt: Date.now(),
+      });
+      continue;
+    }
+
+    // channel.type === "email"
+    const now = Date.now();
+    await ctx.db.insert("email_deliveries", {
+      orgId: args.orgId,
+      alertEventId: args.alertEventId,
+      to: channel.target,
+      subject: `Agent Flight Recorder alert: ${args.rule.name}`,
+      body: renderPatternRegressionEmailText({
+        orgName: args.orgName,
+        label: args.label,
+        resolvedAt: args.resolvedAt,
+        regressedAt: args.regressedAt,
+        deepLink: args.deepLink,
+      }),
+      status: "pending",
+      attempts: 0,
+      createdAt: now,
+      nextAttemptAt: now,
+    });
+  }
+}
+
+/**
+ * Fire every ENABLED `pattern_regressed` alert_rule in `orgId` for one
+ * detected resolved -> reopened regression. Mirrors firePatternSpikeAlert's
+ * shape exactly (one append-only alert_events row + one delivery per rule
+ * channel, per matching rule; a no-op with `{ fired: 0 }` when the org has no
+ * matching enabled rule — same "no-op when no rule matches" behavior every
+ * other alert kind has).
+ *
+ * Muting (docs/adr/005-failure-patterns.md Cycle 3's `failure_patterns.muted`)
+ * suppresses this call entirely at the caller (recordFailurePatternOccurrence
+ * never invokes this mutation for a muted pattern) — mute silences alerts, it
+ * does not disable the lifecycle, so the rollup still reopens either way.
+ */
+export const firePatternRegressionAlert = internalMutation({
+  args: {
+    orgId: v.id("organizations"),
+    fingerprintHash: v.string(),
+    class: v.string(),
+    label: v.string(),
+    resolvedAt: v.number(),
+    regressedAt: v.number(),
+    representativeRunId: v.optional(v.id("runs")),
+  },
+  handler: async (ctx, args): Promise<{ fired: number }> => {
+    const rules = await ctx.db
+      .query("alert_rules")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .take(MAX_PAGE_SIZE);
+
+    const matching = rules.filter((r) => r.enabled && r.kind === "pattern_regressed");
+    if (matching.length === 0) return { fired: 0 };
+
+    const org = await ctx.db.get(args.orgId);
+    const orgName = org?.name ?? "unknown organization";
+    const deepLink = buildPatternDeepLink(args.fingerprintHash);
+    const summary =
+      `Failure pattern "${args.label}" regressed after being marked resolved — ${deepLink}`;
+
+    let fired = 0;
+    for (const rule of matching) {
+      const alertEventId = await ctx.db.insert("alert_events", {
+        orgId: args.orgId,
+        ruleId: rule._id,
+        runId: args.representativeRunId,
+        firedAt: Date.now(),
+        summary,
+        deliveryStatus: "pending",
+        patternFingerprintHash: args.fingerprintHash,
+        metadata: {
+          fingerprintHash: args.fingerprintHash,
+          class: args.class,
+          label: args.label,
+          resolvedAt: args.resolvedAt,
+          regressedAt: args.regressedAt,
+          deepLink,
+        },
+      });
+
+      await enqueuePatternRegressionDeliveries(ctx, {
+        orgId: args.orgId,
+        rule,
+        alertEventId,
+        orgName,
+        label: args.label,
+        resolvedAt: args.resolvedAt,
+        regressedAt: args.regressedAt,
         deepLink,
         representativeRunId: args.representativeRunId,
       });

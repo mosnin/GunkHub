@@ -4,14 +4,16 @@ import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
 import type { RunExplanationSummaryState } from '@/lib/services/explanations'
 import type { FailurePatternOccurrence, FailurePatternTrendPoint } from '@agent-flight-recorder/contracts'
 
+import { isRegressedPattern } from '@/components/patterns/adapt'
 import { MutedBadge } from '@/components/patterns/MutedBadge'
+import { PatternLifecycleControl } from '@/components/patterns/PatternLifecycleControl'
 import { PatternMuteControl } from '@/components/patterns/PatternMuteControl'
 import { PatternTrendSparkline } from '@/components/patterns/PatternTrendSparkline'
 import { SpikeBadge } from '@/components/patterns/SpikeBadge'
 import { ExplanationPreview } from '@/components/runs/ExplanationPreview'
 import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { EmptyState } from '@/components/ui/EmptyState'
-import { formatRelativeTime, truncateId } from '@/lib/utils'
+import { formatRelativeTime, parseSafeHttpUrl, truncateId } from '@/lib/utils'
 
 /** Resolved label + owning agent for one affected agent version, keyed by agentVersionId. Resolved server-side by the detail page (mirrors how the run-detail page resolves `agentVersionLabel` via `getAgentVersion`). */
 export interface ResolvedAgentVersion {
@@ -57,9 +59,32 @@ export function PatternDetail({
 }: PatternDetailProps) {
   const spike = pattern.lastSpikeAssessment
   const isSpiking = spike?.isSpiking === true
+  const regressed = isRegressedPattern(pattern)
+  const resolutionRefUrl = pattern.resolutionRef ? parseSafeHttpUrl(pattern.resolutionRef) : null
 
   return (
     <div className="flex flex-col gap-6">
+      {/* Regression banner — the emotional core of this feature: a resolved
+          pattern that failed again must be unmistakable, not just a badge
+          buried in the header. Palette-only urgency (Neon Glow), no
+          off-palette red. */}
+      {regressed && (
+        <div
+          role="alert"
+          className="rounded-[4px] border border-neon-glow bg-primary-900/30 px-5 py-3 flex items-start gap-3"
+        >
+          <span
+            className="w-2 h-2 mt-1.5 rounded-full bg-neon-glow shadow-[var(--shadow-glow)] motion-safe:animate-neon-pulse shrink-0 forced-colors:bg-[Highlight]"
+            aria-hidden="true"
+          />
+          <p className="text-sm text-whiteout leading-relaxed">
+            <span className="font-semibold text-neon-glow">Regressed</span> — this pattern was resolved
+            {typeof pattern.resolvedAt === 'number' && <> on {new Date(pattern.resolvedAt).toLocaleDateString()}</>}, but
+            it failed again{typeof pattern.regressedAt === 'number' && <> {formatRelativeTime(pattern.regressedAt)}</>}.
+          </p>
+        </div>
+      )}
+
       {/* Header — label, class, fingerprint, spike state */}
       <div className="rounded-[4px] border border-graphite-light bg-graphite-deep px-5 py-4">
         <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -88,6 +113,15 @@ export function PatternDetail({
               mutedAt={pattern.mutedAt}
               isAdmin={isAdmin}
             />
+            <div className="pt-1.5 border-t border-graphite w-full flex justify-end">
+              <PatternLifecycleControl
+                fingerprintHash={pattern.fingerprintHash}
+                status={pattern.status}
+                regressed={regressed}
+                resolutionNote={pattern.resolutionNote}
+                resolutionRef={pattern.resolutionRef}
+              />
+            </div>
           </div>
         </div>
 
@@ -155,6 +189,81 @@ export function PatternDetail({
           </p>
         )}
       </section>
+
+      {/* Resolution details — who acknowledged/resolved this pattern, when,
+          and the free-text note/reference left behind (docs/adr/006-failure-
+          resolution.md). Rendered whenever there's any lifecycle history to
+          show; omitted entirely for a plain never-touched "open" pattern so
+          it doesn't add noise to the common case. */}
+      {(pattern.acknowledgedAt !== undefined || pattern.resolvedAt !== undefined) && (
+        <section
+          aria-labelledby="pattern-resolution-heading"
+          className="rounded-[4px] border border-graphite-light bg-graphite-deep px-5 py-4"
+        >
+          <h2 id="pattern-resolution-heading" className="text-xs font-mono uppercase tracking-wider text-pewter mb-3">
+            Resolution
+          </h2>
+          <div className="flex flex-col gap-3">
+            {pattern.acknowledgedAt !== undefined && (
+              <div>
+                <p className="text-xs text-pewter uppercase tracking-wider">Acknowledged</p>
+                <p className="text-sm text-neutral-300 mt-0.5">
+                  {formatRelativeTime(pattern.acknowledgedAt)}
+                  {pattern.acknowledgedByUserId && (
+                    <>
+                      {' '}
+                      by <span className="font-mono text-xs text-cloud">{truncateId(pattern.acknowledgedByUserId, 12)}</span>
+                    </>
+                  )}
+                </p>
+              </div>
+            )}
+            {pattern.resolvedAt !== undefined && (
+              <div>
+                <p className="text-xs text-pewter uppercase tracking-wider">Resolved</p>
+                <p className="text-sm text-neutral-300 mt-0.5">
+                  {formatRelativeTime(pattern.resolvedAt)}
+                  {pattern.resolvedByUserId && (
+                    <>
+                      {' '}
+                      by <span className="font-mono text-xs text-cloud">{truncateId(pattern.resolvedByUserId, 12)}</span>
+                    </>
+                  )}
+                </p>
+              </div>
+            )}
+            {pattern.resolutionNote && (
+              <div>
+                <p className="text-xs text-pewter uppercase tracking-wider">Note</p>
+                <p className="text-sm text-neutral-300 mt-0.5 leading-relaxed whitespace-pre-wrap">
+                  {pattern.resolutionNote}
+                </p>
+              </div>
+            )}
+            {pattern.resolutionRef && (
+              <div>
+                <p className="text-xs text-pewter uppercase tracking-wider">Reference</p>
+                {/* Only rendered as a link when it parses as an http(s) URL —
+                    see parseSafeHttpUrl. Anything else (a bare version id,
+                    prose) stays plain text; never dangerouslySetInnerHTML. */}
+                {resolutionRefUrl ? (
+                  <a
+                    href={resolutionRefUrl.toString()}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 font-mono text-sm text-neon-glow hover:underline break-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neon-glow rounded-[4px]"
+                  >
+                    {pattern.resolutionRef}
+                    <span aria-hidden="true">↗</span>
+                  </a>
+                ) : (
+                  <p className="font-mono text-sm text-neutral-300 break-all mt-0.5">{pattern.resolutionRef}</p>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
 
       {/* Why did this fail? — connects the pattern to a concrete root-cause
           explanation for its most-recent representative run (Explainability

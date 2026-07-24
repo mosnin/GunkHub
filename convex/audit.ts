@@ -45,6 +45,10 @@ export const AUDIT_ACTIONS = [
   // ADR-005 Cycle 3 — failure pattern muting.
   "failure_pattern.muted",
   "failure_pattern.unmuted",
+  // ADR-006 — failure pattern resolution lifecycle.
+  "failure_pattern.acknowledged",
+  "failure_pattern.resolved",
+  "failure_pattern.reopened",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

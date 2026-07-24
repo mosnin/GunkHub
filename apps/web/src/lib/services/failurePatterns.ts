@@ -81,6 +81,22 @@ function mapFailurePattern(doc: Record<string, unknown>): FailurePattern {
     ...(typeof doc['lastPatternSpikeAlertFiredAt'] === 'number' && {
       lastPatternSpikeAlertFiredAt: doc['lastPatternSpikeAlertFiredAt'],
     }),
+    // Resolution lifecycle (docs/adr/006-failure-resolution.md, cycle 1):
+    // acknowledgePattern/resolvePattern/reopenPattern (Team A, member-gated,
+    // audited) patch these fields onto the rollup. Same "only emit when
+    // actually present" discipline as muted/mutedAt above — an "open"
+    // pattern (the default, absent `status`) omits every one of these keys
+    // rather than sending explicit `status: undefined`/`0`-ish placeholders.
+    ...(typeof doc['status'] === 'string' && { status: doc['status'] as FailurePattern['status'] }),
+    ...(typeof doc['acknowledgedAt'] === 'number' && { acknowledgedAt: doc['acknowledgedAt'] }),
+    ...(typeof doc['acknowledgedByUserId'] === 'string' && {
+      acknowledgedByUserId: doc['acknowledgedByUserId'],
+    }),
+    ...(typeof doc['resolvedAt'] === 'number' && { resolvedAt: doc['resolvedAt'] }),
+    ...(typeof doc['resolvedByUserId'] === 'string' && { resolvedByUserId: doc['resolvedByUserId'] }),
+    ...(typeof doc['resolutionNote'] === 'string' && { resolutionNote: doc['resolutionNote'] }),
+    ...(typeof doc['resolutionRef'] === 'string' && { resolutionRef: doc['resolutionRef'] }),
+    ...(typeof doc['regressedAt'] === 'number' && { regressedAt: doc['regressedAt'] }),
   }
 }
 
@@ -214,6 +230,90 @@ export async function unmutePattern(fingerprintHash: string): Promise<FailurePat
   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const doc = await withConvexTimeout(
     client.mutation(convex.failure_patterns.unmutePattern, {
+      orgId: convexOrgId,
+      fingerprintHash,
+    }),
+  )
+  if (!doc || typeof doc !== 'object') return null
+  return mapFailurePattern(doc as Record<string, unknown>)
+}
+
+// ---------------------------------------------------------------------------
+// Resolution lifecycle (docs/adr/006-failure-resolution.md, cycle 1) —
+// acknowledge / resolve / reopen. Unlike mutePattern/unmutePattern (admin-
+// gated org-wide alert suppression), Team A's acknowledgePattern/
+// resolvePattern/reopenPattern are MEMBER-gated — this is normal triage, the
+// same tier as commenting. This service layer does not duplicate that gate
+// (or the audit write): it only resolves the caller's org and surfaces
+// whatever Convex returns/throws. A non-member/insufficient-role caller gets
+// Convex's `FORBIDDEN: ...` throw, which the route maps via `mapApiError` to
+// a clean 403. Same null-on-not-found-in-org tenancy posture as every other
+// fingerprint-scoped mutation in this file.
+// ---------------------------------------------------------------------------
+
+/** Acknowledge a failure pattern — status -> "acknowledged". See `resolvePattern`'s doc comment for the shared tenancy/error posture. */
+export async function acknowledgePattern(fingerprintHash: string): Promise<FailurePattern | null> {
+  const { convexOrgId } = await requireOrgContext()
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await withConvexTimeout(
+    client.mutation(convex.failure_patterns.acknowledgePattern, {
+      orgId: convexOrgId,
+      fingerprintHash,
+    }),
+  )
+  if (!doc || typeof doc !== 'object') return null
+  return mapFailurePattern(doc as Record<string, unknown>)
+}
+
+/**
+ * Resolve a failure pattern — status -> "resolved", stamping an optional
+ * bounded `note`/`ref`. Both are opaque plain text as far as this layer (and
+ * Convex) are concerned — `ref` is never parsed as a URL or fetched, even
+ * when it looks like one; rendering it as a link (if ever) is a UI-layer
+ * decision made elsewhere. Server-side length validation
+ * (MAX_RESOLUTION_NOTE_LENGTH / MAX_RESOLUTION_REF_LENGTH, both 2048 chars)
+ * lives in convex/failure_patterns.ts's `resolvePattern` and throws
+ * `afrError("INVALID_ARGUMENT", ...)` on violation, which mapApiError maps to
+ * 422 — the route also validates client-side for a fast, clear rejection
+ * before ever calling Convex (see fingerprintValidation.ts-style split).
+ *
+ * Returns `null` for the same reason every fingerprint-scoped mutation above
+ * does: "never existed" and "belongs to a different org" must be
+ * indistinguishable, collapsing to one generic 404 at the route.
+ */
+export async function resolvePattern(
+  fingerprintHash: string,
+  fields: { note?: string; ref?: string },
+): Promise<FailurePattern | null> {
+  const { convexOrgId } = await requireOrgContext()
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await withConvexTimeout(
+    client.mutation(convex.failure_patterns.resolvePattern, {
+      orgId: convexOrgId,
+      fingerprintHash,
+      ...(fields.note !== undefined && { note: fields.note }),
+      ...(fields.ref !== undefined && { ref: fields.ref }),
+    }),
+  )
+  if (!doc || typeof doc !== 'object') return null
+  return mapFailurePattern(doc as Record<string, unknown>)
+}
+
+/**
+ * Reopen a failure pattern — status -> "open", clearing `regressedAt` (Team
+ * A's `reopenPattern` also clears `resolvedAt` but keeps
+ * resolvedByUserId/resolutionNote/resolutionRef/acknowledgedAt as history —
+ * see that mutation's doc comment). Same tenancy/error posture as
+ * `acknowledgePattern`/`resolvePattern` above.
+ */
+export async function reopenPattern(fingerprintHash: string): Promise<FailurePattern | null> {
+  const { convexOrgId } = await requireOrgContext()
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await withConvexTimeout(
+    client.mutation(convex.failure_patterns.reopenPattern, {
       orgId: convexOrgId,
       fingerprintHash,
     }),

@@ -66,7 +66,40 @@ export interface FailurePattern {
   muted?: boolean;
   /** Epoch ms of the most recent mute. Not cleared on unmute (a "last muted at" marker, not "muted since"). */
   mutedAt?: number;
+
+  // ---------------------------------------------------------------------
+  // Resolution lifecycle (docs/adr/006-failure-resolution.md). A human
+  // annotation on the rollup, exactly like Comments hang off runs/events —
+  // NEVER source of truth, same observability-grade posture as every other
+  // field above. Written by acknowledgePattern/resolvePattern/reopenPattern
+  // (member-gated, audited) and by the regression guard inside
+  // recordFailurePatternOccurrence.
+  // ---------------------------------------------------------------------
+
+  /** Absent means "open" — the default for every pre-cycle-6 row and every freshly-created rollup. */
+  status?: FailurePatternStatus;
+  acknowledgedAt?: number;
+  acknowledgedByUserId?: string;
+  resolvedAt?: number;
+  resolvedByUserId?: string;
+  /** Bounded free text describing how/why this fingerprint was resolved. */
+  resolutionNote?: string;
+  /**
+   * Bounded free-form reference — e.g. an agentVersionId or a URL. Plain
+   * string only: if a caller renders it as a link, that is a UI-layer
+   * decision; this layer never auto-fetches it.
+   */
+  resolutionRef?: string;
+  /**
+   * Set by the regression guard the moment a RESOLVED pattern receives a new
+   * occurrence dated after `resolvedAt` — "your fix didn't hold." Cleared by
+   * `reopenPattern` (a human manually reopening is not itself a regression).
+   */
+  regressedAt?: number;
 }
+
+/** Failure pattern lifecycle state (docs/adr/006-failure-resolution.md). Absent on the rollup means "open". */
+export type FailurePatternStatus = "open" | "acknowledged" | "resolved";
 
 /** `getFailurePattern`'s full detail shape: the rollup, a bounded recent-occurrences sample, and a 14-day trend. */
 export interface FailurePatternDetail {

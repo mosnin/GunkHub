@@ -142,6 +142,9 @@ describe('read_api.apiListFailurePatterns', () => {
       affectedAgentVersionIds?: any[];
       lastSeenAt?: number;
       lastSpikeAssessment?: { assessedAt: number; isSpiking: boolean; recentCount: number; baselineMean: number; z: number };
+      muted?: boolean;
+      status?: 'open' | 'acknowledged' | 'resolved';
+      regressedAt?: number;
     } = {},
   ) {
     return await t.run(async (ctx) => {
@@ -158,6 +161,9 @@ describe('read_api.apiListFailurePatterns', () => {
         representativeRunIds: [],
         affectedAgentVersionIds: opts.affectedAgentVersionIds ?? [],
         ...(opts.lastSpikeAssessment !== undefined && { lastSpikeAssessment: opts.lastSpikeAssessment }),
+        ...(opts.muted !== undefined && { muted: opts.muted }),
+        ...(opts.status !== undefined && { status: opts.status }),
+        ...(opts.regressedAt !== undefined && { regressedAt: opts.regressedAt }),
       });
     });
   }
@@ -311,5 +317,103 @@ describe('read_api.apiListFailurePatterns', () => {
     });
     expect(result.patterns).toHaveLength(1);
     expect(result.patterns[0].fingerprintHash).toBe('fp_agent_a_spiking');
+  });
+
+  // Resolution cycle 1 (docs/adr/006-failure-resolution.md, "resolution
+  // reflection") — same overfetch-then-filter, read-side-only posture as
+  // --spiking/--muted above.
+  it('--status narrows to patterns with an exact lifecycle status match', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_resolved', { status: 'resolved' });
+    await seedPattern(t, orgA, 'fp_acknowledged', { status: 'acknowledged' });
+    await seedPattern(t, orgA, 'fp_open_explicit', { status: 'open' });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', status: 'resolved' });
+    expect(result.patterns).toHaveLength(1);
+    expect(result.patterns[0].fingerprintHash).toBe('fp_resolved');
+  });
+
+  it('--status open matches patterns with no status field set (absent means open)', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_no_status_field');
+    await seedPattern(t, orgA, 'fp_resolved', { status: 'resolved' });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', status: 'open' });
+    expect(result.patterns).toHaveLength(1);
+    expect(result.patterns[0].fingerprintHash).toBe('fp_no_status_field');
+  });
+
+  it('omitting --status returns patterns of every lifecycle status', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_open');
+    await seedPattern(t, orgA, 'fp_resolved', { status: 'resolved' });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key' });
+    expect(result.patterns).toHaveLength(2);
+  });
+
+  it('--regressed narrows to patterns with regressedAt set', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_regressed', { status: 'open', regressedAt: Date.now() });
+    await seedPattern(t, orgA, 'fp_not_regressed', { status: 'open' });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', regressed: true });
+    expect(result.patterns).toHaveLength(1);
+    expect(result.patterns[0].fingerprintHash).toBe('fp_regressed');
+  });
+
+  it('omitting --regressed returns patterns regardless of regression state', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_regressed', { regressedAt: Date.now() });
+    await seedPattern(t, orgA, 'fp_not_regressed');
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key' });
+    expect(result.patterns).toHaveLength(2);
+  });
+
+  it('--status and --agent compose (both filters applied)', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t);
+    const [versionForAgentA] = await t.run(async (ctx) => {
+      const now = Date.now();
+      const v1 = await ctx.db.insert('agent_versions', { agentId: agentA, orgId: orgA, version: '1', createdAt: now });
+      return [v1];
+    });
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_agent_a_resolved', {
+      affectedAgentVersionIds: [versionForAgentA],
+      status: 'resolved',
+    });
+    await seedPattern(t, orgA, 'fp_agent_a_open', { affectedAgentVersionIds: [versionForAgentA] });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, {
+      apiKeyHash: 'read_key',
+      agentId: String(agentA),
+      status: 'resolved',
+    });
+    expect(result.patterns).toHaveLength(1);
+    expect(result.patterns[0].fingerprintHash).toBe('fp_agent_a_resolved');
   });
 })

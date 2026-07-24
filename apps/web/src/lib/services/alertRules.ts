@@ -23,6 +23,12 @@ export const ALERT_RULE_KINDS: ReadonlySet<string> = new Set<string>([
   'failure_rate',
   'eval_failed',
   'pattern_spike',
+  // ADR-006 (docs/adr/006-failure-resolution.md): fires when a RESOLVED
+  // failure pattern auto-reopens because a new occurrence landed after its
+  // resolvedAt ("regressed"). Mirrors pattern_spike's plumbing exactly (own
+  // rule kind, own firing mutation — convex/alerts.ts's
+  // firePatternRegressionAlert — never a reuse of pattern_spike).
+  'pattern_regressed',
 ])
 
 export function isValidAlertRuleKind(value: unknown): value is AlertRuleKind {
@@ -53,11 +59,21 @@ export function mapAlertRule(doc: Record<string, unknown>): AlertRule {
 
 /**
  * Maps a raw `alert_events` Convex doc onto the real contracts `AlertEvent`
- * shape, including the `pattern_spike`-only fields (`patternFingerprintHash`,
- * `metadata`) `firePatternSpikeAlert` (convex/alerts.ts) now writes. Both
- * fields are optional/additive on the contract, so this is a no-op for
- * ordinary `run_failed` / `failure_rate` / `eval_failed` events — they simply
- * come back without those two keys, unchanged from before this cycle.
+ * shape, including the `pattern_spike`/`pattern_regressed`-only fields
+ * (`patternFingerprintHash`, `metadata`) `firePatternSpikeAlert` and
+ * `firePatternRegressionAlert` (convex/alerts.ts) write. Both fields are
+ * optional/additive on the contract, so this is a no-op for ordinary
+ * `run_failed` / `failure_rate` / `eval_failed` events — they simply come
+ * back without those two keys.
+ *
+ * `metadata` is passed through as an opaque `Record<string, unknown>` — a
+ * generic structural copy, not a kind-specific field list — so it already
+ * carries whichever shape a given kind writes without needing a change here:
+ * `pattern_spike`'s `{ fingerprintHash, class, label, recentCount, deepLink }`
+ * and ADR-006's `pattern_regressed` `{ fingerprintHash, class, label,
+ * resolvedAt, regressedAt, deepLink }` both round-trip unchanged, including
+ * the `deepLink` the alerts/events feed uses to link back to
+ * `/patterns/[fingerprint]`.
  */
 export function mapAlertEvent(doc: Record<string, unknown>): AlertEvent {
   return {

@@ -26,6 +26,7 @@ import type { V1ApiConfig, V1FetchLike } from './v1-client.js'
 import type {
   Event,
   FailurePattern,
+  FailurePatternStatus,
   FailureSummary,
   ReplayProjection,
   Run,
@@ -99,6 +100,20 @@ export interface V1GetExplanationData {
 // mutates it — there is deliberately no key-authed "mute" write here (see
 // `getFailurePatterns`'s doc and `packages/cli/src/commands/patterns.ts` for
 // the full reasoning).
+//
+// Resolution cycle 1 (docs/adr/006-failure-resolution.md, Team A's
+// lifecycle fields): `FailurePattern` now also carries `status` ('open' |
+// 'acknowledged' | 'resolved', absent meaning 'open'), `acknowledgedAt`/
+// `acknowledgedByUserId`, `resolvedAt`/`resolvedByUserId`/`resolutionNote`/
+// `resolutionRef`, and `regressedAt` (set by the backend's regression guard
+// the moment a resolved pattern gets a new occurrence — cleared on a manual
+// reopen). Exactly like `muted`, this surface only ever REFLECTS lifecycle
+// state — `status`/`regressed` below are read-side filters only. There is no
+// method here to acknowledge/resolve/reopen a pattern: those are member-
+// gated, audited, Clerk-authed org actions (a separate team's routes). A
+// key-authed write here would bypass both the member-gate and the audit
+// log — same reasoning as the no-CLI-mute decision, see
+// `packages/cli/src/commands/patterns.ts` for the full writeup.
 
 export interface V1ListFailurePatternsData {
   patterns: FailurePattern[]
@@ -125,6 +140,23 @@ export interface ListFailurePatternsParams {
    * route, not by this parameter.
    */
   muted?: boolean
+  /**
+   * Resolution-lifecycle filter (docs/adr/006-failure-resolution.md): narrow
+   * to patterns whose `status` exactly matches ('open' | 'acknowledged' |
+   * 'resolved'). A pattern with no `status` field set is treated as 'open'
+   * (the documented default for every pre-lifecycle row). Omit to see
+   * patterns of any status. Purely a read-side filter — it has no effect on
+   * lifecycle state, which only changes through the member-gated,
+   * Clerk-authed acknowledge/resolve/reopen routes.
+   */
+  status?: FailurePatternStatus
+  /**
+   * Narrow to patterns that currently have `regressedAt` set — i.e. a
+   * RESOLVED pattern that received a new occurrence after it was resolved
+   * ("your fix didn't hold"), per the backend's regression guard. Omit (or
+   * pass `false`) to see patterns regardless of regression state.
+   */
+  regressed?: boolean
   limit?: number
   cursor?: string
 }
@@ -349,11 +381,18 @@ export class FlightReader {
    *   least one version of that agent), `spiking` (narrows to patterns whose
    *   `lastSpikeAssessment.isSpiking === true`), `muted` (narrows to
    *   muted/active patterns — a read-side filter only, see
-   *   {@link ListFailurePatternsParams.muted}) plus `limit`/`cursor` pagination.
+   *   {@link ListFailurePatternsParams.muted}), `status` (narrows to an exact
+   *   lifecycle status — 'open' | 'acknowledged' | 'resolved', see
+   *   {@link ListFailurePatternsParams.status}), `regressed` (narrows to
+   *   patterns with `regressedAt` set, see
+   *   {@link ListFailurePatternsParams.regressed}) plus `limit`/`cursor` pagination.
    * @returns `{ patterns, nextCursor }` — pass `nextCursor` back as `cursor` to page.
-   *   Each pattern carries `muted`/`mutedAt` when set (PREVENTION cycle 3) —
-   *   there is no method on this class to change mute state; that is an
-   *   admin-only, Clerk-authed write on the web app, not part of this
+   *   Each pattern carries `muted`/`mutedAt` when set (PREVENTION cycle 3),
+   *   and `status`/`acknowledgedAt`/`acknowledgedByUserId`/`resolvedAt`/
+   *   `resolvedByUserId`/`resolutionNote`/`resolutionRef`/`regressedAt` when
+   *   set (Resolution cycle 1, ADR-006) — there is no method on this class to
+   *   change mute or lifecycle state; those are admin/member-only,
+   *   Clerk-authed, audited writes on the web app, not part of this
    *   key-authed read surface.
    * @throws {@link V1ApiError} on any auth/rate-limit/server/network failure.
    */
@@ -365,6 +404,8 @@ export class FlightReader {
         agentId: filters.agentId,
         ...(filters.spiking !== undefined && { spiking: filters.spiking }),
         ...(filters.muted !== undefined && { muted: filters.muted }),
+        ...(filters.status !== undefined && { status: filters.status }),
+        ...(filters.regressed !== undefined && { regressed: filters.regressed }),
         limit: filters.limit,
         cursor: filters.cursor,
       },

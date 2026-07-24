@@ -16,7 +16,15 @@
     // flags flag as noise. The valuable check — fixtures matching contracts types
     // (exactOptionalPropertyTypes, strict) — is retained, so drift still fails CI.
     "noUncheckedIndexedAccess": false,
-    "noPropertyAccessFromIndexSignature": false
+    "noPropertyAccessFromIndexSignature": false,
+    // Mirrors the `@` alias in tests/vitest.config.ts (itself mirroring
+    // apps/web/tsconfig.json's `"@/*": ["./src/*"]`). Without this, tests that
+    // import apps/web service modules resolve at runtime but not at compile
+    // time, so typecheck fails on modules vitest happily loads.
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["../apps/web/src/*"]
+    }
   },
   "include": ["**/*.ts"],
   "exclude": ["node_modules"]

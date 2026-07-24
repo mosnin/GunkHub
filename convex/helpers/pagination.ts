@@ -231,3 +231,19 @@ export const RUN_EXPLANATION_SCHEMA_VERSION = 1;
  * cache.
  */
 export const MAX_RUN_EXPLANATION_SUMMARY_BATCH = 50;
+
+// ---------------------------------------------------------------------------
+// ADR-006 — failure pattern resolution lifecycle. See
+// docs/adr/006-failure-resolution.md.
+// ---------------------------------------------------------------------------
+
+/** Write ceiling for failure_patterns.resolutionNote (plain text, optional). */
+export const MAX_RESOLUTION_NOTE_LENGTH = 2 * 1024;
+
+/**
+ * Write ceiling for failure_patterns.resolutionRef (plain text, optional —
+ * e.g. an agentVersionId or a URL). Never auto-fetched/validated as a real
+ * URL server-side; a generous cap that comfortably fits a long URL without
+ * allowing unbounded growth.
+ */
+export const MAX_RESOLUTION_REF_LENGTH = 2 * 1024;

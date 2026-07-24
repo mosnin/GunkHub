@@ -5,6 +5,9 @@ import { EmptyState } from '@/components/ui/EmptyState'
 
 interface PatternListProps {
   patterns: AdaptedFailurePattern[]
+  /** Overrides the empty-state copy — used by PatternsPage when a `?status=` filter (not the absence of any patterns at all) is why this list is empty, so the message says "try a different filter" instead of the default "instrument your agent" copy. */
+  emptyTitle?: string
+  emptyDescription?: string
 }
 
 /**
@@ -14,12 +17,15 @@ interface PatternListProps {
  * empty state; loading/error are handled by the page (same split as
  * SelectableRunList / AuditPage).
  */
-export function PatternList({ patterns }: PatternListProps) {
+export function PatternList({ patterns, emptyTitle, emptyDescription }: PatternListProps) {
   if (patterns.length === 0) {
     return (
       <EmptyState
-        title="No recurring failure patterns yet"
-        description="Patterns appear as failures recur across runs. Once the same failure fingerprint is seen more than once, it shows up here — ranked by how recently it last happened."
+        title={emptyTitle ?? 'No recurring failure patterns yet'}
+        description={
+          emptyDescription ??
+          'Patterns appear as failures recur across runs. Once the same failure fingerprint is seen more than once, it shows up here — ranked by how recently it last happened.'
+        }
       />
     )
   }
@@ -46,6 +52,9 @@ export function PatternList({ patterns }: PatternListProps) {
             </th>
             <th className="px-4 py-2.5 text-right text-xs font-medium text-pewter uppercase tracking-wider min-w-[90px]">
               Versions
+            </th>
+            <th className="px-4 py-2.5 text-left text-xs font-medium text-pewter uppercase tracking-wider min-w-[130px]">
+              Status
             </th>
             <th className="px-4 py-2.5 text-left text-xs font-medium text-pewter uppercase tracking-wider min-w-[150px]">
               Spike

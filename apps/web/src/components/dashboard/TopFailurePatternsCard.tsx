@@ -2,7 +2,9 @@ import Link from 'next/link'
 
 import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
 
+import { isRegressedPattern } from '@/components/patterns/adapt'
 import { MutedBadge } from '@/components/patterns/MutedBadge'
+import { PatternStatusBadge } from '@/components/patterns/PatternStatusBadge'
 import { SpikeBadge } from '@/components/patterns/SpikeBadge'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { ErrorState } from '@/components/ui/ErrorState'
@@ -21,15 +23,19 @@ function formatFailureClass(cls: string): string {
 }
 
 /**
- * Dashboard glance ordering: spiking patterns first (the ones an engineer
- * needs to see NOW), then the rest by `lastSeenAt` descending — same base
- * order as the full Patterns list (PatternList), just with a "surface what's
- * actively spiking" boost on top since this card only has room for a few
- * rows.
+ * Dashboard glance ordering: REGRESSED patterns first — "you thought this
+ * was fixed and it isn't" is the single most urgent thing this card can
+ * show (docs/adr/006-failure-resolution.md) — then spiking patterns (the
+ * ones an engineer needs to see NOW), then the rest by `lastSeenAt`
+ * descending. Same base order as the full Patterns list (PatternList), just
+ * with those two boosts on top since this card only has room for a few rows.
  */
 function rankForDashboard(patterns: AdaptedFailurePattern[]): AdaptedFailurePattern[] {
   return [...patterns]
     .sort((a, b) => {
+      const aRegressed = isRegressedPattern(a) ? 1 : 0
+      const bRegressed = isRegressedPattern(b) ? 1 : 0
+      if (aRegressed !== bRegressed) return bRegressed - aRegressed
       const aSpiking = a.lastSpikeAssessment?.isSpiking === true ? 1 : 0
       const bSpiking = b.lastSpikeAssessment?.isSpiking === true ? 1 : 0
       if (aSpiking !== bSpiking) return bSpiking - aSpiking
@@ -97,6 +103,9 @@ export function TopFailurePatternsCard({ patterns, error }: TopFailurePatternsCa
                 <span className="font-mono text-sm text-neutral-300 shrink-0 tabular-nums">
                   {pattern.count.toLocaleString()}
                 </span>
+                {isRegressedPattern(pattern) && (
+                  <PatternStatusBadge status={pattern.status} regressed className="shrink-0" />
+                )}
                 <SpikeBadge
                   isSpiking={pattern.lastSpikeAssessment?.isSpiking === true}
                   assessed={pattern.hasSpikeAssessment}

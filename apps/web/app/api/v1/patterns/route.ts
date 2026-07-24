@@ -22,6 +22,13 @@ import { apiListFailurePatterns } from '@/lib/services/api_v1'
 // there is no mutation on this route or `apiListFailurePatterns` that sets
 // `muted`. Setting mute state is an admin-only, Clerk-authed, audited action
 // on a separate route; this key-authed v1 surface can only reflect it.
+//
+// `status`/`regressed` (Resolution cycle 1, ADR-006, "resolution
+// reflection"): same READ-side-only posture as `muted` — no mutation here
+// sets `status`/`resolvedAt`/`regressedAt`/etc. Acknowledging, resolving, or
+// reopening a pattern is a member-gated, audited, Clerk-authed action on a
+// separate route; this surface only ever reflects the resulting lifecycle
+// state. Powers `afr patterns --status`/`--regressed` and the STATUS column.
 // ---------------------------------------------------------------------------
 export const GET = withApiHandler(
   '/api/v1/patterns',
@@ -44,12 +51,23 @@ export const GET = withApiHandler(
     // rather than rejected, consistent with every other filter on this route.
     const rawMuted = sp.get('muted')
     const muted = rawMuted === 'true' ? true : rawMuted === 'false' ? false : undefined
+    // --status (Resolution cycle 1): only the three known literal values opt
+    // in; anything else (missing, garbage, mixed case) is treated as unset
+    // rather than rejected — same permissive-parsing posture as every other
+    // filter on this route. Junk values are safely ignored, not a 500.
+    const rawStatus = sp.get('status')
+    const status =
+      rawStatus === 'open' || rawStatus === 'acknowledged' || rawStatus === 'resolved' ? rawStatus : undefined
+    // --regressed: same "true" opts in, anything else unset pattern as --spiking.
+    const regressed = sp.get('regressed') === 'true' ? true : undefined
 
     try {
       const result = await apiListFailurePatterns(hashApiKey(apiKey), {
         ...(sp.get('agentId') !== null && { agentId: sp.get('agentId') as string }),
         ...(spiking !== undefined && { spiking }),
         ...(muted !== undefined && { muted }),
+        ...(status !== undefined && { status }),
+        ...(regressed !== undefined && { regressed }),
         ...(limit !== undefined && { limit }),
         ...(sp.get('cursor') !== null && { cursor: sp.get('cursor') as string }),
       })

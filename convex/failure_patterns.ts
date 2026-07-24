@@ -48,6 +48,8 @@ import { v } from "convex/values";
 import { internalMutation, internalQuery, mutation, query } from "./_generated/server.js";
 import { recordAuditEvent } from "./audit.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { afrError } from "./helpers/errors.js";
+import { MAX_RESOLUTION_NOTE_LENGTH, MAX_RESOLUTION_REF_LENGTH } from "./helpers/pagination.js";
 import * as insightsModule from "./insights.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
@@ -410,7 +412,7 @@ export const recordFailurePatternOccurrence = internalMutation({
       salientKey: args.salientKey,
     });
 
-    await upsertRollup(ctx, {
+    const rollupResult = await upsertRollup(ctx, {
       orgId: args.orgId,
       fingerprintHash: args.fingerprintHash,
       class: args.class,
@@ -426,6 +428,27 @@ export const recordFailurePatternOccurrence = internalMutation({
       fingerprintHash: args.fingerprintHash,
       day: dayKeyOf(occurredAt),
     });
+
+    // REGRESSION GUARD (docs/adr/006-failure-resolution.md): a RESOLVED
+    // pattern that just received a new occurrence dated after its
+    // resolvedAt was auto-reopened by upsertRollup above. Fire a
+    // pattern_regressed alert — UNLESS the pattern is muted (mute silences
+    // alerts, it does not disable the lifecycle: the reopen above still
+    // happened regardless of this branch). Idempotent by construction: the
+    // rollup's status is now "open", so no later occurrence on this same
+    // (still-open) episode can re-enter this branch until a human resolves
+    // it again.
+    if (rollupResult.regressedFire && !rollupResult.regressedFire.muted) {
+      await ctx.runMutation(_firePatternRegressionAlertRef, {
+        orgId: rollupResult.regressedFire.orgId,
+        fingerprintHash: rollupResult.regressedFire.fingerprintHash,
+        class: rollupResult.regressedFire.class,
+        label: rollupResult.regressedFire.label,
+        resolvedAt: rollupResult.regressedFire.resolvedAt,
+        regressedAt: rollupResult.regressedFire.regressedAt,
+        representativeRunId: rollupResult.regressedFire.representativeRunId,
+      });
+    }
 
     return { recorded: true as const };
   },
@@ -462,6 +485,20 @@ async function incrementDailyCount(
   }
 }
 
+/** What recordFailurePatternOccurrence needs from upsertRollup to (maybe) fire a regression alert, outside the DB transaction's own concerns. */
+interface RollupUpsertResult {
+  regressedFire?: {
+    orgId: Id<"organizations">;
+    fingerprintHash: string;
+    class: string;
+    label: string;
+    resolvedAt: number;
+    regressedAt: number;
+    representativeRunId: Id<"runs">;
+    muted: boolean;
+  };
+}
+
 async function upsertRollup(
   ctx: MutationCtx,
   args: {
@@ -474,7 +511,7 @@ async function upsertRollup(
     agentVersionId: Id<"agent_versions"> | undefined;
     occurredAt: number;
   },
-): Promise<void> {
+): Promise<RollupUpsertResult> {
   const existing = await ctx.db
     .query("failure_patterns")
     .withIndex("by_org_fingerprint", (q) => q.eq("orgId", args.orgId).eq("fingerprintHash", args.fingerprintHash))
@@ -493,7 +530,7 @@ async function upsertRollup(
       representativeRunIds: [args.runId],
       affectedAgentVersionIds: args.agentVersionId ? [args.agentVersionId] : [],
     });
-    return;
+    return {};
   }
 
   const representativeRunIds = dedupCapMostRecentFirst(
@@ -505,7 +542,20 @@ async function upsertRollup(
     ? dedupCapMostRecentFirst(existing.affectedAgentVersionIds, args.agentVersionId, MAX_AFFECTED_AGENT_VERSION_IDS)
     : existing.affectedAgentVersionIds;
 
-  await ctx.db.patch(existing._id, {
+  // REGRESSION GUARD (docs/adr/006-failure-resolution.md): this fingerprint
+  // was marked RESOLVED by a human, and a new occurrence just landed dated
+  // AFTER that resolution — the fix didn't hold. Auto-reopen: status flips
+  // back to "open" and regressedAt is stamped with THIS occurrence's
+  // timestamp (not `Date.now()` — occurredAt may be caller-supplied, e.g. in
+  // tests or a backfill, and this is "when the regressing failure actually
+  // happened", mirroring how lastSeenAt/firstSeenAt already use occurredAt
+  // rather than wall-clock time).
+  const isRegression =
+    existing.status === "resolved" &&
+    existing.resolvedAt !== undefined &&
+    args.occurredAt > existing.resolvedAt;
+
+  const patch: Partial<Doc<"failure_patterns">> = {
     count: existing.count + 1,
     // label/class/salientKey may drift slightly between occurrences of the
     // "same" fingerprint hash in principle (e.g. a fallback fingerprinter
@@ -517,7 +567,26 @@ async function upsertRollup(
     lastSeenAt: Math.max(existing.lastSeenAt, args.occurredAt),
     representativeRunIds,
     affectedAgentVersionIds,
-  });
+  };
+
+  let regressedFire: RollupUpsertResult["regressedFire"];
+  if (isRegression) {
+    patch.status = "open";
+    patch.regressedAt = args.occurredAt;
+    regressedFire = {
+      orgId: args.orgId,
+      fingerprintHash: args.fingerprintHash,
+      class: args.class,
+      label: args.label,
+      resolvedAt: existing.resolvedAt as number,
+      regressedAt: args.occurredAt,
+      representativeRunId: args.runId,
+      muted: existing.muted === true,
+    };
+  }
+
+  await ctx.db.patch(existing._id, patch);
+  return { regressedFire };
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +810,175 @@ export const unmutePattern = mutation({
 });
 
 // ---------------------------------------------------------------------------
+// Resolution lifecycle (docs/adr/006-failure-resolution.md) — acknowledge /
+// resolve / reopen. MEMBER-gated (not admin-only): this is a human
+// annotation on the rollup, the same tier as commenting/resolving a comment
+// (convex/comments.ts's resolveComment) — not org-wide alerting config like
+// mutePattern/unmutePattern above. All three are AUDITED and return the
+// updated rollup doc, or `null` when `fingerprintHash` does not exist IN THIS
+// ORG — same "never existed" / "belongs to a different org" collapse every
+// other lookup-by-fingerprint mutation in this file already uses.
+// ---------------------------------------------------------------------------
+
+function validateResolutionFields(args: { note?: string; ref?: string }): void {
+  if (args.note !== undefined && args.note.length > MAX_RESOLUTION_NOTE_LENGTH) {
+    throw afrError(
+      "INVALID_ARGUMENT",
+      `resolutionNote must be at most ${String(MAX_RESOLUTION_NOTE_LENGTH)} characters`,
+    );
+  }
+  if (args.ref !== undefined && args.ref.length > MAX_RESOLUTION_REF_LENGTH) {
+    throw afrError(
+      "INVALID_ARGUMENT",
+      `resolutionRef must be at most ${String(MAX_RESOLUTION_REF_LENGTH)} characters`,
+    );
+  }
+}
+
+/**
+ * Acknowledge a fingerprint: status -> "acknowledged". A normal member
+ * action (like commenting) — signals "someone is looking at this," distinct
+ * from mute (which is admin-gated alert-suppression config). Does not touch
+ * resolvedAt/resolutionNote/resolutionRef/regressedAt.
+ *
+ * Contract for other teams:
+ *   `failure_patterns:acknowledgePattern({ orgId, fingerprintHash }) => Doc<"failure_patterns"> | null`
+ */
+export const acknowledgePattern = mutation({
+  args: { orgId: v.id("organizations"), fingerprintHash: v.string() },
+  handler: async (ctx, args): Promise<Doc<"failure_patterns"> | null> => {
+    const { userId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "member" });
+
+    const pattern = await findRollup(ctx, args.orgId, args.fingerprintHash);
+    if (!pattern) return null;
+
+    const acknowledgedAt = Date.now();
+    await ctx.db.patch(pattern._id, {
+      status: "acknowledged",
+      acknowledgedAt,
+      acknowledgedByUserId: userId,
+    });
+
+    await recordAuditEvent(ctx, {
+      orgId: args.orgId,
+      actorClerkUserId: userId,
+      action: "failure_pattern.acknowledged",
+      targetType: "failure_pattern",
+      targetId: args.fingerprintHash,
+      metadata: { fingerprintHash: args.fingerprintHash, class: pattern.class, label: pattern.label },
+    });
+
+    return await ctx.db.get(pattern._id);
+  },
+});
+
+/**
+ * Resolve a fingerprint: status -> "resolved", stamping resolvedAt/By and an
+ * optional bounded note/ref. This resolvedAt is exactly the timestamp the
+ * regression guard (upsertRollup, above) compares every future occurrence's
+ * `occurredAt` against — see that function's doc comment.
+ *
+ * `regressedAt` is deliberately left untouched by a resolve (even a
+ * re-resolve after a prior regression) — it is cleared ONLY by `reopenPattern`
+ * (a human explicitly reopening), so "when did this last regress" stays
+ * visible as history through a subsequent resolve, the same "historical
+ * marker, not a live flag" convention `mutedAt` already established in cycle
+ * 3.
+ *
+ * Contract for other teams:
+ *   `failure_patterns:resolvePattern({ orgId, fingerprintHash, note?, ref? }) => Doc<"failure_patterns"> | null`
+ */
+export const resolvePattern = mutation({
+  args: {
+    orgId: v.id("organizations"),
+    fingerprintHash: v.string(),
+    note: v.optional(v.string()),
+    ref: v.optional(v.string()),
+  },
+  handler: async (ctx, args): Promise<Doc<"failure_patterns"> | null> => {
+    const { userId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "member" });
+    validateResolutionFields({ note: args.note, ref: args.ref });
+
+    const pattern = await findRollup(ctx, args.orgId, args.fingerprintHash);
+    if (!pattern) return null;
+
+    const resolvedAt = Date.now();
+    await ctx.db.patch(pattern._id, {
+      status: "resolved",
+      resolvedAt,
+      resolvedByUserId: userId,
+      resolutionNote: args.note,
+      resolutionRef: args.ref,
+    });
+
+    await recordAuditEvent(ctx, {
+      orgId: args.orgId,
+      actorClerkUserId: userId,
+      action: "failure_pattern.resolved",
+      targetType: "failure_pattern",
+      targetId: args.fingerprintHash,
+      metadata: {
+        fingerprintHash: args.fingerprintHash,
+        class: pattern.class,
+        label: pattern.label,
+        hasNote: args.note !== undefined,
+        hasRef: args.ref !== undefined,
+      },
+    });
+
+    return await ctx.db.get(pattern._id);
+  },
+});
+
+/**
+ * Reopen a fingerprint: status -> "open". Used both for a human manually
+ * reopening (e.g. "actually this is still happening") and is the terminal
+ * state the regression guard's auto-reopen also lands on (though that path
+ * writes the rollup directly from upsertRollup/recordFailurePatternOccurrence,
+ * not via this mutation — see that function's doc comment).
+ *
+ * Clears `resolvedAt` and `regressedAt` (both are "currently resolved
+ * since" / "currently regressed since" markers that stop being true once the
+ * pattern is open again) but deliberately KEEPS `resolvedByUserId`/
+ * `resolutionNote`/`resolutionRef`/`acknowledgedAt`/`acknowledgedByUserId` as
+ * historical context about the most recent resolution/acknowledgement — the
+ * same "don't erase the paper trail" posture `mutedAt` already established
+ * (not cleared on unmute).
+ *
+ * Contract for other teams:
+ *   `failure_patterns:reopenPattern({ orgId, fingerprintHash }) => Doc<"failure_patterns"> | null`
+ */
+export const reopenPattern = mutation({
+  args: { orgId: v.id("organizations"), fingerprintHash: v.string() },
+  handler: async (ctx, args): Promise<Doc<"failure_patterns"> | null> => {
+    const { userId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "member" });
+
+    const pattern = await findRollup(ctx, args.orgId, args.fingerprintHash);
+    if (!pattern) return null;
+
+    await ctx.db.patch(pattern._id, {
+      status: "open",
+      resolvedAt: undefined,
+      regressedAt: undefined,
+    });
+
+    await recordAuditEvent(ctx, {
+      orgId: args.orgId,
+      actorClerkUserId: userId,
+      action: "failure_pattern.reopened",
+      targetType: "failure_pattern",
+      targetId: args.fingerprintHash,
+      metadata: { fingerprintHash: args.fingerprintHash, class: pattern.class, label: pattern.label },
+    });
+
+    return await ctx.db.get(pattern._id);
+  },
+});
+
+// ---------------------------------------------------------------------------
 // Spike-rollup cron — internalMutation, scheduled from convex/crons.ts.
 // ---------------------------------------------------------------------------
 
@@ -881,6 +1119,7 @@ const _listActivePatternsForSpikeAssessmentRef = makeFunctionReference<"query">(
   "failure_patterns:_listActivePatternsForSpikeAssessment",
 );
 const _firePatternSpikeAlertRef = makeFunctionReference<"mutation">("alerts:firePatternSpikeAlert");
+const _firePatternRegressionAlertRef = makeFunctionReference<"mutation">("alerts:firePatternRegressionAlert");
 
 // ---------------------------------------------------------------------------
 // Terminal-failure wiring helper — exported for run_explanations.ts to call.

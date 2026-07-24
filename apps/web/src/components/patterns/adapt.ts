@@ -27,6 +27,7 @@ import type {
   FailurePattern,
   FailurePatternDetail,
   FailurePatternOccurrence,
+  FailurePatternStatus,
   FailurePatternTrendPoint,
 } from '@agent-flight-recorder/contracts'
 
@@ -56,6 +57,33 @@ export interface AdaptedFailurePattern extends FailurePattern {
   muted: boolean
   /** Epoch ms the pattern was muted, when known. Undefined if never muted or the service doesn't supply it yet. */
   mutedAt?: number
+
+  /**
+   * Resolution lifecycle (cycle 1 of the Resolution feature — see
+   * docs/adr/006-failure-resolution.md, Team A's `status`/`resolvedAt`/etc.
+   * fields on the `FailurePattern` contract). Absent on the raw object means
+   * "open" — the honest default for every pre-lifecycle row, matching the
+   * contract's own "absent means open" convention, not a fabricated value.
+   */
+  status: FailurePatternStatus
+  acknowledgedAt?: number
+  acknowledgedByUserId?: string
+  resolvedAt?: number
+  resolvedByUserId?: string
+  resolutionNote?: string
+  resolutionRef?: string
+  /**
+   * Set the moment a RESOLVED pattern receives a new occurrence dated after
+   * `resolvedAt` — "your fix didn't hold." A pattern is considered
+   * REGRESSED for display purposes when `status` is `open` (the regression
+   * guard reopens it) AND `regressedAt` is set; see `isRegressed` below.
+   */
+  regressedAt?: number
+}
+
+/** True when a pattern is a REGRESSED one — reopened by the automatic regression guard after having been resolved, as opposed to a plain manual reopen (which clears `regressedAt`, per the contract's own doc comment). */
+export function isRegressedPattern(pattern: Pick<AdaptedFailurePattern, 'status' | 'regressedAt'>): boolean {
+  return pattern.status === 'open' && typeof pattern.regressedAt === 'number'
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -102,6 +130,17 @@ export function adaptFailurePattern(raw: unknown): AdaptedFailurePattern {
   const mutedAtRaw = r['mutedAt']
   const mutedAt = typeof mutedAtRaw === 'number' && Number.isFinite(mutedAtRaw) ? mutedAtRaw : undefined
 
+  const rawStatus = r['status']
+  const status: FailurePatternStatus =
+    rawStatus === 'acknowledged' || rawStatus === 'resolved' || rawStatus === 'open' ? rawStatus : 'open'
+  const acknowledgedAt = typeof r['acknowledgedAt'] === 'number' ? r['acknowledgedAt'] : undefined
+  const acknowledgedByUserId = typeof r['acknowledgedByUserId'] === 'string' ? r['acknowledgedByUserId'] : undefined
+  const resolvedAt = typeof r['resolvedAt'] === 'number' ? r['resolvedAt'] : undefined
+  const resolvedByUserId = typeof r['resolvedByUserId'] === 'string' ? r['resolvedByUserId'] : undefined
+  const resolutionNote = typeof r['resolutionNote'] === 'string' ? r['resolutionNote'] : undefined
+  const resolutionRef = typeof r['resolutionRef'] === 'string' ? r['resolutionRef'] : undefined
+  const regressedAt = typeof r['regressedAt'] === 'number' ? r['regressedAt'] : undefined
+
   return {
     id: str(r['id']),
     orgId: str(r['orgId']),
@@ -120,6 +159,14 @@ export function adaptFailurePattern(raw: unknown): AdaptedFailurePattern {
     hasSpikeAssessment: lastSpikeAssessment !== undefined,
     muted,
     ...(mutedAt !== undefined && { mutedAt }),
+    status,
+    ...(acknowledgedAt !== undefined && { acknowledgedAt }),
+    ...(acknowledgedByUserId !== undefined && { acknowledgedByUserId }),
+    ...(resolvedAt !== undefined && { resolvedAt }),
+    ...(resolvedByUserId !== undefined && { resolvedByUserId }),
+    ...(resolutionNote !== undefined && { resolutionNote }),
+    ...(resolutionRef !== undefined && { resolutionRef }),
+    ...(regressedAt !== undefined && { regressedAt }),
   }
 }
 

@@ -34,6 +34,7 @@ import type {
   ApiGetReplayResponse,
   ApiListRunsRequest,
   ApiListRunsResponse,
+  FailurePatternStatus,
 } from '@agent-flight-recorder/contracts'
 
 import { convex } from '@/lib/convexFunctions'
@@ -168,6 +169,26 @@ export async function apiGetExplanation(
  */
 export interface ApiV1ListFailurePatternsParams {
   agentId?: string
+  // BUG FIX (Team D found, this cycle): convex/read_api.ts's
+  // apiListFailurePatterns has accepted `spiking`/`muted` since last cycle,
+  // and now also `status`/`regressed` (ADR-006, docs/adr/006-failure-
+  // resolution.md) — but this forwarder only ever declared/forwarded
+  // agentId/limit/cursor, so `afr patterns --spiking`/`--muted` have been
+  // silently returning UNFILTERED results since they shipped: the v1 route
+  // parses the query param correctly, the CLI sends it correctly, the Convex
+  // mutation implements the filter correctly, and this forwarder dropped it
+  // on the floor in between. TypeScript does not catch this because the args
+  // cross a hand-maintained `makeFunctionReference` string ref — there is no
+  // structural type checked against the real Convex handler's `args` shape,
+  // so an object spread silently omitting a field is not a type error. See
+  // the table-driven test in tests/unit/api_v1_failure_patterns_params.test.ts
+  // that pins every declared param actually reaching the mutation call, so
+  // the next added filter fails loudly here instead of silently returning
+  // wrong data.
+  spiking?: boolean
+  muted?: boolean
+  status?: FailurePatternStatus
+  regressed?: boolean
   limit?: number
   cursor?: string
 }
@@ -182,6 +203,10 @@ export async function apiListFailurePatterns(
     client.mutation(convex.read_api.apiListFailurePatterns, {
       apiKeyHash,
       ...(params.agentId !== undefined && { agentId: params.agentId }),
+      ...(params.spiking !== undefined && { spiking: params.spiking }),
+      ...(params.muted !== undefined && { muted: params.muted }),
+      ...(params.status !== undefined && { status: params.status }),
+      ...(params.regressed !== undefined && { regressed: params.regressed }),
       ...(params.limit !== undefined && { limit: params.limit }),
       ...(params.cursor !== undefined && { cursor: params.cursor }),
     }),

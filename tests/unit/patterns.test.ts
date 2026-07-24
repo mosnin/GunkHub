@@ -77,6 +77,26 @@ describe('afr patterns — arg parsing', () => {
   it('parses --active', () => {
     expect(parsePatternsArgs(['--active'])).toEqual({ active: true })
   })
+
+  it('parses --status', () => {
+    expect(parsePatternsArgs(['--status', 'resolved'])).toEqual({ status: 'resolved' })
+  })
+
+  it('parses --regressed', () => {
+    expect(parsePatternsArgs(['--regressed'])).toEqual({ regressed: true })
+  })
+
+  it('parses --status alongside --agent/--regressed/--limit/--json', () => {
+    expect(
+      parsePatternsArgs(['--agent', 'agent_1', '--status', 'open', '--regressed', '--limit', '5', '--json'])
+    ).toEqual({
+      agent: 'agent_1',
+      status: 'open',
+      regressed: true,
+      limit: 5,
+      json: true,
+    })
+  })
 })
 
 describe('afr patterns — happy path', () => {
@@ -259,6 +279,98 @@ describe('afr patterns — happy path', () => {
       expect(result.exitCode).toBe(1)
       expect(result.message).toContain('mutually exclusive')
     }
+  })
+
+  it('shows "open" in the STATUS column when status is absent (default)', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [makePattern()] } })
+    )
+    const result = await runPatterns({}, env, fetchImpl)
+    const log = vi.fn()
+    printPatterns({}, result, log)
+    const output = log.mock.calls.map((c) => c[0] as string).join('\n')
+    expect(output).toContain('STATUS')
+    expect(output).toContain('open')
+  })
+
+  it('shows "acknowledged"/"resolved" in the STATUS column when set', async () => {
+    const acknowledged = makePattern({ id: 'fp_ack', status: 'acknowledged' })
+    const resolved = makePattern({ id: 'fp_res', status: 'resolved', resolvedAt: Date.now() })
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [acknowledged, resolved] } })
+    )
+    const result = await runPatterns({}, env, fetchImpl)
+    const log = vi.fn()
+    printPatterns({}, result, log)
+    const output = log.mock.calls.map((c) => c[0] as string).join('\n')
+    expect(output).toContain('acknowledged')
+    expect(output).toContain('resolved')
+  })
+
+  it('shows "REGRESSED" instead of "open" when status is open and regressedAt is set', async () => {
+    const regressed = makePattern({ status: 'open', regressedAt: Date.now() })
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [regressed] } })
+    )
+    const result = await runPatterns({}, env, fetchImpl)
+    const log = vi.fn()
+    printPatterns({}, result, log)
+    const output = log.mock.calls.map((c) => c[0] as string).join('\n')
+    expect(output).toContain('REGRESSED')
+  })
+
+  it('does not show "REGRESSED" for a resolved pattern even if regressedAt was set historically', async () => {
+    // `regressedAt` is omitted rather than passed as `undefined`:
+    // exactOptionalPropertyTypes is on, and a resolved pattern that was
+    // reopened-then-resolved-again carries no live regression marker.
+    const stillResolved = makePattern({ status: 'resolved' })
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [stillResolved] } })
+    )
+    const result = await runPatterns({}, env, fetchImpl)
+    const log = vi.fn()
+    printPatterns({}, result, log)
+    const output = log.mock.calls.map((c) => c[0] as string).join('\n')
+    expect(output).not.toContain('REGRESSED')
+    expect(output).toContain('resolved')
+  })
+
+  it('--status forwards the value as a query param', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    await runPatterns({ status: 'resolved' }, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('status=resolved')
+  })
+
+  it('omits the status query param when --status is not passed', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    await runPatterns({}, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).not.toContain('status=')
+  })
+
+  it('--regressed forwards regressed=true as a query param', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    await runPatterns({ regressed: true }, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('regressed=true')
+  })
+
+  it('rejects an invalid --status value as a usage error (exit 1)', async () => {
+    const result = await runPatterns({ status: 'bogus' }, env)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.exitCode).toBe(1)
+      expect(result.message).toContain('--status must be one of')
+    }
+  })
+
+  it('--status and --agent compose (both forwarded)', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    await runPatterns({ agent: 'agent_1', status: 'resolved' }, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('agentId=agent_1')
+    expect(url).toContain('status=resolved')
   })
 
   it('prints a "more results available" hint when nextCursor is present', async () => {

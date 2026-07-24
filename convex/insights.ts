@@ -2728,3 +2728,220 @@ export function classifyPatternEpisode(
 
   return avgGapMs >= quietGapMs ? "regressed" : "ongoing";
 }
+
+// ---------------------------------------------------------------------------
+// 11. isRegression / timeToResolutionMs / summarizeResolutionHealth — cycle 1
+//    of "Resolution" (failure lifecycle + regression guard). Team A is adding
+//    a lifecycle (status open/acknowledged/resolved, resolvedAt/By,
+//    resolutionNote/ref, regressedAt) to failure_patterns, plus a regression
+//    guard: a RESOLVED pattern that fires again auto-reopens + alerts. These
+//    three functions are the PURE, DETERMINISTIC analytics/decision layer
+//    over that lifecycle — no ctx/db access, reused by Team A's
+//    mutations/cron (deciding/recording a regression) and Team C's routes
+//    (rendering resolution-health stats). Like every other function in this
+//    file, none of these read Date.now() or Math.random(): `nowMs` is always
+//    supplied by the caller, so the same inputs always produce the same
+//    outputs, forever.
+// ---------------------------------------------------------------------------
+
+/**
+ * A lifecycle snapshot of one failure pattern, as Team A's schema/queries are
+ * expected to shape it for these pure helpers. `count` (total occurrences
+ * ever recorded for this fingerprint) is carried for parity with the
+ * `classifyPatternEpisode` snapshot shape above, even though
+ * `summarizeResolutionHealth` does not currently use it.
+ */
+export interface PatternLifecycleSnapshot {
+  status: "open" | "acknowledged" | "resolved";
+  firstSeenAt: number;
+  lastSeenAt: number;
+  resolvedAt?: number;
+  regressedAt?: number;
+  count: number;
+}
+
+/**
+ * Is a NEW occurrence of a pattern a genuine REGRESSION?
+ *
+ * True iff ALL of:
+ *   1. `prevStatus === "resolved"` — a pattern that was open or acknowledged
+ *      firing again is just... still firing. Only a pattern the team believed
+ *      was DONE can "regress."
+ *   2. `resolvedAt` is a defined, finite number — a "resolved" status with no
+ *      recorded resolution timestamp is malformed data; treated defensively
+ *      as "cannot prove this is a regression," not as a crash.
+ *   3. `newOccurredAt` is strictly AFTER `resolvedAt` — an occurrence that
+ *      raced the resolution mutation (same instant or earlier, e.g. a
+ *      slightly-stale event replay) is not treated as a regression.
+ *
+ * Defensive against non-finite (`NaN`/`Infinity`) or missing timestamps in
+ * either direction: any such input simply fails the check (returns `false`)
+ * rather than throwing or comparing against `NaN` (`NaN > x` is always
+ * `false` in JS, so this falls out naturally, but the explicit
+ * `Number.isFinite` guards make that intentional rather than incidental).
+ */
+export function isRegression(
+  prevStatus: string,
+  resolvedAt: number | undefined,
+  newOccurredAt: number,
+): boolean {
+  if (prevStatus !== "resolved") return false;
+  if (resolvedAt === undefined || !Number.isFinite(resolvedAt)) return false;
+  if (!Number.isFinite(newOccurredAt)) return false;
+  return newOccurredAt > resolvedAt;
+}
+
+/**
+ * Time-to-resolution, in milliseconds, for a pattern first seen at
+ * `firstSeenAt` and resolved at `resolvedAt`.
+ *
+ * Returns `undefined` (not `0`, not `NaN`) when there is nothing meaningful
+ * to report: `resolvedAt` is `undefined` (pattern isn't resolved), or either
+ * timestamp is non-finite (malformed data). A `resolvedAt` that precedes
+ * `firstSeenAt` (malformed — resolution can't predate the pattern's first
+ * occurrence) is clamped to `0` rather than returning a negative duration:
+ * this is still "resolved," just with an unusable/corrupted duration, and
+ * `0` is the honest floor for "we cannot measure a negative amount of time."
+ */
+export function timeToResolutionMs(firstSeenAt: number, resolvedAt: number | undefined): number | undefined {
+  if (resolvedAt === undefined) return undefined;
+  if (!Number.isFinite(firstSeenAt) || !Number.isFinite(resolvedAt)) return undefined;
+  const diffMs = resolvedAt - firstSeenAt;
+  return diffMs >= 0 ? diffMs : 0;
+}
+
+/** Median of a non-empty array of finite numbers. Not exported — internal to summarizeResolutionHealth. */
+function medianOf(values: number[]): number {
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1]! + sorted[mid]!) / 2 : sorted[mid]!;
+}
+
+/** Penalty (out of 100 points) applied to the health score at a 100% regression rate. See summarizeResolutionHealth. */
+const RESOLUTION_HEALTH_REGRESSION_PENALTY = 50;
+
+/**
+ * Aggregate resolution-lifecycle health over a set of pattern snapshots, for
+ * an org-level "how well are we resolving failure patterns, and how often do
+ * they come back" view.
+ *
+ * COUNTS BY STATUS: `open`/`acknowledged`/`resolved` are exactly the counts of
+ * snapshots currently in each status (a snapshot with some other/malformed
+ * `status` string is counted in `total` but not in any of the three buckets —
+ * defensive, not a crash).
+ *
+ * REGRESSION RATE (documented denominator — this is the one subtle part):
+ * the fraction of "resolved-or-once-resolved" patterns that have regressed.
+ * `regressed` (the numerator) counts every snapshot with a defined, finite
+ * `regressedAt` — this INCLUDES a pattern that regressed and has since been
+ * re-resolved (currently `status: "resolved"` again with `regressedAt` still
+ * set from its last regression) as well as one the regression guard
+ * auto-reopened and which is currently sitting at `status: "open"` again.
+ * A pattern that regressed still counts against health even if it is
+ * currently re-resolved — see the design note this cycle's task description
+ * calls out explicitly. The denominator is every snapshot that is EITHER
+ * currently `resolved` OR has ever regressed (`regressedAt` defined) —
+ * i.e. every pattern that has been through resolution at least once, whether
+ * or not it's sitting in `resolved` right now. A pattern still `open`/
+ * `acknowledged` that has NEVER been resolved is excluded from the
+ * denominator entirely: it was never a candidate to regress, so it would be
+ * wrong to count it as a "did not regress" success. `regressionRate` is `0`
+ * (not `NaN`) when the denominator is `0` (no pattern has ever been
+ * resolved).
+ *
+ * TIME TO RESOLUTION: `avgTimeToResolutionMs`/`medianTimeToResolutionMs` are
+ * computed ONLY over currently-`resolved` snapshots with a usable
+ * `timeToResolutionMs` (see that function — `undefined` results, e.g. from a
+ * malformed timestamp, are excluded rather than treated as `0`). `null` when
+ * there are no such snapshots, never `NaN`.
+ *
+ * HEALTH SCORE (0-100, honestly-documented heuristic, not a precise
+ * statistic): `healthScore = clamp(0, 100, round(resolvedFraction * 100 -
+ * regressionRate * 50))`, where `resolvedFraction = resolved / total`. In
+ * words: start from "what fraction of all known patterns are currently
+ * resolved" (0-100 points) and subtract up to 50 points, scaled linearly by
+ * how often resolved patterns come back (a 100% regression rate costs the
+ * full 50; a 20% regression rate costs 10). This rewards a high
+ * resolved-fraction and penalizes a high regression rate, in that priority
+ * order — it does NOT attempt to model resolution speed, severity, or recency
+ * of individual patterns; `avgTimeToResolutionMs`/`medianTimeToResolutionMs`
+ * are reported alongside for a caller that wants that separately. `total ===
+ * 0` (no patterns at all — the best possible state, nothing to resolve) is a
+ * documented special case returning `healthScore: 100` (a neutral-good
+ * default) rather than `0/0`-driven `NaN`.
+ *
+ * Deterministic: `nowMs` is accepted (per the task's pure-function contract)
+ * but this cycle's formula does not currently use it — every input that
+ * drives the score is already a plain aggregate over `snapshots`. Kept as a
+ * required parameter so a future cycle can add a recency-weighted term
+ * without changing this function's signature.
+ *
+ * Defensive against a non-array or empty `snapshots`, and against individual
+ * snapshots with non-finite/missing timestamps (excluded from timing/rate
+ * math rather than corrupting it) or an unrecognized `status` (excluded from
+ * the three status buckets, but still counted in `total`). Never throws,
+ * never returns `NaN`/`Infinity` in any field.
+ */
+export function summarizeResolutionHealth(
+  snapshots: PatternLifecycleSnapshot[],
+  nowMs: number,
+): {
+  total: number;
+  open: number;
+  acknowledged: number;
+  resolved: number;
+  regressed: number;
+  regressionRate: number;
+  avgTimeToResolutionMs: number | null;
+  medianTimeToResolutionMs: number | null;
+  healthScore: number;
+} {
+  void nowMs; // accepted per contract; not used by this cycle's formula — see doc comment.
+
+  const list = Array.isArray(snapshots) ? snapshots.filter((s): s is PatternLifecycleSnapshot => !!s) : [];
+  const total = list.length;
+
+  let open = 0;
+  let acknowledged = 0;
+  let resolved = 0;
+  let regressed = 0;
+  let onceResolvedDenom = 0;
+  const ttrValues: number[] = [];
+
+  for (const s of list) {
+    if (s.status === "open") open += 1;
+    else if (s.status === "acknowledged") acknowledged += 1;
+    else if (s.status === "resolved") resolved += 1;
+
+    const hasRegressed = typeof s.regressedAt === "number" && Number.isFinite(s.regressedAt);
+    if (hasRegressed) regressed += 1;
+
+    const countsTowardResolvedDenom = s.status === "resolved" || hasRegressed;
+    if (countsTowardResolvedDenom) onceResolvedDenom += 1;
+
+    if (s.status === "resolved") {
+      const ttr = timeToResolutionMs(s.firstSeenAt, s.resolvedAt);
+      if (ttr !== undefined) ttrValues.push(ttr);
+    }
+  }
+
+  const regressionRate = onceResolvedDenom > 0 ? regressed / onceResolvedDenom : 0;
+  const avgTimeToResolutionMs = ttrValues.length > 0 ? ttrValues.reduce((a, b) => a + b, 0) / ttrValues.length : null;
+  const medianTimeToResolutionMs = ttrValues.length > 0 ? medianOf(ttrValues) : null;
+
+  const resolvedFraction = total > 0 ? resolved / total : 0;
+  const rawScore = total > 0 ? resolvedFraction * 100 - regressionRate * RESOLUTION_HEALTH_REGRESSION_PENALTY : 100;
+  const healthScore = Math.max(0, Math.min(100, Math.round(rawScore)));
+
+  return {
+    total,
+    open,
+    acknowledged,
+    resolved,
+    regressed,
+    regressionRate,
+    avgTimeToResolutionMs,
+    medianTimeToResolutionMs,
+    healthScore,
+  };
+}

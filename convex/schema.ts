@@ -337,6 +337,13 @@ export default defineSchema({
       // as org-wide, same documented behavior as `failure_rate` rules without
       // a windowMinutes/thresholdPct set.
       v.literal("pattern_spike"),
+      // ADR-006 — failure pattern resolution lifecycle: fires the moment a
+      // RESOLVED `failure_patterns` rollup receives a new occurrence dated
+      // after its `resolvedAt` (the regression guard, convex/failure_patterns.ts's
+      // recordFailurePatternOccurrence) and auto-reopens. Same org-wide
+      // (not project-scoped) treatment as `pattern_spike` — see
+      // convex/alerts.ts's firePatternRegressionAlert.
+      v.literal("pattern_regressed"),
     ),
     thresholdPct: v.optional(v.number()),
     windowMinutes: v.optional(v.number()),
@@ -667,6 +674,38 @@ export default defineSchema({
     // it is a "last muted at" historical marker, not a "currently muted
     // since" field (muted itself is the live suppression flag).
     mutedAt: v.optional(v.number()),
+    // ---------------------------------------------------------------------
+    // Resolution cycle (docs/adr/006-failure-resolution.md): a human
+    // lifecycle layered on top of the rollup, exactly like `comments` are a
+    // human annotation hung off runs/events — NOT a new source of truth.
+    // Absent `status` means "open" (every pre-this-cycle row and every
+    // freshly-created rollup defaults to open by omission, not by an
+    // explicit write). Written only by acknowledgePattern/resolvePattern/
+    // reopenPattern (member-gated, audited) and by
+    // recordFailurePatternOccurrence's own regression-guard auto-reopen path.
+    // ---------------------------------------------------------------------
+    status: v.optional(
+      v.union(v.literal("open"), v.literal("acknowledged"), v.literal("resolved")),
+    ),
+    acknowledgedAt: v.optional(v.number()),
+    acknowledgedByUserId: v.optional(v.string()),
+    resolvedAt: v.optional(v.number()),
+    resolvedByUserId: v.optional(v.string()),
+    // Bounded free text (<= MAX_RESOLUTION_NOTE_LENGTH) describing how/why
+    // this fingerprint was resolved.
+    resolutionNote: v.optional(v.string()),
+    // Bounded free-form reference (<= MAX_RESOLUTION_REF_LENGTH) — e.g. an
+    // agentVersionId or an external URL. Deliberately a plain string, never
+    // auto-fetched/validated as a real URL server-side: if it renders as a
+    // link client-side, that is a UI-layer decision, not this layer's.
+    resolutionRef: v.optional(v.string()),
+    // Set by the regression guard (recordFailurePatternOccurrence) the
+    // moment a RESOLVED pattern receives a new occurrence dated after
+    // resolvedAt — "your fix didn't hold." Cleared on reopenPattern (a human
+    // manually reopening is not a regression) but NOT cleared merely by a
+    // later resolvePattern (see that mutation's doc comment for why it keeps
+    // this as history until the next reopen/regression).
+    regressedAt: v.optional(v.number()),
   })
     // One row per (orgId, fingerprintHash): recordFailurePatternOccurrence
     // always resolves the existing rollup (if any) via this index before

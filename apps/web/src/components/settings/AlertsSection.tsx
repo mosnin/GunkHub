@@ -16,6 +16,12 @@ const KIND_LABEL: Record<AlertRuleKind, string> = {
   failure_rate: 'Failure rate threshold',
   eval_failed: 'Eval failed',
   pattern_spike: 'Failure pattern spiking',
+  // Resolution lifecycle (docs/adr/006-failure-resolution.md) — fired when a
+  // RESOLVED failure pattern receives a new occurrence and the regression
+  // guard reopens it. Not this cycle's UI scope beyond keeping this
+  // exhaustive record compiling; see PatternStatusBadge's REGRESSED
+  // treatment on the pattern itself for the primary surface of this signal.
+  pattern_regressed: 'Failure pattern regressed',
 }
 
 interface AlertsSectionProps {

@@ -80,4 +80,5 @@ export type {
   RunExplanationKind,
   FailurePattern,
   FailurePatternClass,
+  FailurePatternStatus,
 } from '@agent-flight-recorder/contracts'

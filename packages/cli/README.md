@@ -107,9 +107,9 @@ Lists recurring failure patterns for your organization — a durable memory of f
 
 ```bash
 $ afr patterns
-ID            CLASS        LABEL                                  COUNT  FIRST SEEN                LAST SEEN                 SPIKING       MUTED
-fp_a1b2c3d4e…  tool_error   lookup_order tool call times out       12     2026-07-10T09:00:00.000Z  2026-07-24T14:32:00.000Z  yes (9)       -
-fp_f6e5d4c3b…  tool_error   flaky_search tool call 5xx             40     2026-06-01T09:00:00.000Z  2026-07-23T11:00:00.000Z  yes (6) [muted]  yes
+ID            CLASS        LABEL                                  COUNT  FIRST SEEN                LAST SEEN                 SPIKING       MUTED  STATUS
+fp_a1b2c3d4e…  tool_error   lookup_order tool call times out       12     2026-07-10T09:00:00.000Z  2026-07-24T14:32:00.000Z  yes (9)       -      open
+fp_f6e5d4c3b…  tool_error   flaky_search tool call 5xx             40     2026-06-01T09:00:00.000Z  2026-07-23T11:00:00.000Z  yes (6) [muted]  yes    REGRESSED
 
 $ afr patterns --agent agent_support --limit 10 --json
 {
@@ -123,11 +123,16 @@ $ afr patterns --spiking
 
 $ afr patterns --muted     # only patterns an org admin has muted
 $ afr patterns --active    # only patterns that are NOT muted
+
+$ afr patterns --status resolved   # only patterns whose lifecycle status is exactly 'resolved'
+$ afr patterns --regressed         # only patterns with regressedAt set — a resolved pattern that recurred
 ```
 
-Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--spiking` (only patterns currently flagged as spiking), `--muted` / `--active` (mute-aware filter — mutually exclusive, passing both is a usage error, exit 1), `--limit <n>`, `--json` (prints the raw API response, including `muted`/`mutedAt`).
+Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--spiking` (only patterns currently flagged as spiking), `--muted` / `--active` (mute-aware filter — mutually exclusive, passing both is a usage error, exit 1), `--status <open|acknowledged|resolved>` (exact lifecycle-status filter — an invalid value is a usage error, exit 1), `--regressed` (only patterns with `regressedAt` set), `--limit <n>`, `--json` (prints the raw API response, including `muted`/`mutedAt` and the full resolution-lifecycle fields).
 
 **Mute suppresses alerts, not visibility.** A muted, spiking pattern still shows `yes (N)` in the SPIKING column — it is annotated `[muted]` rather than hidden, so it stays visibly distinct from an active spiking pattern. There is deliberately no `afr patterns mute`/`unmute` command: muting a pattern is an admin-only, audited, Clerk-authed org action taken in the web app, not a key-authed read-API action — this command only ever *reflects* mute state.
+
+**Resolution lifecycle (ADR-006, "resolution reflection").** The STATUS column shows a pattern's lifecycle: `open` (the default when no status has ever been set), `acknowledged`, or `resolved`. When a pattern is back to `open` AND carries `regressedAt` — i.e. it was resolved, then received a new occurrence after that ("your fix didn't hold") — the STATUS column shows `REGRESSED` instead of `open`, so a regression stands out from an ordinary open pattern or one a human manually reopened. There is deliberately no `afr patterns resolve`/`acknowledge`/`reopen` command: those are member-gated, audited, Clerk-authed org actions taken in the web app. A key-authed write here would bypass both the member-gate and the audit log those actions require — this command, like the mute reflection above, only ever *reflects* lifecycle state, never mutates it.
 
 Like every other read here, this is derived, observability-grade data (CLAUDE.md) — never a substitute for a single run's own event log or `afr explain <runId>`.
 

@@ -8,6 +8,9 @@ import { isCommandFailure, readEnv, resolveApiConfig, toCommandFailure } from '.
 import type { CommandFailure } from './shared.js'
 import type { ApiFetchLike, V1ListFailurePatternsData } from '../apiClient.js'
 import type { CliEnv } from '../env.js'
+import type { FailurePatternStatus } from '@agent-flight-recorder/contracts'
+
+const VALID_STATUSES: readonly FailurePatternStatus[] = ['open', 'acknowledged', 'resolved']
 
 export const PATTERNS_HELP = `Usage: afr patterns [options]
 
@@ -28,6 +31,13 @@ Options:
   --muted             Only patterns an org admin has muted
   --active            Only patterns that are NOT muted (the default view is
                        unfiltered — this excludes muted patterns explicitly)
+  --status <s>        Only patterns whose lifecycle status is exactly <s> —
+                       one of 'open', 'acknowledged', 'resolved' (a pattern
+                       with no status set is treated as 'open'). Resolution
+                       lifecycle (ADR-006).
+  --regressed         Only patterns that have regressedAt set — a RESOLVED
+                       pattern that received a new occurrence after it was
+                       resolved ("your fix didn't hold").
   --limit <n>         Max number of patterns to return
   --json              Print the raw API response as JSON
   --help              Show this message
@@ -37,6 +47,14 @@ Note: this command only REFLECTS mute state (a MUTED column, and the
 an admin, audited, Clerk-authed org action taken in the web app, not a
 key-authed read-API action. A muted, spiking pattern still shows up as
 spiking here (mute suppresses future alerts, not visibility).
+
+Note: this command likewise only REFLECTS resolution-lifecycle state (a
+STATUS column, a REGRESSED marker, and the --status/--regressed filters
+above). There is deliberately no 'afr patterns resolve/acknowledge/reopen' —
+those are member-gated, audited, Clerk-authed org actions taken in the web
+app. A key-authed write here would bypass both the member-gate and the audit
+log that those actions require (ADR-006). This surface only ever reflects
+lifecycle status; it never mutates it.
 `
 
 export interface PatternsArgs {
@@ -46,6 +64,9 @@ export interface PatternsArgs {
   muted?: boolean
   /** Raw `--active` flag, as typed. Combine with `muted` via `resolveMutedFilter` — do not read this directly for filtering. */
   active?: boolean
+  /** Raw `--status` value, as typed — validated against `VALID_STATUSES` by `resolveStatusFilter` before use. */
+  status?: string
+  regressed?: boolean
   limit?: number
   json?: boolean
   help?: boolean
@@ -61,6 +82,8 @@ export function parsePatternsArgs(argv: string[]): PatternsArgs {
       spiking: { type: 'boolean' },
       muted: { type: 'boolean' },
       active: { type: 'boolean' },
+      status: { type: 'string' },
+      regressed: { type: 'boolean' },
       limit: { type: 'string' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -71,6 +94,8 @@ export function parsePatternsArgs(argv: string[]): PatternsArgs {
   if (values['spiking']) result.spiking = true
   if (values['muted']) result.muted = true
   if (values['active']) result.active = true
+  if (values['status']) result.status = values['status']
+  if (values['regressed']) result.regressed = true
   if (values['limit']) result.limit = Number(values['limit'])
   if (values['json']) result.json = true
   if (values['help']) result.help = true
@@ -93,6 +118,26 @@ function resolveMutedFilter(args: PatternsArgs): { muted?: boolean } | CommandFa
   return {}
 }
 
+/**
+ * Validate `--status` against the closed set of lifecycle statuses
+ * (ADR-006). Unlike `--muted`/`--active`'s permissive-elsewhere posture,
+ * a garbage `--status` value is a usage error (exit 1) rather than silently
+ * treated as unset — the flag only makes sense with one of the three known
+ * values, and silently ignoring a typo (e.g. `--status resovled`) would
+ * return an unfiltered list that looks like a match.
+ */
+function resolveStatusFilter(args: PatternsArgs): { status?: FailurePatternStatus } | CommandFailure {
+  if (args.status === undefined) return {}
+  if (!(VALID_STATUSES as readonly string[]).includes(args.status)) {
+    return {
+      ok: false,
+      exitCode: 1,
+      message: `--status must be one of ${VALID_STATUSES.join(', ')} — got "${args.status}".`,
+    }
+  }
+  return { status: args.status as FailurePatternStatus }
+}
+
 export type PatternsResult = (V1ListFailurePatternsData & { ok: true }) | CommandFailure
 
 /** `afr patterns` — list recurring failure patterns through the v1 read API. */
@@ -107,6 +152,9 @@ export async function runPatterns(
   const mutedFilter = resolveMutedFilter(args)
   if (isCommandFailure(mutedFilter)) return mutedFilter
 
+  const statusFilter = resolveStatusFilter(args)
+  if (isCommandFailure(statusFilter)) return statusFilter
+
   try {
     const data = await listFailurePatterns(
       config,
@@ -114,6 +162,8 @@ export async function runPatterns(
         ...(args.agent !== undefined && { agentId: args.agent }),
         ...(args.spiking !== undefined && { spiking: args.spiking }),
         ...(mutedFilter.muted !== undefined && { muted: mutedFilter.muted }),
+        ...(statusFilter.status !== undefined && { status: statusFilter.status }),
+        ...(args.regressed !== undefined && { regressed: args.regressed }),
         ...(args.limit !== undefined && { limit: args.limit }),
       },
       fetchImpl
@@ -154,6 +204,18 @@ export function printPatterns(
     const spikingCell = isSpiking
       ? `yes (${pattern.lastSpikeAssessment?.recentCount})${isMuted ? ' [muted]' : ''}`
       : '-'
+    // Resolution lifecycle (ADR-006): absent `status` means 'open' (the
+    // documented default for pre-lifecycle rows). A pattern is shown as
+    // "REGRESSED" — distinct from its literal `status` value — when it is
+    // open AND carries `regressedAt`: that combination is exactly what the
+    // backend's regression guard produces the moment a resolved pattern gets
+    // a new occurrence (status flips back to 'open', regressedAt is stamped)
+    // and is the "reopened by a regression" signal an engineer needs to see
+    // at a glance, distinct from a pattern that was manually reopened
+    // (status 'open', no regressedAt) or one still resolved.
+    const status = pattern.status ?? 'open'
+    const isRecentRegression = status === 'open' && pattern.regressedAt !== undefined
+    const statusCell = isRecentRegression ? 'REGRESSED' : status
     return [
       truncateId(pattern.id),
       pattern.class,
@@ -163,10 +225,15 @@ export function printPatterns(
       formatTimestamp(pattern.lastSeenAt),
       spikingCell,
       isMuted ? 'yes' : '-',
+      statusCell,
     ]
   })
-  log(renderTable(['ID', 'CLASS', 'LABEL', 'COUNT', 'FIRST SEEN', 'LAST SEEN', 'SPIKING', 'MUTED'], rows))
+  log(
+    renderTable(['ID', 'CLASS', 'LABEL', 'COUNT', 'FIRST SEEN', 'LAST SEEN', 'SPIKING', 'MUTED', 'STATUS'], rows)
+  )
   if (result.nextCursor) {
-    log('\n(more results available — narrow with --agent/--spiking/--muted/--active/--limit to see fewer pages)')
+    log(
+      '\n(more results available — narrow with --agent/--spiking/--muted/--active/--status/--regressed/--limit to see fewer pages)'
+    )
   }
 }
