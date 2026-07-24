@@ -1904,3 +1904,242 @@ describe('assessPatternSpike', () => {
     expect(typeof result.z).toBe('number')
   })
 })
+
+// ---------------------------------------------------------------------------
+// assessPatternSpikeTransition / classifyPatternEpisode — cycle 2 (DEEPEN).
+// PURE, DETERMINISTIC (Team A's spike-rollup cron depends on these exact
+// signatures). No ctx, no convex-test harness needed.
+// ---------------------------------------------------------------------------
+import { assessPatternSpikeTransition, classifyPatternEpisode } from './insights'
+import type { StoredSpikeAssessment, SpikeTransitionDecision } from './insights'
+
+const HOUR_MS = 60 * 60 * 1000
+
+function stored(isSpiking: boolean, assessedAt = 0, extra?: Partial<StoredSpikeAssessment>): StoredSpikeAssessment {
+  return { assessedAt, isSpiking, recentCount: isSpiking ? 10 : 1, baselineMean: 1, z: isSpiking ? 5 : 0, ...extra }
+}
+
+describe('assessPatternSpikeTransition', () => {
+  it('fires on a rising edge: prev not spiking, curr spiking, no lastFiredAt', () => {
+    const decision = assessPatternSpikeTransition(stored(false), stored(true), { nowMs: 1000 })
+    expect(decision).toEqual({ shouldFire: true, reason: 'entered_spiking' })
+  })
+
+  it('fires on a rising edge when prev is undefined (first-ever assessment can still fire)', () => {
+    const decision = assessPatternSpikeTransition(undefined, stored(true), { nowMs: 1000 })
+    expect(decision.shouldFire).toBe(true)
+    expect(decision.reason).toBe('entered_spiking')
+  })
+
+  it('does not fire when curr is not spiking, regardless of prev', () => {
+    expect(assessPatternSpikeTransition(stored(true), stored(false), { nowMs: 1000 })).toEqual({
+      shouldFire: false,
+      reason: 'not_spiking',
+    })
+    expect(assessPatternSpikeTransition(undefined, stored(false), { nowMs: 1000 })).toEqual({
+      shouldFire: false,
+      reason: 'not_spiking',
+    })
+  })
+
+  it('suppresses a SUSTAINED spike: prev spiking, curr still spiking -> no re-fire', () => {
+    const decision = assessPatternSpikeTransition(stored(true), stored(true), { nowMs: 1000 })
+    expect(decision).toEqual({ shouldFire: false, reason: 'still_spiking_suppressed' })
+  })
+
+  it('a rising edge fires exactly once across a sequence of ticks while the spike persists', () => {
+    // Simulate ticks: not spiking, spiking, spiking, spiking (never dips) — only tick 2 should fire.
+    const ticks = [stored(false), stored(true), stored(true), stored(true)]
+    const fires: boolean[] = []
+    let prev: StoredSpikeAssessment | undefined
+    for (const curr of ticks) {
+      const decision = assessPatternSpikeTransition(prev, curr, { nowMs: 1000 })
+      fires.push(decision.shouldFire)
+      prev = curr
+    }
+    expect(fires).toEqual([false, true, false, false])
+  })
+
+  it('cooldown suppresses a re-fire shortly after the last fire, even on a genuine rising edge', () => {
+    const nowMs = 10 * HOUR_MS
+    const lastFiredAt = nowMs - 1 * HOUR_MS // fired 1h ago
+    const decision = assessPatternSpikeTransition(stored(false), stored(true), {
+      nowMs,
+      lastFiredAt,
+      cooldownMs: 6 * HOUR_MS,
+    })
+    expect(decision).toEqual({ shouldFire: false, reason: 'cooldown_active' })
+  })
+
+  it('allows a re-fire once the cooldown has fully elapsed', () => {
+    const nowMs = 10 * HOUR_MS
+    const lastFiredAt = nowMs - 6 * HOUR_MS - 1 // just past the 6h cooldown boundary
+    const decision = assessPatternSpikeTransition(stored(false), stored(true), {
+      nowMs,
+      lastFiredAt,
+      cooldownMs: 6 * HOUR_MS,
+    })
+    expect(decision).toEqual({ shouldFire: true, reason: 'entered_spiking' })
+  })
+
+  it('cooldown boundary is exclusive-safe: exactly at cooldownMs is still suppressed (< not <=)', () => {
+    const nowMs = 10 * HOUR_MS
+    const lastFiredAt = nowMs - 6 * HOUR_MS // exactly cooldownMs ago
+    const decision = assessPatternSpikeTransition(stored(false), stored(true), {
+      nowMs,
+      lastFiredAt,
+      cooldownMs: 6 * HOUR_MS,
+    })
+    // nowMs - lastFiredAt === cooldownMs, which is NOT < cooldownMs, so this should fire.
+    expect(decision).toEqual({ shouldFire: true, reason: 'entered_spiking' })
+  })
+
+  it('defaults cooldownMs to 6h when not provided', () => {
+    const nowMs = 10 * HOUR_MS
+    const justInside = assessPatternSpikeTransition(stored(false), stored(true), {
+      nowMs,
+      lastFiredAt: nowMs - 5 * HOUR_MS,
+    })
+    expect(justInside.reason).toBe('cooldown_active')
+
+    const justOutside = assessPatternSpikeTransition(stored(false), stored(true), {
+      nowMs,
+      lastFiredAt: nowMs - 7 * HOUR_MS,
+    })
+    expect(justOutside.reason).toBe('entered_spiking')
+  })
+
+  it('lastFiredAt undefined never triggers cooldown, even with a rising edge', () => {
+    const decision = assessPatternSpikeTransition(stored(false), stored(true), { nowMs: 1000, lastFiredAt: undefined })
+    expect(decision.shouldFire).toBe(true)
+  })
+
+  it('ADVERSARIAL: malformed prev (isSpiking missing/falsy-but-not-boolean) is treated as not-spiking baseline, never throws', () => {
+    const malformedPrev = { assessedAt: 0, isSpiking: undefined as unknown as boolean, recentCount: 0, baselineMean: 0, z: 0 }
+    expect(() => assessPatternSpikeTransition(malformedPrev, stored(true), { nowMs: 1000 })).not.toThrow()
+    const decision = assessPatternSpikeTransition(malformedPrev, stored(true), { nowMs: 1000 })
+    expect(decision.shouldFire).toBe(true) // treated as a rising edge, same as prev === undefined
+  })
+
+  it('is deterministic: same inputs always produce the same decision', () => {
+    const args = [stored(false, 0), stored(true, HOUR_MS), { nowMs: 5 * HOUR_MS, lastFiredAt: HOUR_MS, cooldownMs: 2 * HOUR_MS }] as const
+    const results = new Set<string>()
+    for (let i = 0; i < 10; i++) results.add(JSON.stringify(assessPatternSpikeTransition(...args)))
+    expect(results.size).toBe(1)
+  })
+
+  it('has the exact shape callers (Team A) depend on', () => {
+    const decision: SpikeTransitionDecision = assessPatternSpikeTransition(undefined, stored(true), { nowMs: 1 })
+    expect(typeof decision.shouldFire).toBe('boolean')
+    expect(typeof decision.reason).toBe('string')
+  })
+})
+
+describe('classifyPatternEpisode', () => {
+  const DAY_MS_LOCAL = 24 * HOUR_MS
+
+  it('classifies "new" when firstSeenAt is within the last 24h (default newWindowMs)', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 1 * HOUR_MS, lastSeenAt: nowMs - 1 * HOUR_MS, count: 1 }
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('new')
+  })
+
+  it('boundary: exactly at newWindowMs is still "new" (<=, not <)', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 24 * HOUR_MS, lastSeenAt: nowMs - 24 * HOUR_MS, count: 1 }
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('new')
+  })
+
+  it('boundary: just past newWindowMs is no longer "new"', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 24 * HOUR_MS - 1, lastSeenAt: nowMs - 24 * HOUR_MS - 1, count: 1 }
+    expect(classifyPatternEpisode(pattern, nowMs)).not.toBe('new')
+  })
+
+  it('classifies "regressed": old pattern (not new) with a wide average gap (sparse occurrences over its lifetime)', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    // firstSeenAt 20 days ago, lastSeenAt 19 days ago (not new), only 2 occurrences
+    // spread across ~1 day of activity but the pattern itself is old -> avg gap
+    // computed from full history: use a wide firstSeenAt..lastSeenAt spread with low count.
+    const pattern = { firstSeenAt: nowMs - 20 * DAY_MS_LOCAL, lastSeenAt: nowMs - 2 * DAY_MS_LOCAL, count: 2 }
+    // avgGap = 18 days / 2 = 9 days >> quietGapMs default (72h = 3 days) -> regressed
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('regressed')
+  })
+
+  it('classifies "ongoing": old pattern with frequent occurrences (small average gap)', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    // firstSeenAt 20 days ago, lastSeenAt 2 days ago (not new), 100 occurrences densely spread.
+    const pattern = { firstSeenAt: nowMs - 20 * DAY_MS_LOCAL, lastSeenAt: nowMs - 2 * DAY_MS_LOCAL, count: 100 }
+    // avgGap = 18 days / 100 ~= 4.3h << quietGapMs default (72h) -> ongoing
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('ongoing')
+  })
+
+  it('boundary: avgGap exactly at quietGapMs is "regressed" (>=, not >)', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const quietGapMs = 72 * HOUR_MS
+    // Not new: firstSeenAt far enough back. avgGap = (lastSeenAt - firstSeenAt) / count === quietGapMs exactly.
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const lastSeenAt = firstSeenAt + quietGapMs * 2 // count=2 -> avgGap = quietGapMs
+    const pattern = { firstSeenAt, lastSeenAt, count: 2 }
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('regressed')
+  })
+
+  it('boundary: avgGap just under quietGapMs is "ongoing"', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const quietGapMs = 72 * HOUR_MS
+    const firstSeenAt = nowMs - 10 * DAY_MS_LOCAL
+    const lastSeenAt = firstSeenAt + quietGapMs * 2 - 10 // count=2 -> avgGap just under quietGapMs
+    const pattern = { firstSeenAt, lastSeenAt, count: 2 }
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('ongoing')
+  })
+
+  it('count <= 1 is treated as trivially satisfying the sparse rule: an old single occurrence reads as "regressed"', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 10 * DAY_MS_LOCAL, lastSeenAt: nowMs - 10 * DAY_MS_LOCAL, count: 1 }
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('regressed')
+  })
+
+  it('count === 0 is also treated as the sparse/regressed case (defensive against malformed input)', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 10 * DAY_MS_LOCAL, lastSeenAt: nowMs - 5 * DAY_MS_LOCAL, count: 0 }
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('regressed')
+  })
+
+  it('respects custom opts (newWindowMs, quietGapMs)', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 2 * DAY_MS_LOCAL, lastSeenAt: nowMs - 1 * DAY_MS_LOCAL, count: 1 }
+    // Default newWindowMs (24h) would NOT classify this as new (2 days old); a larger custom window does.
+    expect(classifyPatternEpisode(pattern, nowMs)).not.toBe('new')
+    expect(classifyPatternEpisode(pattern, nowMs, { newWindowMs: 3 * DAY_MS_LOCAL })).toBe('new')
+  })
+
+  it('ADVERSARIAL: lastSeenAt before firstSeenAt is clamped, never produces a negative gap or throws', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 10 * DAY_MS_LOCAL, lastSeenAt: nowMs - 20 * DAY_MS_LOCAL, count: 5 }
+    expect(() => classifyPatternEpisode(pattern, nowMs)).not.toThrow()
+    // Clamped so lastSeenAt >= firstSeenAt -> avgGap === 0 -> "ongoing" (not sparse).
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('ongoing')
+  })
+
+  it('ADVERSARIAL: non-finite firstSeenAt/lastSeenAt fall back to nowMs, never throws or produces NaN', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: NaN as unknown as number, lastSeenAt: NaN as unknown as number, count: 3 }
+    expect(() => classifyPatternEpisode(pattern, nowMs)).not.toThrow()
+    // firstSeenAt falls back to nowMs -> "new" (age 0 <= newWindowMs).
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('new')
+  })
+
+  it('is deterministic: same inputs always produce the same classification', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 20 * DAY_MS_LOCAL, lastSeenAt: nowMs - 2 * DAY_MS_LOCAL, count: 7 }
+    const results = new Set<string>()
+    for (let i = 0; i < 10; i++) results.add(classifyPatternEpisode(pattern, nowMs))
+    expect(results.size).toBe(1)
+  })
+
+  it('return type is exactly one of the three literal episode labels', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const result = classifyPatternEpisode({ firstSeenAt: nowMs, lastSeenAt: nowMs, count: 1 }, nowMs)
+    expect(['new', 'regressed', 'ongoing']).toContain(result)
+  })
+})

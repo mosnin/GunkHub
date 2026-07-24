@@ -1,5 +1,6 @@
 'use client'
 
+import Link from 'next/link'
 import { useState } from 'react'
 
 import type { AlertChannel, AlertEvent, AlertRule, AlertRuleKind } from '@agent-flight-recorder/contracts'
@@ -14,6 +15,7 @@ const KIND_LABEL: Record<AlertRuleKind, string> = {
   run_failed: 'Run failed',
   failure_rate: 'Failure rate threshold',
   eval_failed: 'Eval failed',
+  pattern_spike: 'Failure pattern spiking',
 }
 
 interface AlertsSectionProps {
@@ -516,6 +518,19 @@ export function AlertsSection({ initialRules, initialEvents, isAdmin, loadError 
   )
 }
 
+/** Extracted `pattern_spike` display fields for one alert event, or `null` when this firing isn't a pattern-spike (the common case for `run_failed`/`failure_rate`/`eval_failed` events, which never set `patternFingerprintHash`). Reads `metadata` defensively — it's a freeform, kind-specific `v.any()` field server-side, never assumed to be shaped correctly. */
+function patternSpikeInfo(e: AlertEvent): { fingerprintHash: string; deepLink: string; label?: string; failureClass?: string; recentCount?: number } | null {
+  if (!e.patternFingerprintHash) return null
+  const m = e.metadata && typeof e.metadata === 'object' ? e.metadata : {}
+  return {
+    fingerprintHash: e.patternFingerprintHash,
+    deepLink: typeof m['deepLink'] === 'string' ? m['deepLink'] : `/patterns/${e.patternFingerprintHash}`,
+    ...(typeof m['label'] === 'string' && { label: m['label'] }),
+    ...(typeof m['class'] === 'string' && { failureClass: m['class'] }),
+    ...(typeof m['recentCount'] === 'number' && { recentCount: m['recentCount'] }),
+  }
+}
+
 function FiringHistory({ events }: { events: AlertEvent[] }) {
   return (
     <div>
@@ -524,24 +539,48 @@ function FiringHistory({ events }: { events: AlertEvent[] }) {
         <p className="text-sm text-neutral-500">No alerts have fired yet.</p>
       ) : (
         <div className="flex flex-col gap-1">
-          {events.map((e) => (
-            <div key={e.id} className="flex items-center gap-2 px-3 py-2 rounded-[4px] border border-graphite bg-graphite-deep text-xs">
-              <span
-                className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                  e.deliveryStatus === 'delivered'
-                    ? 'bg-neon-glow shadow-[var(--shadow-glow)]'
-                    : e.deliveryStatus === 'failed'
-                      ? 'bg-destructive-500 shadow-[var(--shadow-glow-warn)]'
-                      : 'bg-pewter'
-                }`}
-                aria-hidden="true"
-              />
-              <span className="text-neutral-300 flex-1 truncate">{e.summary}</span>
-              <span className="text-pewter font-mono">{e.deliveryStatus}</span>
-              <CopyToClipboardButton value={e.id} label="Copy alert event ID" />
-              <span className="text-pewter font-mono shrink-0">{formatRelativeTime(e.firedAt)}</span>
-            </div>
-          ))}
+          {events.map((e) => {
+            const spike = patternSpikeInfo(e)
+            return (
+              <div key={e.id} className="flex items-center gap-2 px-3 py-2 rounded-[4px] border border-graphite bg-graphite-deep text-xs">
+                <span
+                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                    e.deliveryStatus === 'delivered'
+                      ? 'bg-neon-glow shadow-[var(--shadow-glow)]'
+                      : e.deliveryStatus === 'failed'
+                        ? 'bg-destructive-500 shadow-[var(--shadow-glow-warn)]'
+                        : 'bg-pewter'
+                  }`}
+                  aria-hidden="true"
+                />
+                {spike ? (
+                  <>
+                    <span className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-[4px] text-[11px] font-mono font-medium border bg-graphite text-neon-glow border-graphite-light whitespace-nowrap">
+                      pattern spike
+                    </span>
+                    <Link
+                      href={spike.deepLink}
+                      className="text-neutral-300 hover:text-neon-glow transition-colors duration-100 flex-1 truncate focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neon-glow rounded-[4px]"
+                      title={spike.label ?? e.summary}
+                    >
+                      {spike.label ?? e.summary}
+                      {spike.failureClass && (
+                        <span className="text-pewter"> · {spike.failureClass.replace(/_/g, ' ')}</span>
+                      )}
+                      {typeof spike.recentCount === 'number' && (
+                        <span className="text-pewter"> · {spike.recentCount.toLocaleString()} recent</span>
+                      )}
+                    </Link>
+                  </>
+                ) : (
+                  <span className="text-neutral-300 flex-1 truncate">{e.summary}</span>
+                )}
+                <span className="text-pewter font-mono">{e.deliveryStatus}</span>
+                <CopyToClipboardButton value={e.id} label="Copy alert event ID" />
+                <span className="text-pewter font-mono shrink-0">{formatRelativeTime(e.firedAt)}</span>
+              </div>
+            )
+          })}
         </div>
       )}
     </div>

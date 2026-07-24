@@ -1,9 +1,12 @@
 /* eslint-disable */
-// Tests for Failure Patterns (PREVENTION, cycle 1) —
+// Tests for Failure Patterns (PREVENTION, cycle 1 + cycle 2) —
 // docs/adr/005-failure-patterns.md. Exercises the pure fallback
 // fingerprint/spike engines, the idempotent occurrence-recording +
 // rollup-upsert mutation, org-scoped listing/detail queries, the trend
-// bucketing helper, and the spike-rollup cron.
+// bucketing helper, and the spike-rollup cron. Cycle 2 additionally covers:
+// the accurate (non-sample-truncated) daily trend, the spike-transition
+// anti-flap/cooldown fallback, and pattern_spike alert firing (idempotency,
+// rule-enablement, cross-org isolation).
 import { convexTest } from 'convex-test'
 import { describe, it, expect } from 'vitest'
 import schema from './schema'
@@ -11,6 +14,7 @@ import { api, internal } from './_generated/api'
 import {
   deriveFailureFingerprintFallback,
   assessPatternSpikeFallback,
+  assessPatternSpikeTransitionFallback,
   buildTrendFromOccurrences,
   extractFingerprintSignals,
   fingerprintExplanation,
@@ -342,6 +346,310 @@ describe('assessPatternSpikesCron', () => {
     const t = convexTest(schema, modules)
     await seedTwoOrgs(t)
     const result = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, {})
-    expect(result).toEqual({ assessed: 0, spiking: 0 })
+    expect(result).toEqual({ assessed: 0, spiking: 0, fired: 0 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — accurate daily trend (failure_pattern_daily_counts)
+// ---------------------------------------------------------------------------
+
+describe('accurate daily trend (failure_pattern_daily_counts)', () => {
+  it('recordFailurePatternOccurrence increments an exact per-day counter, and getFailurePattern.trend reflects it even past MAX_RECENT_OCCURRENCES', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+
+    // 55 occurrences today for the same fingerprint — deliberately more than
+    // MAX_RECENT_OCCURRENCES (50), so a trend that was still derived from a
+    // bounded/truncated read could under-report today's count. The accurate
+    // per-day counter must report exactly 55 regardless.
+    const runIds = await Promise.all(Array.from({ length: 55 }, () => seedRun(t, orgA, projectA, agentA, versionA)))
+    for (const runId of runIds) {
+      await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+        orgId: orgA, runId, agentId: agentA, agentVersionId: versionA,
+        fingerprintHash: 'busy', class: 'tool_error', label: 'L', salientKey: 'search_web',
+      })
+    }
+
+    const asA = t.withIdentity(identity('member', 'a'))
+    const detail = await asA.query(api.failure_patterns.getFailurePattern, { orgId: orgA, fingerprintHash: 'busy' })
+    expect(detail).not.toBeNull()
+    // recentOccurrences is bounded (<= MAX_RECENT_OCCURRENCES = 50)...
+    expect(detail.recentOccurrences.length).toBe(50)
+    // ...but the trend's last day (today) is EXACT: all 55, not just the 50
+    // occurrences that happened to be in the bounded recent-occurrences sample.
+    expect(detail.trend[detail.trend.length - 1].count).toBe(55)
+
+    const dailyCountRows = await t.run(async (ctx) =>
+      ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'busy')).collect(),
+    )
+    expect(dailyCountRows.length).toBe(1)
+    expect(dailyCountRows[0]!.count).toBe(55)
+  })
+
+  it('splits counts correctly across two different days for the same fingerprint', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const oneDayMs = 24 * 60 * 60 * 1000
+
+    const runToday = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: runToday, agentId: agentA, fingerprintHash: 'split', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: Date.now(),
+    })
+    const runYesterday = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: runYesterday, agentId: agentA, fingerprintHash: 'split', class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt: Date.now() - oneDayMs,
+    })
+
+    const rows = await t.run(async (ctx) =>
+      ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'split')).collect(),
+    )
+    expect(rows.length).toBe(2)
+    expect(rows.every((r) => r.count === 1)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — assessPatternSpikeTransitionFallback (pure anti-flap/cooldown logic)
+// ---------------------------------------------------------------------------
+
+describe('assessPatternSpikeTransitionFallback', () => {
+  const spiking = { isSpiking: true, recentCount: 40, baselineMean: 1, z: 10 }
+  const notSpiking = { isSpiking: false, recentCount: 1, baselineMean: 1, z: 0 }
+
+  it('fires on a fresh false/undefined -> true transition', () => {
+    const r1 = assessPatternSpikeTransitionFallback(undefined, spiking, { nowMs: 1_000_000 })
+    expect(r1.shouldFire).toBe(true)
+    const r2 = assessPatternSpikeTransitionFallback(notSpiking, spiking, { nowMs: 1_000_000 })
+    expect(r2.shouldFire).toBe(true)
+  })
+
+  it('does not fire while still spiking (true -> true)', () => {
+    const r = assessPatternSpikeTransitionFallback(spiking, spiking, { nowMs: 1_000_000 })
+    expect(r.shouldFire).toBe(false)
+    expect(r.reason).toBe('already_spiking')
+  })
+
+  it('does not fire at all when the current assessment is not spiking', () => {
+    const r = assessPatternSpikeTransitionFallback(undefined, notSpiking, { nowMs: 1_000_000 })
+    expect(r.shouldFire).toBe(false)
+    expect(r.reason).toBe('not_spiking')
+  })
+
+  it('suppresses a transition fire inside the cooldown window', () => {
+    const r = assessPatternSpikeTransitionFallback(notSpiking, spiking, {
+      nowMs: 1_000_000, lastFiredAt: 999_000, cooldownMs: 10_000,
+    })
+    expect(r.shouldFire).toBe(false)
+    expect(r.reason).toBe('cooldown_active')
+  })
+
+  it('re-arms and fires again once the cooldown has elapsed', () => {
+    const r = assessPatternSpikeTransitionFallback(notSpiking, spiking, {
+      nowMs: 1_020_000, lastFiredAt: 1_000_000, cooldownMs: 10_000,
+    })
+    expect(r.shouldFire).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — pattern_spike alert firing (assessPatternSpikesCron + convex/alerts.ts)
+// ---------------------------------------------------------------------------
+
+/** UTC "YYYY-MM-DD" for `n` days before `now`. Mirrors failure_patterns.ts's own dateNDaysAgoUtc (not exported). */
+function dayNDaysAgo(now: number, n: number): string {
+  const d = new Date(now)
+  d.setUTCDate(d.getUTCDate() - n)
+  return d.toISOString().slice(0, 10)
+}
+
+/**
+ * Seeds a failure_patterns rollup directly (bypassing recordFailurePatternOccurrence,
+ * which is unnecessary for these tests — only the rollup + daily-count rows matter)
+ * with a flat, low (count=1/day) 13-day baseline plus a controllable "today" count,
+ * so assessPatternSpikeFallback's deterministic zero-variance-baseline branch decides
+ * isSpiking (avoids any z-score float fragility in these tests).
+ */
+async function seedPatternWithSpikeTrend(
+  t: ReturnType<typeof convexTest>,
+  args: {
+    orgId: any
+    fingerprintHash: string
+    now: number
+    todayCount: number
+    lastSpikeAssessment?: { assessedAt: number; isSpiking: boolean; recentCount: number; baselineMean: number; z: number }
+    lastPatternSpikeAlertFiredAt?: number
+  },
+) {
+  return await t.run(async (ctx) => {
+    const patternId = await ctx.db.insert('failure_patterns', {
+      orgId: args.orgId,
+      fingerprintHash: args.fingerprintHash,
+      class: 'tool_error',
+      label: `Tool Error: ${args.fingerprintHash}`,
+      salientKey: args.fingerprintHash,
+      count: 13 + args.todayCount,
+      firstSeenAt: args.now - 13 * 24 * 60 * 60 * 1000,
+      lastSeenAt: args.now,
+      representativeRunIds: [],
+      affectedAgentVersionIds: [],
+      lastSpikeAssessment: args.lastSpikeAssessment,
+      lastPatternSpikeAlertFiredAt: args.lastPatternSpikeAlertFiredAt,
+    })
+    for (let i = 13; i >= 1; i--) {
+      await ctx.db.insert('failure_pattern_daily_counts', {
+        orgId: args.orgId, fingerprintHash: args.fingerprintHash, day: dayNDaysAgo(args.now, i), count: 1,
+      })
+    }
+    await ctx.db.insert('failure_pattern_daily_counts', {
+      orgId: args.orgId, fingerprintHash: args.fingerprintHash, day: dayNDaysAgo(args.now, 0), count: args.todayCount,
+    })
+    return patternId
+  })
+}
+
+/** Seeds an alert_rules row directly (bypassing the createAlertRule mutation's admin-auth/validation — irrelevant to these cron-firing tests). */
+async function createPatternSpikeRule(t: ReturnType<typeof convexTest>, orgId: any, enabled = true) {
+  return await t.run(async (ctx) => {
+    const now = Date.now()
+    return await ctx.db.insert('alert_rules', {
+      orgId, name: 'pattern spikes', kind: 'pattern_spike', channels: [{ type: 'webhook', target: 'https://example.com/hook' }],
+      enabled, createdAt: now, updatedAt: now,
+    })
+  })
+}
+
+describe('pattern_spike alert firing', () => {
+  it('fires exactly once on the not-spiking -> spiking transition, not again while still spiking, and re-arms after it drops and re-spikes past cooldown', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    await createPatternSpikeRule(t, orgA)
+
+    const now = Date.parse('2026-07-24T12:00:00.000Z')
+    await seedPatternWithSpikeTrend(t, { orgId: orgA, fingerprintHash: 'spiky', now, todayCount: 40 })
+
+    // First tick: fresh spike entry — fires exactly once.
+    const first = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now })
+    expect(first.spiking).toBe(1)
+    expect(first.fired).toBe(1)
+
+    let events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(1)
+    expect(events[0]!.patternFingerprintHash).toBe('spiky')
+    // recentCount reflects Team B's real assessPatternSpike (insights.ts),
+    // which sums the trailing 3-day recent window (today=40 + the two
+    // preceding baseline days at count=1 each = 42), not just "today" alone —
+    // see that function's doc comment for why (SPIKE_DEFAULT_RECENT_DAYS).
+    expect(events[0]!.metadata).toMatchObject({ fingerprintHash: 'spiky', class: 'tool_error', recentCount: 42, deepLink: '/patterns/spiky' })
+    expect(events[0]!.summary).toContain('/patterns/spiky')
+
+    // Second tick, 15 minutes later, pattern is STILL spiking (nothing changed
+    // upstream) — must NOT fire again.
+    const secondTick = now + 15 * 60 * 1000
+    const second = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: secondTick })
+    expect(second.fired).toBe(0)
+    events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(1)
+
+    // The pattern's count drops back to baseline (no longer spiking)...
+    await t.run(async (ctx) => {
+      const pattern = await ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'spiky')).first()
+      const todayRow = await ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'spiky').eq('day', dayNDaysAgo(secondTick, 0))).first()
+      await ctx.db.patch(todayRow!._id, { count: 1 })
+      void pattern
+    })
+    const dropTick = secondTick + 15 * 60 * 1000
+    const drop = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: dropTick })
+    expect(drop.spiking).toBe(0)
+    expect(drop.fired).toBe(0)
+
+    // ...then spikes again, but WITHIN the cooldown window — must not re-fire yet.
+    await t.run(async (ctx) => {
+      const todayRow = await ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'spiky').eq('day', dayNDaysAgo(dropTick, 0))).first()
+      await ctx.db.patch(todayRow!._id, { count: 50 })
+    })
+    const withinCooldownTick = dropTick + 15 * 60 * 1000
+    const withinCooldown = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: withinCooldownTick })
+    expect(withinCooldown.spiking).toBe(1)
+    expect(withinCooldown.fired).toBe(0)
+    events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(1)
+
+    // Drop again, then re-spike PAST the cooldown (default 6h) — re-arms and fires.
+    await t.run(async (ctx) => {
+      const todayRow = await ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'spiky').eq('day', dayNDaysAgo(withinCooldownTick, 0))).first()
+      await ctx.db.patch(todayRow!._id, { count: 1 })
+    })
+    const secondDropTick = withinCooldownTick + 15 * 60 * 1000
+    await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: secondDropTick })
+
+    await t.run(async (ctx) => {
+      const todayRow = await ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'spiky').eq('day', dayNDaysAgo(secondDropTick, 0))).first()
+      await ctx.db.patch(todayRow!._id, { count: 60 })
+    })
+    const pastCooldownTick = now + 7 * 60 * 60 * 1000 // > 6h after the first fire
+    const rearmed = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: pastCooldownTick })
+    expect(rearmed.spiking).toBe(1)
+    expect(rearmed.fired).toBe(1)
+
+    events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(2)
+  })
+
+  it('stores the spike assessment but fires NO alert when the org has no pattern_spike rule at all', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    // No alert_rules seeded for orgA.
+
+    const now = Date.parse('2026-07-24T12:00:00.000Z')
+    await seedPatternWithSpikeTrend(t, { orgId: orgA, fingerprintHash: 'no-rule', now, todayCount: 40 })
+
+    const result = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now })
+    expect(result.spiking).toBe(1)
+    expect(result.fired).toBe(0)
+
+    const events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(0)
+
+    const pattern = await t.run((ctx) => ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'no-rule')).first())
+    expect(pattern!.lastSpikeAssessment!.isSpiking).toBe(true)
+  })
+
+  it('fires NO alert when the only matching pattern_spike rule is disabled', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    await createPatternSpikeRule(t, orgA, false)
+
+    const now = Date.parse('2026-07-24T12:00:00.000Z')
+    await seedPatternWithSpikeTrend(t, { orgId: orgA, fingerprintHash: 'disabled-rule', now, todayCount: 40 })
+
+    const result = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now })
+    expect(result.fired).toBe(0)
+    const events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(0)
+  })
+
+  it('cross-org isolation: firing for org A never creates an alert_events row for org B, even when both spike simultaneously', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB } = await seedTwoOrgs(t)
+    await createPatternSpikeRule(t, orgA)
+    // orgB gets NO pattern_spike rule.
+
+    const now = Date.parse('2026-07-24T12:00:00.000Z')
+    await seedPatternWithSpikeTrend(t, { orgId: orgA, fingerprintHash: 'a-spike', now, todayCount: 40 })
+    await seedPatternWithSpikeTrend(t, { orgId: orgB, fingerprintHash: 'b-spike', now, todayCount: 40 })
+
+    const result = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now })
+    expect(result.assessed).toBe(2)
+    expect(result.spiking).toBe(2)
+    expect(result.fired).toBe(1)
+
+    const eventsA = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    const eventsB = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgB)).collect())
+    expect(eventsA.length).toBe(1)
+    expect(eventsA[0]!.orgId).toBe(orgA)
+    expect(eventsB.length).toBe(0)
   })
 })

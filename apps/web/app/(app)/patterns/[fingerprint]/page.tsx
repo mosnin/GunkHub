@@ -1,13 +1,15 @@
 import Link from 'next/link'
 import { notFound } from 'next/navigation'
 
-import type { ResolvedAgentVersion } from '@/components/patterns/PatternDetail'
+import type { ResolvedAgentVersion, TopRunExplanationPreview } from '@/components/patterns/PatternDetail'
 import type { Metadata } from 'next'
 
 import { adaptFailurePatternDetail } from '@/components/patterns/adapt'
 import { PatternDetail } from '@/components/patterns/PatternDetail'
 import { ErrorState } from '@/components/ui/ErrorState'
+import { getRunExplanationSummaries, withAnalyzingGracePeriod } from '@/lib/services/explanations'
 import { getFailurePatternDetail } from '@/lib/services/failurePatterns'
+import { getRun } from '@/lib/services/runs'
 
 export const metadata: Metadata = { title: 'Pattern Detail' }
 
@@ -69,6 +71,33 @@ export default async function PatternDetailPage({ params }: PatternDetailPagePro
     )
   }
 
+  // "Why did this fail?" preview for the top (most-recent) representative
+  // run — one bounded batch call, same helper the dashboard's Recent Runs
+  // list uses, plus the same grace-period downgrade so a run that ended long
+  // ago with no explanation reads as "not available" rather than an
+  // indefinite "analyzing…". Non-fatal: any failure here just omits the
+  // section (`topRunExplanation` stays null), the rest of the page still
+  // renders.
+  let topRunExplanation: TopRunExplanationPreview | null = null
+  const topRunId = detail.pattern.hasRepresentativeRuns ? detail.pattern.representativeRunIds[0] : undefined
+  if (topRunId) {
+    try {
+      const [summariesSettled, runSettled] = await Promise.allSettled([
+        getRunExplanationSummaries([topRunId]),
+        getRun(topRunId),
+      ])
+      const rawState =
+        summariesSettled.status === 'fulfilled' ? summariesSettled.value[topRunId] : undefined
+      const runEndedAt = runSettled.status === 'fulfilled' ? runSettled.value.run.endedAt : undefined
+      const state = rawState ?? { status: 'unavailable' as const }
+      const graced = withAnalyzingGracePeriod({ [topRunId]: state }, [{ id: topRunId, endedAt: runEndedAt }])
+      topRunExplanation = { runId: topRunId, state: graced[topRunId] ?? state }
+    } catch {
+      // Non-fatal — section is simply omitted.
+      topRunExplanation = null
+    }
+  }
+
   return (
     <div className="p-6 max-w-4xl mx-auto">
       <Link
@@ -82,6 +111,7 @@ export default async function PatternDetailPage({ params }: PatternDetailPagePro
         recentOccurrences={detail.recentOccurrences}
         trend={detail.trend}
         agentVersions={agentVersions}
+        topRunExplanation={topRunExplanation}
       />
     </div>
   )

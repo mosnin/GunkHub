@@ -1,10 +1,17 @@
 # ADR 005 — Failure Patterns (Prevention)
 
-Status: Accepted (Cycle 1)
+Status: Accepted (Cycle 1); Amended (Cycle 2 — pattern-spike alerting +
+accurate daily trend)
 Date: 2026-07-24
 Relates to: ADR-0002 (event log is canonical), ADR-0003 (tenancy boundary),
 ADR-002 (data model expansion — observability-grade rollups), ADR-004 (run
 explanations)
+
+> **Cycle 2 amendment:** this ADR's Cycle 1 text below is left unchanged as
+> the historical record of what shipped first. See "Cycle 2 (DEEPEN)" at the
+> end of this file for what changed: pattern-spike alert firing (closing the
+> "stored, not alerted on" gap) and an accurate, non-sample-truncated daily
+> trend.
 
 ## Context
 
@@ -108,3 +115,84 @@ spiking pattern should either add a `pattern_spike` alert-rule kind, or poll
   assessment is stored, not (yet) alerted on" above) — `lastSpikeAssessment`
   is visible on the rollup for any future consumer, but nothing in this
   cycle notifies a human about it.
+
+## Cycle 2 (DEEPEN) — pattern-spike alerting + accurate daily trend
+
+This cycle closes the two gaps Cycle 1 left open, without changing any of the
+invariants above (event log immutability, org-scoping, occurrences remaining
+append-only, the rollup remaining a derived/regeneratable aggregate).
+
+**1. `pattern_spike` alert-rule kind + real firing.** `alert_rules.kind`
+(`convex/alerts.ts` / `convex/schema.ts`, `packages/contracts/src/alerts.ts`)
+gains a fourth variant, `pattern_spike` — additive to the closed enum, a
+patch/minor contracts bump (0.7.7 → 0.7.8). `alert_events` gains two additive/
+optional fields: `patternFingerprintHash` (the fingerprint whose rollup
+transitioned into spiking) and `metadata` (freeform, kind-specific structured
+payload — for `pattern_spike`, `{ fingerprintHash, class, label, recentCount,
+deepLink }`, where `deepLink` is `/patterns/[fingerprint]`). Neither field is
+populated for any other alert kind.
+
+`convex/failure_patterns.ts`'s `assessPatternSpikesCron` now calls
+`convex/alerts.ts`'s new `firePatternSpikeAlert` (an `internalMutation`)
+whenever a pattern's spike assessment transitions from not-spiking to
+spiking. `firePatternSpikeAlert` mirrors `convex/alert_engine.ts`'s existing
+per-rule firing semantics exactly: it fires once per ENABLED `pattern_spike`
+alert_rule in the pattern's org (a rule of this kind is treated as org-wide —
+`projectId` is not meaningful for an org-scoped, not project-scoped, rollup),
+inserting one append-only `alert_events` row plus one channel delivery
+(`webhook_deliveries`/`email_deliveries`) per rule channel, same as every
+other kind. An org with no matching enabled rule gets its spike assessment
+stored (unchanged from Cycle 1) but no alert fires — same "no-op when no rule
+matches" behavior every other alert kind already has.
+
+**2. Anti-flap / idempotency: rising-edge-only, with a cooldown, stored on the
+rollup itself.** A pattern-spike alert must fire AT MOST ONCE per spike
+episode, not on every 15-minute cron tick for as long as the pattern remains
+above threshold. This is decided by a new pure Insight Engine (Team B)
+function, `assessPatternSpikeTransition(prev, curr, opts)`
+(`convex/insights.ts`), consumed via the same guarded-dynamic-lookup +
+local-fallback discipline `deriveFailureFingerprint`/`assessPatternSpike`
+already established in Cycle 1 — `assessPatternSpikeTransitionFallback` in
+`convex/failure_patterns.ts` is what runs if Team B's export isn't present.
+The decision only needs `prev` (the previously stored `lastSpikeAssessment`)
+and this pattern's own `lastPatternSpikeAlertFiredAt` (a new additive,
+optional field on `failure_patterns` — the epoch ms this pattern last fired a
+spike alert, across every `pattern_spike` rule in the org; a per-pattern
+cooldown, not per-rule): a rising edge (not-spiking/never-assessed ->
+spiking) fires unless still inside the cooldown window (default 6h) since the
+last fire, and a sustained spike (already spiking -> still spiking) never
+fires again regardless of cooldown. `lastPatternSpikeAlertFiredAt` is
+advanced whenever a fire is ATTEMPTED, independent of whether any rule
+existed to receive it — the anti-flap state tracks "did this pattern's
+assessment just transition," not "did a human get notified."
+
+**3. Accurate daily trend — no longer a bounded occurrence sample.** Cycle
+1's trend was built by reading up to `MAX_TREND_OCCURRENCE_SAMPLE` (2,000)
+occurrence rows and bucketing them into 14 daily counts — silently
+undercounting any day past that sample's horizon for a high-volume
+fingerprint. Cycle 2 replaces this with `failure_pattern_daily_counts`, a new
+additive table: exactly one row per `(orgId, fingerprintHash, day)`,
+upserted/incremented by `recordFailurePatternOccurrence` alongside every new
+occurrence (same append-friendly, observability-grade category as
+`daily_rollups`/`usage_counters` — never itself a fact about a single run).
+Both `getFailurePattern` and `assessPatternSpikesCron` now read the trend via
+`readAccurateTrend`, which ranges the `by_org_fingerprint_day` index over the
+14-day window — reading at most 14 rows per call, REGARDLESS of how many
+occurrences the fingerprint has ever recorded, so this is simultaneously more
+accurate and cheaper than the sample it replaces. `MAX_TREND_OCCURRENCE_SAMPLE`
+is removed; `buildTrendFromOccurrences` (the Cycle 1 bucketing function) is
+kept, exported, and tested as a still-correct pure utility for any caller that
+only has a raw occurrence list in hand, but is no longer used by either query.
+
+**Contracts/schema summary:**
+- `packages/contracts/src/alerts.ts`: `AlertRuleKind` gains `"pattern_spike"`;
+  `AlertEvent` gains optional `patternFingerprintHash`/`metadata`. Version
+  0.7.7 → 0.7.8.
+- `convex/schema.ts`: `alert_rules.kind` gains `pattern_spike`; `alert_events`
+  gains optional `patternFingerprintHash`/`metadata`; `failure_patterns` gains
+  optional `lastPatternSpikeAlertFiredAt`; new additive table
+  `failure_pattern_daily_counts`. No existing field changes shape — migration
+  is a no-op.
+- No read-facing API route or UI surface for `pattern_spike` rules/events is
+  added this cycle (Team C/D/E, as with Cycle 1's `listFailurePatterns`/
+  `getFailurePattern`).

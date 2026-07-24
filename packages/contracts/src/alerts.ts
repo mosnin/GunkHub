@@ -1,8 +1,15 @@
 // ADR-002 — alert rules (ordinary config) and alert events (append-only
 // record of a rule firing; deliveryStatus/deliveredAt are the one sanctioned
 // patch — see convex/schema.ts and docs/adr/002-data-model-expansion.md).
+//
+// Failure Patterns cycle 2 (docs/adr/005-failure-patterns.md) adds the
+// "pattern_spike" rule kind plus two additive/optional AlertEvent fields
+// (`patternFingerprintHash`, `metadata`) so a fired pattern-spike alert can
+// carry a deep link back to /patterns/[fingerprint] — see
+// convex/failure_patterns.ts's assessPatternSpikesCron and
+// convex/alerts.ts's firePatternSpikeAlert.
 
-export type AlertRuleKind = "run_failed" | "failure_rate" | "eval_failed";
+export type AlertRuleKind = "run_failed" | "failure_rate" | "eval_failed" | "pattern_spike";
 export type AlertChannelType = "webhook" | "email";
 
 export interface AlertChannel {
@@ -35,4 +42,13 @@ export interface AlertEvent {
   summary: string;
   deliveryStatus: AlertDeliveryStatus;
   deliveredAt?: number;
+  /** Present only for a "pattern_spike"-kind firing — see convex/alerts.ts's firePatternSpikeAlert. */
+  patternFingerprintHash?: string;
+  /**
+   * Freeform, kind-specific structured payload (display-only). For
+   * "pattern_spike": `{ fingerprintHash, class, label, recentCount, deepLink }`,
+   * where `deepLink` is the app-relative path to this pattern's detail page
+   * (`/patterns/[fingerprint]`).
+   */
+  metadata?: Record<string, unknown>;
 }

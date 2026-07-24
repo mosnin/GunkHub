@@ -124,7 +124,7 @@ function codeFromV1Body(body: unknown): string | undefined {
 export async function fetchV1<T>(
   config: V1ApiConfig,
   path: string,
-  params: Record<string, string | number | undefined> = {},
+  params: Record<string, string | number | boolean | undefined> = {},
   fetchImpl: V1FetchLike = fetch as unknown as V1FetchLike
 ): Promise<T> {
   const url = new URL(`${config.baseUrl.replace(/\/$/, '')}${path}`)

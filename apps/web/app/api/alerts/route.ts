@@ -1,14 +1,13 @@
 import { auth } from '@clerk/nextjs/server'
 import { type NextRequest, NextResponse } from 'next/server'
 
-import type { AlertChannel, AlertRuleKind, ApiError } from '@agent-flight-recorder/contracts'
+import type { AlertChannel, ApiError } from '@agent-flight-recorder/contracts'
 
 import { hasOrgAuthContext } from '@/lib/apiAuthGuard'
 import { mapApiError } from '@/lib/apiErrorMapping'
 import { withApiHandler } from '@/lib/apiHandler'
-import { createAlertRule, listAlertRules } from '@/lib/services/alerts'
+import { createAlertRule, isValidAlertRuleKind, listAlertRules } from '@/lib/services/alerts'
 
-const ALERT_RULE_KINDS = new Set<string>(['run_failed', 'failure_rate', 'eval_failed'])
 const CHANNEL_TYPES = new Set<string>(['webhook', 'email'])
 
 function validateChannelsBody(raw: unknown): AlertChannel[] | NextResponse {
@@ -108,11 +107,11 @@ export const POST = withApiHandler(
       )
     }
     const kind = body['kind']
-    if (typeof kind !== 'string' || !ALERT_RULE_KINDS.has(kind)) {
+    if (!isValidAlertRuleKind(kind)) {
       return NextResponse.json<ApiError>(
         {
           code: 'VALIDATION_ERROR',
-          message: 'kind must be one of run_failed, failure_rate, eval_failed',
+          message: 'kind must be one of run_failed, failure_rate, eval_failed, pattern_spike',
         },
         { status: 422 }
       )
@@ -123,7 +122,7 @@ export const POST = withApiHandler(
     try {
       const rule = await createAlertRule({
         name: name.trim(),
-        kind: kind as AlertRuleKind,
+        kind,
         channels,
         ...(typeof body['projectId'] === 'string' && { projectId: body['projectId'] }),
         ...(typeof body['thresholdPct'] === 'number' && { thresholdPct: body['thresholdPct'] }),

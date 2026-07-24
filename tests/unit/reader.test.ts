@@ -287,6 +287,22 @@ describe('FlightReader.getFailurePatterns', () => {
     expect(url).toContain('cursor=cur-1')
   })
 
+  it('sends spiking=true as a query param when spiking:true is passed', async () => {
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    const reader = new FlightReader(config, fetchImpl)
+    await reader.getFailurePatterns({ spiking: true })
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('spiking=true')
+  })
+
+  it('omits the spiking query param when spiking is not passed', async () => {
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    const reader = new FlightReader(config, fetchImpl)
+    await reader.getFailurePatterns()
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).not.toContain('spiking')
+  })
+
   it('resolves an empty list without throwing when the org has no patterns', async () => {
     const data = { patterns: [] }
     const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data }))

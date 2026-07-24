@@ -138,7 +138,11 @@ describe('read_api.apiListFailurePatterns', () => {
     t: ReturnType<typeof convexTest>,
     orgId: any,
     fingerprintHash: string,
-    opts: { affectedAgentVersionIds?: any[]; lastSeenAt?: number } = {},
+    opts: {
+      affectedAgentVersionIds?: any[];
+      lastSeenAt?: number;
+      lastSpikeAssessment?: { assessedAt: number; isSpiking: boolean; recentCount: number; baselineMean: number; z: number };
+    } = {},
   ) {
     return await t.run(async (ctx) => {
       const now = Date.now();
@@ -153,6 +157,7 @@ describe('read_api.apiListFailurePatterns', () => {
         lastSeenAt: opts.lastSeenAt ?? now,
         representativeRunIds: [],
         affectedAgentVersionIds: opts.affectedAgentVersionIds ?? [],
+        ...(opts.lastSpikeAssessment !== undefined && { lastSpikeAssessment: opts.lastSpikeAssessment }),
       });
     });
   }
@@ -246,5 +251,65 @@ describe('read_api.apiListFailurePatterns', () => {
     await expect(
       t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key_a', agentId: String(agentB) }),
     ).rejects.toThrow(/not found/i);
+  });
+
+  it('--spiking narrows to patterns whose lastSpikeAssessment.isSpiking is true (PREVENTION cycle 2)', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_spiking', {
+      lastSpikeAssessment: { assessedAt: Date.now(), isSpiking: true, recentCount: 9, baselineMean: 1.2, z: 4.1 },
+    });
+    await seedPattern(t, orgA, 'fp_not_spiking', {
+      lastSpikeAssessment: { assessedAt: Date.now(), isSpiking: false, recentCount: 1, baselineMean: 1.1, z: 0.2 },
+    });
+    await seedPattern(t, orgA, 'fp_no_assessment');
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', spiking: true });
+    expect(result.patterns).toHaveLength(1);
+    expect(result.patterns[0].fingerprintHash).toBe('fp_spiking');
+  });
+
+  it('spiking:false (or omitted) returns all patterns regardless of spike status', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA } = await seedTwoOrgs(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_spiking', {
+      lastSpikeAssessment: { assessedAt: Date.now(), isSpiking: true, recentCount: 9, baselineMean: 1.2, z: 4.1 },
+    });
+    await seedPattern(t, orgA, 'fp_not_spiking');
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, { apiKeyHash: 'read_key', spiking: false });
+    expect(result.patterns).toHaveLength(2);
+  });
+
+  it('--spiking composes with --agent (both filters applied)', async () => {
+    const t = convexTest(schema, modules);
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t);
+    const [versionForAgentA] = await t.run(async (ctx) => {
+      const now = Date.now();
+      const v1 = await ctx.db.insert('agent_versions', { agentId: agentA, orgId: orgA, version: '1', createdAt: now });
+      return [v1];
+    });
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'read_key', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] });
+    });
+    await seedPattern(t, orgA, 'fp_agent_a_spiking', {
+      affectedAgentVersionIds: [versionForAgentA],
+      lastSpikeAssessment: { assessedAt: Date.now(), isSpiking: true, recentCount: 9, baselineMean: 1.2, z: 4.1 },
+    });
+    await seedPattern(t, orgA, 'fp_agent_a_not_spiking', { affectedAgentVersionIds: [versionForAgentA] });
+
+    const result = await t.mutation(api.read_api.apiListFailurePatterns, {
+      apiKeyHash: 'read_key',
+      agentId: String(agentA),
+      spiking: true,
+    });
+    expect(result.patterns).toHaveLength(1);
+    expect(result.patterns[0].fingerprintHash).toBe('fp_agent_a_spiking');
   });
 })

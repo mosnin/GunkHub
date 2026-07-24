@@ -72,13 +72,16 @@ crons.interval(
   {},
 );
 
-// Failure Patterns (PREVENTION, cycle 1) — periodic spike-rollup. Runs every
-// 15 minutes: recomputes each of the most recently active patterns' 14-day
-// daily trend and stores a fresh spike assessment on the rollup. Cheap,
-// bounded (SPIKE_ROLLUP_MAX_PATTERNS_PER_RUN patterns/tick, each a bounded
-// occurrences read) — see convex/failure_patterns.ts's
-// assessPatternSpikesCron for the read bounds and the "no alert-firing seam
-// yet" handoff note.
+// Failure Patterns (PREVENTION, cycle 1 + cycle 2) — periodic spike-rollup +
+// alerting. Runs every 15 minutes: recomputes each of the most recently
+// active patterns' ACCURATE 14-day daily trend (from
+// failure_pattern_daily_counts, cycle 2 — no longer a bounded occurrence
+// sample), stores a fresh spike assessment on the rollup, and (cycle 2) fires
+// a `pattern_spike` alert the moment a pattern transitions from not-spiking
+// to spiking, gated by a per-pattern cooldown. Cheap, bounded
+// (SPIKE_ROLLUP_MAX_PATTERNS_PER_RUN patterns/tick, each trend read is at
+// most TREND_WINDOW_DAYS rows) — see convex/failure_patterns.ts's
+// assessPatternSpikesCron and convex/alerts.ts's firePatternSpikeAlert.
 crons.interval(
   "assess-failure-pattern-spikes",
   { minutes: 15 },

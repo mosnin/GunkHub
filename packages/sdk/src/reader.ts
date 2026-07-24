@@ -99,6 +99,14 @@ export interface V1ListFailurePatternsData {
 export interface ListFailurePatternsParams {
   /** Narrow to patterns that have been seen on at least one version of this agent. */
   agentId?: string
+  /**
+   * Narrow to patterns whose most recent spike assessment flagged them as
+   * currently spiking (`lastSpikeAssessment.isSpiking === true`) — the
+   * proactive-prevention filter (PREVENTION cycle 2, "make spikes
+   * actionable"). Patterns with no assessment yet, or a non-spiking one, are
+   * excluded when this is `true`. Omit (or pass `false`) to see all patterns.
+   */
+  spiking?: boolean
   limit?: number
   cursor?: string
 }
@@ -320,7 +328,8 @@ export class FlightReader {
    * run's own `RunExplanation` remain that).
    *
    * @param filters - optional `agentId` (narrows to patterns seen on at
-   *   least one version of that agent) plus `limit`/`cursor` pagination.
+   *   least one version of that agent), `spiking` (narrows to patterns whose
+   *   `lastSpikeAssessment.isSpiking === true`) plus `limit`/`cursor` pagination.
    * @returns `{ patterns, nextCursor }` — pass `nextCursor` back as `cursor` to page.
    * @throws {@link V1ApiError} on any auth/rate-limit/server/network failure.
    */
@@ -330,6 +339,7 @@ export class FlightReader {
       '/api/v1/patterns',
       {
         agentId: filters.agentId,
+        ...(filters.spiking !== undefined && { spiking: filters.spiking }),
         limit: filters.limit,
         cursor: filters.cursor,
       },

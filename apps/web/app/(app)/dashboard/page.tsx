@@ -6,7 +6,9 @@ import type { Run } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { DashboardStats } from '@/components/dashboard/DashboardStats'
+import { TopFailurePatternsCard } from '@/components/dashboard/TopFailurePatternsCard'
 import { PageHeader } from '@/components/layout/PageHeader'
+import { adaptFailurePattern } from '@/components/patterns/adapt'
 import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
 import { RunList } from '@/components/runs/RunList'
 import { Card } from '@/components/ui/Card'
@@ -15,9 +17,12 @@ import { ErrorState } from '@/components/ui/ErrorState'
 import { Reveal, RevealGroup, RevealItem } from '@/components/ui/Motion'
 import { getDashboardStats, getPerAgentDashboardStats, type DashboardRange } from '@/lib/services/dashboard'
 import { getRunExplanationSummaries, withAnalyzingGracePeriod } from '@/lib/services/explanations'
+import { listFailurePatterns } from '@/lib/services/failurePatterns'
 import { getRecentFailedVerifications } from '@/lib/services/projection_verify'
 import { listRuns } from '@/lib/services/runs'
 import { truncateId, formatRelativeTime } from '@/lib/utils'
+
+const TOP_PATTERNS_LIMIT = 10
 
 export const metadata: Metadata = { title: 'Dashboard' }
 
@@ -115,6 +120,22 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
     // Non-fatal
   }
 
+  // "Top recurring failures" widget (PREVENTION, cycle 2) — org-wide, not
+  // scoped to the recent-runs window above, so it fetches independently and
+  // never blocks the rest of the page. adaptFailurePattern is the same
+  // reconciliation adapter the /patterns pages use (see
+  // components/patterns/adapt.ts) — keeps this widget honest about which
+  // fields the service actually returned (e.g. `hasSpikeAssessment`) instead
+  // of defaulting a missing spike assessment to a false "not spiking".
+  let topFailurePatterns: ReturnType<typeof adaptFailurePattern>[] | null = null
+  let topFailurePatternsError: string | null = null
+  try {
+    const raw = await listFailurePatterns(TOP_PATTERNS_LIMIT)
+    topFailurePatterns = raw.map(adaptFailurePattern)
+  } catch (err) {
+    topFailurePatternsError = err instanceof Error ? err.message : 'Failed to load failure patterns'
+  }
+
   // Analytics — Team B's insights rollup. Independent of the recent-runs
   // fetch above (and its own error state), so a failure here never blanks
   // the rest of the page.
@@ -144,6 +165,13 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
             <StatTile label="Failed" value={String(failedRuns)} accent={failedRuns > 0 ? 'warn' : 'neutral'} hint="need attention" />
             <StatTile label="Active" value={String(activeRuns)} accent={activeRuns > 0 ? 'neon' : 'neutral'} hint="running now" />
           </RevealGroup>
+
+          {/* Top recurring failures — org-wide, shown regardless of whether
+              this window has recent runs (a pattern can still be actively
+              spiking even if nothing ran in the last 7/30 days). */}
+          <div className="mt-6">
+            <TopFailurePatternsCard patterns={topFailurePatterns} error={topFailurePatternsError} />
+          </div>
 
           {hasRuns ? (
             <>

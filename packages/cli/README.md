@@ -103,12 +103,12 @@ Options: `--json` (prints the raw, derived `{ ok, status, ... }` result).
 
 ### `afr patterns`
 
-Lists recurring failure patterns for your organization — a durable memory of fingerprinted, recurring failures derived from failed runs (PREVENTION cycle 1, ADR-005). Each row is a rollup: a class, a human label, how many times it has recurred, first/last seen timestamps, and whether the periodic spike-rollup cron currently flags it as spiking.
+Lists recurring failure patterns for your organization — a durable memory of fingerprinted, recurring failures derived from failed runs (PREVENTION cycle 1, ADR-005). Each row is a rollup: a class, a human label, how many times it has recurred, first/last seen timestamps, and whether the periodic spike-rollup cron currently flags it as spiking (and, when spiking, its `recentCount`).
 
 ```bash
 $ afr patterns
 ID            CLASS        LABEL                                  COUNT  FIRST SEEN                LAST SEEN                 SPIKING
-fp_a1b2c3d4e…  tool_error   lookup_order tool call times out       12     2026-07-10T09:00:00.000Z  2026-07-24T14:32:00.000Z  yes
+fp_a1b2c3d4e…  tool_error   lookup_order tool call times out       12     2026-07-10T09:00:00.000Z  2026-07-24T14:32:00.000Z  yes (9)
 
 $ afr patterns --agent agent_support --limit 10 --json
 {
@@ -116,9 +116,12 @@ $ afr patterns --agent agent_support --limit 10 --json
   "patterns": [ ... ],
   "nextCursor": null
 }
+
+$ afr patterns --spiking
+# only patterns whose lastSpikeAssessment.isSpiking === true (PREVENTION cycle 2 — proactive prevention)
 ```
 
-Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--limit <n>`, `--json` (prints the raw API response).
+Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--spiking` (only patterns currently flagged as spiking), `--limit <n>`, `--json` (prints the raw API response).
 
 Like every other read here, this is derived, observability-grade data (CLAUDE.md) — never a substitute for a single run's own event log or `afr explain <runId>`.
 
@@ -160,8 +163,8 @@ Prints the CLI and SDK versions.
 
 ```bash
 $ afr version
-afr (Agent Flight Recorder CLI) v0.4.0
-sdk: v0.8.0
+afr (Agent Flight Recorder CLI) v0.5.0
+sdk: v0.9.0
 ```
 
 ### `afr --help` / `afr help`

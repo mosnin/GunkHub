@@ -497,9 +497,9 @@ See `examples/read_back.ts` for the full runnable version.
 
 `filters` for `listRuns`: `status`, `agentId`, `environment`, `sessionId`, `limit`, `cursor` (all optional).
 
-`filters` for `getFailurePatterns`: `agentId`, `limit`, `cursor` (all optional).
+`filters` for `getFailurePatterns`: `agentId`, `spiking`, `limit`, `cursor` (all optional).
 
-### `getFailurePatterns(filters?)` — recurring failure patterns (PREVENTION cycle 1, ADR-005)
+### `getFailurePatterns(filters?)` — recurring failure patterns (PREVENTION cycle 1, ADR-005; `spiking` filter added cycle 2)
 
 Lists recurring failure fingerprints for the key's organization, most-recently-seen first — a durable memory of failures that keep recurring across runs, derived from `RunExplanation`s. Each `FailurePattern` carries `class`, `label`, `count`, `firstSeenAt`/`lastSeenAt`, a bounded sample of `representativeRunIds`, the `affectedAgentVersionIds` it's been seen on, and an optional `lastSpikeAssessment` (`isSpiking`, `recentCount`, `baselineMean`, `z`) from the periodic spike-rollup cron.
 
@@ -508,7 +508,12 @@ const { patterns } = await reader.getFailurePatterns({ agentId: 'agent_123', lim
 for (const pattern of patterns) {
   console.log(`${pattern.label} — seen ${pattern.count}x, last at ${new Date(pattern.lastSeenAt).toISOString()}`)
 }
+
+// Proactive prevention (cycle 2): only patterns the spike-rollup cron currently flags as spiking.
+const { patterns: spiking } = await reader.getFailurePatterns({ spiking: true })
 ```
+
+Pass `spiking: true` to narrow to patterns whose `lastSpikeAssessment.isSpiking === true` — patterns with no assessment yet, or a non-spiking one, are excluded. Omit it (or pass `false`) to see all patterns regardless of spike status.
 
 Like every other query surface in this system (CLAUDE.md), this is **observability-grade derived data, never source of truth** — the event log and each run's own `RunExplanation` remain the only facts about what happened on any single run. `@agent-flight-recorder/cli`'s `afr patterns` is a thin wrapper over this method.
 
@@ -684,6 +689,8 @@ this pattern (including the tool-error path).
 ---
 
 ## Version
+
+v0.9.0 — `FlightReader.getFailurePatterns(filters?)` gains a `spiking` filter (PREVENTION cycle 2): narrows the result to patterns whose `lastSpikeAssessment.isSpiking === true`, forwarded as a `spiking=true` query param. Additive/optional — existing callers are unaffected. Backs `afr patterns --spiking`.
 
 v0.8.0 — `FlightReader.getFailurePatterns(filters?)`: a typed read method over the Failure Patterns endpoint (`GET /api/v1/patterns`, PREVENTION cycle 1 / ADR-005) — lists recurring failure fingerprints for the key's org, most-recently-seen first, optionally narrowed by `agentId`. New exports: `V1ListFailurePatternsData`, `ListFailurePatternsParams`, `FailurePattern`, `FailurePatternClass` (re-exported from contracts). Backs `@agent-flight-recorder/cli`'s new `afr patterns` command.
 

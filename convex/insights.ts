@@ -2475,3 +2475,180 @@ export function assessPatternSpike(trend: PatternTrendPoint[], opts?: AssessPatt
 
   return { isSpiking, recentCount, baselineMean, z };
 }
+
+// ---------------------------------------------------------------------------
+// 10. assessPatternSpikeTransition / classifyPatternEpisode — cycle 2 (DEEPEN)
+//    of "Failure Patterns." PURE, DETERMINISTIC decision logic that turns raw
+//    SpikeAssessment readouts (cycle 1, above) into ALERT-WORTHY transitions
+//    with anti-flap protection, plus a coarse episode label for alert
+//    context/UI. Team A's spike-rollup cron calls these directly to decide
+//    when to fire a pattern-spike alert — the signatures below are
+//    load-bearing; do not change them without coordinating with Team A.
+//
+// Like assessPatternSpike, neither function reads the wall clock or any
+// source of randomness: `nowMs`/`lastFiredAt` are always passed in by the
+// caller. Same inputs, same outputs, forever.
+// ---------------------------------------------------------------------------
+
+/**
+ * A `SpikeAssessment` (cycle 1) as persisted by Team A's rollup cron, with the
+ * timestamp it was assessed at. This is NOT the same shape assessPatternSpike
+ * returns (that has no timestamp) — it's the shape Team A stores on the
+ * pattern's rollup row after calling assessPatternSpike, and is what gets
+ * diffed here (this tick's assessment vs. the previously-stored one) to
+ * detect a transition.
+ */
+export interface StoredSpikeAssessment {
+  assessedAt: number;
+  isSpiking: boolean;
+  recentCount: number;
+  baselineMean: number;
+  z: number;
+}
+
+export interface SpikeTransitionDecision {
+  shouldFire: boolean;
+  reason: string;
+}
+
+/** Default anti-flap cooldown: once a spike alert fires, suppress any further fire for this pattern for 6 hours. */
+const SPIKE_TRANSITION_DEFAULT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Decide whether a pattern-spike ALERT should fire on this cron tick, given
+ * the previously-stored assessment (if any) and this tick's fresh one.
+ *
+ * ANTI-FLAP RULE (the entire point of this function):
+ *
+ *   1. RISING EDGE ONLY. An alert fires only on the transition from
+ *      "not spiking" (or never assessed before — `prev` is `undefined`) to
+ *      "spiking." A pattern that was ALREADY spiking on the previous tick and
+ *      is STILL spiking on this one does not fire again — reason
+ *      `"still_spiking_suppressed"`. This is what stops one sustained spike
+ *      from generating a fresh alert on every cron tick for as long as it
+ *      lasts.
+ *   2. COOLDOWN ON TOP OF THE RISING EDGE. Even a genuine rising edge is
+ *      suppressed if `lastFiredAt` is within `cooldownMs` (default 6h) of
+ *      `nowMs` — reason `"cooldown_active"`. This is what stops a pattern
+ *      whose z-score is oscillating right around the spike threshold (e.g.
+ *      spiking on tick N, dipping just under on tick N+1, spiking again on
+ *      tick N+2) from re-firing every time it crosses back over: the first
+ *      rising edge fires and starts the cooldown clock; any further rising
+ *      edge inside that window is swallowed until the cooldown elapses, at
+ *      which point the NEXT rising edge (not merely the passage of time) can
+ *      fire again.
+ *   3. NOT SPIKING. If `curr.isSpiking` is false, there is nothing to alert
+ *      on regardless of `prev` — reason `"not_spiking"`.
+ *
+ * `prev` is treated defensively: `undefined`, or any `prev` whose
+ * `isSpiking` is not strictly `true`, is treated identically as a
+ * not-spiking baseline — so a pattern assessed for the very first time this
+ * tick can still fire (a first-ever spike is a rising edge from an implicit
+ * "not spiking" baseline), and a malformed/missing `prev` never throws.
+ *
+ * `lastFiredAt` undefined means "never fired before" — cooldown can never
+ * suppress in that case (there is nothing to be within cooldownMs of).
+ *
+ * Pure: takes `nowMs` and `lastFiredAt` as arguments, never reads Date.now().
+ */
+export function assessPatternSpikeTransition(
+  prev: StoredSpikeAssessment | undefined,
+  curr: StoredSpikeAssessment,
+  opts: { cooldownMs?: number; nowMs: number; lastFiredAt?: number },
+): SpikeTransitionDecision {
+  const cooldownMs = opts.cooldownMs ?? SPIKE_TRANSITION_DEFAULT_COOLDOWN_MS;
+  const nowMs = opts.nowMs;
+  const lastFiredAt = opts.lastFiredAt;
+
+  const wasSpiking = prev?.isSpiking === true;
+  const isSpiking = curr?.isSpiking === true;
+
+  if (!isSpiking) {
+    return { shouldFire: false, reason: "not_spiking" };
+  }
+
+  if (wasSpiking) {
+    // Sustained spike, not a new rising edge — suppressed regardless of cooldown.
+    return { shouldFire: false, reason: "still_spiking_suppressed" };
+  }
+
+  // Rising edge (prev not spiking / undefined -> curr spiking). Still subject
+  // to the cooldown, so a pattern oscillating around the threshold cannot
+  // fire on every crossing.
+  if (lastFiredAt !== undefined && nowMs - lastFiredAt < cooldownMs) {
+    return { shouldFire: false, reason: "cooldown_active" };
+  }
+
+  return { shouldFire: true, reason: "entered_spiking" };
+}
+
+/** Default "new" window: a pattern first seen within the last 24h is labeled "new." */
+const EPISODE_DEFAULT_NEW_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** Default "quiet gap" heuristic window — see classifyPatternEpisode's doc comment for exactly what this measures. */
+const EPISODE_DEFAULT_QUIET_GAP_MS = 72 * 60 * 60 * 1000;
+
+/**
+ * Classify a pattern's current episode for alert context / UI labeling, from
+ * only the three fields a fingerprint-grouped pattern record carries:
+ * `firstSeenAt`, `lastSeenAt`, and `count` (total occurrences ever recorded
+ * for this fingerprint).
+ *
+ * HONEST LIMITS OF WHAT THIS CAN CLASSIFY: with only first-seen/last-seen/
+ * count, there is no record of the pattern's full occurrence history or gap
+ * structure — we cannot know, e.g., "this pattern went quiet for 10 days and
+ * just came back" versus "this pattern has fired steadily every day since
+ * `firstSeenAt`." The rule below is a deliberately simple, deterministic
+ * heuristic, not a precise reconstruction of the pattern's timeline:
+ *
+ *   1. "new" — `nowMs - firstSeenAt <= newWindowMs` (default 24h). The
+ *      pattern was first observed very recently; regardless of anything
+ *      else, that recency is itself the most useful/actionable fact, so it
+ *      wins first.
+ *   2. "regressed" — NOT new, AND the pattern's observed activity is sparse
+ *      relative to its own age: specifically, the average gap implied by its
+ *      history — `(lastSeenAt - firstSeenAt) / count` — is at least
+ *      `quietGapMs` (default 72h). This is the honest heuristic promised
+ *      above: it does NOT mean "this pattern was literally quiet for
+ *      quietGapMs and then resumed" (we have no per-occurrence timeline to
+ *      prove that) — it means "the pattern's occurrences are spaced widely
+ *      enough, on average, over its lifetime, that treating it as
+ *      continuously-firing would be misleading." A pattern with `count <= 1`
+ *      has no meaningful average gap to compute (division by zero or a
+ *      single point in time) and is treated as satisfying this rule
+ *      trivially (an old pattern seen only once, long ago, reads as
+ *      "regressed" rather than "ongoing" — a single stale occurrence is not
+ *      an active, ongoing pattern).
+ *   3. "ongoing" — everything else: not new, and its average inter-occurrence
+ *      gap is under `quietGapMs` — i.e. it has been firing frequently enough,
+ *      relative to its own lifetime, to read as a continuously active
+ *      pattern rather than a recent one-off return.
+ *
+ * Deterministic and side-effect-free: `nowMs` is always passed in, never
+ * read from Date.now(). Defensive against a malformed `lastSeenAt <
+ * firstSeenAt` or `count <= 0` (clamped rather than producing NaN/negative
+ * gaps).
+ */
+export function classifyPatternEpisode(
+  pattern: { firstSeenAt: number; lastSeenAt: number; count: number },
+  nowMs: number,
+  opts?: { newWindowMs?: number; quietGapMs?: number },
+): "new" | "regressed" | "ongoing" {
+  const newWindowMs = opts?.newWindowMs ?? EPISODE_DEFAULT_NEW_WINDOW_MS;
+  const quietGapMs = opts?.quietGapMs ?? EPISODE_DEFAULT_QUIET_GAP_MS;
+
+  const firstSeenAt = Number.isFinite(pattern?.firstSeenAt) ? pattern.firstSeenAt : nowMs;
+  const rawLastSeenAt = Number.isFinite(pattern?.lastSeenAt) ? pattern.lastSeenAt : firstSeenAt;
+  const lastSeenAt = Math.max(firstSeenAt, rawLastSeenAt);
+  const count = Number.isFinite(pattern?.count) && pattern.count > 0 ? pattern.count : 0;
+
+  if (nowMs - firstSeenAt <= newWindowMs) {
+    return "new";
+  }
+
+  // count <= 1 has no meaningful average gap — treat as trivially satisfying
+  // the "sparse" rule (see doc comment: a single stale occurrence reads as
+  // "regressed," not "ongoing").
+  const avgGapMs = count <= 1 ? Infinity : (lastSeenAt - firstSeenAt) / count;
+
+  return avgGapMs >= quietGapMs ? "regressed" : "ongoing";
+}

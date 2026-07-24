@@ -22,6 +22,9 @@ for a single run's own event log or explanation ('afr explain <runId>').
 
 Options:
   --agent <agentId>   Only patterns seen on at least one version of this agent
+  --spiking           Only patterns currently flagged as spiking
+                       (lastSpikeAssessment.isSpiking === true) — proactive
+                       prevention (PREVENTION cycle 2)
   --limit <n>         Max number of patterns to return
   --json              Print the raw API response as JSON
   --help              Show this message
@@ -29,6 +32,7 @@ Options:
 
 export interface PatternsArgs {
   agent?: string
+  spiking?: boolean
   limit?: number
   json?: boolean
   help?: boolean
@@ -41,6 +45,7 @@ export function parsePatternsArgs(argv: string[]): PatternsArgs {
     allowPositionals: true,
     options: {
       agent: { type: 'string' },
+      spiking: { type: 'boolean' },
       limit: { type: 'string' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -48,6 +53,7 @@ export function parsePatternsArgs(argv: string[]): PatternsArgs {
   })
   const result: PatternsArgs = {}
   if (values['agent']) result.agent = values['agent']
+  if (values['spiking']) result.spiking = true
   if (values['limit']) result.limit = Number(values['limit'])
   if (values['json']) result.json = true
   if (values['help']) result.help = true
@@ -70,6 +76,7 @@ export async function runPatterns(
       config,
       {
         ...(args.agent !== undefined && { agentId: args.agent }),
+        ...(args.spiking !== undefined && { spiking: args.spiking }),
         ...(args.limit !== undefined && { limit: args.limit }),
       },
       fetchImpl
@@ -107,10 +114,12 @@ export function printPatterns(
     String(pattern.count),
     formatTimestamp(pattern.firstSeenAt),
     formatTimestamp(pattern.lastSeenAt),
-    pattern.lastSpikeAssessment?.isSpiking ? 'yes' : '-',
+    pattern.lastSpikeAssessment?.isSpiking
+      ? `yes (${pattern.lastSpikeAssessment.recentCount})`
+      : '-',
   ])
   log(renderTable(['ID', 'CLASS', 'LABEL', 'COUNT', 'FIRST SEEN', 'LAST SEEN', 'SPIKING'], rows))
   if (result.nextCursor) {
-    log('\n(more results available — narrow with --agent/--limit to see fewer pages)')
+    log('\n(more results available — narrow with --agent/--spiking/--limit to see fewer pages)')
   }
 }

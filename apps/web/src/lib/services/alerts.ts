@@ -12,35 +12,9 @@ import type { AlertChannel, AlertEvent, AlertRule, AlertRuleKind } from '@agent-
 
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient, resolveConvexOrgId, withConvexTimeout } from '@/lib/convexServer'
+import { mapAlertEvent, mapAlertRule } from '@/lib/services/alertRules'
 
-function mapAlertRule(doc: Record<string, unknown>): AlertRule {
-  return {
-    id: doc['_id'] as string,
-    orgId: doc['orgId'] as string,
-    name: doc['name'] as string,
-    kind: doc['kind'] as AlertRuleKind,
-    channels: (doc['channels'] ?? []) as AlertChannel[],
-    enabled: doc['enabled'] as boolean,
-    createdAt: doc['createdAt'] as number,
-    updatedAt: doc['updatedAt'] as number,
-    ...(doc['projectId'] !== undefined && { projectId: doc['projectId'] as string }),
-    ...(doc['thresholdPct'] !== undefined && { thresholdPct: doc['thresholdPct'] as number }),
-    ...(doc['windowMinutes'] !== undefined && { windowMinutes: doc['windowMinutes'] as number }),
-  }
-}
-
-function mapAlertEvent(doc: Record<string, unknown>): AlertEvent {
-  return {
-    id: doc['_id'] as string,
-    orgId: doc['orgId'] as string,
-    ruleId: doc['ruleId'] as string,
-    firedAt: doc['firedAt'] as number,
-    summary: doc['summary'] as string,
-    deliveryStatus: doc['deliveryStatus'] as AlertEvent['deliveryStatus'],
-    ...(doc['runId'] !== undefined && { runId: doc['runId'] as string }),
-    ...(doc['deliveredAt'] !== undefined && { deliveredAt: doc['deliveredAt'] as number }),
-  }
-}
+export { ALERT_RULE_KINDS, isValidAlertRuleKind, isValidChannelType } from '@/lib/services/alertRules'
 
 async function requireOrgContext(): Promise<{ clerkOrgId: string; convexOrgId: string }> {
   const { orgId: clerkOrgId } = auth()

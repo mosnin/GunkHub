@@ -328,6 +328,15 @@ export default defineSchema({
       v.literal("run_failed"),
       v.literal("failure_rate"),
       v.literal("eval_failed"),
+      // Failure Patterns cycle 2 (docs/adr/005-failure-patterns.md): fires
+      // when a `failure_patterns` rollup transitions from not-spiking to
+      // spiking (see convex/failure_patterns.ts's assessPatternSpikesCron and
+      // convex/alerts.ts's firePatternSpikeAlert). `projectId` is not
+      // meaningful for this kind (a failure-pattern rollup is org-scoped, not
+      // project-scoped) — a rule of this kind with `projectId` set is treated
+      // as org-wide, same documented behavior as `failure_rate` rules without
+      // a windowMinutes/thresholdPct set.
+      v.literal("pattern_spike"),
     ),
     thresholdPct: v.optional(v.number()),
     windowMinutes: v.optional(v.number()),
@@ -358,6 +367,22 @@ export default defineSchema({
       v.literal("failed"),
     ),
     deliveredAt: v.optional(v.number()),
+    // Failure Patterns cycle 2: present only on alert_events fired by a
+    // `pattern_spike` rule — the fingerprint whose rollup transitioned into
+    // spiking. Optional/additive; every other kind leaves this unset. Not
+    // itself a foreign key into failure_patterns (a rollup can in principle
+    // be deleted/regenerated per ADR-005 — this is a point-in-time label, not
+    // a live reference), so a plain string, mirroring
+    // failure_pattern_occurrences.fingerprintHash's own type.
+    patternFingerprintHash: v.optional(v.string()),
+    // Freeform, kind-specific structured payload for UI/webhook consumers
+    // that want more than the human-readable `summary` string — same
+    // justified v.any() exception as audit_log.metadata (display-only,
+    // shape varies per alert-rule kind). For `pattern_spike`, carries
+    // { fingerprintHash, class, label, recentCount, deepLink } so a
+    // consumer can render/link to /patterns/[fingerprint] without
+    // re-parsing `summary`.
+    metadata: v.optional(v.any()),
   })
     .index("by_org_fired", ["orgId", "firedAt"])
     .index("by_rule", ["ruleId"])
@@ -606,7 +631,9 @@ export default defineSchema({
     affectedAgentVersionIds: v.array(v.id("agent_versions")),
     // Written by the periodic spike-rollup cron (convex/failure_patterns.ts /
     // convex/crons.ts) — the most recent spike assessment over this
-    // pattern's daily trend. Absent until the cron has run at least once
+    // pattern's daily trend, itself computed from the ACCURATE
+    // failure_pattern_daily_counts table below (cycle 2), not a bounded
+    // occurrence sample. Absent until the cron has run at least once
     // since this pattern was created.
     lastSpikeAssessment: v.optional(
       v.object({
@@ -617,6 +644,15 @@ export default defineSchema({
         z: v.number(),
       }),
     ),
+    // Cycle 2 (pattern-spike alerting): epoch ms of the last time a
+    // `pattern_spike` alert was fired for THIS pattern (across every
+    // `pattern_spike` alert_rule in the org — this is a per-pattern cooldown,
+    // not per-rule). Written only by assessPatternSpikesCron, immediately
+    // after a spike-transition alert is fired. Absent = never fired. Used as
+    // the anti-flap cooldown input to assessPatternSpikeTransition (or its
+    // local fallback) so a pattern hovering at the spike threshold cannot
+    // fire on every 15-minute cron tick.
+    lastPatternSpikeAlertFiredAt: v.optional(v.number()),
   })
     // One row per (orgId, fingerprintHash): recordFailurePatternOccurrence
     // always resolves the existing rollup (if any) via this index before
@@ -626,6 +662,36 @@ export default defineSchema({
     // listFailurePatterns' ranked-by-recency read, and the spike-rollup
     // cron's "active patterns" scan.
     .index("by_org_lastSeenAt", ["orgId", "lastSeenAt"]),
+
+  // Cycle 2 (docs/adr/005-failure-patterns.md addendum): ACCURATE per-day
+  // occurrence counters, replacing the cycle-1 trend (which bucketed a
+  // BOUNDED, most-recent-first occurrence sample — see
+  // MAX_TREND_OCCURRENCE_SAMPLE's removal — and silently undercounted any day
+  // past that sample's horizon for a high-volume fingerprint). Exactly one
+  // row per (orgId, fingerprintHash, day), upserted (incremented in place) by
+  // recordFailurePatternOccurrence every time a new occurrence lands for that
+  // day — additive, observability-grade, same category as daily_rollups /
+  // usage_counters: NEVER itself a fact about a single run (the occurrence
+  // row above remains that), just a running tally derived from it. A day's
+  // count here can never retroactively change except by a NEW occurrence
+  // landing on that (already-past) day, which cannot happen (occurrences are
+  // always recorded for "now", never backdated) — so once a day is in the
+  // past, its count here is final and exact, unlike the old bounded-sample
+  // approach which could "forget" older days entirely once the sample was
+  // full of more recent ones.
+  failure_pattern_daily_counts: defineTable({
+    orgId: v.id("organizations"),
+    fingerprintHash: v.string(),
+    day: v.string(), // "YYYY-MM-DD", UTC
+    count: v.number(),
+  })
+    // recordFailurePatternOccurrence's upsert-or-increment lookup, and the
+    // trend read (getFailurePattern / assessPatternSpikesCron): a `day` range
+    // query scoped to one (orgId, fingerprintHash) pair reads at most
+    // TREND_WINDOW_DAYS (14) rows, regardless of how many occurrences the
+    // fingerprint has ever recorded — the read cost of an accurate trend is
+    // now bounded by the WINDOW, not by occurrence VOLUME.
+    .index("by_org_fingerprint_day", ["orgId", "fingerprintHash", "day"]),
 
   daily_rollups: defineTable({
     orgId: v.id("organizations"),

@@ -1,6 +1,19 @@
-// Failure Patterns (PREVENTION, cycle 1) — a durable, org-scoped memory of
-// recurring failure fingerprints derived from failed runs. See
+// Failure Patterns (PREVENTION, cycle 1 + cycle 2) — a durable, org-scoped
+// memory of recurring failure fingerprints derived from failed runs. See
 // docs/adr/005-failure-patterns.md for the full design rationale.
+//
+// CYCLE 2 (deepen): closes the two gaps cycle 1 left open. (1) The 14-day
+// trend is now read from the ACCURATE `failure_pattern_daily_counts` table
+// (an exact per-day counter, incremented alongside every occurrence) instead
+// of bucketing a bounded, most-recent-first occurrence sample — see that
+// table's schema doc comment and `readAccurateTrend` below. (2)
+// `assessPatternSpikesCron` now actually FIRES a `pattern_spike` alert (via
+// `convex/alerts.ts`'s `firePatternSpikeAlert`) the moment a pattern
+// transitions from not-spiking to spiking, gated by
+// `assessPatternSpikeTransition` (Team B interface, guarded dynamic lookup +
+// local fallback, same discipline as `assessPatternSpike`) plus a per-pattern
+// cooldown (`lastPatternSpikeAlertFiredAt`) so a pattern hovering at the
+// threshold cannot fire every 15-minute tick.
 //
 // OBSERVABILITY-GRADE DERIVED DATA, NEVER SOURCE OF TRUTH (mirrors ADR-002's
 // constraint language for daily_rollups/usage_counters): a `failure_patterns`
@@ -37,7 +50,7 @@ import { requireOrgMembership } from "./auth.js";
 import * as insightsModule from "./insights.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
-import type { MutationCtx } from "./_generated/server.js";
+import type { MutationCtx, QueryCtx } from "./_generated/server.js";
 
 // ---------------------------------------------------------------------------
 // Write ceilings (local to this file — see the module doc comment for why
@@ -55,12 +68,21 @@ export const DEFAULT_FAILURE_PATTERN_PAGE_SIZE = 50;
 export const MAX_FAILURE_PATTERN_PAGE_SIZE = 200;
 /** Bounded sample of an individual pattern's recent occurrences (getFailurePattern). */
 export const MAX_RECENT_OCCURRENCES = 50;
-/** Bounded read used to build the 14-day trend — generous relative to any org's realistic daily occurrence volume for one fingerprint. */
-export const MAX_TREND_OCCURRENCE_SAMPLE = 2_000;
 /** Trend window length, in UTC calendar days (inclusive of today). */
 export const TREND_WINDOW_DAYS = 14;
 /** Bounded number of patterns the spike-rollup cron assesses per invocation. */
 export const SPIKE_ROLLUP_MAX_PATTERNS_PER_RUN = 200;
+/**
+ * Anti-flap cooldown (cycle 2 pattern-spike alerting): the minimum time that
+ * must elapse since a pattern's LAST fired pattern_spike alert before another
+ * spike-transition for the SAME pattern is allowed to fire again. Without
+ * this, a fingerprint whose count hovers right at the spike threshold could
+ * flip isSpiking false/true across consecutive 15-minute cron ticks and fire
+ * an alert every single tick. 6 hours is long enough to absorb that kind of
+ * threshold jitter while still re-arming well within the same day if the
+ * pattern genuinely regresses again.
+ */
+export const DEFAULT_PATTERN_SPIKE_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Team B coordination — deriveFailureFingerprint / assessPatternSpike
@@ -234,6 +256,98 @@ export function assessPatternSpikeFallback(
 }
 
 // ---------------------------------------------------------------------------
+// Team B coordination — assessPatternSpikeTransition (cycle 2). Same guarded
+// dynamic-lookup + local-fallback discipline as deriveFailureFingerprint /
+// assessPatternSpike above.
+// ---------------------------------------------------------------------------
+
+/**
+ * AGREED SIGNATURE (coordination with Team B, `convex/insights.ts`, cycle 2):
+ *
+ *   assessPatternSpikeTransition(
+ *     prev: SpikeAssessmentLike | undefined,
+ *     curr: SpikeAssessmentLike,
+ *     opts?: { cooldownMs?: number; nowMs: number; lastFiredAt?: number },
+ *   ) => { shouldFire: boolean; reason: string }
+ *
+ * PURE, never throws. Decides whether a freshly-computed spike assessment
+ * (`curr`) represents a NEW spike episode worth alerting on, given the
+ * PREVIOUSLY stored assessment (`prev`) and this pattern's own
+ * anti-flap/cooldown state (`opts.lastFiredAt`) — i.e. hysteresis across
+ * `assessPatternSpikesCron`'s 15-minute ticks, not a stateless per-tick
+ * decision. As of this cycle Team B has not yet landed this export in
+ * insights.ts (only `deriveFailureFingerprint`/`assessPatternSpike` are
+ * Team-B-coordination interfaces from cycle 1) — `getAssessPatternSpikeTransition`
+ * below falls back to `assessPatternSpikeTransitionFallback` and picks up
+ * Team B's real implementation with zero code change the moment it lands.
+ */
+export interface SpikeAssessmentLike {
+  isSpiking: boolean;
+  recentCount: number;
+  baselineMean: number;
+  z: number;
+}
+
+export interface SpikeTransitionResult {
+  shouldFire: boolean;
+  reason: string;
+}
+
+export interface SpikeTransitionOptions {
+  cooldownMs?: number;
+  nowMs: number;
+  lastFiredAt?: number;
+}
+
+type AssessPatternSpikeTransitionFn = (
+  prev: SpikeAssessmentLike | undefined,
+  curr: SpikeAssessmentLike,
+  opts?: SpikeTransitionOptions,
+) => SpikeTransitionResult;
+
+function getAssessPatternSpikeTransition(): AssessPatternSpikeTransitionFn {
+  const candidate = (insightsModule as unknown as Record<string, unknown>)["assessPatternSpikeTransition"];
+  return typeof candidate === "function"
+    ? (candidate as AssessPatternSpikeTransitionFn)
+    : assessPatternSpikeTransitionFallback;
+}
+
+/**
+ * FALLBACK ONLY — see the doc comment above. Fires only on a genuine
+ * false/undefined -> true transition (never while already spiking, i.e. no
+ * re-fire on every tick a pattern remains above threshold), and only if the
+ * cooldown since the last fire (if any) has elapsed — so a pattern
+ * oscillating right at the spike threshold across ticks cannot fire more
+ * than once per `cooldownMs` window. A pattern that stops spiking and later
+ * spikes again re-arms naturally: `wasSpiking` is computed fresh from `prev`
+ * on every call, and once `curr.isSpiking` goes false the NEXT true reading
+ * is again a false -> true transition, gated only by the cooldown (which by
+ * then has typically long since elapsed).
+ */
+export function assessPatternSpikeTransitionFallback(
+  prev: SpikeAssessmentLike | undefined,
+  curr: SpikeAssessmentLike,
+  opts?: SpikeTransitionOptions,
+): SpikeTransitionResult {
+  if (!curr || !curr.isSpiking) {
+    return { shouldFire: false, reason: "not_spiking" };
+  }
+
+  const wasSpiking = prev?.isSpiking === true;
+  if (wasSpiking) {
+    return { shouldFire: false, reason: "already_spiking" };
+  }
+
+  const cooldownMs = opts?.cooldownMs ?? DEFAULT_PATTERN_SPIKE_ALERT_COOLDOWN_MS;
+  const nowMs = opts?.nowMs ?? Date.now();
+  if (opts?.lastFiredAt !== undefined && nowMs - opts.lastFiredAt < cooldownMs) {
+    return { shouldFire: false, reason: "cooldown_active" };
+  }
+
+  return { shouldFire: true, reason: "spike_transition_entry" };
+}
+
+// ---------------------------------------------------------------------------
 // recordFailurePatternOccurrence — the only write path for occurrences, and
 // the upsert path for the rollup.
 // ---------------------------------------------------------------------------
@@ -306,9 +420,46 @@ export const recordFailurePatternOccurrence = internalMutation({
       occurredAt,
     });
 
+    await incrementDailyCount(ctx, {
+      orgId: args.orgId,
+      fingerprintHash: args.fingerprintHash,
+      day: dayKeyOf(occurredAt),
+    });
+
     return { recorded: true as const };
   },
 });
+
+/**
+ * Upsert-increment the ACCURATE per-(org,fingerprint,day) counter (cycle 2 —
+ * see failure_pattern_daily_counts' schema doc comment for why this replaces
+ * the old bounded-occurrence-sample trend). Called exactly once per new
+ * occurrence recorded (never on the idempotent no-op path above), so a day's
+ * count here is always exactly the number of occurrences recorded on that
+ * UTC calendar day — never a sample, never truncated.
+ */
+async function incrementDailyCount(
+  ctx: MutationCtx,
+  args: { orgId: Id<"organizations">; fingerprintHash: string; day: string },
+): Promise<void> {
+  const existing = await ctx.db
+    .query("failure_pattern_daily_counts")
+    .withIndex("by_org_fingerprint_day", (q) =>
+      q.eq("orgId", args.orgId).eq("fingerprintHash", args.fingerprintHash).eq("day", args.day),
+    )
+    .first();
+
+  if (existing) {
+    await ctx.db.patch(existing._id, { count: existing.count + 1 });
+  } else {
+    await ctx.db.insert("failure_pattern_daily_counts", {
+      orgId: args.orgId,
+      fingerprintHash: args.fingerprintHash,
+      day: args.day,
+      count: 1,
+    });
+  }
+}
 
 async function upsertRollup(
   ctx: MutationCtx,
@@ -413,20 +564,65 @@ export const getFailurePattern = query({
       .first();
     if (!pattern) return null;
 
-    const occurrences = await ctx.db
+    // Recent-occurrences sample: a bounded, most-recent-first read, unrelated
+    // to trend accuracy (see readAccurateTrend below) — this is just "show me
+    // the last N raw occurrences," not an input to any aggregate count.
+    const recentOccurrences = await ctx.db
       .query("failure_pattern_occurrences")
       .withIndex("by_org_fingerprint", (q) => q.eq("orgId", args.orgId).eq("fingerprintHash", args.fingerprintHash))
       .order("desc")
-      .take(MAX_TREND_OCCURRENCE_SAMPLE);
+      .take(MAX_RECENT_OCCURRENCES);
 
-    const recentOccurrences = occurrences.slice(0, MAX_RECENT_OCCURRENCES);
-    const trend = buildTrendFromOccurrences(occurrences);
+    const trend = await readAccurateTrend(ctx, args.orgId, args.fingerprintHash);
 
     return { pattern, recentOccurrences, trend };
   },
 });
 
-/** Bucket a bounded, most-recent-first occurrence sample into the trailing TREND_WINDOW_DAYS UTC daily counts, oldest first. Days with zero occurrences in the sample are included as count:0 (a real gap, not an omission — subject to the sample being large enough to see that far back; see MAX_TREND_OCCURRENCE_SAMPLE). */
+/**
+ * ACCURATE 14-day daily trend (cycle 2), read directly from
+ * `failure_pattern_daily_counts` — an exact per-day counter incremented by
+ * `incrementDailyCount` on every occurrence, not a bucketed bounded sample.
+ * The index range (orgId, fingerprintHash, day-in-[start,end]) can return at
+ * most `TREND_WINDOW_DAYS` (14) rows no matter how many total occurrences the
+ * fingerprint has ever recorded, so this is both MORE ACCURATE and CHEAPER
+ * than the old approach (which read up to 2,000 occurrence rows per call and
+ * still silently undercounted anything past that sample's horizon).
+ */
+async function readAccurateTrend(
+  ctx: QueryCtx | MutationCtx,
+  orgId: Id<"organizations">,
+  fingerprintHash: string,
+  now: number = Date.now(),
+): Promise<PatternTrendPoint[]> {
+  const startDay = dateNDaysAgoUtc(TREND_WINDOW_DAYS - 1, now);
+  const endDay = dateNDaysAgoUtc(0, now);
+
+  const rows = await ctx.db
+    .query("failure_pattern_daily_counts")
+    .withIndex("by_org_fingerprint_day", (q) =>
+      q.eq("orgId", orgId).eq("fingerprintHash", fingerprintHash).gte("day", startDay).lte("day", endDay),
+    )
+    .collect();
+
+  const countsByDay = new Map(rows.map((r) => [r.day, r.count]));
+  const days: string[] = [];
+  for (let i = TREND_WINDOW_DAYS - 1; i >= 0; i--) days.push(dateNDaysAgoUtc(i, now));
+  return days.map((day) => ({ day, count: countsByDay.get(day) ?? 0 }));
+}
+
+/**
+ * LEGACY / TEST-ONLY: buckets a caller-supplied occurrence sample into the
+ * trailing TREND_WINDOW_DAYS UTC daily counts, oldest first. This is the
+ * cycle-1 approach and is NO LONGER used by getFailurePattern or
+ * assessPatternSpikesCron (both now use `readAccurateTrend`, backed by the
+ * exact `failure_pattern_daily_counts` counters — see that table's schema
+ * doc comment for why the bounded-sample approach undercounted high-volume
+ * fingerprints past the sample horizon). Kept exported and covered by
+ * existing tests as a pure, still-correct bucketing utility — useful for
+ * anything that only has a raw occurrence list in hand (e.g. an ad hoc
+ * script) and not the daily-counts table.
+ */
 export function buildTrendFromOccurrences(
   occurrences: Array<{ occurredAt: number }>,
   now: number = Date.now(),
@@ -468,43 +664,52 @@ export const _listActivePatternsForSpikeAssessment = internalQuery({
 });
 
 /**
- * Periodic spike-rollup: for each of the most recently active patterns
- * (bounded — see SPIKE_ROLLUP_MAX_PATTERNS_PER_RUN), recompute its 14-day
- * daily trend from `failure_pattern_occurrences` and call Team B's
- * `assessPatternSpike` (or the local fallback), storing the result on
- * `lastSpikeAssessment`.
+ * Periodic spike-rollup + alerting (cycle 2): for each of the most recently
+ * active patterns (bounded — see SPIKE_ROLLUP_MAX_PATTERNS_PER_RUN),
+ * recompute its ACCURATE 14-day daily trend (`readAccurateTrend`, backed by
+ * `failure_pattern_daily_counts` — no longer a bounded occurrence sample) and
+ * call Team B's `assessPatternSpike` (or the local fallback), storing the
+ * result on `lastSpikeAssessment`.
  *
- * ALERT-FIRING SEAM (handoff note for the orchestrator / Team C): this cron
- * ONLY stores the assessment — it does NOT create an `alert_events` row via
- * `convex/alerts.ts`'s `recordAlertFired`, because that requires an
- * `alert_rules` row, and `alert_rules.kind` (convex/alerts.ts /
- * ALERT_RULE_KIND) is a closed enum of `run_failed | failure_rate |
- * eval_failed` — there is no `pattern_spike` kind yet, and adding one is an
- * `alerts.ts` schema/API change outside this file's ownership this cycle. A
- * caller (Team C, or a future cycle of this feature) that wants a real fired
- * alert on `isSpiking: true` should either add a `pattern_spike` alert-rule
- * kind and call `recordAlertFired` from here, or poll
- * `failure_patterns.lastSpikeAssessment` from the alert-evaluation path
- * instead. Left as an explicit gap rather than an ad hoc write into another
- * team's table.
+ * ALERT-FIRING (cycle 2 — closes the gap cycle 1 left open): compares the
+ * FRESH assessment against the PREVIOUSLY stored one via
+ * `assessPatternSpikeTransition` (or its local fallback), passing this
+ * pattern's own `lastPatternSpikeAlertFiredAt` as the cooldown input. Only a
+ * genuine not-spiking -> spiking transition, outside the cooldown window,
+ * calls `convex/alerts.ts`'s `firePatternSpikeAlert` — which itself only
+ * fires for orgs with at least one ENABLED `pattern_spike` alert_rule (an org
+ * with no such rule gets its assessment stored, same as cycle 1, but no
+ * alert_events row, exactly mirroring how every other alert kind is a no-op
+ * when no matching enabled rule exists). `lastPatternSpikeAlertFiredAt` is
+ * only advanced when a fire was actually ATTEMPTED (the transition said
+ * `shouldFire: true`), regardless of whether any rule existed to receive
+ * it — so the cooldown/anti-flap state tracks "did this pattern's spike
+ * assessment just transition," not "did a human get notified," which keeps
+ * the pure transition logic independent of alert-rule configuration.
  */
 export const assessPatternSpikesCron = internalMutation({
-  args: {},
-  handler: async (ctx): Promise<{ assessed: number; spiking: number }> => {
+  // `now` is optional/injectable (default Date.now()) — same de-flake pattern
+  // as convex/webhook_engine.ts's deliverPendingWebhooks — so tests can pin a
+  // single wall-clock reading per invocation and assert cooldown/transition
+  // behavior deterministically instead of racing the real clock.
+  args: { now: v.optional(v.number()) },
+  handler: async (ctx, args): Promise<{ assessed: number; spiking: number; fired: number }> => {
     const patterns = await ctx.runQuery(_listActivePatternsForSpikeAssessmentRef, {});
     const assessSpike = getAssessPatternSpike();
-    const now = Date.now();
+    const assessTransition = getAssessPatternSpikeTransition();
+    const now = args.now ?? Date.now();
     let spiking = 0;
+    let fired = 0;
 
     for (const pattern of patterns) {
-      const occurrences = await ctx.db
-        .query("failure_pattern_occurrences")
-        .withIndex("by_org_fingerprint", (q) => q.eq("orgId", pattern.orgId).eq("fingerprintHash", pattern.fingerprintHash))
-        .order("desc")
-        .take(MAX_TREND_OCCURRENCE_SAMPLE);
-
-      const trend = buildTrendFromOccurrences(occurrences, now);
+      const trend = await readAccurateTrend(ctx, pattern.orgId, pattern.fingerprintHash, now);
       const assessment = assessSpike(trend);
+
+      const transition = assessTransition(pattern.lastSpikeAssessment, assessment, {
+        nowMs: now,
+        lastFiredAt: pattern.lastPatternSpikeAlertFiredAt,
+        cooldownMs: DEFAULT_PATTERN_SPIKE_ALERT_COOLDOWN_MS,
+      });
 
       await ctx.db.patch(pattern._id, {
         lastSpikeAssessment: {
@@ -514,21 +719,35 @@ export const assessPatternSpikesCron = internalMutation({
           baselineMean: assessment.baselineMean,
           z: Number.isFinite(assessment.z) ? assessment.z : Number.MAX_SAFE_INTEGER,
         },
+        ...(transition.shouldFire ? { lastPatternSpikeAlertFiredAt: now } : {}),
       });
       if (assessment.isSpiking) spiking += 1;
+
+      if (transition.shouldFire) {
+        const result = await ctx.runMutation(_firePatternSpikeAlertRef, {
+          orgId: pattern.orgId,
+          fingerprintHash: pattern.fingerprintHash,
+          class: pattern.class,
+          label: pattern.label,
+          recentCount: assessment.recentCount,
+          representativeRunId: pattern.representativeRunIds[0],
+        });
+        fired += result.fired;
+      }
     }
 
-    return { assessed: patterns.length, spiking };
+    return { assessed: patterns.length, spiking, fired };
   },
 });
 
-// Function reference by name (not a bare value import) — same established
+// Function references by name (not bare value imports) — same established
 // pattern as convex/alert_engine.ts / convex/projection_verify.ts /
 // convex/run_explanations.ts (this repo's convex/_generated/api.ts is not a
 // live codegen output).
 const _listActivePatternsForSpikeAssessmentRef = makeFunctionReference<"query">(
   "failure_patterns:_listActivePatternsForSpikeAssessment",
 );
+const _firePatternSpikeAlertRef = makeFunctionReference<"mutation">("alerts:firePatternSpikeAlert");
 
 // ---------------------------------------------------------------------------
 // Terminal-failure wiring helper — exported for run_explanations.ts to call.

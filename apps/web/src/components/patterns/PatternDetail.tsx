@@ -1,10 +1,12 @@
 import Link from 'next/link'
 
 import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
+import type { RunExplanationSummaryState } from '@/lib/services/explanations'
 import type { FailurePatternOccurrence, FailurePatternTrendPoint } from '@agent-flight-recorder/contracts'
 
 import { PatternTrendSparkline } from '@/components/patterns/PatternTrendSparkline'
 import { SpikeBadge } from '@/components/patterns/SpikeBadge'
+import { ExplanationPreview } from '@/components/runs/ExplanationPreview'
 import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { formatRelativeTime, truncateId } from '@/lib/utils'
@@ -15,11 +17,18 @@ export interface ResolvedAgentVersion {
   version: string
 }
 
+/** "Why did this fail?" preview for this pattern's most-recent representative run — resolved server-side by the detail page (one `getRunExplanationSummaries([runId])` call, same helper the dashboard uses). `null` when the pattern has no representative runs at all (nothing to preview, so the section is omitted rather than showing a placeholder for a run that doesn't exist). */
+export interface TopRunExplanationPreview {
+  runId: string
+  state: RunExplanationSummaryState
+}
+
 interface PatternDetailProps {
   pattern: AdaptedFailurePattern
   recentOccurrences: FailurePatternOccurrence[]
   trend: FailurePatternTrendPoint[]
   agentVersions: Record<string, ResolvedAgentVersion | undefined>
+  topRunExplanation?: TopRunExplanationPreview | null
 }
 
 function formatFailureClass(cls: string): string {
@@ -34,7 +43,13 @@ function formatDay(day: string): string {
 }
 
 /** Full detail view for one failure-fingerprint pattern: trend, spike assessment, representative runs, and affected agent versions. */
-export function PatternDetail({ pattern, recentOccurrences, trend, agentVersions }: PatternDetailProps) {
+export function PatternDetail({
+  pattern,
+  recentOccurrences,
+  trend,
+  agentVersions,
+  topRunExplanation,
+}: PatternDetailProps) {
   const spike = pattern.lastSpikeAssessment
   const isSpiking = spike?.isSpiking === true
 
@@ -124,6 +139,37 @@ export function PatternDetail({ pattern, recentOccurrences, trend, agentVersions
           </p>
         )}
       </section>
+
+      {/* Why did this fail? — connects the pattern to a concrete root-cause
+          explanation for its most-recent representative run (Explainability
+          Layer reuse). Omitted entirely when there's no representative run
+          to preview at all; a run WITH no explanation yet still renders this
+          section, with an honest placeholder instead of a fabricated one. */}
+      {topRunExplanation && (
+        <section
+          aria-labelledby="pattern-explanation-heading"
+          className="rounded-[4px] border border-graphite-light bg-graphite-deep px-5 py-4"
+        >
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <h2 id="pattern-explanation-heading" className="text-xs font-mono uppercase tracking-wider text-pewter">
+              Why did this fail?
+            </h2>
+            <Link
+              href={`/runs/${topRunExplanation.runId}`}
+              className="inline-flex items-center gap-1 text-xs font-mono text-pewter hover:text-cloud transition-colors duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neon-glow rounded-[4px]"
+            >
+              view run <span aria-hidden="true">→</span>
+            </Link>
+          </div>
+          {topRunExplanation.state.status === 'unavailable' ? (
+            <p className="text-sm text-neutral-500">
+              No failure analysis is available yet for this pattern&apos;s most recent representative run.
+            </p>
+          ) : (
+            <ExplanationPreview state={topRunExplanation.state} />
+          )}
+        </section>
+      )}
 
       {/* Representative runs */}
       <section aria-labelledby="pattern-runs-heading" className="rounded-[4px] border border-graphite-light bg-graphite-deep px-5 py-4">

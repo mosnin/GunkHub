@@ -287,10 +287,21 @@ export const apiGetExplanation = mutation({
 // ones whose `affectedAgentVersionIds` intersects — an in-memory filter over
 // the fetched page, same overfetch-then-filter pattern apiListRuns uses for
 // its own secondary filters.
+//
+// `spiking`, when `true` (PREVENTION cycle 2 — proactive filtering), narrows
+// the same fetched page further to patterns whose most recent spike
+// assessment flagged them as currently spiking
+// (`lastSpikeAssessment?.isSpiking === true`). Same overfetch-then-filter
+// in-memory approach as `agentId` above — there is no secondary index on
+// `lastSpikeAssessment.isSpiking` (it's an optional nested field on a rollup
+// row, not worth a dedicated index for what is an observability-grade,
+// derived filter). `spiking: false` (or omitted) returns all patterns,
+// unfiltered by spike status.
 export const apiListFailurePatterns = mutation({
   args: {
     apiKeyHash: v.string(),
     agentId: v.optional(v.string()),
+    spiking: v.optional(v.boolean()),
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
   },
@@ -318,12 +329,16 @@ export const apiListFailurePatterns = mutation({
       .order("desc")
       .paginate({ numItems: limit, cursor: args.cursor ?? null });
 
-    const patterns =
+    let patterns =
       agentVersionIds === undefined
         ? page.page
         : page.page.filter((pattern) =>
             pattern.affectedAgentVersionIds.some((versionId) => agentVersionIds.has(String(versionId))),
           );
+
+    if (args.spiking === true) {
+      patterns = patterns.filter((pattern) => pattern.lastSpikeAssessment?.isSpiking === true);
+    }
 
     return {
       patterns,

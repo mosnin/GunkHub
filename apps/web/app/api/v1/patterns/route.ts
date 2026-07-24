@@ -9,7 +9,7 @@ import { apiListFailurePatterns } from '@/lib/services/api_v1'
 // ---------------------------------------------------------------------------
 // GET /api/v1/patterns — public read API, x-api-key auth (`read` scope).
 //
-// Query params: agentId, limit, cursor. Recurring failure patterns for the
+// Query params: agentId, spiking, limit, cursor. Recurring failure patterns for the
 // key's org (PREVENTION cycle 1, ADR-005) — a durable memory of
 // fingerprinted, recurring failures derived from failed runs, most-recently-
 // seen first. Wraps convex/read_api.ts `apiListFailurePatterns` (sdk_quality
@@ -28,10 +28,15 @@ export const GET = withApiHandler(
     const sp = req.nextUrl.searchParams
     const rawLimit = sp.get('limit')
     const limit = rawLimit !== null && Number.isFinite(Number(rawLimit)) ? Number(rawLimit) : undefined
+    // --spiking (PREVENTION cycle 2): only "true" opts in to the filter — any
+    // other value (including "false" or garbage) is treated as unset, same
+    // permissive-parsing posture as `limit` above.
+    const spiking = sp.get('spiking') === 'true' ? true : undefined
 
     try {
       const result = await apiListFailurePatterns(hashApiKey(apiKey), {
         ...(sp.get('agentId') !== null && { agentId: sp.get('agentId') as string }),
+        ...(spiking !== undefined && { spiking }),
         ...(limit !== undefined && { limit }),
         ...(sp.get('cursor') !== null && { cursor: sp.get('cursor') as string }),
       })

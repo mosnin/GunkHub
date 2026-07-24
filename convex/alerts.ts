@@ -15,10 +15,16 @@ import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from "./helpers/delivery.
 import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_ALERT_CHANNELS, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
+import type { Doc, Id } from "./_generated/dataModel.js";
+import type { MutationCtx } from "./_generated/server.js";
+
 const ALERT_RULE_KIND = v.union(
   v.literal("run_failed"),
   v.literal("failure_rate"),
   v.literal("eval_failed"),
+  // Failure Patterns cycle 2 (docs/adr/005-failure-patterns.md) — see
+  // firePatternSpikeAlert below.
+  v.literal("pattern_spike"),
 );
 
 const ALERT_CHANNEL = v.object({
@@ -275,5 +281,199 @@ export const updateAlertDeliveryStatus = internalMutation({
       deliveryStatus: args.deliveryStatus,
       deliveredAt: args.deliveredAt,
     });
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Failure Patterns cycle 2 (docs/adr/005-failure-patterns.md) — pattern-spike
+// alert firing. Called ONLY from convex/failure_patterns.ts's
+// assessPatternSpikesCron, exactly once per pattern that its own
+// spike-transition check (assessPatternSpikeTransition, or the local
+// fallback — see that file) decides is a fresh spike entry. This mutation
+// itself performs NO idempotency/cooldown check of its own — that
+// responsibility lives entirely in the caller (the stored
+// `lastSpikeAssessment` + `lastPatternSpikeAlertFiredAt` cooldown state on
+// the `failure_patterns` rollup), exactly as documented there. This mirrors
+// convex/alert_engine.ts's evaluateAlertsForRun firing semantics for every
+// OTHER rule kind: only ENABLED rules fire, one alert_events row + one set of
+// channel deliveries per matching rule (a rule of this kind is org-wide —
+// `projectId` is not meaningful for a failure-pattern rollup, which is not
+// project-scoped — so, unlike run_failed/failure_rate/eval_failed, a rule's
+// `projectId` is never consulted here).
+// ---------------------------------------------------------------------------
+
+/**
+ * Find an existing webhook_targets row for (orgId, url), or create one.
+ * Duplicated (not imported) from convex/alert_engine.ts's
+ * findOrCreateAlertWebhookTarget on purpose — alert_engine.ts's version is
+ * written against a `Doc<"runs">`-centric firing flow it owns, and importing
+ * across that boundary during this cycle risks a break if that file's shape
+ * changes; this is the same "duplicate a small, stable helper rather than
+ * import across an active team boundary" convention convex/insights.ts's own
+ * header note documents for its date-math helpers.
+ */
+async function findOrCreateAlertWebhookTarget(
+  ctx: MutationCtx,
+  orgId: Id<"organizations">,
+  url: string,
+): Promise<Id<"webhook_targets">> {
+  const existing = await ctx.db
+    .query("webhook_targets")
+    .withIndex("by_org", (q) => q.eq("orgId", orgId))
+    .filter((q) => q.eq(q.field("url"), url))
+    .first();
+  if (existing) return existing._id;
+
+  const { randomBytes } = await import("node:crypto");
+  const secret = randomBytes(32).toString("hex");
+  return await ctx.db.insert("webhook_targets", {
+    orgId,
+    url,
+    secret,
+    events: ["alert.fired"],
+    enabled: true,
+    createdAt: Date.now(),
+  });
+}
+
+/** Plain-text email body for a fired pattern_spike alert. Deliberately simple (no HTML) — mirrors renderAlertEmailText's plain-text convention. */
+function renderPatternSpikeEmailText(args: {
+  orgName: string;
+  label: string;
+  recentCount: number;
+  deepLink: string;
+}): string {
+  return [
+    `Agent Flight Recorder detected a failure-pattern spike in ${args.orgName}.`,
+    "",
+    `Pattern: ${args.label}`,
+    `Recent occurrences: ${String(args.recentCount)}`,
+    `Details: ${args.deepLink}`,
+  ].join("\n");
+}
+
+async function enqueuePatternSpikeDeliveries(
+  ctx: MutationCtx,
+  args: {
+    orgId: Id<"organizations">;
+    rule: Doc<"alert_rules">;
+    alertEventId: Id<"alert_events">;
+    orgName: string;
+    label: string;
+    recentCount: number;
+    deepLink: string;
+    representativeRunId: Id<"runs"> | undefined;
+  },
+): Promise<void> {
+  for (const channel of args.rule.channels) {
+    if (channel.type === "webhook") {
+      const webhookId = await findOrCreateAlertWebhookTarget(ctx, args.orgId, channel.target);
+      await ctx.db.insert("webhook_deliveries", {
+        orgId: args.orgId,
+        webhookId,
+        event: "alert.fired",
+        runId: args.representativeRunId,
+        status: "pending",
+        attempts: 0,
+        createdAt: Date.now(),
+        alertEventId: args.alertEventId,
+        nextAttemptAt: Date.now(),
+      });
+      continue;
+    }
+
+    // channel.type === "email"
+    const now = Date.now();
+    await ctx.db.insert("email_deliveries", {
+      orgId: args.orgId,
+      alertEventId: args.alertEventId,
+      to: channel.target,
+      subject: `Agent Flight Recorder alert: ${args.rule.name}`,
+      body: renderPatternSpikeEmailText({
+        orgName: args.orgName,
+        label: args.label,
+        recentCount: args.recentCount,
+        deepLink: args.deepLink,
+      }),
+      status: "pending",
+      attempts: 0,
+      createdAt: now,
+      nextAttemptAt: now,
+    });
+  }
+}
+
+/**
+ * Fire every ENABLED `pattern_spike` alert_rule in `orgId` for one detected
+ * spike-transition. Inserts one append-only `alert_events` row per matching
+ * rule (never patched except via updateAlertDeliveryStatus/the delivery-drain
+ * rollup, same as every other kind) plus one channel delivery per rule
+ * channel, exactly mirroring convex/alert_engine.ts's per-rule firing shape.
+ *
+ * `representativeRunId` (typically `failure_patterns.representativeRunIds[0]`
+ * — the most recent run that produced this fingerprint) is attached to the
+ * alert_events row and threaded through to any webhook delivery so
+ * convex/webhook_engine.ts's existing envelope builder (which already
+ * tolerates `delivery.runId` being unset, rendering `run: null`) can surface
+ * a real, clickable run for context — no change to that file was needed.
+ */
+export const firePatternSpikeAlert = internalMutation({
+  args: {
+    orgId: v.id("organizations"),
+    fingerprintHash: v.string(),
+    class: v.string(),
+    label: v.string(),
+    recentCount: v.number(),
+    representativeRunId: v.optional(v.id("runs")),
+  },
+  handler: async (ctx, args): Promise<{ fired: number }> => {
+    const rules = await ctx.db
+      .query("alert_rules")
+      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
+      .take(MAX_PAGE_SIZE);
+
+    const matching = rules.filter((r) => r.enabled && r.kind === "pattern_spike");
+    if (matching.length === 0) return { fired: 0 };
+
+    const org = await ctx.db.get(args.orgId);
+    const orgName = org?.name ?? "unknown organization";
+    const deepLink = `/patterns/${args.fingerprintHash}`;
+    const summary =
+      `Failure pattern "${args.label}" is spiking (${String(args.recentCount)} recent occurrences) — ${deepLink}`;
+
+    let fired = 0;
+    for (const rule of matching) {
+      const alertEventId = await ctx.db.insert("alert_events", {
+        orgId: args.orgId,
+        ruleId: rule._id,
+        runId: args.representativeRunId,
+        firedAt: Date.now(),
+        summary,
+        deliveryStatus: "pending",
+        patternFingerprintHash: args.fingerprintHash,
+        metadata: {
+          fingerprintHash: args.fingerprintHash,
+          class: args.class,
+          label: args.label,
+          recentCount: args.recentCount,
+          deepLink,
+        },
+      });
+
+      await enqueuePatternSpikeDeliveries(ctx, {
+        orgId: args.orgId,
+        rule,
+        alertEventId,
+        orgName,
+        label: args.label,
+        recentCount: args.recentCount,
+        deepLink,
+        representativeRunId: args.representativeRunId,
+      });
+
+      fired++;
+    }
+
+    return { fired };
   },
 });

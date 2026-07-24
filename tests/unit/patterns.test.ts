@@ -56,6 +56,19 @@ describe('afr patterns — arg parsing', () => {
   it('parses no args', () => {
     expect(parsePatternsArgs([])).toEqual({})
   })
+
+  it('parses --spiking', () => {
+    expect(parsePatternsArgs(['--spiking'])).toEqual({ spiking: true })
+  })
+
+  it('parses --spiking alongside --agent/--limit/--json', () => {
+    expect(parsePatternsArgs(['--agent', 'agent_1', '--spiking', '--limit', '5', '--json'])).toEqual({
+      agent: 'agent_1',
+      spiking: true,
+      limit: 5,
+      json: true,
+    })
+  })
 })
 
 describe('afr patterns — happy path', () => {
@@ -73,7 +86,7 @@ describe('afr patterns — happy path', () => {
     expect(output).toContain('12')
   })
 
-  it('marks a spiking pattern in the SPIKING column', async () => {
+  it('marks a spiking pattern in the SPIKING column, with its recentCount', async () => {
     const spiking = makePattern({
       lastSpikeAssessment: { assessedAt: Date.now(), isSpiking: true, recentCount: 9, baselineMean: 1.2, z: 4.1 },
     })
@@ -85,6 +98,62 @@ describe('afr patterns — happy path', () => {
     printPatterns({}, result, log)
     const output = log.mock.calls.map((c) => c[0] as string).join('\n')
     expect(output).toMatch(/yes/)
+    expect(output).toContain('yes (9)')
+  })
+
+  it('shows "-" in the SPIKING column for a pattern with no spike assessment', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [makePattern()] } })
+    )
+    const result = await runPatterns({}, env, fetchImpl)
+    const log = vi.fn()
+    printPatterns({}, result, log)
+    const output = log.mock.calls.map((c) => c[0] as string).join('\n')
+    expect(output).not.toContain('yes')
+  })
+
+  it('shows "-" in the SPIKING column for a pattern with a non-spiking assessment', async () => {
+    const notSpiking = makePattern({
+      lastSpikeAssessment: { assessedAt: Date.now(), isSpiking: false, recentCount: 1, baselineMean: 1.1, z: 0.2 },
+    })
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [notSpiking] } })
+    )
+    const result = await runPatterns({}, env, fetchImpl)
+    const log = vi.fn()
+    printPatterns({}, result, log)
+    const output = log.mock.calls.map((c) => c[0] as string).join('\n')
+    expect(output).not.toContain('yes')
+  })
+
+  it('--spiking forwards spiking=true as a query param', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    await runPatterns({ spiking: true }, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('spiking=true')
+  })
+
+  it('omits the spiking query param when --spiking is not passed', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    await runPatterns({}, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).not.toContain('spiking')
+  })
+
+  it('--spiking and --agent/--json compose (both forwarded, --json prints raw response)', async () => {
+    const spiking = makePattern({
+      lastSpikeAssessment: { assessedAt: Date.now(), isSpiking: true, recentCount: 4, baselineMean: 1, z: 3 },
+    })
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [spiking] } })
+    )
+    const result = await runPatterns({ agent: 'agent_1', spiking: true, json: true }, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('agentId=agent_1')
+    expect(url).toContain('spiking=true')
+    const log = vi.fn()
+    printPatterns({ json: true }, result, log)
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('"isSpiking"'))
   })
 
   it('prints "No recurring failure patterns found." when the org has none yet', async () => {
