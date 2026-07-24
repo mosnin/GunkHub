@@ -138,7 +138,15 @@ export default function RootPage() {
                 <h3 className="text-[15px] font-medium text-whiteout">{f.k}</h3>
               </div>
               <p className="text-sm leading-relaxed text-ash">{f.d}</p>
-              <div className="pointer-events-none absolute -right-6 -bottom-8 font-mono text-[64px] leading-none text-graphite/60 select-none">
+              {/* Decorative ordinal watermark (design.md §Imagery). Its 1.38:1 contrast is
+                  deliberate — it must not compete with the card content in front of it — so it
+                  is exempt from the text contrast floor only while it is genuinely not text:
+                  non-interactive, non-selectable, and hidden from assistive tech. Dropping
+                  aria-hidden makes it unlabelled content, not decoration. */}
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute -right-6 -bottom-8 font-mono text-[64px] leading-none text-graphite/60 select-none"
+              >
                 {String(i + 1).padStart(2, '0')}
               </div>
             </RevealItem>

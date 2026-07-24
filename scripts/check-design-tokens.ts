@@ -240,6 +240,8 @@ export type ViolationCode =
   | 'OFF_SCALE_TYPE'
   | 'MONO_RANGE_REVIEW'
   | 'MONO_STEP_REQUIREMENT'
+  | 'DECORATIVE_NOT_HIDDEN'
+  | 'IMAGERY_EXEMPT'
   | 'ELEVATION_SHADOW'
   | 'OFF_SYSTEM_RADIUS'
   | 'DEAD_CLASS'
@@ -744,6 +746,14 @@ export interface ClassOccurrence {
   readonly ancestorTags: readonly string[]
   /** Local component name -> module specifier, for one-hop component resolution. */
   readonly imports: ReadonlyMap<string, string>
+  /**
+   * Is this element hidden from assistive technology, by its own `aria-hidden`
+   * or an ancestor's? `aria-hidden` prunes the whole subtree, so an ancestor's
+   * counts. Needed because "decorative" is a claim about BOTH senses: an
+   * element styled as decoration but still announced to a screen reader is not
+   * decoration, it is unlabelled content.
+   */
+  readonly ariaHidden: boolean
 }
 
 function walk(dir: string, out: string[], exts: readonly string[]): string[] {
@@ -854,6 +864,21 @@ function classNameGroupsOf(open: ts.JsxOpeningLikeElement, sf: ts.SourceFile): C
   return []
 }
 
+/** True only for an explicit truthy `aria-hidden` (`"true"` or `{true}`). */
+function ariaHiddenOf(open: ts.JsxOpeningLikeElement): boolean {
+  for (const attr of open.attributes.properties) {
+    if (!ts.isJsxAttribute(attr)) continue
+    if (attr.name.getText() !== 'aria-hidden') continue
+    const init = attr.initializer
+    if (init === undefined) return true // bare `aria-hidden` is true
+    if (ts.isStringLiteral(init)) return init.text === 'true'
+    if (ts.isJsxExpression(init) && init.expression !== undefined) {
+      return init.expression.kind === ts.SyntaxKind.TrueKeyword
+    }
+  }
+  return false
+}
+
 function tagNameOf(open: ts.JsxOpeningLikeElement): string {
   return open.tagName.getText()
 }
@@ -890,6 +915,7 @@ export function extractClassOccurrences(file: string): ClassOccurrence[] {
     const ancestors = [...stack].reverse()
     const ancestorGroups = ancestors.map((a) => classNameGroupsOf(a, sf))
     const ancestorTags = ancestors.map(tagNameOf)
+    const ariaHidden = ancestors.some(ariaHiddenOf)
     // Groups on THIS element. When the literal sits inside a className, that
     // attribute's groups are the alternatives it competes with; when it lives in
     // a shared style table there is no attribute, so the literal stands alone.
@@ -910,6 +936,7 @@ export function extractClassOccurrences(file: string): ClassOccurrence[] {
         ancestorGroups,
         ancestorTags,
         imports,
+        ariaHidden,
       })
     }
   }
@@ -1104,6 +1131,14 @@ const TEXT_PREFIXES = new Set(['text', 'placeholder', 'decoration'])
 /** Directional border/divide suffixes: `border-l-neutral-700` -> `neutral-700`. */
 const DIRECTIONS = new Set(['t', 'r', 'b', 'l', 'x', 'y', 's', 'e'])
 
+/** Every class declared on this element or any element enclosing it. */
+function contextClasses(occ: ClassOccurrence): Set<string> {
+  return new Set<string>([
+    ...occ.siblings.map(stripVariants),
+    ...occ.ancestorGroups.flat().flatMap((g) => g.tokens).map(stripVariants),
+  ])
+}
+
 /**
  * Is this element rendered in the monospaced family?
  *
@@ -1175,6 +1210,13 @@ export interface AnalyzeResult {
   readonly classesInspected: number
   readonly unusedWaivers: readonly Waiver[]
   /**
+   * Findings that WERE detected and then deliberately not raised, each with the
+   * rule that excused them. Never silence: an exemption nobody can see is
+   * indistinguishable from a check that missed the case, and six months later
+   * nobody can tell which one it was.
+   */
+  readonly exemptions: readonly Violation[]
+  /**
    * Usage count of every numeric Tailwind ramp stop (`neutral-500`, …) across
    * apps/web, counted from the scan rather than from the violation list so a
    * stop is reported as unused only when it is genuinely absent. This is what
@@ -1193,6 +1235,7 @@ export function analyze(options: AnalyzeOptions = {}): AnalyzeResult {
   const waivers = options.waivers ?? WAIVERS
 
   const docViolations: Violation[] = []
+  const exemptions: Violation[] = []
   const stopUsage = new Map<string, number>()
   const raw: Violation[] = []
   const DOC = rel(designPath)
@@ -1775,6 +1818,69 @@ export function analyze(options: AnalyzeOptions = {}): AnalyzeResult {
           .filter((x) => x.ratio < AA_NORMAL)
         if (failing.length > 0) {
           const worst = failing.reduce((a, b) => (a.ratio <= b.ratio ? a : b))
+
+          // ── Imagery, not typography ──────────────────────────────────────
+          //
+          // design.md §Imagery is categorical: "Large decorative background
+          // numerals (the `watermark` step) belong to this category rather than
+          // to typography: they are atmospheric marks, and must be
+          // non-selectable, non-interactive, and redundant to information
+          // already present in real text."
+          //
+          // A text-contrast floor cannot apply to something the document says
+          // is not text. WCAG agrees independently — 1.4.3 exempts "pure
+          // decoration" from the contrast requirement — so this is alignment
+          // with the standard, not a local carve-out. Forcing a background
+          // flourish to 4.5:1 would make it compete with the content in front
+          // of it, which is a worse outcome than the finding.
+          //
+          // THE EXEMPTION IS THE FULL DISCRIMINATOR OR NOTHING. The required
+          // classes are read from design.md's own `watermark` row, so the doc
+          // still governs; ALL of them must be present, on the element or an
+          // ancestor that they inherit from; and the element must be hidden
+          // from assistive technology. That last clause is what stops this
+          // being a loophole: an element styled as decoration but still
+          // announced by a screen reader is not decoration, it is unlabelled
+          // content, and silencing its contrast would hide a real defect
+          // behind two utility classes.
+          const watermark = design.monoSteps.find((st) => /watermark/i.test(st.step))
+          const required = watermark?.requires ?? []
+          const decorativeClasses = required.length > 0 && required.every((r) => contextClasses(occ).has(r))
+
+          if (decorativeClasses && occ.ariaHidden) {
+            exemptions.push({
+              ...at, code: 'IMAGERY_EXEMPT',
+              site: `${worst.g.label} ${worst.ratio.toFixed(2)}:1`,
+              detail:
+                `${name} (${paintedHex}) on ${worst.g.label} is ${worst.ratio.toFixed(2)}:1, below the ${AA_NORMAL}:1 text floor — ` +
+                `NOT raised, because this element satisfies design.md's watermark discriminator ` +
+                `(${required.join(' + ')}) and is aria-hidden. design.md §Imagery places decorative background ` +
+                `numerals outside typography, and WCAG 1.4.3 exempts pure decoration from the contrast floor.`,
+              fix:
+                `no change needed. If this element is NOT decoration — if a user is meant to read it — remove ` +
+                `${required.join('/')} and give it a token that clears AA on ${worst.g.label}.`,
+            })
+            continue
+          }
+
+          if (decorativeClasses && !occ.ariaHidden) {
+            raw.push({
+              ...at, code: 'DECORATIVE_NOT_HIDDEN',
+              site: `${worst.g.label} ${worst.ratio.toFixed(2)}:1`,
+              detail:
+                `this element is styled as decoration (${required.join(' + ')}) and renders ${name} at ` +
+                `${worst.ratio.toFixed(2)}:1 on ${worst.g.label} — far below the ${AA_NORMAL}:1 text floor — but it is still in ` +
+                `the accessibility tree, so a screen reader announces it. It is therefore claiming to be content ` +
+                `while being styled as imagery, and it cannot be both. design.md §Imagery requires decorative ` +
+                `numerals to be non-selectable, non-interactive AND redundant to information already in real text.`,
+              fix:
+                `add \`aria-hidden="true"\` — that completes design.md's discriminator and this becomes an ` +
+                `IMAGERY_EXEMPT note rather than a violation. If the text IS meant to be read, do the opposite: ` +
+                `drop ${required.join('/')} and use a token that clears AA on ${worst.g.label}.`,
+            })
+            continue
+          }
+
           const alt = suggestTextToken(paintedHex, failing.map((f) => f.g.hex))
           raw.push({
             ...at, code: 'SUB_AA_TEXT',
@@ -1912,6 +2018,7 @@ export function analyze(options: AnalyzeOptions = {}): AnalyzeResult {
     violations,
     design,
     tailwind,
+    exemptions,
     filesScanned: sourceFiles.length,
     classesInspected,
     unusedWaivers: waivers.filter((_, i) => !used.has(i)),
@@ -2171,6 +2278,8 @@ const HEADLINE: Record<ViolationCode, string> = {
   OFF_SCALE_TYPE: 'Font size off design.md’s type scale',
   MONO_RANGE_REVIEW: 'Mono size outside the prose window — prose vs mark not statically decidable',
   MONO_STEP_REQUIREMENT: 'Mono step used without the class design.md makes mandatory on it',
+  DECORATIVE_NOT_HIDDEN: 'Styled as imagery but still announced to screen readers',
+  IMAGERY_EXEMPT: 'Below the text floor, exempted as imagery — discriminator satisfied',
   ELEVATION_SHADOW: 'Box-shadow where design.md forbids it',
   OFF_SYSTEM_RADIUS: 'Radius outside the 4px / 9999px system',
   CSS_OFF_PALETTE: 'Raw off-palette hex in a stylesheet',
@@ -2179,7 +2288,7 @@ const HEADLINE: Record<ViolationCode, string> = {
 
 const DOC_ORDER: readonly ViolationCode[] = ['MATRIX_DRIFT', 'TEXT_ON_DRIFT', 'ALIAS_DRIFT', 'RAMP_DRIFT']
 const CODE_ORDER: readonly ViolationCode[] = [
-  'SUB_AA_TEXT', 'DEAD_CLASS', 'OFF_PALETTE', 'DERIVED_RAMP', 'ARBITRARY_COLOR',
+  'SUB_AA_TEXT', 'DECORATIVE_NOT_HIDDEN', 'DEAD_CLASS', 'OFF_PALETTE', 'DERIVED_RAMP', 'ARBITRARY_COLOR',
   'OFF_SCALE_TYPE', 'MONO_STEP_REQUIREMENT', 'ELEVATION_SHADOW', 'OFF_SYSTEM_RADIUS',
   'CSS_OFF_PALETTE', 'ALIAS_SPELLING', 'MONO_RANGE_REVIEW',
 ]
@@ -2344,7 +2453,7 @@ function main(): number {
   }
 
   if (blocking.length > 0) {
-    console.log(`${RED}${BOLD}✗ TIER 1 — BLOCKING: ${blocking.length} violation${blocking.length === 1 ? '' : 's'} that fail this build${RESET}`)
+    console.log(`${RED}${BOLD}✗ TIER 1 — BLOCKING: ${blocking.length} violation${blocking.length === 1 ? '' : 's'} failing this build${RESET}`)
     console.log(`${DIM}  Any occurrence of these codes fails CI. No grace period, no baseline.${RESET}\n`)
     summarise(blocking, CODE_ORDER)
     console.log('')
@@ -2421,6 +2530,17 @@ function main(): number {
         `\n  ones would defeat it. So each is named, with the question to answer, and left to a reader.${RESET}\n`,
     )
     printGroup(reportOnly, CODE_ORDER, showAll)
+  }
+
+  // ── Exemptions: detected, then deliberately not raised ────────────────────
+  if (result.exemptions.length > 0) {
+    console.log(`${BOLD}${CYAN}⊙ EXEMPTED: ${result.exemptions.length} finding${result.exemptions.length === 1 ? '' : 's'} detected and excused by a design.md rule${RESET}`)
+    console.log(
+      `${DIM}  Shown because an exemption nobody can see is indistinguishable from a check that missed the` +
+        `\n  case. Each names the rule that excused it, so the judgement can be re-litigated rather than` +
+        `\n  inherited.${RESET}\n`,
+    )
+    printGroup(result.exemptions, ['IMAGERY_EXEMPT'], showAll)
   }
 
   if (result.unusedWaivers.length > 0) {

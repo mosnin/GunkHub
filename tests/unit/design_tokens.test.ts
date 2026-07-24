@@ -61,6 +61,7 @@ interface DocOverrides {
   readonly interSizes?: string
   readonly monoSizes?: string
   readonly radii?: string
+  readonly monoRules?: string
 }
 
 const DEFAULT_TOKEN_ROWS = [
@@ -131,7 +132,18 @@ ${o.aliases ?? DEFAULT_ALIASES}
 - **Sizes:** ${o.interSizes ?? '10px, 12px, 14px, 16px, 24px, 32px'}
 
 ### Geist Mono — Code snippets and data displays. · \`--font-geistmono\`
-- **Sizes:** ${o.monoSizes ?? '12px, 14px, 16px'}
+- **Sizes:** ${o.monoSizes ?? '10px, 12px, 14px, 16px, 64px'}
+
+### Mono Range Rules
+
+**Prose is floored at 12px and capped at 20px.**
+
+| Step | Sanctioned for | Forbidden for |
+|------|----------------|---------------|
+| \`micro\` 10px | Non-prose marks only: wordmark lockups (\`AFR\`). | All prose. |
+${o.monoRules ?? '| `watermark` 64px | Decorative background numerals only. Must be non-interactive and non-selectable (`pointer-events-none`, `select-none`). | Anything a user must read. |'}
+
+**Why 11px does not exist.** There is no 11px step and none will be added.
 
 ### Type Scale
 
@@ -246,7 +258,7 @@ function run(fixture: Fixture): {
 }
 
 /** Like `run`, but hands back the full Violation objects. */
-function runFull(fixture: Fixture): { violations: readonly Violation[] } {
+function runFull(fixture: Fixture): { violations: readonly Violation[]; exemptions: readonly Violation[] } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'design-tokens-full-'))
   tmpDirs.push(root)
   const webRoot = path.join(root, 'web')
@@ -712,9 +724,18 @@ describe('shape, elevation and type conformance', () => {
     // violation only in the mono context. A family-blind check gets this wrong
     // in both directions.
     expect(run({ web: { 'a.tsx': component('text-[10px]') } }).codes).not.toContain('OFF_SCALE_TYPE')
+    // 10px IS on the mono scale (the `micro` step) but sits below the 12px
+    // prose floor, so it is not off-scale — it is the undecidable prose-vs-mark
+    // case, which reports and never fails.
     const mono = run({ web: { 'a.tsx': component('font-mono text-[10px]') } })
-    expect(mono.codes).toContain('OFF_SCALE_TYPE')
-    expect(mono.messages.join('\n')).toMatch(/geist mono/i)
+    expect(mono.codes).toContain('MONO_RANGE_REVIEW')
+    expect(mono.codes).not.toContain('OFF_SCALE_TYPE')
+    expect(mono.messages.join('\n')).toMatch(/NOT statically decidable/)
+    // A size that is on NEITHER scale is a hard violation, and quotes design.md's
+    // own non-existence clause.
+    const off = run({ web: { 'a.tsx': component('font-mono text-[11px]') } })
+    expect(off.codes).toContain('OFF_SCALE_TYPE')
+    expect(off.messages.join('\n')).toMatch(/no 11px step and none will be added/)
   })
 
   it('checks named font sizes against the scale too', () => {
@@ -991,5 +1012,83 @@ describe('the honesty notices are pinned so they cannot be trimmed as noise', ()
     expect(FALSE_POSITIVE_NOTICE).toMatch(/ternary/)
     expect(FALSE_POSITIVE_NOTICE).toMatch(/hover/)
     expect(FALSE_POSITIVE_NOTICE).toMatch(/report it/)
+  })
+})
+
+// ─── 11. The imagery exemption, and why it is not a loophole ─────────────────
+
+describe('decorative imagery is exempt from the TEXT contrast floor', () => {
+  // design.md §Imagery: decorative background numerals "belong to this category
+  // rather than to typography". A text floor cannot bind something the document
+  // says is not text, and WCAG 1.4.3 exempts pure decoration too. But the
+  // exemption is the FULL discriminator or nothing — these tests pin every way
+  // it can be claimed without being earned.
+  const WATERMARK = 'pointer-events-none select-none font-mono text-[64px] text-graphite/60'
+
+  const decorative = (extra: string, cls = WATERMARK): string =>
+    `export function C() {\n  return (\n    <div className="bg-blackout">\n      <span ${extra} className="${cls}">01</span>\n    </div>\n  )\n}\n`
+
+  it('exempts an element with the full discriminator AND aria-hidden', () => {
+    const r = run({ web: { 'a.tsx': decorative('aria-hidden="true"') } })
+    expect(r.codes).not.toContain('SUB_AA_TEXT')
+    expect(r.codes).not.toContain('DECORATIVE_NOT_HIDDEN')
+  })
+
+  it('reports the exemption as a visible NOTE rather than staying silent', () => {
+    // An exemption nobody can see is indistinguishable from a missed case.
+    const r = runFull({ web: { 'a.tsx': decorative('aria-hidden="true"') } })
+    const note = r.exemptions.find((e) => e.code === 'IMAGERY_EXEMPT')
+    expect(note, 'the exemption must be surfaced, not swallowed').toBeDefined()
+    expect(note?.detail).toMatch(/1\.38:1/) // the real ratio is still stated
+    expect(note?.detail).toMatch(/watermark discriminator/)
+    expect(note?.detail).toMatch(/Imagery/)
+  })
+
+  it('does NOT exempt the same low-contrast class without the discriminator', () => {
+    const r = run({ web: { 'a.tsx': decorative('', 'font-mono text-[64px] text-graphite/60') } })
+    expect(r.codes).toContain('SUB_AA_TEXT')
+  })
+
+  it('does NOT exempt on a PARTIAL discriminator — both classes are required', () => {
+    for (const partial of ['pointer-events-none', 'select-none']) {
+      const r = run({ web: { 'a.tsx': decorative('aria-hidden="true"', `${partial} font-mono text-[64px] text-graphite/60`) } })
+      expect(r.codes, `${partial} alone must not earn the exemption`).toContain('SUB_AA_TEXT')
+    }
+  })
+
+  it('does NOT exempt a visually-decorative element that screen readers still announce', () => {
+    // Styled as imagery but in the accessibility tree: it is claiming to be
+    // content and decoration at once, and cannot be both.
+    const r = run({ web: { 'a.tsx': decorative('') } })
+    expect(r.codes).toContain('DECORATIVE_NOT_HIDDEN')
+    expect(r.codes).not.toContain('IMAGERY_EXEMPT')
+    expect(r.messages.join('\n')).toMatch(/aria-hidden/)
+    // …and it BLOCKS, so the exemption cannot be half-claimed to buy silence.
+    expect(tierOf('DECORATIVE_NOT_HIDDEN')).toBe('block')
+  })
+
+  it('does not accept aria-hidden="false" as hidden', () => {
+    const r = run({ web: { 'a.tsx': decorative('aria-hidden="false"') } })
+    expect(r.codes).toContain('DECORATIVE_NOT_HIDDEN')
+  })
+
+  it('honours aria-hidden inherited from an ancestor, which really does prune the subtree', () => {
+    const body =
+      `export function C() {\n  return (\n    <div aria-hidden="true" className="bg-blackout">\n` +
+      `      <span className="${WATERMARK}">01</span>\n    </div>\n  )\n}\n`
+    const r = runFull({ web: { 'a.tsx': body } })
+    expect(r.violations.map((v) => v.code)).not.toContain('DECORATIVE_NOT_HIDDEN')
+    expect(r.exemptions.map((e) => e.code)).toContain('IMAGERY_EXEMPT')
+  })
+
+  it('takes the discriminator from design.md, so the doc still governs it', () => {
+    // Blank the watermark row's required classes and the exemption must vanish:
+    // the rule lives in the document, not in this script.
+    const monoRules = '| `watermark` 64px | Decorative background numerals only. | Anything a user must read. |'
+    const r = run({
+      doc: { monoRules },
+      web: { 'a.tsx': decorative('aria-hidden="true"') },
+    })
+    expect(r.codes).toContain('SUB_AA_TEXT')
   })
 })
