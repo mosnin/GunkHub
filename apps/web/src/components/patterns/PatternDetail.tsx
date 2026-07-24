@@ -1,14 +1,16 @@
 import Link from 'next/link'
 
 import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
+import type { ResolutionEvidenceState } from '@/components/patterns/ResolutionEvidencePanel'
 import type { RunExplanationSummaryState } from '@/lib/services/explanations'
 import type { FailurePatternOccurrence, FailurePatternTrendPoint } from '@agent-flight-recorder/contracts'
 
-import { isRegressedPattern } from '@/components/patterns/adapt'
+import { isRegressedPattern, recurrencesSinceResolution } from '@/components/patterns/adapt'
 import { MutedBadge } from '@/components/patterns/MutedBadge'
 import { PatternLifecycleControl } from '@/components/patterns/PatternLifecycleControl'
 import { PatternMuteControl } from '@/components/patterns/PatternMuteControl'
 import { PatternTrendSparkline } from '@/components/patterns/PatternTrendSparkline'
+import { ResolutionEvidencePanel } from '@/components/patterns/ResolutionEvidencePanel'
 import { SpikeBadge } from '@/components/patterns/SpikeBadge'
 import { ExplanationPreview } from '@/components/runs/ExplanationPreview'
 import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
@@ -35,6 +37,14 @@ interface PatternDetailProps {
   topRunExplanation?: TopRunExplanationPreview | null
   /** Resolved server-side by the detail page from `getCurrentAuth().orgRole === 'admin'` — gates the mute/unmute control (cycle 3). See PatternMuteControl. */
   isAdmin: boolean
+  /**
+   * "Did the fix hold?" evidence (cycle 2). Always supplied by the page —
+   * including its `unavailable`/`error` variants — so this section is never
+   * silently omitted for a resolved pattern. Omitted entirely only for a
+   * pattern with no lifecycle history at all, where there is nothing to
+   * evidence and the section would be pure noise.
+   */
+  evidenceState?: ResolutionEvidenceState
 }
 
 function formatFailureClass(cls: string): string {
@@ -56,11 +66,18 @@ export function PatternDetail({
   agentVersions,
   topRunExplanation,
   isAdmin,
+  evidenceState,
 }: PatternDetailProps) {
   const spike = pattern.lastSpikeAssessment
   const isSpiking = spike?.isSpiking === true
   const regressed = isRegressedPattern(pattern)
   const resolutionRefUrl = pattern.resolutionRef ? parseSafeHttpUrl(pattern.resolutionRef) : null
+  // EXACT, from the rollup's own baseline — `count - resolvedAtOccurrenceCount`.
+  // Null when no baseline was captured, which renders as no claim at all
+  // rather than a zero that would read as "it held".
+  const recurrences = recurrencesSinceResolution(pattern)
+  const hasLifecycleHistory =
+    pattern.status !== 'open' || pattern.acknowledgedAt !== undefined || pattern.resolvedAt !== undefined
 
   return (
     <div className="flex flex-col gap-6">
@@ -78,9 +95,20 @@ export function PatternDetail({
             aria-hidden="true"
           />
           <p className="text-sm text-whiteout leading-relaxed">
-            <span className="font-semibold text-neon-glow">Regressed</span> — this pattern was resolved
-            {typeof pattern.resolvedAt === 'number' && <> on {new Date(pattern.resolvedAt).toLocaleDateString()}</>}, but
-            it failed again{typeof pattern.regressedAt === 'number' && <> {formatRelativeTime(pattern.regressedAt)}</>}.
+            <span className="font-semibold text-neon-glow">Your fix didn&apos;t hold</span> — this pattern was resolved
+            {typeof pattern.resolvedAt === 'number' && <> on {new Date(pattern.resolvedAt).toLocaleDateString()}</>}
+            {pattern.resolvedInVersionId && agentVersions[pattern.resolvedInVersionId] && (
+              <> in <span className="font-mono">{agentVersions[pattern.resolvedInVersionId]?.version}</span></>
+            )}
+            , but it failed again{typeof pattern.regressedAt === 'number' && <> {formatRelativeTime(pattern.regressedAt)}</>}
+            {recurrences !== null && recurrences > 0 && (
+              <>
+                {' '}
+                — <span className="font-mono">{recurrences.toLocaleString()}</span>{' '}
+                {recurrences === 1 ? 'recurrence' : 'recurrences'} since it was marked resolved
+              </>
+            )}
+            .
           </p>
         </div>
       )}
@@ -190,6 +218,16 @@ export function PatternDetail({
         )}
       </section>
 
+      {/* "Did the fix hold?" — the evidence behind the resolution claim, plus
+          the lifecycle timeline. Rendered for any pattern with lifecycle
+          history, INCLUDING its unavailable/error variants: a resolved
+          pattern that silently omits this section is indistinguishable from
+          one whose fix was proven, which is precisely the confusion cycle 2
+          exists to remove. */}
+      {hasLifecycleHistory && evidenceState && (
+        <ResolutionEvidencePanel pattern={pattern} state={evidenceState} />
+      )}
+
       {/* Resolution details — who acknowledged/resolved this pattern, when,
           and the free-text note/reference left behind (docs/adr/006-failure-
           resolution.md). Rendered whenever there's any lifecycle history to
@@ -230,6 +268,28 @@ export function PatternDetail({
                     </>
                   )}
                 </p>
+              </div>
+            )}
+            {pattern.resolvedInVersionId && (
+              <div>
+                <p className="text-xs text-pewter uppercase tracking-wider">Fixed in version</p>
+                {/* Validated at resolve time to belong to this org and to an
+                    agent this pattern was observed on — so unlike
+                    `resolutionRef` below, this is a trustworthy id, not free
+                    text. It still only becomes a LINK once resolved to a real
+                    agent. */}
+                {agentVersions[pattern.resolvedInVersionId] ? (
+                  <Link
+                    href={`/agents/${agentVersions[pattern.resolvedInVersionId]?.agentId}`}
+                    className="font-mono text-sm text-neon-glow hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neon-glow rounded-[4px]"
+                  >
+                    {agentVersions[pattern.resolvedInVersionId]?.version}
+                  </Link>
+                ) : (
+                  <p className="font-mono text-sm text-neutral-300 mt-0.5">
+                    {truncateId(pattern.resolvedInVersionId, 16)}
+                  </p>
+                )}
               </div>
             )}
             {pattern.resolutionNote && (

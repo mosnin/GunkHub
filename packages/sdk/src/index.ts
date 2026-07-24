@@ -67,6 +67,7 @@ export type {
   V1GetExplanationData,
   V1ListFailurePatternsData,
   ListFailurePatternsParams,
+  V1PatternEvidenceData,
 } from './reader.js'
 export type { V1ApiConfig, V1FetchLike, V1ApiErrorKind, V1Envelope } from './v1-client.js'
 
@@ -81,4 +82,15 @@ export type {
   FailurePattern,
   FailurePatternClass,
   FailurePatternStatus,
+  // Fix confidence (ADR-006 cycle 2). Canonical declarations live in
+  // contracts; re-exported so a consumer reading `V1PatternEvidenceData` gets
+  // its member types from the same import.
+  FixConfidenceResult,
+  FixConfidenceState,
+  FixConfidenceLimit,
+  FixVersionAttribution,
+  PatternResolutionEvidence,
+  PatternResolutionMetadata,
+  PatternResolutionExposure,
+  PatternLifecycleTransition,
 } from '@agent-flight-recorder/contracts'

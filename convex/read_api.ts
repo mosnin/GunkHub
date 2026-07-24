@@ -24,12 +24,36 @@
 import { v } from "convex/values";
 
 import { mutation } from "./_generated/server.js";
+// Constants ONLY — deliberately not this module's mutations/queries. Those are
+// Clerk-authed and cannot be called from this key-authed surface (see header).
+// Cycle 1 avoided importing convex/failure_patterns.ts at all because it was
+// another team's in-flight deliverable; it has since landed, and the exposure
+// bounds below MUST be the same numbers on both surfaces — a `read_api` that
+// scanned to a different ceiling than `getPatternResolutionEvidence` would
+// report a different exposure count for the same pattern depending on which
+// door you came in, which is a silent correctness bug of exactly the kind
+// this cycle exists to eliminate. Importing the constants makes that drift
+// impossible; duplicating them would only make it invisible.
+import {
+  MAX_AFFECTED_AGENT_IDS,
+  MAX_AGENT_SET_OCCURRENCE_SCAN,
+  MAX_PATTERN_LIFECYCLE_TRANSITIONS,
+  RESOLUTION_RUN_SCAN_CAP,
+} from "./failure_patterns.js";
+import { afrError } from "./helpers/errors.js";
 import { DEFAULT_PAGE_SIZE, MAX_EVENTS_PER_REPLAY, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 import { buildReplayProjectionMirror } from "./helpers/replay_projection.js";
+import { fixConfidence } from "./insights.js";
 import { enforceRateLimit, resolveApiKey } from "./sdk_ingest.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
 import type { MutationCtx } from "./_generated/server.js";
+import type {
+  PatternLifecycleTransition,
+  PatternResolutionExposure,
+  PatternResolutionMetadata,
+} from "./failure_patterns.js";
+import type { FixConfidenceResult } from "./insights.js";
 
 const READ_SCOPE = "read";
 
@@ -323,6 +347,75 @@ function patternStatus(pattern: Doc<"failure_patterns">): string {
   return pattern.status ?? "open";
 }
 
+// ---------------------------------------------------------------------------
+// `state` (ADR-006 cycle 2) — the FIX-CONFIDENCE grade, Team B's vocabulary
+// verbatim (`FixConfidenceState`, convex/insights.ts §12). A different axis
+// from `status`: `status` is what a human ASSERTED, `state` is what the
+// evidence SUPPORTS. Both are exposed, and they are deliberately not merged.
+//
+// WHY ONLY "regressed" IS ACCEPTED HERE, AND WHY THE REST THROW:
+//
+// Three of the four states ("unproven" / "proving" / "confirmed") are
+// functions of POST-RESOLUTION EXPOSURE — how many runs have executed since
+// the fix. Computing that for one pattern is a bounded scan of up to
+// RESOLUTION_RUN_SCAN_CAP (2000) run rows across up to MAX_AFFECTED_AGENT_IDS
+// agents. Doing it for a whole page of up to MAX_PAGE_SIZE patterns is a
+// six-figure row read on a single request — not a slow endpoint, an endpoint
+// that cannot exist. So this surface cannot answer those three, and it says
+// so with a 422 (INVALID_ARGUMENT) that names the endpoint which CAN:
+// apiGetFailurePatternEvidence, one pattern at a time.
+//
+// "regressed" is the exception because it is exposure-INDEPENDENT: it falls
+// out of `recurred` alone, which is decided by two timestamps already on the
+// rollup. Exact, O(1) per pattern, no scan.
+//
+// The alternative designs were both worse, and both are the failure mode this
+// project keeps hitting:
+//   - Accept all four and quietly return nothing for the expensive three:
+//     that is a silently-dropped filter, the exact class of bug that shipped
+//     unnoticed for weeks last cycle.
+//   - Accept all four and compute them without exposure: every unrecurred
+//     pattern reads "unproven" regardless of how well-tested it actually is —
+//     a wrong answer dressed as a real one.
+// Rejecting loudly is the only option that never lies. When a future cycle
+// snapshots confidence onto the rollup, this restriction lifts without the
+// param changing name or meaning.
+//
+// This is ALSO why `state=regressed` is not redundant with the existing
+// `regressed` boolean, and why a CI job should prefer it: `regressed: true`
+// matches any pattern with `regressedAt` SET, including one whose regression
+// predates its current resolution (regressed, then genuinely re-fixed and
+// re-resolved — `resolvePattern` deliberately preserves `regressedAt` as
+// history). `state=regressed` matches only a recurrence STRICTLY AFTER the
+// live `resolvedAt`, i.e. a fix that actually did not hold. Using the boolean
+// for "fail the build if a confirmed-fixed pattern regressed" would fail
+// builds on patterns that were already fixed again.
+// ---------------------------------------------------------------------------
+const EXPOSURE_DEPENDENT_STATE_MESSAGE =
+  'state filter supports only "regressed" on this endpoint; "unproven"/"proving"/"confirmed" depend on post-resolution run exposure, which is measured per pattern by apiGetFailurePatternEvidence';
+
+/**
+ * The evidence state of a rollup, computed WITHOUT measuring exposure.
+ *
+ * Delegates to Team B's `fixConfidence` rather than reimplementing the
+ * precedence rules, so the recurrence definition ("strictly after
+ * `resolvedAt`", and a recurrence with no usable resolution still counts)
+ * cannot drift from §12. Exposure is deliberately left unmeasured, which is
+ * why only the `regressed` verdict from this call is trustworthy — every
+ * other pattern necessarily reads `unproven` here.
+ */
+function recurredSinceResolution(pattern: Doc<"failure_patterns">, now: number): boolean {
+  return (
+    fixConfidence(
+      {
+        ...(pattern.resolvedAt !== undefined && { resolvedAt: pattern.resolvedAt }),
+        ...(pattern.regressedAt !== undefined && { recurredAt: pattern.regressedAt }),
+      },
+      now,
+    ).state === "regressed"
+  );
+}
+
 export const apiListFailurePatterns = mutation({
   args: {
     apiKeyHash: v.string(),
@@ -331,10 +424,29 @@ export const apiListFailurePatterns = mutation({
     muted: v.optional(v.boolean()),
     status: v.optional(v.union(v.literal("open"), v.literal("acknowledged"), v.literal("resolved"))),
     regressed: v.optional(v.boolean()),
+    // Declared with Team B's FULL four-literal vocabulary (never a parallel
+    // one), so the accepted values are self-documenting and the three this
+    // endpoint cannot answer are rejected explicitly rather than by an
+    // opaque validator error.
+    state: v.optional(
+      v.union(
+        v.literal("unproven"),
+        v.literal("proving"),
+        v.literal("confirmed"),
+        v.literal("regressed"),
+      ),
+    ),
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
+    // Rejected BEFORE the key is resolved and the rate-limit unit is spent: an
+    // argument this endpoint structurally cannot honor is a malformed request,
+    // and it should not cost the caller a token of their per-minute budget.
+    if (args.state !== undefined && args.state !== "regressed") {
+      throw afrError("INVALID_ARGUMENT", EXPOSURE_DEPENDENT_STATE_MESSAGE);
+    }
+
     const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
     // AUDIT FIX (cycle 3): clamp below 1 as well as above MAX_PAGE_SIZE — an
     // unclamped non-positive `limit` (e.g. `--limit -5`, or `0`) used to be
@@ -389,9 +501,240 @@ export const apiListFailurePatterns = mutation({
       patterns = patterns.filter((pattern) => pattern.regressedAt !== undefined);
     }
 
+    if (args.state === "regressed") {
+      const now = Date.now();
+      patterns = patterns.filter((pattern) => recurredSinceResolution(pattern, now));
+    }
+
     return {
       patterns,
       nextCursor: page.isDone ? undefined : page.continueCursor,
     };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Key-authed (read scope) counterpart to convex/failure_patterns.ts's
+// `getPatternResolutionEvidence` (ADR-006 cycle 2, "prove the fix held").
+// Powers `afr patterns evidence <fingerprint>` and the SDK reader's
+// `getFailurePatternEvidence`.
+//
+// A MIRROR, not a call: `getPatternResolutionEvidence` is a Clerk-authed
+// `query` gated on `requireOrgMembership`, which this surface has no JWT to
+// satisfy (see this file's header). The two exposure helpers it uses are
+// module-private there, so they are re-expressed below against the same
+// tables, the same indexes, and — crucially — the SAME EXPORTED BOUNDS, so
+// the two doors cannot report different numbers for the same pattern.
+//
+// STRICTLY READ-ONLY, exactly like every other function in this file. It
+// reports the lifecycle and its evidence; it never sets any of it. ADR-006's
+// acknowledge/resolve/reopen remain member-gated, Clerk-authed and audited,
+// and are deliberately absent from this key-authed surface — an API key has
+// no human actor to attribute a privileged state change to, and
+// `audit_log.actorClerkUserId` exists precisely to answer "which person did
+// this". Reading proof that a fix held needs no human actor; asserting that
+// it held does. That asymmetry is why this endpoint exists and a key-authed
+// `resolve` does not.
+// ---------------------------------------------------------------------------
+
+/** Mirror of failure_patterns.ts's private `resolveAgentIdsForPattern` — same sources, same bounds. */
+async function resolveAgentIdsForPatternMirror(
+  ctx: MutationCtx,
+  pattern: Doc<"failure_patterns">,
+): Promise<Id<"agents">[]> {
+  if (pattern.affectedAgentIds && pattern.affectedAgentIds.length > 0) {
+    return pattern.affectedAgentIds;
+  }
+
+  // Fallback for rollups written before `affectedAgentIds` existed. Org-scoped
+  // by construction: reached only via this fingerprint's own org-scoped index.
+  const occurrences = await ctx.db
+    .query("failure_pattern_occurrences")
+    .withIndex("by_org_fingerprint", (q) =>
+      q.eq("orgId", pattern.orgId).eq("fingerprintHash", pattern.fingerprintHash),
+    )
+    .order("desc")
+    .take(MAX_AGENT_SET_OCCURRENCE_SCAN);
+
+  const seen: Id<"agents">[] = [];
+  for (const occurrence of occurrences) {
+    if (!seen.includes(occurrence.agentId)) seen.push(occurrence.agentId);
+    if (seen.length >= MAX_AFFECTED_AGENT_IDS) break;
+  }
+  return seen;
+}
+
+/**
+ * Mirror of failure_patterns.ts's private `countRunsStartedInWindow`, in the
+ * open-ended ("runs since resolution") form this caller needs.
+ *
+ * Deliberately NOT clamped to `Date.now()`: SDK-supplied `startedAt` values
+ * and clock skew mean a run can legitimately sit marginally ahead of the
+ * reader's clock, and dropping it would UNDERCOUNT exposure — the one
+ * direction this number must never err in, because undercounted exposure
+ * makes an untested fix look better tested than it is.
+ */
+async function countRunsStartedSinceMirror(
+  ctx: MutationCtx,
+  agentIds: Id<"agents">[],
+  afterExclusive: number,
+): Promise<{ count: number; truncated: boolean }> {
+  let count = 0;
+  for (const agentId of agentIds) {
+    const remaining = RESOLUTION_RUN_SCAN_CAP - count;
+    if (remaining <= 0) return { count, truncated: true };
+
+    // take(remaining + 1) so hitting the ceiling is DETECTABLE (a full page
+    // plus one) rather than indistinguishable from "exactly `remaining` runs".
+    const rows = await ctx.db
+      .query("runs")
+      .withIndex("by_agent_started", (q) => q.eq("agentId", agentId).gt("startedAt", afterExclusive))
+      .take(remaining + 1);
+
+    if (rows.length > remaining) return { count: RESOLUTION_RUN_SCAN_CAP, truncated: true };
+    count += rows.length;
+  }
+  return { count, truncated: false };
+}
+
+export interface ApiPatternResolutionEvidence {
+  pattern: Doc<"failure_patterns">;
+  resolution: PatternResolutionMetadata | null;
+  exposure: PatternResolutionExposure | null;
+  /** Oldest-first, bounded to the MAX_PATTERN_LIFECYCLE_TRANSITIONS most recent. */
+  transitions: PatternLifecycleTransition[];
+  /**
+   * Team B's graded verdict over the evidence above (convex/insights.ts §12).
+   * Null exactly when `resolution` is null — with nothing asserted there is
+   * nothing to grade, and a fabricated "unproven" would read as a judgment
+   * about a fix rather than the absence of one.
+   */
+  confidence: FixConfidenceResult | null;
+}
+
+export const apiGetFailurePatternEvidence = mutation({
+  args: { apiKeyHash: v.string(), fingerprintHash: v.string() },
+  handler: async (ctx, args): Promise<ApiPatternResolutionEvidence | null> => {
+    const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+
+    const pattern = await ctx.db
+      .query("failure_patterns")
+      .withIndex("by_org_fingerprint", (q) =>
+        q.eq("orgId", apiKey.orgId).eq("fingerprintHash", args.fingerprintHash),
+      )
+      .first();
+    // Null (not a throw) collapses "never existed" and "belongs to another
+    // org" into one indistinguishable answer, exactly as every other
+    // fingerprint-scoped lookup in this codebase does — a caller who could
+    // tell those apart would have an existence oracle for another org's data.
+    if (!pattern) return null;
+
+    // Lifecycle transitions come from the APPEND-ONLY audit log, not a mutable
+    // history table. Read newest-first so the bound keeps the most RECENT
+    // transitions, then reversed into the oldest-first order a timeline
+    // renders in. Includes the regression guard's own automatic
+    // `failure_pattern.regressed` rows (actor "system").
+    const auditRows = await ctx.db
+      .query("audit_log")
+      .withIndex("by_org_target", (q) =>
+        q.eq("orgId", apiKey.orgId).eq("targetType", "failure_pattern").eq("targetId", args.fingerprintHash),
+      )
+      .order("desc")
+      .take(MAX_PATTERN_LIFECYCLE_TRANSITIONS);
+
+    const transitions: PatternLifecycleTransition[] = auditRows
+      .map((row) => ({
+        action: row.action,
+        actorClerkUserId: row.actorClerkUserId,
+        timestamp: row.timestamp,
+        metadata: row.metadata as unknown,
+      }))
+      .reverse();
+
+    // No live resolution to evidence. Also the state after a MANUAL reopen
+    // (which clears `resolvedAt`) — but NOT after the regression guard's
+    // auto-reopen, which KEEPS `resolvedAt` precisely so the "your fix didn't
+    // hold" evidence below stays computable. A pattern with status "open" and
+    // a non-null exposure is therefore valid and expected, not a bug.
+    if (pattern.resolvedAt === undefined) {
+      return { pattern, resolution: null, exposure: null, transitions, confidence: null };
+    }
+
+    const resolvedInVersion =
+      pattern.resolvedInVersionId !== undefined ? await ctx.db.get(pattern.resolvedInVersionId) : null;
+
+    const resolution: PatternResolutionMetadata = {
+      resolvedAt: pattern.resolvedAt,
+      resolvedByUserId: pattern.resolvedByUserId,
+      resolutionNote: pattern.resolutionNote,
+      resolutionRef: pattern.resolutionRef,
+      resolvedInVersionId: pattern.resolvedInVersionId,
+      // Defensive org re-check: resolvePattern validated this id at write
+      // time, but a version could have been purged/replaced since, and a
+      // cross-org string must never be rendered from here.
+      resolvedInVersion:
+        resolvedInVersion && resolvedInVersion.orgId === apiKey.orgId ? resolvedInVersion.version : undefined,
+      resolvedAtOccurrenceCount: pattern.resolvedAtOccurrenceCount,
+      resolvedAtRunCount: pattern.resolvedAtRunCount,
+    };
+
+    const agentIds = await resolveAgentIdsForPatternMirror(ctx, pattern);
+    const exposureRuns = await countRunsStartedSinceMirror(ctx, agentIds, pattern.resolvedAt);
+
+    // EXACT when the snapshot exists. When it does not (a row resolved before
+    // this cycle shipped), 0 — NOT the all-time `count`, which would claim
+    // every occurrence the pattern ever had as a post-resolution recurrence.
+    const recurrenceCount =
+      pattern.resolvedAtOccurrenceCount !== undefined
+        ? Math.max(0, pattern.count - pattern.resolvedAtOccurrenceCount)
+        : 0;
+
+    const exposure: PatternResolutionExposure = {
+      since: pattern.resolvedAt,
+      runCount: exposureRuns.count,
+      runCountTruncated: exposureRuns.truncated,
+      recurrenceCount,
+      baselineRunCount: pattern.resolvedAtRunCount,
+      agentIds,
+      // "Held SO FAR" — zero recurrences since resolution. NOT a claim the fix
+      // is correct: `runCount` is what says whether this is meaningful
+      // evidence. `heldSoFar: true` with `runCount: 0` means simply untested,
+      // which is why `confidence.state` below reads "unproven" there and never
+      // "confirmed".
+      heldSoFar: recurrenceCount === 0,
+    };
+
+    // `recurredAt` prefers the regression guard's own stamp. The fallback
+    // matters: a pattern can carry recurrences (count > resolvedAtOccurrence-
+    // Count) while `regressedAt` is absent or stale — e.g. a rollup resolved
+    // before the guard shipped. Without the fallback, fixConfidence would see
+    // no counter-example and could grade a demonstrably-recurring pattern
+    // "proving" or even "confirmed" while `exposure.heldSoFar` said false in
+    // the very same response. `lastSeenAt` is the best available timestamp for
+    // that most recent occurrence, and when recurrenceCount > 0 it is by
+    // construction after `resolvedAt`.
+    const recurredAt =
+      pattern.regressedAt ?? (recurrenceCount > 0 ? pattern.lastSeenAt : undefined);
+
+    const confidence = fixConfidence(
+      {
+        resolvedAt: pattern.resolvedAt,
+        ...(pattern.resolvedInVersionId !== undefined && {
+          resolvedInVersionId: pattern.resolvedInVersionId,
+        }),
+        // `exposureVersionId` is deliberately NOT supplied: exposure here is
+        // counted per AGENT (runs started for the pattern's affected agents),
+        // not per agent VERSION, so there is no single version the count can
+        // honestly be attributed to. Omitting it yields
+        // `versionAttribution: "unknown"`, which is the truth. Supplying
+        // `resolvedInVersionId` for both sides would manufacture a "matched"
+        // verdict out of nothing.
+        postResolutionRuns: exposure.runCount,
+        ...(recurredAt !== undefined && { recurredAt }),
+      },
+      Date.now(),
+    );
+
+    return { pattern, resolution, exposure, transitions, confidence };
   },
 });

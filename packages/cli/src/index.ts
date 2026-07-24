@@ -14,6 +14,12 @@ import { printConfigCheck, runConfigCheck } from './commands/config-check.js'
 import { EXPLAIN_HELP, parseExplainArgs, printExplain, runExplain } from './commands/explain.js'
 import { EXPORT_HELP, parseExportArgs, printExport, runExport } from './commands/export.js'
 import { INIT_HELP, parseInitArgs, printInit, runInit } from './commands/init.js'
+import {
+  PATTERNS_EVIDENCE_HELP,
+  parsePatternsEvidenceArgs,
+  printPatternsEvidence,
+  runPatternsEvidence,
+} from './commands/patterns-evidence.js'
 import { PATTERNS_HELP, parsePatternsArgs, printPatterns, runPatterns } from './commands/patterns.js'
 import { printRecordDemo, runRecordDemo } from './commands/record-demo.js'
 import { REPLAY_HELP, parseReplayArgs, printReplay, runReplay } from './commands/replay.js'
@@ -36,6 +42,12 @@ export { parseExplainArgs, runExplain, printExplain } from './commands/explain.j
 export type { ExplainArgs, ExplainResult } from './commands/explain.js'
 export { parsePatternsArgs, runPatterns, printPatterns } from './commands/patterns.js'
 export type { PatternsArgs, PatternsResult } from './commands/patterns.js'
+export {
+  parsePatternsEvidenceArgs,
+  runPatternsEvidence,
+  printPatternsEvidence,
+} from './commands/patterns-evidence.js'
+export type { PatternsEvidenceArgs, PatternsEvidenceResult } from './commands/patterns-evidence.js'
 export * from './apiClient.js'
 export { parseRunsListArgs, runRunsList, printRunsList } from './commands/runs-list.js'
 export type { RunsListArgs, RunsListResult } from './commands/runs-list.js'
@@ -67,6 +79,7 @@ Commands:
   afr export <runId>             Export a run's run/events/replay bundle
   afr explain <runId>            Root-cause explanation for a run — failure class, summary, root cause, suggested fix
   afr patterns [options]         List recurring failure patterns for your organization
+  afr patterns evidence <hash>   Show whether a pattern's fix actually held (exposure + confidence)
 
 Run 'afr <command> --help' for command-specific options.
 
@@ -143,6 +156,23 @@ export async function main(argv: string[], log: (line: string) => void = console
     }
 
     case 'patterns': {
+      // `evidence` is the only subcommand — every other token stream is the
+      // bare `afr patterns [options]` list, so flags keep working unchanged.
+      if (afterCommand[0] === 'evidence') {
+        const args = parsePatternsEvidenceArgs(afterCommand.slice(1))
+        if (args.help) {
+          log(PATTERNS_EVIDENCE_HELP)
+          return 0
+        }
+        if (!args.fingerprintHash) {
+          log("Usage: afr patterns evidence <fingerprintHash>. Run 'afr patterns evidence --help' for details.")
+          return 1
+        }
+        const result = await runPatternsEvidence(args.fingerprintHash)
+        printPatternsEvidence(args, result, log)
+        return result.ok ? 0 : result.exitCode
+      }
+
       const args = parsePatternsArgs(afterCommand)
       if (args.help) {
         log(PATTERNS_HELP)

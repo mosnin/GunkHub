@@ -26,6 +26,7 @@ import type {
   V1ListEventsData,
   V1ListFailurePatternsData,
   V1ListRunsData,
+  V1PatternEvidenceData,
   V1ReplayData,
 } from '@agent-flight-recorder/sdk'
 
@@ -109,6 +110,7 @@ export type {
   V1ReplayData,
   V1GetExplanationData,
   V1ListFailurePatternsData,
+  V1PatternEvidenceData,
   ListRunsParams,
   ListEventsParams,
   ListFailurePatternsParams,
@@ -178,6 +180,18 @@ export async function listFailurePatterns(
 ): Promise<V1ListFailurePatternsData> {
   try {
     return await new FlightReader(config, fetchImpl).getFailurePatterns(params)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+export async function getFailurePatternEvidence(
+  config: ApiClientConfig,
+  fingerprintHash: string,
+  fetchImpl?: ApiFetchLike
+): Promise<V1PatternEvidenceData> {
+  try {
+    return await new FlightReader(config, fetchImpl).getFailurePatternEvidence(fingerprintHash)
   } catch (err) {
     toApiClientError(err)
   }

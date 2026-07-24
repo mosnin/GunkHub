@@ -5,7 +5,14 @@
  * `tests/unit/explain.test.ts` / `tests/unit/cli_v1_api.test.ts`'s `afr runs
  * list` coverage.
  */
-import { main, parsePatternsArgs, printPatterns, runPatterns } from '@agent-flight-recorder/cli'
+import {
+  main,
+  parsePatternsArgs,
+  printPatterns,
+  printPatternsEvidence,
+  runPatterns,
+  runPatternsEvidence,
+} from '@agent-flight-recorder/cli'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { ApiFetchLike } from '@agent-flight-recorder/cli'
@@ -435,5 +442,236 @@ describe('afr patterns — errors and dispatch', () => {
     } finally {
       process.env = { ...originalEnv }
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ADR-006 cycle 2 — the fix-confidence `--state` filter, and
+// `afr patterns evidence <fingerprint>`.
+// ---------------------------------------------------------------------------
+
+describe('afr patterns --state — filter validation and forwarding', () => {
+  it('parses --state', () => {
+    expect(parsePatternsArgs(['--state', 'regressed'])).toEqual({ state: 'regressed' })
+  })
+
+  it('forwards --state regressed as a query param', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, { data: { patterns: [], nextCursor: undefined }, requestId: 'r1' })
+    ) as unknown as ApiFetchLike
+    const result = await runPatterns({ state: 'regressed' }, env, fetchImpl)
+
+    expect(result.ok).toBe(true)
+    const url = String(vi.mocked(fetchImpl).mock.calls[0]![0])
+    expect(url).toContain('state=regressed')
+  })
+
+  /**
+   * A typo must not silently return an unfiltered list that looks like a
+   * match — the same posture --status already takes.
+   */
+  it('rejects an unknown --state value as a usage error, before any network call', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { data: {}, requestId: 'r' })) as unknown as ApiFetchLike
+    const result = await runPatterns({ state: 'regresed' }, env, fetchImpl)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.exitCode).toBe(1)
+    expect(result.message).toContain('--state must be one of')
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The three exposure-dependent states are REJECTED here rather than
+   * forwarded and silently answered wrong. The error must name the command
+   * that can answer them, so the user is redirected rather than stuck.
+   */
+  it.each(['unproven', 'proving', 'confirmed'])(
+    'rejects the exposure-dependent state %s and points at the evidence command',
+    async (state) => {
+      const fetchImpl = vi.fn(async () => jsonResponse(200, { data: {}, requestId: 'r' })) as unknown as ApiFetchLike
+      const result = await runPatterns({ state }, env, fetchImpl)
+
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.exitCode).toBe(1)
+      expect(result.message).toContain('afr patterns evidence')
+      expect(fetchImpl).not.toHaveBeenCalled()
+    }
+  )
+
+  it('sends no state param when --state is omitted', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, { data: { patterns: [], nextCursor: undefined }, requestId: 'r1' })
+    ) as unknown as ApiFetchLike
+    await runPatterns({}, env, fetchImpl)
+
+    expect(String(vi.mocked(fetchImpl).mock.calls[0]![0])).not.toContain('state=')
+  })
+})
+
+describe('afr patterns evidence — fix-confidence evidence', () => {
+  function makeEvidence(overrides: Record<string, unknown> = {}) {
+    return {
+      pattern: makePattern({ status: 'resolved', resolvedAt: 1_700_000_600_000 }),
+      resolution: {
+        resolvedAt: 1_700_000_600_000,
+        resolvedByUserId: 'user_1',
+        resolutionNote: 'Added a retry around the flaky lookup',
+        resolvedInVersionId: 'av_2',
+        resolvedInVersion: 'v1.4.0',
+        resolvedAtOccurrenceCount: 12,
+        resolvedAtRunCount: 300,
+      },
+      exposure: {
+        since: 1_700_000_600_000,
+        runCount: 120,
+        runCountTruncated: false,
+        recurrenceCount: 0,
+        baselineRunCount: 300,
+        agentIds: ['agent_1'],
+        heldSoFar: true,
+      },
+      transitions: [
+        { action: 'failure_pattern.resolved', actorClerkUserId: 'user_1', timestamp: 1_700_000_600_000 },
+      ],
+      confidence: {
+        score: 0.82,
+        state: 'confirmed',
+        exposureRuns: 120,
+        observedRuns: 120,
+        versionAttribution: 'unknown',
+        elapsedMs: 8 * 24 * 60 * 60 * 1000,
+        recurred: false,
+        hasResolution: true,
+        exposureMeasured: true,
+        exposureCredit: 1,
+        soakCredit: 1,
+        limitingFactor: 'none',
+      },
+      ...overrides,
+    }
+  }
+
+  it('requests the evidence endpoint for the fingerprint', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, { data: makeEvidence(), requestId: 'r1' })
+    ) as unknown as ApiFetchLike
+    const result = await runPatternsEvidence('hash_1', env, fetchImpl)
+
+    expect(result.ok).toBe(true)
+    expect(String(vi.mocked(fetchImpl).mock.calls[0]![0])).toContain('/api/v1/patterns/hash_1/evidence')
+  })
+
+  it('--json emits the confidence block a CI job gates on', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, { data: makeEvidence(), requestId: 'r1' })
+    ) as unknown as ApiFetchLike
+    const result = await runPatternsEvidence('hash_1', env, fetchImpl)
+
+    const lines: string[] = []
+    printPatternsEvidence({ json: true }, result, (line) => lines.push(line))
+    const parsed = JSON.parse(lines.join('\n')) as {
+      confidence: { state: string; score: number }
+      exposure: { runCount: number }
+    }
+    expect(parsed.confidence.state).toBe('confirmed')
+    // 0-1, never a 0-100 percentage — the CI threshold depends on this scale.
+    expect(parsed.confidence.score).toBeLessThanOrEqual(1)
+    expect(parsed.exposure.runCount).toBe(120)
+  })
+
+  it('renders a truncated run count as a floor, never as an exact total', async () => {
+    const evidence = makeEvidence()
+    ;(evidence.exposure as { runCount: number; runCountTruncated: boolean }).runCount = 2000
+    ;(evidence.exposure as { runCount: number; runCountTruncated: boolean }).runCountTruncated = true
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, { data: evidence, requestId: 'r1' })
+    ) as unknown as ApiFetchLike
+    const result = await runPatternsEvidence('hash_1', env, fetchImpl)
+
+    const lines: string[] = []
+    printPatternsEvidence({}, result, (line) => lines.push(line))
+    expect(lines.join('\n')).toContain('2000+')
+  })
+
+  /**
+   * Zero exposure must never read as success in the rendered output either —
+   * the state carries it, and the "why not higher" line says it in words.
+   */
+  it('renders an unproven, unexercised fix without implying it held', async () => {
+    const evidence = makeEvidence({
+      exposure: {
+        since: 1_700_000_600_000,
+        runCount: 0,
+        runCountTruncated: false,
+        recurrenceCount: 0,
+        agentIds: ['agent_1'],
+        heldSoFar: true,
+      },
+      confidence: {
+        score: 0,
+        state: 'unproven',
+        exposureRuns: 0,
+        observedRuns: 0,
+        versionAttribution: 'unknown',
+        elapsedMs: 1000,
+        recurred: false,
+        hasResolution: true,
+        exposureMeasured: true,
+        exposureCredit: 0,
+        soakCredit: 0,
+        limitingFactor: 'no-exposure',
+      },
+    })
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, { data: evidence, requestId: 'r1' })
+    ) as unknown as ApiFetchLike
+    const result = await runPatternsEvidence('hash_1', env, fetchImpl)
+
+    const lines: string[] = []
+    printPatternsEvidence({}, result, (line) => lines.push(line))
+    const output = lines.join('\n')
+    expect(output).toContain('UNPROVEN')
+    expect(output).toContain('Nothing has run since the fix')
+  })
+
+  it('handles a pattern with no resolution to evidence', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, {
+        data: { pattern: makePattern(), resolution: null, exposure: null, transitions: [], confidence: null },
+        requestId: 'r1',
+      })
+    ) as unknown as ApiFetchLike
+    const result = await runPatternsEvidence('hash_1', env, fetchImpl)
+
+    const lines: string[] = []
+    printPatternsEvidence({}, result, (line) => lines.push(line))
+    expect(lines.join('\n')).toContain('nothing to prove yet')
+  })
+
+  it('maps a 404 to exit code 3', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(404, { error: { code: 'NOT_FOUND', message: 'Failure pattern not found' }, requestId: 'r1' })
+    ) as unknown as ApiFetchLike
+    const result = await runPatternsEvidence('nope', env, fetchImpl)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.exitCode).toBe(3)
+  })
+
+  it('dispatches through main() and prints its own help', async () => {
+    const lines: string[] = []
+    const code = await main(['patterns', 'evidence', '--help'], (line) => lines.push(line))
+    expect(code).toBe(0)
+    expect(lines.join('\n')).toContain('afr patterns evidence <fingerprintHash>')
+  })
+
+  it('requires a fingerprint argument', async () => {
+    const lines: string[] = []
+    const code = await main(['patterns', 'evidence'], (line) => lines.push(line))
+    expect(code).toBe(1)
+    expect(lines.join('\n')).toContain('Usage: afr patterns evidence')
   })
 })

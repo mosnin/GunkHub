@@ -9,8 +9,20 @@ import type { CommandFailure } from './shared.js'
 import type { ApiFetchLike, V1ListFailurePatternsData } from '../apiClient.js'
 import type { CliEnv } from '../env.js'
 import type { FailurePatternStatus } from '@agent-flight-recorder/contracts'
+import type { FixConfidenceState } from '@agent-flight-recorder/sdk'
 
 const VALID_STATUSES: readonly FailurePatternStatus[] = ['open', 'acknowledged', 'resolved']
+
+/** Team B's fix-confidence vocabulary (convex/insights.ts §12), verbatim — never a parallel one. */
+const VALID_STATES: readonly FixConfidenceState[] = ['unproven', 'proving', 'confirmed', 'regressed']
+
+/**
+ * The only `--state` value `afr patterns` can answer. The other three depend
+ * on per-pattern post-resolution run exposure, which the list endpoint cannot
+ * measure across a whole page; `afr patterns evidence <fingerprint>` answers
+ * those one pattern at a time.
+ */
+const LIST_ANSWERABLE_STATES: readonly FixConfidenceState[] = ['regressed']
 
 export const PATTERNS_HELP = `Usage: afr patterns [options]
 
@@ -38,6 +50,20 @@ Options:
   --regressed         Only patterns that have regressedAt set — a RESOLVED
                        pattern that received a new occurrence after it was
                        resolved ("your fix didn't hold").
+  --state <s>         Only patterns whose FIX-CONFIDENCE state is <s>
+                       (ADR-006 cycle 2). A different axis from --status:
+                       --status is what a human ASSERTED, --state is what the
+                       EVIDENCE supports. Only 'regressed' is answerable here;
+                       'unproven'/'proving'/'confirmed' need per-pattern run
+                       exposure — use 'afr patterns evidence <fingerprint>'.
+
+                       PREFER --state regressed OVER --regressed IN CI:
+                       --regressed also matches a pattern whose regression
+                       predates its current resolution (it regressed, was
+                       genuinely re-fixed, and was re-resolved — regressedAt
+                       is kept as history). --state regressed matches only a
+                       recurrence strictly after the live resolvedAt, i.e. a
+                       fix that actually did not hold.
   --limit <n>         Max number of patterns to return
   --json              Print the raw API response as JSON
   --help              Show this message
@@ -67,6 +93,8 @@ export interface PatternsArgs {
   /** Raw `--status` value, as typed — validated against `VALID_STATUSES` by `resolveStatusFilter` before use. */
   status?: string
   regressed?: boolean
+  /** Raw `--state` value, as typed — validated against `VALID_STATES` by `resolveStateFilter` before use. */
+  state?: string
   limit?: number
   json?: boolean
   help?: boolean
@@ -84,6 +112,7 @@ export function parsePatternsArgs(argv: string[]): PatternsArgs {
       active: { type: 'boolean' },
       status: { type: 'string' },
       regressed: { type: 'boolean' },
+      state: { type: 'string' },
       limit: { type: 'string' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -96,6 +125,7 @@ export function parsePatternsArgs(argv: string[]): PatternsArgs {
   if (values['active']) result.active = true
   if (values['status']) result.status = values['status']
   if (values['regressed']) result.regressed = true
+  if (values['state']) result.state = values['state']
   if (values['limit']) result.limit = Number(values['limit'])
   if (values['json']) result.json = true
   if (values['help']) result.help = true
@@ -138,6 +168,39 @@ function resolveStatusFilter(args: PatternsArgs): { status?: FailurePatternStatu
   return { status: args.status as FailurePatternStatus }
 }
 
+/**
+ * Validate `--state` against Team B's closed fix-confidence vocabulary, and
+ * then against the narrower set this endpoint can actually answer.
+ *
+ * TWO DISTINCT REJECTIONS, deliberately worded differently:
+ *   - an unknown value ("regresed") is a typo — same posture as
+ *     `resolveStatusFilter`, since silently ignoring it would return an
+ *     unfiltered list that looks like a match.
+ *   - a KNOWN but unanswerable value ('confirmed') is a real question this
+ *     command cannot answer, so it names the command that can rather than
+ *     pretending the filter applied. Both are caught locally, before any
+ *     network round trip; the server rejects them too (defence in depth), but
+ *     the CLI should not spend a rate-limit unit to learn this.
+ */
+function resolveStateFilter(args: PatternsArgs): { state?: FixConfidenceState } | CommandFailure {
+  if (args.state === undefined) return {}
+  if (!(VALID_STATES as readonly string[]).includes(args.state)) {
+    return {
+      ok: false,
+      exitCode: 1,
+      message: `--state must be one of ${VALID_STATES.join(', ')} — got "${args.state}".`,
+    }
+  }
+  if (!(LIST_ANSWERABLE_STATES as readonly string[]).includes(args.state)) {
+    return {
+      ok: false,
+      exitCode: 1,
+      message: `--state ${args.state} is not available on 'afr patterns' — it depends on per-pattern post-resolution run exposure, which cannot be measured across a whole page. Use 'afr patterns evidence <fingerprint>' for ${VALID_STATES.filter((s) => !LIST_ANSWERABLE_STATES.includes(s)).join('/')}.`,
+    }
+  }
+  return { state: args.state as FixConfidenceState }
+}
+
 export type PatternsResult = (V1ListFailurePatternsData & { ok: true }) | CommandFailure
 
 /** `afr patterns` — list recurring failure patterns through the v1 read API. */
@@ -155,6 +218,9 @@ export async function runPatterns(
   const statusFilter = resolveStatusFilter(args)
   if (isCommandFailure(statusFilter)) return statusFilter
 
+  const stateFilter = resolveStateFilter(args)
+  if (isCommandFailure(stateFilter)) return stateFilter
+
   try {
     const data = await listFailurePatterns(
       config,
@@ -164,6 +230,7 @@ export async function runPatterns(
         ...(mutedFilter.muted !== undefined && { muted: mutedFilter.muted }),
         ...(statusFilter.status !== undefined && { status: statusFilter.status }),
         ...(args.regressed !== undefined && { regressed: args.regressed }),
+        ...(stateFilter.state !== undefined && { state: stateFilter.state }),
         ...(args.limit !== undefined && { limit: args.limit }),
       },
       fetchImpl
@@ -233,7 +300,7 @@ export function printPatterns(
   )
   if (result.nextCursor) {
     log(
-      '\n(more results available — narrow with --agent/--spiking/--muted/--active/--status/--regressed/--limit to see fewer pages)'
+      '\n(more results available — narrow with --agent/--spiking/--muted/--active/--status/--regressed/--state/--limit to see fewer pages)'
     )
   }
 }

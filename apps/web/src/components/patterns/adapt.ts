@@ -29,6 +29,9 @@ import type {
   FailurePatternOccurrence,
   FailurePatternStatus,
   FailurePatternTrendPoint,
+  PatternLifecycleTransition,
+  PatternResolutionExposure,
+  PatternResolutionMetadata,
 } from '@agent-flight-recorder/contracts'
 
 /**
@@ -79,6 +82,38 @@ export interface AdaptedFailurePattern extends FailurePattern {
    * guard reopens it) AND `regressedAt` is set; see `isRegressed` below.
    */
   regressedAt?: number
+
+  /**
+   * Resolution EVIDENCE snapshot (cycle 2 — "prove the fix held"). These three
+   * ride on the rollup itself so the LIST can distinguish an asserted
+   * resolution from a proven one without a second query.
+   *
+   * `resolvedAtRunCount` is a 14-day trailing BASELINE — runs BEFORE
+   * resolution. It is NOT a cumulative total, so it must never be subtracted
+   * from post-resolution exposure; the two are labelled "before" and "since"
+   * wherever they are rendered together.
+   */
+  resolvedInVersionId?: string
+  resolvedAtRunCount?: number
+  resolvedAtOccurrenceCount?: number
+  /** Agents this fingerprint has been observed on (bounded). Exposure is measured across these. */
+  affectedAgentIds: string[]
+  /** True when `affectedAgentIds` came from the service, not a default. */
+  hasAffectedAgents: boolean
+}
+
+/**
+ * EXACT recurrences since the resolution, derived the one way the backend
+ * defines it: `count - resolvedAtOccurrenceCount`. Returns `null` when no
+ * baseline was captured (pre-cycle-2 resolution, or never resolved) — the
+ * honest "we cannot say" rather than a fabricated zero, which would read as
+ * "it held" for a pattern we simply have no baseline for.
+ */
+export function recurrencesSinceResolution(
+  pattern: Pick<AdaptedFailurePattern, 'count' | 'resolvedAtOccurrenceCount'>,
+): number | null {
+  if (typeof pattern.resolvedAtOccurrenceCount !== 'number') return null
+  return Math.max(0, pattern.count - pattern.resolvedAtOccurrenceCount)
 }
 
 /** True when a pattern is a REGRESSED one — reopened by the automatic regression guard after having been resolved, as opposed to a plain manual reopen (which clears `regressedAt`, per the contract's own doc comment). */
@@ -141,6 +176,14 @@ export function adaptFailurePattern(raw: unknown): AdaptedFailurePattern {
   const resolutionRef = typeof r['resolutionRef'] === 'string' ? r['resolutionRef'] : undefined
   const regressedAt = typeof r['regressedAt'] === 'number' ? r['regressedAt'] : undefined
 
+  const resolvedInVersionId = typeof r['resolvedInVersionId'] === 'string' ? r['resolvedInVersionId'] : undefined
+  const resolvedAtRunCount = typeof r['resolvedAtRunCount'] === 'number' ? r['resolvedAtRunCount'] : undefined
+  const resolvedAtOccurrenceCount =
+    typeof r['resolvedAtOccurrenceCount'] === 'number' ? r['resolvedAtOccurrenceCount'] : undefined
+  const affectedAgentIds = Array.isArray(r['affectedAgentIds'])
+    ? (r['affectedAgentIds'] as unknown[]).filter((x): x is string => typeof x === 'string')
+    : []
+
   return {
     id: str(r['id']),
     orgId: str(r['orgId']),
@@ -167,6 +210,11 @@ export function adaptFailurePattern(raw: unknown): AdaptedFailurePattern {
     ...(resolutionNote !== undefined && { resolutionNote }),
     ...(resolutionRef !== undefined && { resolutionRef }),
     ...(regressedAt !== undefined && { regressedAt }),
+    ...(resolvedInVersionId !== undefined && { resolvedInVersionId }),
+    ...(resolvedAtRunCount !== undefined && { resolvedAtRunCount }),
+    ...(resolvedAtOccurrenceCount !== undefined && { resolvedAtOccurrenceCount }),
+    affectedAgentIds,
+    hasAffectedAgents: Array.isArray(r['affectedAgentIds']),
   }
 }
 
@@ -201,6 +249,209 @@ export interface AdaptedFailurePatternDetail {
   pattern: AdaptedFailurePattern
   recentOccurrences: FailurePatternOccurrence[]
   trend: FailurePatternTrendPoint[]
+}
+
+// ---------------------------------------------------------------------------
+// Fix confidence (cycle 2) — "did the fix hold?"
+//
+// Team B's `fixConfidence()` and its result type live in `convex/insights.ts`,
+// which this layer must NOT import: per CLAUDE.md components use the service
+// seam, never Convex directly. The types below are therefore a UI-side MIRROR
+// of `FixConfidenceResult` — deliberately structural, adapted defensively from
+// `unknown`, so a shape change on Team B's side degrades to "not scored"
+// rather than a crash or, worse, a confident-looking render of garbage.
+//
+// The MATH is never reimplemented here. This layer only ever ADAPTS a score
+// that Team B computed; if the service does not supply one, the UI says so.
+// ---------------------------------------------------------------------------
+
+export type FixConfidenceState = 'unproven' | 'proving' | 'confirmed' | 'regressed'
+export type FixVersionAttribution = 'matched' | 'mismatched' | 'unknown'
+export type FixConfidenceLimit =
+  | 'recurrence'
+  | 'no-resolution'
+  | 'version-mismatch'
+  | 'no-exposure'
+  | 'accumulating'
+  | 'none'
+
+/**
+ * The confidence ceiling, mirrored from Team B's `FIX_CONFIDENCE_MAX`. It is
+ * 0.95 and never 1.0 — no finite observation window proves the absence of a
+ * rare failure — and the UI renders the score AGAINST this ceiling ("0.62 /
+ * 0.95") rather than as a percentage, precisely so nothing ever reads as
+ * "100% certain".
+ */
+export const FIX_CONFIDENCE_MAX = 0.95
+
+/** UI-side mirror of Team B's `FixConfidenceResult`. Score is 0..0.95 (NOT 0-100 — `healthScore`/`provenHealthScore` are the 0-100 fields, a different unit). */
+export interface AdaptedFixConfidence {
+  score: number
+  state: FixConfidenceState
+  /** Runs that actually count as exposure — zeroed on version mismatch. */
+  exposureRuns: number
+  /** Raw post-resolution runs BEFORE version attribution was applied. */
+  observedRuns: number
+  versionAttribution: FixVersionAttribution
+  elapsedMs: number
+  recurred: boolean
+  hasResolution: boolean
+  exposureMeasured: boolean
+  /** 0..1, intended for direct rendering as a bar fill. */
+  exposureCredit: number
+  /** 0..1, intended for direct rendering as a bar fill. */
+  soakCredit: number
+  limitingFactor: FixConfidenceLimit
+}
+
+function clamp01(v: unknown): number {
+  const n = num(v)
+  return n < 0 ? 0 : n > 1 ? 1 : n
+}
+
+/**
+ * Adapts a raw fix-confidence result. Returns `null` when the object isn't
+ * present or carries no usable `state` — absence means NOT APPLICABLE (the
+ * pattern was never resolved, so there is nothing to prove), which is a
+ * different fact from `unproven` and must never be rendered as one.
+ */
+export function adaptFixConfidence(raw: unknown): AdaptedFixConfidence | null {
+  if (!isRecord(raw)) return null
+  const s = raw['state']
+  const state: FixConfidenceState | null =
+    s === 'unproven' || s === 'proving' || s === 'confirmed' || s === 'regressed' ? s : null
+  if (state === null) return null
+
+  const attribution = raw['versionAttribution']
+  const versionAttribution: FixVersionAttribution =
+    attribution === 'matched' || attribution === 'mismatched' ? attribution : 'unknown'
+
+  const limit = raw['limitingFactor']
+  const limitingFactor: FixConfidenceLimit =
+    limit === 'recurrence' ||
+    limit === 'no-resolution' ||
+    limit === 'version-mismatch' ||
+    limit === 'no-exposure' ||
+    limit === 'accumulating' ||
+    limit === 'none'
+      ? limit
+      : 'accumulating'
+
+  const score = num(raw['score'])
+  return {
+    score: score < 0 ? 0 : score > FIX_CONFIDENCE_MAX ? FIX_CONFIDENCE_MAX : score,
+    state,
+    exposureRuns: Math.max(0, num(raw['exposureRuns'])),
+    observedRuns: Math.max(0, num(raw['observedRuns'])),
+    versionAttribution,
+    elapsedMs: Math.max(0, num(raw['elapsedMs'])),
+    recurred: raw['recurred'] === true,
+    hasResolution: raw['hasResolution'] === true,
+    exposureMeasured: raw['exposureMeasured'] === true,
+    exposureCredit: clamp01(raw['exposureCredit']),
+    soakCredit: clamp01(raw['soakCredit']),
+    limitingFactor,
+  }
+}
+
+/** Adapts one raw lifecycle transition from the append-only audit log. */
+export function adaptLifecycleTransition(raw: unknown): PatternLifecycleTransition {
+  const r = isRecord(raw) ? raw : {}
+  return {
+    action: str(r['action']),
+    actorClerkUserId: str(r['actorClerkUserId']),
+    timestamp: num(r['timestamp']),
+    ...(r['metadata'] !== undefined && { metadata: r['metadata'] }),
+  }
+}
+
+function adaptResolutionMetadata(raw: unknown): PatternResolutionMetadata | null {
+  if (!isRecord(raw)) return null
+  const resolvedAt = raw['resolvedAt']
+  if (typeof resolvedAt !== 'number' || !Number.isFinite(resolvedAt)) return null
+  return {
+    resolvedAt,
+    ...(typeof raw['resolvedByUserId'] === 'string' && { resolvedByUserId: raw['resolvedByUserId'] }),
+    ...(typeof raw['resolutionNote'] === 'string' && { resolutionNote: raw['resolutionNote'] }),
+    ...(typeof raw['resolutionRef'] === 'string' && { resolutionRef: raw['resolutionRef'] }),
+    ...(typeof raw['resolvedInVersionId'] === 'string' && { resolvedInVersionId: raw['resolvedInVersionId'] }),
+    ...(typeof raw['resolvedInVersion'] === 'string' && { resolvedInVersion: raw['resolvedInVersion'] }),
+    ...(typeof raw['resolvedAtOccurrenceCount'] === 'number' && {
+      resolvedAtOccurrenceCount: raw['resolvedAtOccurrenceCount'],
+    }),
+    ...(typeof raw['resolvedAtRunCount'] === 'number' && { resolvedAtRunCount: raw['resolvedAtRunCount'] }),
+  }
+}
+
+function adaptResolutionExposure(raw: unknown): PatternResolutionExposure | null {
+  if (!isRecord(raw)) return null
+  const since = raw['since']
+  if (typeof since !== 'number' || !Number.isFinite(since)) return null
+  return {
+    since,
+    runCount: Math.max(0, num(raw['runCount'])),
+    runCountTruncated: raw['runCountTruncated'] === true,
+    recurrenceCount: Math.max(0, num(raw['recurrenceCount'])),
+    ...(typeof raw['baselineRunCount'] === 'number' && { baselineRunCount: raw['baselineRunCount'] }),
+    agentIds: Array.isArray(raw['agentIds'])
+      ? (raw['agentIds'] as unknown[]).filter((x): x is string => typeof x === 'string')
+      : [],
+    heldSoFar: raw['heldSoFar'] === true,
+  }
+}
+
+/** The adapted `getPatternResolutionEvidence` projection, plus the confidence score when the service supplied one. */
+export interface AdaptedResolutionEvidence {
+  /** Null when there is no live resolution to evidence — never resolved, or MANUALLY reopened (which clears `resolvedAt`). */
+  resolution: PatternResolutionMetadata | null
+  /** Null exactly when `resolution` is null. */
+  exposure: PatternResolutionExposure | null
+  /** Oldest-first lifecycle history reconstructed from the append-only audit log. */
+  transitions: PatternLifecycleTransition[]
+  /** Null when the service did not score this pattern (never resolved => not applicable, or confidence not wired yet). */
+  confidence: AdaptedFixConfidence | null
+}
+
+/** Adapts a raw `getPatternResolutionEvidence` result. Returns `null` for a missing/unusable payload so callers render an explicit "no evidence" state. */
+export function adaptResolutionEvidence(raw: unknown): AdaptedResolutionEvidence | null {
+  if (!isRecord(raw)) return null
+  return {
+    resolution: adaptResolutionMetadata(raw['resolution']),
+    exposure: adaptResolutionExposure(raw['exposure']),
+    transitions: Array.isArray(raw['transitions']) ? raw['transitions'].map(adaptLifecycleTransition) : [],
+    confidence: adaptFixConfidence(raw['confidence']),
+  }
+}
+
+/**
+ * Fetches resolution evidence across the service seam
+ * (`failure_patterns:getPatternResolutionEvidence` via Team C's service).
+ *
+ * Returns a discriminated result rather than throwing, so the page renders an
+ * honest "evidence unavailable" panel instead of a blank screen — and, in
+ * particular, never renders a resolved pattern as if it were proven merely
+ * because the evidence query failed. A silently omitted evidence section is
+ * indistinguishable from a proven fix, which is the confusion this whole
+ * cycle exists to remove.
+ *
+ * `unavailable` (a `null` result) is the tenancy-collapsed "no such
+ * fingerprint in this org" outcome, deliberately indistinguishable from
+ * "belongs to another org" — see the service function's own comment.
+ */
+export type ResolutionEvidenceFetch =
+  | { status: 'ready'; evidence: AdaptedResolutionEvidence }
+  | { status: 'unavailable' }
+  | { status: 'error'; message: string }
+
+export async function loadPatternResolutionEvidence(fingerprintHash: string): Promise<ResolutionEvidenceFetch> {
+  try {
+    const { getPatternResolutionEvidence } = await import('@/lib/services/failurePatterns')
+    const raw = await getPatternResolutionEvidence(fingerprintHash)
+    const evidence = adaptResolutionEvidence(raw)
+    return evidence ? { status: 'ready', evidence } : { status: 'unavailable' }
+  } catch (err) {
+    return { status: 'error', message: err instanceof Error ? err.message : 'Failed to load resolution evidence' }
+  }
 }
 
 /** Adapts a raw `getFailurePatternDetail`/`getFailurePattern` result into the real contract detail shape. */

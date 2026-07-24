@@ -199,6 +199,73 @@ export interface PatternResolutionExposure {
   heldSoFar: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Fix confidence (docs/adr/006-failure-resolution.md cycle 2). The scoring
+// ENGINE lives in convex/insights.ts §12 and is the single source of truth for
+// the math; these are the CANONICAL type declarations for its vocabulary and
+// result shape, per CLAUDE.md ("all shared entity types live in
+// packages/contracts only"). The SDK, CLI, and web forwarder previously each
+// mirrored these unions locally because they cannot import a Convex module —
+// those mirrors should now collapse onto these types.
+//
+// Keep the literals here EXACTLY in step with convex/insights.ts. They are not
+// decoration: build gates are written against them (e.g. `state !==
+// "regressed"`), and a lagging mirror stays self-consistent — and therefore
+// silently type-checks — while no longer matching what it was written to
+// catch.
+// ---------------------------------------------------------------------------
+
+/**
+ * Lifecycle verdict on a claimed fix.
+ * - `unproven`  — asserted, but nothing has exercised the path yet.
+ * - `proving`   — real exposure is accumulating without recurrence.
+ * - `confirmed` — enough clean exposure to act on.
+ * - `regressed` — the pattern came back after the resolution.
+ */
+export type FixConfidenceState = "unproven" | "proving" | "confirmed" | "regressed";
+
+/** Whether the exposure runs can be attributed to the version the fix shipped in. */
+export type FixVersionAttribution = "matched" | "mismatched" | "unknown";
+
+/** Why the score is not higher. For UI explanation; ordered by the engine's precedence. */
+export type FixConfidenceLimit =
+  | "recurrence"
+  | "no-resolution"
+  | "version-mismatch"
+  | "no-exposure"
+  | "accumulating"
+  | "none";
+
+/**
+ * The inspectable result of the fix-confidence engine. The score is
+ * deliberately accompanied by every input that produced it: an engineer must
+ * be able to read "0.42 because 21 runs over 2 days on the matching version,
+ * no recurrence" rather than being handed a bare number to trust. Consumers
+ * should render the drivers, not just `score`.
+ */
+export interface FixConfidenceResult {
+  /** 0..0.95, rounded to 4 decimals. Never NaN. */
+  score: number;
+  state: FixConfidenceState;
+  /** Runs that actually count as exposure — sanitized, and ZEROED on version mismatch. */
+  exposureRuns: number;
+  /** Sanitized post-resolution run count BEFORE version attribution was applied. */
+  observedRuns: number;
+  versionAttribution: FixVersionAttribution;
+  /** `now - resolvedAt`, clamped to >= 0. `0` when there is no usable resolution. */
+  elapsedMs: number;
+  recurred: boolean;
+  /** Whether a usable (finite) `resolvedAt` was supplied at all. */
+  hasResolution: boolean;
+  /** Whether exposure was measured at all (vs. left undefined). */
+  exposureMeasured: boolean;
+  /** 0..1 — share of the exposure bar filled. */
+  exposureCredit: number;
+  /** 0..1 — share of the soak bar filled. */
+  soakCredit: number;
+  limitingFactor: FixConfidenceLimit;
+}
+
 /** `getPatternResolutionEvidence`'s full shape. */
 export interface PatternResolutionEvidence {
   pattern: FailurePattern;
@@ -206,6 +273,18 @@ export interface PatternResolutionEvidence {
   resolution: PatternResolutionMetadata | null;
   /** Null exactly when `resolution` is null — exposure is always measured from a `resolvedAt`. */
   exposure: PatternResolutionExposure | null;
+  /**
+   * The full inspectable fix-confidence verdict — score AND every driver
+   * behind it. Computed server-side against the SERVER clock (soak credit is
+   * time-dependent, so a client-supplied clock would be forgeable into a
+   * `confirmed` verdict).
+   *
+   * Null on precisely the same condition as `resolution`/`exposure`: no
+   * resolution means there is nothing to score. NOT null after an automatic
+   * regression reopen — that path keeps `resolvedAt`, so this carries a
+   * `state: "regressed"`, `score: 0` verdict with real numbers behind it.
+   */
+  confidence: FixConfidenceResult | null;
   /** Oldest-first, bounded to the 100 most recent transitions. */
   transitions: PatternLifecycleTransition[];
 }

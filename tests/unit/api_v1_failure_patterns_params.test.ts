@@ -70,6 +70,10 @@ const PARAM_TABLE: { name: keyof ApiV1ListFailurePatternsParams; value: unknown 
   { name: 'muted', value: true },
   { name: 'status', value: 'resolved' },
   { name: 'regressed', value: true },
+  // ADR-006 cycle 2: the fix-confidence state filter (Team B's vocabulary,
+  // convex/insights.ts §12). Added to this table in the SAME commit as the
+  // param itself — that ordering is the whole point of this file.
+  { name: 'state', value: 'regressed' },
   { name: 'limit', value: 25 },
   { name: 'cursor', value: 'cursor_abc' },
 ]
@@ -93,6 +97,7 @@ describe('apiListFailurePatterns — every declared param reaches the Convex mut
       muted: false,
       status: 'acknowledged',
       regressed: true,
+      state: 'regressed',
       limit: 10,
       cursor: 'cursor_xyz',
     }
@@ -106,9 +111,23 @@ describe('apiListFailurePatterns — every declared param reaches the Convex mut
       muted: false,
       status: 'acknowledged',
       regressed: true,
+      state: 'regressed',
       limit: 10,
       cursor: 'cursor_xyz',
     })
+  })
+
+  /**
+   * `status` (the human lifecycle label) and `state` (the EVIDENCE grade) are
+   * different axes that happen to share the word "resolved"/"regressed" in
+   * their vocabularies, and they are forwarded as two independent params.
+   * Pinned explicitly because collapsing them — or forwarding one under the
+   * other's key — would be invisible to TypeScript across the string ref.
+   */
+  it('forwards status and state as independent params', async () => {
+    await apiListFailurePatterns('hashed_key', { status: 'open', state: 'regressed' })
+    const [, args] = mutationMock.mock.calls[0]!
+    expect(args).toEqual({ apiKeyHash: 'hashed_key', status: 'open', state: 'regressed' })
   })
 
   it('omits undeclared/undefined params entirely (never a stray `undefined` key)', async () => {

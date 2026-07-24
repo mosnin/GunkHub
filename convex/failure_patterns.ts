@@ -51,9 +51,22 @@ import { getAuthContext, requireOrgMembership } from "./auth.js";
 import { afrError } from "./helpers/errors.js";
 import { MAX_RESOLUTION_NOTE_LENGTH, MAX_RESOLUTION_REF_LENGTH } from "./helpers/pagination.js";
 import * as insightsModule from "./insights.js";
+// STATIC import, deliberately UNLIKE the guarded dynamic lookups used for
+// deriveFailureFingerprint/assessPatternSpike/assessPatternSpikeTransition
+// above. Those are guarded because this file had to ship BEFORE Team B's
+// exports existed, and a thin local fallback was an acceptable stand-in for
+// them. `fixConfidence` is neither: it has landed (convex/insights.ts §12), it
+// is the SINGLE SOURCE OF TRUTH for the confidence math, and a local fallback
+// would be a second copy of that math — a divergence bug by construction, and
+// exactly the silent-degradation this import is here to prevent. If it ever
+// disappears, this file must fail to typecheck LOUDLY rather than quietly
+// serve a made-up number. (No import cycle: insights.ts does not import this
+// module.)
+import { fixConfidence } from "./insights.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
 import type { MutationCtx, QueryCtx } from "./_generated/server.js";
+import type { FixConfidenceResult } from "./insights.js";
 
 // ---------------------------------------------------------------------------
 // Write ceilings (local to this file — see the module doc comment for why
@@ -985,6 +998,13 @@ export interface RunExposureCount {
   count: number;
   /** True when RESOLUTION_RUN_SCAN_CAP was reached — `count` is a floor, not an exact total. */
   truncated: boolean;
+  /**
+   * Distinct, non-null `agentVersionId`s seen across the counted runs, capped
+   * at MAX_AFFECTED_AGENT_VERSION_IDS. Feeds `fixConfidence`'s version
+   * attribution — see `exposureVersionIdFor` for why only a SINGLETON set is
+   * ever forwarded to the engine.
+   */
+  versionIds: Id<"agent_versions">[];
 }
 
 /**
@@ -1017,9 +1037,22 @@ async function countRunsStartedInWindow(
   untilInclusive?: number,
 ): Promise<RunExposureCount> {
   let count = 0;
+  const versionIds: Id<"agent_versions">[] = [];
+  const noteVersions = (rows: Doc<"runs">[]): void => {
+    for (const row of rows) {
+      if (
+        row.agentVersionId !== undefined &&
+        !versionIds.includes(row.agentVersionId) &&
+        versionIds.length < MAX_AFFECTED_AGENT_VERSION_IDS
+      ) {
+        versionIds.push(row.agentVersionId);
+      }
+    }
+  };
+
   for (const agentId of agentIds) {
     const remaining = RESOLUTION_RUN_SCAN_CAP - count;
-    if (remaining <= 0) return { count, truncated: true };
+    if (remaining <= 0) return { count, truncated: true, versionIds };
 
     // take(remaining + 1) so hitting the ceiling is DETECTABLE (a full page
     // plus one) rather than indistinguishable from "exactly `remaining` runs".
@@ -1031,10 +1064,43 @@ async function countRunsStartedInWindow(
       })
       .take(remaining + 1);
 
-    if (rows.length > remaining) return { count: RESOLUTION_RUN_SCAN_CAP, truncated: true };
+    if (rows.length > remaining) {
+      noteVersions(rows.slice(0, remaining));
+      return { count: RESOLUTION_RUN_SCAN_CAP, truncated: true, versionIds };
+    }
+    noteVersions(rows);
     count += rows.length;
   }
-  return { count, truncated: false };
+  return { count, truncated: false, versionIds };
+}
+
+/**
+ * The `exposureVersionId` to hand `fixConfidence`, given the distinct versions
+ * the post-resolution runs actually executed on.
+ *
+ * ONLY a singleton set is forwarded. This is the load-bearing half of version
+ * attribution and it is deliberately asymmetric, because the engine's two
+ * outcomes are not equally safe:
+ *   - Forwarding an id that DIFFERS from `resolvedInVersionId` zeroes
+ *     `exposureRuns` outright (`versionAttribution: "mismatched"`), which
+ *     would report a genuinely well-tested fix as `unproven`.
+ *   - Forwarding NOTHING yields `"unknown"`, which credits the exposure as
+ *     observed.
+ * So we forward an id only when we can say, without ambiguity, "every counted
+ * run executed on exactly this version." If the exposure spans several
+ * versions, or none of the runs recorded a version at all, there is no single
+ * honest answer and `undefined` is the correct one — mirroring the engine's
+ * own stated rule that a caller who cannot say which version ran should not be
+ * punished for it, only one who says it was the wrong one.
+ *
+ * A TRUNCATED scan still forwards a singleton: seeing one version across
+ * RESOLUTION_RUN_SCAN_CAP runs is strong evidence, and the only outcome it can
+ * produce that `undefined` would not is a "mismatched" verdict — which, at
+ * that volume, is a real signal that the exposure tested a different build,
+ * not an artifact of the cap.
+ */
+function exposureVersionIdFor(versionIds: Id<"agent_versions">[]): Id<"agent_versions"> | undefined {
+  return versionIds.length === 1 ? versionIds[0] : undefined;
 }
 
 /**
@@ -1297,6 +1363,21 @@ export interface PatternResolutionEvidenceResult {
   resolution: PatternResolutionMetadata | null;
   /** Null exactly when `resolution` is null — exposure is always measured from a resolvedAt. */
   exposure: PatternResolutionExposure | null;
+  /**
+   * The FULL inspectable verdict from `convex/insights.ts`'s `fixConfidence`
+   * — score AND every driver that produced it (exposureRuns, observedRuns,
+   * elapsedMs, recurred, exposureCredit, soakCredit, limitingFactor,
+   * versionAttribution), never a bare number: a confidence score an engineer
+   * cannot audit is exactly the unearned assertion this cycle exists to
+   * replace.
+   *
+   * Null on precisely the same condition as `resolution`/`exposure` — no
+   * resolution means there is nothing to score. NOT null after the regression
+   * guard's auto-reopen: that path deliberately keeps `resolvedAt`, so this
+   * carries a `state: "regressed"`, `score: 0` verdict with the real numbers
+   * behind it — the "your fix didn't hold" case.
+   */
+  confidence: FixConfidenceResult | null;
   /** Oldest-first, bounded to MAX_PATTERN_LIFECYCLE_TRANSITIONS. */
   transitions: PatternLifecycleTransition[];
 }
@@ -1365,7 +1446,7 @@ export const getPatternResolutionEvidence = query({
     // regression guard's auto-reopen, which keeps resolvedAt precisely so
     // the "your fix didn't hold" evidence below stays computable.
     if (pattern.resolvedAt === undefined) {
-      return { pattern, resolution: null, exposure: null, transitions };
+      return { pattern, resolution: null, exposure: null, confidence: null, transitions };
     }
 
     const resolvedInVersion =
@@ -1414,7 +1495,30 @@ export const getPatternResolutionEvidence = query({
       heldSoFar: recurrenceCount === 0,
     };
 
-    return { pattern, resolution, exposure, transitions };
+    // SERVER CLOCK, never a client-supplied one. Confidence is time-dependent
+    // (soak credit grows with `nowMs - resolvedAt`), so accepting `nowMs` as
+    // an argument would let any caller mint a `confirmed` verdict by claiming
+    // a date far in the future. This query takes no time argument at all —
+    // that is the enforcement, not a validation rule that could be relaxed.
+    const confidence = fixConfidence(
+      {
+        resolvedAt: pattern.resolvedAt,
+        resolvedInVersionId: pattern.resolvedInVersionId,
+        // Only ever a version every counted run agreed on — see
+        // exposureVersionIdFor for why a mismatch must never be guessed.
+        exposureVersionId: exposureVersionIdFor(exposureRuns.versionIds),
+        postResolutionRuns: exposureRuns.count,
+        // Team B's own `fixConfidenceInputFor` maps `recurredAt` onto the
+        // lifecycle's `regressedAt`; this is the same wiring from the rollup.
+        // The engine — not this file — decides whether the stamp counts
+        // (a `regressedAt` at or before `resolvedAt` is the occurrence that
+        // PROMPTED the fix, not a recurrence of it).
+        recurredAt: pattern.regressedAt,
+      },
+      Date.now(),
+    );
+
+    return { pattern, resolution, exposure, confidence, transitions };
   },
 });
 

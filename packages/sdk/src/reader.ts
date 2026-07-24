@@ -28,6 +28,8 @@ import type {
   FailurePattern,
   FailurePatternStatus,
   FailureSummary,
+  FixConfidenceState,
+  PatternResolutionEvidence,
   ReplayProjection,
   Run,
   RunExplanation,
@@ -120,6 +122,35 @@ export interface V1ListFailurePatternsData {
   nextCursor?: string
 }
 
+// ---------------------------------------------------------------------------
+// Fix confidence (ADR-006 cycle 2 — "prove the fix held").
+//
+// The scoring ENGINE is convex/insights.ts §12; the canonical TYPES are in
+// `@agent-flight-recorder/contracts` (>= 0.9.0) and are re-exported here so
+// SDK consumers get them from one import, exactly as `FailurePattern` and
+// `FailurePatternStatus` already are.
+//
+// These were briefly mirrored locally in this file, because a published npm
+// package cannot import a Convex module and contracts did not yet carry them.
+// That duplication is gone: one declaration, in contracts, per CLAUDE.md.
+// tests/unit/fix_confidence_vocab.test.ts pins the contracts literals against
+// convex/insights.ts, since that seam is still hand-maintained.
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /api/v1/patterns/:fingerprintHash/evidence` — the full "did the fix
+ * hold?" projection. Structurally identical to the Clerk-authed
+ * `getPatternResolutionEvidence` shape, so both doors return the same thing.
+ *
+ * Reading the numbers correctly: `confidence.score` is a 0-1 fraction capped
+ * at 0.95 (never a percentage, never 1.0); `exposure.runCount` is a FLOOR
+ * when `exposure.runCountTruncated` is true; `exposure.baselineRunCount` is a
+ * 14-day TRAILING baseline for comparison and must never be subtracted from
+ * `runCount`; and `heldSoFar: true` with `runCount: 0` means untested, which
+ * `confidence.state` reports as `'unproven'`.
+ */
+export type V1PatternEvidenceData = PatternResolutionEvidence
+
 export interface ListFailurePatternsParams {
   /** Narrow to patterns that have been seen on at least one version of this agent. */
   agentId?: string
@@ -157,6 +188,28 @@ export interface ListFailurePatternsParams {
    * pass `false`) to see patterns regardless of regression state.
    */
   regressed?: boolean
+  /**
+   * FIX-CONFIDENCE state filter (ADR-006 cycle 2) — a different axis from
+   * {@link ListFailurePatternsParams.status}: `status` is what a human
+   * ASSERTED about a pattern, `state` is what the EVIDENCE supports.
+   *
+   * Only `'regressed'` is answerable on the list endpoint. The other three
+   * states depend on per-pattern post-resolution run exposure, which cannot
+   * be measured across a whole page of patterns; passing them raises a
+   * `V1ApiError` (`kind: 'server'`, HTTP 422) rather than silently returning
+   * an unfiltered or empty page. Use
+   * {@link FlightReader.getFailurePatternEvidence} for those, one pattern at
+   * a time.
+   *
+   * PREFER THIS OVER `regressed` FOR CI. `regressed: true` matches any
+   * pattern with `regressedAt` set — including one whose regression PREDATES
+   * its current resolution (it regressed, was genuinely re-fixed, and was
+   * re-resolved; `resolvePattern` deliberately preserves `regressedAt` as
+   * history). `state: 'regressed'` matches only a recurrence strictly after
+   * the live `resolvedAt` — a fix that actually did not hold. A build gate
+   * built on the boolean will fail on patterns that are already fixed again.
+   */
+  state?: FixConfidenceState
   limit?: number
   cursor?: string
 }
@@ -406,9 +459,50 @@ export class FlightReader {
         ...(filters.muted !== undefined && { muted: filters.muted }),
         ...(filters.status !== undefined && { status: filters.status }),
         ...(filters.regressed !== undefined && { regressed: filters.regressed }),
+        ...(filters.state !== undefined && { state: filters.state }),
         limit: filters.limit,
         cursor: filters.cursor,
       },
+      this.fetchImpl
+    )
+  }
+
+  /**
+   * Evidence that a failure pattern's fix actually held (ADR-006 cycle 2).
+   *
+   * A resolution on its own is an unearned human assertion: someone marked it
+   * fixed and the product believed them. This returns what can be checked
+   * against that claim — the resolution itself, the run exposure accumulated
+   * since, the lifecycle transition history (from the append-only audit log,
+   * including the regression guard's automatic reopens), and a graded
+   * {@link FixConfidence} verdict over all of it.
+   *
+   * READ-ONLY, like everything on this class. There is no method here to
+   * acknowledge, resolve, or reopen a pattern: those are member-gated,
+   * audited, Clerk-authed actions in the web app. An API key has no human
+   * actor, and the audit log exists to record which person made a privileged
+   * change. Reading proof that a fix held needs no actor; asserting that it
+   * held does.
+   *
+   * SCRIPTING THIS IN CI: `confidence.state === 'regressed'` is the
+   * build-failing signal ("a fix we called done came back"). Do not gate on
+   * `heldSoFar` alone — it is `true` for a fix nothing has exercised yet;
+   * pair it with `exposure.runCount`, or just read `confidence.state`, which
+   * already encodes that distinction as `'unproven'`.
+   *
+   * @param fingerprintHash - the pattern's fingerprint hash.
+   * @returns the full evidence projection. `resolution`/`exposure`/
+   *   `confidence` are all null together when the pattern has no live
+   *   resolution to evidence.
+   * @throws {@link V1ApiError} with `kind: 'not_found'` when the fingerprint
+   *   is unknown to this key's organization — "never existed" and "belongs to
+   *   another org" are deliberately indistinguishable.
+   */
+  getFailurePatternEvidence(fingerprintHash: string): Promise<V1PatternEvidenceData> {
+    return fetchV1<V1PatternEvidenceData>(
+      this.config,
+      `/api/v1/patterns/${encodeURIComponent(fingerprintHash)}/evidence`,
+      {},
       this.fetchImpl
     )
   }

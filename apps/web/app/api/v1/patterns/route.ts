@@ -60,6 +60,25 @@ export const GET = withApiHandler(
       rawStatus === 'open' || rawStatus === 'acknowledged' || rawStatus === 'resolved' ? rawStatus : undefined
     // --regressed: same "true" opts in, anything else unset pattern as --spiking.
     const regressed = sp.get('regressed') === 'true' ? true : undefined
+    // --state (ADR-006 cycle 2): the FIX-CONFIDENCE grade, Team B's
+    // `FixConfidenceState` vocabulary verbatim. Parsed permissively like every
+    // other filter here — only the four known literals opt in, anything else
+    // is treated as unset rather than rejected at this layer.
+    //
+    // NOTE the deliberate asymmetry with that permissiveness: a RECOGNIZED but
+    // unanswerable value ('unproven'/'proving'/'confirmed') is forwarded and
+    // then rejected by Convex with INVALID_ARGUMENT -> 422. That is the point.
+    // Those three depend on per-pattern post-resolution run exposure, which
+    // cannot be measured across a whole page, and silently returning an
+    // unfiltered page for them would be precisely the silent-filter-drop bug
+    // this route family has already shipped once. Only 'regressed' is
+    // exposure-independent and therefore answerable here; the per-pattern
+    // evidence endpoint answers the rest.
+    const rawState = sp.get('state')
+    const state =
+      rawState === 'unproven' || rawState === 'proving' || rawState === 'confirmed' || rawState === 'regressed'
+        ? rawState
+        : undefined
 
     try {
       const result = await apiListFailurePatterns(hashApiKey(apiKey), {
@@ -68,6 +87,7 @@ export const GET = withApiHandler(
         ...(muted !== undefined && { muted }),
         ...(status !== undefined && { status }),
         ...(regressed !== undefined && { regressed }),
+        ...(state !== undefined && { state }),
         ...(limit !== undefined && { limit }),
         ...(sp.get('cursor') !== null && { cursor: sp.get('cursor') as string }),
       })

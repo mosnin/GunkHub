@@ -1,8 +1,9 @@
 import Link from 'next/link'
 
-import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
+import type { AdaptedFailurePattern, AdaptedFixConfidence } from '@/components/patterns/adapt'
 
 import { isRegressedPattern } from '@/components/patterns/adapt'
+import { FixConfidenceBadge } from '@/components/patterns/FixConfidenceBadge'
 import { MutedBadge } from '@/components/patterns/MutedBadge'
 import { PatternStatusBadge } from '@/components/patterns/PatternStatusBadge'
 import { SpikeBadge } from '@/components/patterns/SpikeBadge'
@@ -11,6 +12,21 @@ import { formatRelativeTime, truncateId } from '@/lib/utils'
 
 interface PatternRowProps {
   pattern: AdaptedFailurePattern
+  /**
+   * Fix confidence for this row, when the caller has it.
+   *
+   * Rendered INSIDE the existing Status cell rather than as a new column, so
+   * the table's column widths stay stable whether or not confidence is
+   * available — a list that reflows depending on which rows happen to be
+   * resolved is unscannable.
+   *
+   * `null`/absent means "not scored", which renders nothing at all. It must
+   * never fall back to `unproven`: a pattern that was never resolved has no
+   * fix to prove, and a row we simply haven't scored is not evidence of
+   * anything. Post-resolution exposure is live-derived per pattern and is not
+   * on the rollup, so the list only shows this where a caller supplies it.
+   */
+  confidence?: AdaptedFixConfidence | null
 }
 
 function formatFailureClass(cls: string): string {
@@ -23,7 +39,7 @@ function formatFailureClass(cls: string): string {
  * `tabIndex={-1} aria-hidden` Link so clicking anywhere in the row navigates
  * without duplicating focus stops.
  */
-export function PatternRow({ pattern }: PatternRowProps) {
+export function PatternRow({ pattern, confidence }: PatternRowProps) {
   const href = `/patterns/${encodeURIComponent(pattern.fingerprintHash)}`
   const isSpiking = pattern.lastSpikeAssessment?.isSpiking === true
   const regressed = isRegressedPattern(pattern)
@@ -79,6 +95,10 @@ export function PatternRow({ pattern }: PatternRowProps) {
       <td className="px-4 py-3">
         <Link href={href} tabIndex={-1} aria-hidden className="inline-flex items-center gap-1.5 flex-wrap">
           <PatternStatusBadge status={pattern.status} regressed={regressed} />
+          {/* A resolved row and a PROVEN resolved row must not read the same.
+              Suppressed on regressed rows, where the status badge already
+              says it louder and two pulsing badges would be noise. */}
+          {confidence && !regressed && <FixConfidenceBadge state={confidence.state} compact />}
         </Link>
       </td>
       <td className="px-4 py-3">

@@ -31,6 +31,7 @@ import {
   isValidationError,
   MAX_RESOLUTION_NOTE_LENGTH,
   MAX_RESOLUTION_REF_LENGTH,
+  MAX_RESOLUTION_VERSION_ID_LENGTH,
   validateResolveBody,
 } from '../../apps/web/src/lib/services/resolutionFieldValidation.js'
 
@@ -158,6 +159,97 @@ describe('acknowledge/resolve/reopen — member-gate error mapping (not admin-ga
 
   it('an unrecognized convex error is left for the route to rethrow (never silently 200s)', () => {
     expect(mapApiError(new Error('totally unexpected convex internal failure'), REQUEST_ID)).toBeNull()
+  })
+})
+
+describe('resolve body validation — versionId (cycle 2)', () => {
+  const VALID_ID = 'jd7dkq9dnp4qz5zqsz8h8fhr7s6z0z8j'
+
+  it('accepts a well-formed versionId', () => {
+    const result = validateResolveBody({ versionId: VALID_ID })
+    expect(isValidationError(result)).toBe(false)
+    expect(result).toEqual({ versionId: VALID_ID })
+  })
+
+  it('accepts a body with note, ref and versionId together', () => {
+    const result = validateResolveBody({ note: 'fixed', ref: 'PR-42', versionId: VALID_ID })
+    expect(result).toEqual({ note: 'fixed', ref: 'PR-42', versionId: VALID_ID })
+  })
+
+  it('treats an absent versionId as absent (resolve without naming a version is still valid)', () => {
+    expect(validateResolveBody({ note: 'fixed' })).toEqual({ note: 'fixed' })
+  })
+
+  it('treats an explicit null versionId as absent, so a cleared form field is not a 422', () => {
+    const result = validateResolveBody({ versionId: null })
+    expect(isValidationError(result)).toBe(false)
+    // Never forwarded as null — the key is simply not present.
+    expect(Object.keys(result)).not.toContain('versionId')
+  })
+
+  it('rejects a non-string versionId', () => {
+    const result = validateResolveBody({ versionId: 42 })
+    expect(isValidationError(result)).toBe(true)
+  })
+
+  it('rejects an empty or whitespace-bearing versionId before any Convex call', () => {
+    expect(isValidationError(validateResolveBody({ versionId: '' }))).toBe(true)
+    expect(isValidationError(validateResolveBody({ versionId: '   ' }))).toBe(true)
+    expect(isValidationError(validateResolveBody({ versionId: 'ver 1' }))).toBe(true)
+  })
+
+  it('rejects a versionId over the length ceiling', () => {
+    const tooLong = 'a'.repeat(MAX_RESOLUTION_VERSION_ID_LENGTH + 1)
+    expect(isValidationError(validateResolveBody({ versionId: tooLong }))).toBe(true)
+  })
+
+  it('rejects path-traversal-ish junk in versionId', () => {
+    expect(isValidationError(validateResolveBody({ versionId: '../../etc/passwd' }))).toBe(true)
+  })
+})
+
+describe('resolve — versionId rejection stays a real 4xx, never degraded to 404', () => {
+  const REQUEST_ID = 'req-resolution-3'
+  /**
+   * Team A rejects an unknown / cross-org / cross-agent versionId with ONE
+   * uniform INVALID_ARGUMENT message (so the error cannot be used as an
+   * existence oracle for another org's versions). Verbatim from
+   * convex/failure_patterns.ts's INVALID_RESOLUTION_VERSION_MESSAGE.
+   */
+  const REJECTION = `INVALID_ARGUMENT: versionId must reference an agent version in this organization that belongs to an agent this pattern has been observed on`
+
+  it('maps the version rejection to a real 422, not a generic 500', async () => {
+    const res = mapApiError(new Error(REJECTION), REQUEST_ID)
+    expect(res).not.toBeNull()
+    expect(res!.status).toBe(422)
+    const body = (await res!.json()) as { code: string; message: string }
+    expect(body.code).toBe('INVALID_ARGUMENT')
+  })
+
+  it('surfaces a message the operator can actually act on', async () => {
+    const res = mapApiError(new Error(REJECTION), REQUEST_ID)
+    const body = (await res!.json()) as { message: string }
+    expect(body.message).toContain('agent version in this organization')
+  })
+
+  /**
+   * LOAD-BEARING: resolveApiError's prose fallback turns any message
+   * CONTAINING "not found" into a 404. Team A worded the rejection to avoid
+   * that phrase precisely so a bad versionId cannot be mistaken for a missing
+   * fingerprint. If either side ever reworded it, this fails.
+   */
+  it('is not degraded into a 404 by the "not found" prose fallback', async () => {
+    expect(REJECTION.toLowerCase()).not.toContain('not found')
+    const res = mapApiError(new Error(REJECTION), REQUEST_ID)
+    expect(res!.status).not.toBe(404)
+  })
+
+  it('an unusable VERSION (422) stays distinct from an unknown FINGERPRINT (404)', () => {
+    // The fingerprint case never reaches mapApiError at all: the service
+    // returns null and the route emits its own generic 404. The two failures
+    // must remain separately diagnosable by the operator.
+    const versionRes = mapApiError(new Error(REJECTION), REQUEST_ID)
+    expect(versionRes!.status).toBe(422)
   })
 })
 

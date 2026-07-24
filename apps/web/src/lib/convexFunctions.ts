@@ -96,6 +96,16 @@ export const convex = {
     apiGetReplay: makeFunctionReference<M>('read_api:apiGetReplay'),
     apiGetExplanation: makeFunctionReference<M>('read_api:apiGetExplanation'),
     apiListFailurePatterns: makeFunctionReference<M>('read_api:apiListFailurePatterns'),
+    // ADR-006 cycle 2 — the v1 public read API's per-pattern resolution
+    // evidence (Team D's services/api_v1.ts + app/api/v1 route, backing
+    // `afr patterns evidence`). A MUTATION like every other read_api
+    // function (they all do per-key rate-limit/lastUsedAt bookkeeping).
+    //   apiGetFailurePatternEvidence({ apiKeyHash, fingerprintHash })
+    //     => { pattern, resolution, exposure, transitions, confidence } | null
+    // NOTE this v1 shape carries Team B's graded `confidence`, which the
+    // Clerk-authed `failure_patterns:getPatternResolutionEvidence` does NOT —
+    // see that ref's note below.
+    apiGetFailurePatternEvidence: makeFunctionReference<M>('read_api:apiGetFailurePatternEvidence'),
   },
   // convex/alerts.ts already exists (data agent, ADR-002/003) — the management
   // API routes wrap these directly.
@@ -206,5 +216,24 @@ export const convex = {
     acknowledgePattern: makeFunctionReference<M>('failure_patterns:acknowledgePattern'),
     resolvePattern: makeFunctionReference<M>('failure_patterns:resolvePattern'),
     reopenPattern: makeFunctionReference<M>('failure_patterns:reopenPattern'),
+    // Resolution EVIDENCE (cycle 2 — "prove the fix held"). Verified against
+    // the landed convex/failure_patterns.ts (commit 0abff21), not relayed:
+    //   getPatternResolutionEvidence({ orgId, fingerprintHash })
+    //     => { pattern, resolution | null, exposure | null, transitions[] } | null
+    // A QUERY (not a mutation — it only reads), member-gated and org-scoped,
+    // returning `null` for a fingerprint absent from THIS org, same tenancy
+    // collapse as getFailurePattern above.
+    //
+    // Cycle 2 also widened `resolvePattern` with a FLAT fourth optional arg,
+    // `versionId: Id<"agent_versions">`, landing on the rollup's
+    // `resolvedInVersionId`. No new ref is needed for that (the existing
+    // resolvePattern ref is unchanged) — but note that an added arg crossing
+    // this string-ref seam is exactly the invisible-drop failure mode this
+    // file keeps causing, which is why the forwarding spread in
+    // services/failurePatterns.ts is covered by a table-driven args test
+    // (tests/unit/failure_patterns_resolve_args.test.ts).
+    getPatternResolutionEvidence: makeFunctionReference<Q>(
+      'failure_patterns:getPatternResolutionEvidence',
+    ),
   },
 } as const

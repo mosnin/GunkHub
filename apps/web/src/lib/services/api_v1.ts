@@ -35,6 +35,8 @@ import type {
   ApiListRunsRequest,
   ApiListRunsResponse,
   FailurePatternStatus,
+  FixConfidenceState,
+  PatternResolutionEvidence,
 } from '@agent-flight-recorder/contracts'
 
 import { convex } from '@/lib/convexFunctions'
@@ -189,6 +191,25 @@ export interface ApiV1ListFailurePatternsParams {
   muted?: boolean
   status?: FailurePatternStatus
   regressed?: boolean
+  /**
+   * FIX-CONFIDENCE state filter (ADR-006 cycle 2) — Team B's
+   * `FixConfidenceState` vocabulary verbatim, NOT a parallel one. A different
+   * axis from `status`: `status` is what a human asserted, `state` is what the
+   * evidence supports.
+   *
+   * Only `'regressed'` is answerable on the list endpoint — the other three
+   * depend on per-pattern post-resolution run exposure, which cannot be
+   * measured across a whole page. convex/read_api.ts rejects them with
+   * INVALID_ARGUMENT (-> 422) rather than silently returning an empty or
+   * unfiltered page; see that file for the full reasoning.
+   *
+   * Prefer this over `regressed` for CI: `regressed: true` also matches a
+   * pattern whose regression PREDATES its current resolution (regressed, then
+   * genuinely re-fixed), because `resolvePattern` preserves `regressedAt` as
+   * history. `state: 'regressed'` matches only a recurrence strictly after the
+   * live `resolvedAt` — an actual fix that did not hold.
+   */
+  state?: FixConfidenceState
   limit?: number
   cursor?: string
 }
@@ -207,9 +228,48 @@ export async function apiListFailurePatterns(
       ...(params.muted !== undefined && { muted: params.muted }),
       ...(params.status !== undefined && { status: params.status }),
       ...(params.regressed !== undefined && { regressed: params.regressed }),
+      ...(params.state !== undefined && { state: params.state }),
       ...(params.limit !== undefined && { limit: params.limit }),
       ...(params.cursor !== undefined && { cursor: params.cursor }),
     }),
   )
   return result as { patterns: unknown[]; nextCursor?: string }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/patterns/[fingerprintHash]/evidence -> apiGetFailurePatternEvidence
+// ---------------------------------------------------------------------------
+
+/**
+ * v1 read-API: the "did the fix actually hold?" evidence for one failure
+ * pattern (ADR-006 cycle 2). Returns the rollup, the resolution claim, the
+ * measured post-resolution exposure, the lifecycle transition history
+ * (reconstructed from the append-only audit log), and Team B's graded
+ * `confidence` verdict over all of it.
+ *
+ * READ-ONLY. There is no key-authed counterpart that SETS lifecycle state —
+ * acknowledge/resolve/reopen stay member-gated, Clerk-authed and audited
+ * (ADR-006), because an API key has no human actor to attribute a privileged
+ * state change to.
+ *
+ * `null` when the fingerprint does not exist in the key's org — "never
+ * existed" and "belongs to another org" are deliberately indistinguishable.
+ */
+export interface ApiV1GetFailurePatternEvidenceParams {
+  fingerprintHash: string
+}
+
+export async function apiGetFailurePatternEvidence(
+  apiKeyHash: string,
+  params: ApiV1GetFailurePatternEvidenceParams,
+): Promise<PatternResolutionEvidence | null> {
+  const client = getPublicClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await withConvexTimeout(
+    client.mutation(convex.read_api.apiGetFailurePatternEvidence, {
+      apiKeyHash,
+      ...(params.fingerprintHash !== undefined && { fingerprintHash: params.fingerprintHash }),
+    }),
+  )
+  return result as PatternResolutionEvidence | null
 }

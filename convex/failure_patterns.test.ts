@@ -19,6 +19,9 @@ import {
   extractFingerprintSignals,
   fingerprintExplanation,
 } from './failure_patterns'
+// Team B's engine — imported directly so the wiring test pins this file's
+// mapping against the real scorer, not a reimplementation of it.
+import { fixConfidence } from './insights'
 
 const modules = import.meta.glob('./**/*.ts')
 
@@ -1436,5 +1439,219 @@ describe('affectedAgentIds maintenance (ADR-006 cycle 2)', () => {
     const asMember = t.withIdentity(identity('member', 'a'))
     const resolved = await asMember.mutation(api.failure_patterns.resolvePattern, { orgId: orgA, fingerprintHash: 'legacy', versionId: versionA })
     expect(resolved!.resolvedInVersionId).toBe(versionA)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ADR-006 cycle 2 — fix confidence wiring. The MATH is Team B's and is tested
+// in insights.test.ts; these tests pin the WIRING: that the engine is actually
+// reached from the product surface, and that this file maps its inputs
+// (especially version attribution) onto FixConfidenceInput correctly.
+// ---------------------------------------------------------------------------
+
+describe('getPatternResolutionEvidence — fix confidence', () => {
+  async function seedResolved(
+    t: ReturnType<typeof convexTest>,
+    orgA: any, projectA: any, agentA: any, hash: string,
+    opts: { versionId?: any; occurredAt?: number } = {},
+  ) {
+    const occurredAt = opts.occurredAt ?? 1_000_000
+    const runId = await seedRun(t, orgA, projectA, agentA, opts.versionId)
+    // Pin the seeding failure run to the SAME backdated era as its occurrence.
+    // seedRun stamps startedAt from the real clock, which would otherwise sit
+    // long after the backdated resolvedAt these tests use and be miscounted as
+    // post-resolution exposure — an artifact of the fixture, not of the code.
+    await t.run((ctx) => ctx.db.patch(runId, { startedAt: occurredAt }))
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, agentVersionId: opts.versionId,
+      fingerprintHash: hash, class: 'tool_error', label: 'L', salientKey: 'a',
+      occurredAt,
+    })
+    const asMember = t.withIdentity(identity('member', 'a'))
+    return await asMember.mutation(api.failure_patterns.resolvePattern, {
+      orgId: orgA, fingerprintHash: hash, ...(opts.versionId ? { versionId: opts.versionId } : {}),
+    })
+  }
+
+  it('is ABSENT (null) when the pattern was never resolved — nothing to score', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'unresolved', class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 1_000_000,
+    })
+
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'unresolved' })
+    expect(evidence!.confidence).toBeNull()
+  })
+
+  it('is "unproven" with a zero score at zero post-resolution exposure', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedResolved(t, orgA, projectA, agentA, 'no-exposure')
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'no-exposure' })
+    expect(evidence!.confidence!.state).toBe('unproven')
+    expect(evidence!.confidence!.score).toBe(0)
+    expect(evidence!.confidence!.exposureRuns).toBe(0)
+    expect(evidence!.confidence!.limitingFactor).toBe('no-exposure')
+    expect(evidence!.confidence!.hasResolution).toBe(true)
+  })
+
+  it('is PRESENT and "regressed" after the regression guard auto-reopens — the "your fix did not hold" path', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const resolved = await seedResolved(t, orgA, projectA, agentA, 'regressed-confidence')
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 2_000_000 }))
+
+    // Real post-resolution exposure, then a recurrence that auto-reopens.
+    await t.run(async (ctx) => {
+      for (let i = 1; i <= 10; i++) {
+        await ctx.db.insert('runs', { orgId: orgA, projectId: projectA, agentId: agentA, status: 'completed', startedAt: 2_000_000 + i, metadata: {}, tags: [] })
+      }
+    })
+    const run2 = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId: run2, agentId: agentA, fingerprintHash: 'regressed-confidence', class: 'tool_error', label: 'L', salientKey: 'a', occurredAt: 3_000_000,
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'regressed-confidence' })
+    // resolvedAt is deliberately KEPT by the auto-reopen, so confidence is scoreable.
+    expect(evidence!.pattern.status).toBe('open')
+    expect(evidence!.confidence).not.toBeNull()
+    expect(evidence!.confidence!.state).toBe('regressed')
+    expect(evidence!.confidence!.recurred).toBe(true)
+    expect(evidence!.confidence!.score).toBe(0)
+    expect(evidence!.confidence!.limitingFactor).toBe('recurrence')
+    // The drivers are still real numbers, not zeroed placeholders.
+    expect(evidence!.confidence!.observedRuns).toBeGreaterThan(0)
+  })
+
+  it('VERSION MISMATCH: exposure on a different version than the fix shipped in zeroes exposureRuns and reports version-mismatch', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+    // Resolve claiming versionA...
+    const resolved = await seedResolved(t, orgA, projectA, agentA, 'version-mismatch', { versionId: versionA })
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 2_000_000 }))
+
+    // ...but every post-resolution run executed on a DIFFERENT version.
+    const versionTwo = await t.run((ctx) => ctx.db.insert('agent_versions', { agentId: agentA, orgId: orgA, version: 'v2', createdAt: Date.now() }))
+    await t.run(async (ctx) => {
+      for (let i = 1; i <= 30; i++) {
+        await ctx.db.insert('runs', { orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionTwo, status: 'completed', startedAt: 2_000_000 + i, metadata: {}, tags: [] })
+      }
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'version-mismatch' })
+    expect(evidence!.confidence!.versionAttribution).toBe('mismatched')
+    // observedRuns still reports what was measured; exposureRuns is zeroed.
+    expect(evidence!.confidence!.observedRuns).toBe(30)
+    expect(evidence!.confidence!.exposureRuns).toBe(0)
+    expect(evidence!.confidence!.limitingFactor).toBe('version-mismatch')
+    expect(evidence!.confidence!.state).toBe('unproven')
+  })
+
+  it('VERSION MATCH: exposure on the SAME version the fix shipped in is credited and accumulates confidence', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+    const resolved = await seedResolved(t, orgA, projectA, agentA, 'version-match', { versionId: versionA })
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 2_000_000 }))
+
+    await t.run(async (ctx) => {
+      for (let i = 1; i <= 30; i++) {
+        await ctx.db.insert('runs', { orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionA, status: 'completed', startedAt: 2_000_000 + i, metadata: {}, tags: [] })
+      }
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'version-match' })
+    expect(evidence!.confidence!.versionAttribution).toBe('matched')
+    expect(evidence!.confidence!.exposureRuns).toBe(30)
+    expect(evidence!.confidence!.score).toBeGreaterThan(0)
+    expect(evidence!.confidence!.recurred).toBe(false)
+  })
+
+  it('MIXED versions in the exposure window forward NO exposureVersionId — attribution is "unknown" and runs stay credited', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+    const resolved = await seedResolved(t, orgA, projectA, agentA, 'mixed-versions', { versionId: versionA })
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 2_000_000 }))
+
+    const versionTwo = await t.run((ctx) => ctx.db.insert('agent_versions', { agentId: agentA, orgId: orgA, version: 'v2', createdAt: Date.now() }))
+    await t.run(async (ctx) => {
+      for (let i = 1; i <= 10; i++) {
+        await ctx.db.insert('runs', { orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionA, status: 'completed', startedAt: 2_000_000 + i, metadata: {}, tags: [] })
+      }
+      for (let i = 11; i <= 20; i++) {
+        await ctx.db.insert('runs', { orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionTwo, status: 'completed', startedAt: 2_000_000 + i, metadata: {}, tags: [] })
+      }
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'mixed-versions' })
+    // Ambiguous exposure must NOT be punished as a mismatch.
+    expect(evidence!.confidence!.versionAttribution).toBe('unknown')
+    expect(evidence!.confidence!.exposureRuns).toBe(20)
+    expect(evidence!.confidence!.limitingFactor).not.toBe('version-mismatch')
+  })
+
+  it('WIRING PIN: the returned verdict equals fixConfidence() called directly with the same inputs', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA, versionA } = await seedTwoOrgs(t)
+    const resolved = await seedResolved(t, orgA, projectA, agentA, 'wiring', { versionId: versionA })
+    await t.run((ctx) => ctx.db.patch(resolved!._id, { resolvedAt: 2_000_000 }))
+
+    await t.run(async (ctx) => {
+      for (let i = 1; i <= 17; i++) {
+        await ctx.db.insert('runs', { orgId: orgA, projectId: projectA, agentId: agentA, agentVersionId: versionA, status: 'completed', startedAt: 2_000_000 + i, metadata: {}, tags: [] })
+      }
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const evidence = await asMember.query(api.failure_patterns.getPatternResolutionEvidence, { orgId: orgA, fingerprintHash: 'wiring' })
+
+    // Recompute independently from the evidence the query itself reports.
+    const expected = fixConfidence(
+      {
+        resolvedAt: evidence!.resolution!.resolvedAt,
+        resolvedInVersionId: evidence!.resolution!.resolvedInVersionId,
+        exposureVersionId: versionA,
+        postResolutionRuns: evidence!.exposure!.runCount,
+        recurredAt: evidence!.pattern.regressedAt,
+      },
+      Date.now(),
+    )
+
+    // Every non-time-dependent field must match exactly. (elapsedMs/soakCredit
+    // and the score that depends on them advance with the real clock between
+    // the two calls, so they are asserted as close-enough rather than equal.)
+    expect(evidence!.confidence!.state).toBe(expected.state)
+    expect(evidence!.confidence!.exposureRuns).toBe(expected.exposureRuns)
+    expect(evidence!.confidence!.observedRuns).toBe(expected.observedRuns)
+    expect(evidence!.confidence!.versionAttribution).toBe(expected.versionAttribution)
+    expect(evidence!.confidence!.recurred).toBe(expected.recurred)
+    expect(evidence!.confidence!.hasResolution).toBe(expected.hasResolution)
+    expect(evidence!.confidence!.exposureMeasured).toBe(expected.exposureMeasured)
+    expect(evidence!.confidence!.exposureCredit).toBe(expected.exposureCredit)
+    expect(evidence!.confidence!.limitingFactor).toBe(expected.limitingFactor)
+    expect(evidence!.confidence!.score).toBeCloseTo(expected.score, 3)
+  })
+
+  it('uses the SERVER clock: the query accepts no time argument that could forge soak credit', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedResolved(t, orgA, projectA, agentA, 'server-clock')
+    const asMember = t.withIdentity(identity('member', 'a'))
+    // A client-supplied `nowMs` is rejected as an unknown argument rather than
+    // silently honored — soak credit cannot be manufactured from the outside.
+    await expect(
+      asMember.query(api.failure_patterns.getPatternResolutionEvidence, {
+        orgId: orgA, fingerprintHash: 'server-clock', nowMs: Date.now() + 365 * 24 * 60 * 60 * 1000,
+      } as any),
+    ).rejects.toThrow()
   })
 })

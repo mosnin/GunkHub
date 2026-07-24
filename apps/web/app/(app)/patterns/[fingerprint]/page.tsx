@@ -2,9 +2,10 @@ import Link from 'next/link'
 import { notFound } from 'next/navigation'
 
 import type { ResolvedAgentVersion, TopRunExplanationPreview } from '@/components/patterns/PatternDetail'
+import type { ResolutionEvidenceState } from '@/components/patterns/ResolutionEvidencePanel'
 import type { Metadata } from 'next'
 
-import { adaptFailurePatternDetail } from '@/components/patterns/adapt'
+import { adaptFailurePatternDetail, loadPatternResolutionEvidence } from '@/components/patterns/adapt'
 import { PatternDetail } from '@/components/patterns/PatternDetail'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { getCurrentAuth } from '@/lib/auth'
@@ -63,11 +64,22 @@ export default async function PatternDetailPage({ params }: PatternDetailPagePro
   // fails to resolve (deleted, transient error) just renders as a truncated
   // ID instead of a link, same "additive, never blocks the page" posture as
   // the run-detail page's own agentVersionLabel lookup.
+  //
+  // `resolvedInVersionId` is resolved alongside them (deduped) so "resolved in
+  // WHICH version" can be rendered as a real version string in the regression
+  // banner, the resolution block, and the lifecycle timeline — a raw
+  // agent_versions id answers nobody's question.
   const agentVersions: Record<string, ResolvedAgentVersion | undefined> = {}
-  if (detail.pattern.affectedAgentVersionIds.length > 0) {
+  const versionIdsToResolve = Array.from(
+    new Set([
+      ...detail.pattern.affectedAgentVersionIds,
+      ...(detail.pattern.resolvedInVersionId ? [detail.pattern.resolvedInVersionId] : []),
+    ]),
+  )
+  if (versionIdsToResolve.length > 0) {
     const { getAgentVersion } = await import('@/lib/services/agent_versions')
     await Promise.all(
-      detail.pattern.affectedAgentVersionIds.map(async (versionId) => {
+      versionIdsToResolve.map(async (versionId) => {
         try {
           const v = await getAgentVersion(versionId)
           if (v) agentVersions[versionId] = { agentId: v.agentId, version: v.version }
@@ -105,6 +117,29 @@ export default async function PatternDetailPage({ params }: PatternDetailPagePro
     }
   }
 
+  // "Did the fix hold?" evidence. Fetched through the guarded service lookup
+  // in adapt.ts, which degrades to an explicit `unavailable`/`error` state
+  // rather than throwing — a failure here must never make a resolved pattern
+  // silently render as though its fix were proven.
+  const evidenceFetch = await loadPatternResolutionEvidence(fingerprint)
+  const resolvedInVersion =
+    evidenceFetch.status === 'ready'
+      ? (evidenceFetch.evidence.resolution?.resolvedInVersion ??
+        (detail.pattern.resolvedInVersionId
+          ? agentVersions[detail.pattern.resolvedInVersionId]?.version
+          : undefined))
+      : undefined
+  const evidenceState: ResolutionEvidenceState =
+    evidenceFetch.status === 'ready'
+      ? {
+          kind: 'ready',
+          evidence: evidenceFetch.evidence,
+          ...(resolvedInVersion !== undefined && { resolvedInVersion }),
+        }
+      : evidenceFetch.status === 'error'
+        ? { kind: 'error', message: evidenceFetch.message }
+        : { kind: 'unavailable' }
+
   return (
     <div className="p-6 max-w-4xl mx-auto">
       <Link
@@ -120,6 +155,7 @@ export default async function PatternDetailPage({ params }: PatternDetailPagePro
         agentVersions={agentVersions}
         topRunExplanation={topRunExplanation}
         isAdmin={isAdmin}
+        evidenceState={evidenceState}
       />
     </div>
   )

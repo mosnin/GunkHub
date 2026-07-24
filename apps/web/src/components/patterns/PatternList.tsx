@@ -1,10 +1,12 @@
-import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
+import type { AdaptedFailurePattern, AdaptedFixConfidence } from '@/components/patterns/adapt'
 
 import { PatternRow } from '@/components/patterns/PatternRow'
 import { EmptyState } from '@/components/ui/EmptyState'
 
 interface PatternListProps {
   patterns: AdaptedFailurePattern[]
+  /** Fix confidence keyed by `fingerprintHash`, when the caller has it. A missing entry renders no fix badge at all — never a fabricated `unproven`. */
+  confidenceByFingerprint?: Record<string, AdaptedFixConfidence | undefined>
   /** Overrides the empty-state copy — used by PatternsPage when a `?status=` filter (not the absence of any patterns at all) is why this list is empty, so the message says "try a different filter" instead of the default "instrument your agent" copy. */
   emptyTitle?: string
   emptyDescription?: string
@@ -17,7 +19,12 @@ interface PatternListProps {
  * empty state; loading/error are handled by the page (same split as
  * SelectableRunList / AuditPage).
  */
-export function PatternList({ patterns, emptyTitle, emptyDescription }: PatternListProps) {
+export function PatternList({
+  patterns,
+  confidenceByFingerprint,
+  emptyTitle,
+  emptyDescription,
+}: PatternListProps) {
   if (patterns.length === 0) {
     return (
       <EmptyState
@@ -63,7 +70,11 @@ export function PatternList({ patterns, emptyTitle, emptyDescription }: PatternL
         </thead>
         <tbody className="bg-graphite-deep">
           {patterns.map((pattern) => (
-            <PatternRow key={pattern.id || pattern.fingerprintHash} pattern={pattern} />
+            <PatternRow
+              key={pattern.id || pattern.fingerprintHash}
+              pattern={pattern}
+              confidence={confidenceByFingerprint?.[pattern.fingerprintHash] ?? null}
+            />
           ))}
         </tbody>
       </table>

@@ -42,6 +42,20 @@ interface RouteParams {
 // ceiling). Oversized or malformed (non-string) values are rejected with 422
 // before any Convex call. `ref` is never parsed as a URL or fetched/followed
 // by this layer, even when it looks like one.
+//
+// CYCLE 2 — optional `versionId`: which agent version the operator believes
+// contains the fix. This route validates its SHAPE only and forwards it; the
+// real check (exists / in this org / belongs to an agent this pattern was
+// observed on) is Team A's `validateResolutionVersion` and is deliberately
+// NOT duplicated here — a web-side ownership check would have to read another
+// org's data to be accurate.
+//
+// That rejection must stay VISIBLE and DISTINCT: Convex throws
+// `INVALID_ARGUMENT`, mapApiError turns it into a real 422 carrying the
+// actionable message, and this route does not catch it into the generic 404
+// below. An unknown FINGERPRINT is a 404; an unusable VERSION is a 422 — the
+// operator fixes those two differently, so collapsing them would be a
+// regression, not a simplification.
 // ---------------------------------------------------------------------------
 export const POST = withApiHandler(
   '/api/patterns/[fingerprint]/resolve',

@@ -22,6 +22,29 @@ export function formatDuration(ms: number): string {
 }
 
 /**
+ * Format a SPAN of milliseconds at day/week granularity — for durations
+ * measured in soak time rather than run latency. `formatDuration` above tops
+ * out at minutes, which is right for a run and useless for "how long has this
+ * fix been soaking"; this is its coarse counterpart.
+ *
+ * Deliberately floors rather than rounds: a fix that has soaked for 6.9 days
+ * has NOT soaked for a week, and rounding up would overstate the evidence in
+ * exactly the direction this feature exists to prevent.
+ *
+ * Examples: "under an hour" | "3 hours" | "1 day" | "2 weeks"
+ */
+export function formatCoarseDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return 'no time'
+  const hours = Math.floor(ms / 3_600_000)
+  if (hours < 1) return 'under an hour'
+  if (hours < 24) return hours === 1 ? '1 hour' : `${hours} hours`
+  const days = Math.floor(hours / 24)
+  if (days < 14) return days === 1 ? '1 day' : `${days} days`
+  const weeks = Math.floor(days / 7)
+  return `${weeks} weeks`
+}
+
+/**
  * Format a Unix timestamp (ms) as a relative time string.
  * Examples: "just now" | "2 minutes ago" | "3 hours ago"
  */

@@ -126,15 +126,67 @@ $ afr patterns --active    # only patterns that are NOT muted
 
 $ afr patterns --status resolved   # only patterns whose lifecycle status is exactly 'resolved'
 $ afr patterns --regressed         # only patterns with regressedAt set — a resolved pattern that recurred
+
+$ afr patterns --state regressed   # only fixes that demonstrably did NOT hold (see below)
 ```
 
-Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--spiking` (only patterns currently flagged as spiking), `--muted` / `--active` (mute-aware filter — mutually exclusive, passing both is a usage error, exit 1), `--status <open|acknowledged|resolved>` (exact lifecycle-status filter — an invalid value is a usage error, exit 1), `--regressed` (only patterns with `regressedAt` set), `--limit <n>`, `--json` (prints the raw API response, including `muted`/`mutedAt` and the full resolution-lifecycle fields).
+Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--spiking` (only patterns currently flagged as spiking), `--muted` / `--active` (mute-aware filter — mutually exclusive, passing both is a usage error, exit 1), `--status <open|acknowledged|resolved>` (exact lifecycle-status filter — an invalid value is a usage error, exit 1), `--regressed` (only patterns with `regressedAt` set), `--state <unproven|proving|confirmed|regressed>` (fix-confidence filter — see below), `--limit <n>`, `--json` (prints the raw API response, including `muted`/`mutedAt` and the full resolution-lifecycle and evidence fields).
+
+**`--state` vs `--status`, and why CI should use `--state regressed`.** `--status` is what a human *asserted*; `--state` is what the *evidence supports* (ADR-006 cycle 2). Only `--state regressed` is answerable on this command — the other three states depend on per-pattern post-resolution run exposure, which cannot be measured across a whole page, so passing them is a usage error (exit 1) that points you at `afr patterns evidence`. It is deliberately not silently ignored.
+
+Prefer `--state regressed` over `--regressed` in a build gate: `--regressed` matches any pattern with `regressedAt` set, **including one whose regression predates its current resolution** (it regressed, was genuinely re-fixed, and was re-resolved — `regressedAt` is kept as history). `--state regressed` matches only a recurrence strictly after the live `resolvedAt`, i.e. a fix that actually did not hold.
 
 **Mute suppresses alerts, not visibility.** A muted, spiking pattern still shows `yes (N)` in the SPIKING column — it is annotated `[muted]` rather than hidden, so it stays visibly distinct from an active spiking pattern. There is deliberately no `afr patterns mute`/`unmute` command: muting a pattern is an admin-only, audited, Clerk-authed org action taken in the web app, not a key-authed read-API action — this command only ever *reflects* mute state.
 
 **Resolution lifecycle (ADR-006, "resolution reflection").** The STATUS column shows a pattern's lifecycle: `open` (the default when no status has ever been set), `acknowledged`, or `resolved`. When a pattern is back to `open` AND carries `regressedAt` — i.e. it was resolved, then received a new occurrence after that ("your fix didn't hold") — the STATUS column shows `REGRESSED` instead of `open`, so a regression stands out from an ordinary open pattern or one a human manually reopened. There is deliberately no `afr patterns resolve`/`acknowledge`/`reopen` command: those are member-gated, audited, Clerk-authed org actions taken in the web app. A key-authed write here would bypass both the member-gate and the audit log those actions require — this command, like the mute reflection above, only ever *reflects* lifecycle state, never mutates it.
 
 Like every other read here, this is derived, observability-grade data (CLAUDE.md) — never a substitute for a single run's own event log or `afr explain <runId>`.
+
+### `afr patterns evidence <fingerprintHash>`
+
+Shows whether a pattern's fix actually **held** (ADR-006 cycle 2, "prove the fix held"). Marking a pattern resolved is an unearned assertion on its own; this command shows what can be checked against that claim — the resolution, the run exposure accumulated since it, a graded confidence verdict, and the pattern's lifecycle history reconstructed from the append-only audit log (automatic reopens by the regression guard appear with actor `system`).
+
+```bash
+$ afr patterns evidence a1b2c3d4e5f6
+tool_error — lookup_order tool call times out
+  fingerprint: a1b2c3d4e5f6
+  occurrences: 12 (first 2026-07-10T09:00:00.000Z, last 2026-07-18T02:11:00.000Z)
+
+============================================
+  CONFIRMED  (confidence 82%)
+============================================
+
+Resolution claimed:
+  at:        2026-07-18T09:00:00.000Z
+  by:        user_2f9a
+  version:   v1.4.0
+  note:      Added a retry around the flaky lookup
+
+Exposure since the fix:
+  runs:        120
+  recurrences: 0
+  baseline:    300 runs in the 14 days before the fix (for comparison)
+  soak:        8.0d
+  agents:      agent_support
+
+Lifecycle (2 transitions, oldest first):
+  2026-07-11T10:04:00.000Z  failure_pattern.acknowledged  (user_2f9a)
+  2026-07-18T09:00:00.000Z  failure_pattern.resolved  (user_2f9a)
+```
+
+States: `unproven` (resolved, but nothing has exercised the path since — an untested fix, **not** a success), `proving` (clean exposure accumulating, not yet decisive), `confirmed` (enough clean exposure that a still-live pattern would very probably have fired again), `regressed` (it fired again — the fix did not hold; the only state backed by direct proof).
+
+**Scripting it in CI:**
+
+```bash
+afr patterns evidence "$FINGERPRINT" --json | jq -e '.confidence.state != "regressed"'
+```
+
+Gate on `confidence.state`, not on `exposure.heldSoFar` — `heldSoFar` is `true` for a fix nothing has run yet, and the state already encodes that difference as `unproven`. Three more reading rules: `confidence.score` is a **0-1 fraction capped at 0.95**, never a percentage and never 1.0; `exposure.runCount` is a **floor** when `exposure.runCountTruncated` is true (rendered `2000+`); and `exposure.baselineRunCount` is a 14-day trailing baseline for comparison — never subtract it from `runCount`.
+
+Options: `--json`, `--help`. Exit codes follow the usual convention (0 ok, 1 usage, 2 auth, 3 not-found, 4 network/server).
+
+Like `afr patterns`, this is **read-only**. There is no `afr patterns resolve`/`acknowledge`/`reopen` — those are member-gated, audited, Clerk-authed org actions taken in the web app. An API key has no human actor, and the audit log exists to record which *person* made a privileged change. Reading proof that a fix held needs no actor; asserting that it held does.
 
 ### `afr config check`
 
@@ -308,6 +360,12 @@ $ afr export run_a1b2c3d4e5f6 --format json | jq .run.status
 
 Options: `--out <file>` (default: print to stdout), `--format ndjson|json`
 (default: `ndjson`).
+
+## Version
+
+v0.8.0 — **Prove the fix held** (ADR-006 cycle 2). New command: `afr patterns evidence <fingerprintHash>` — the resolution claim, the run exposure accumulated since it, a graded fix-confidence verdict (`score` 0-0.95, `state` one of `unproven`/`proving`/`confirmed`/`regressed`, plus every driver that produced them), and the pattern's lifecycle transition history from the append-only audit log; `--json` carries the whole envelope so a CI job can gate on `confidence.state`. `afr patterns` gains `--state <unproven|proving|confirmed|regressed>`; only `--state regressed` is answerable there (the other three need per-pattern exposure and are a usage error pointing at `afr patterns evidence`, never a silently unfiltered list). New exports: `parsePatternsEvidenceArgs`, `runPatternsEvidence`, `printPatternsEvidence`, `PatternsEvidenceArgs`, `PatternsEvidenceResult`, and `getFailurePatternEvidence` from the API client. Requires `@agent-flight-recorder/sdk` >= 0.12.0. Read-only and additive — no existing command, flag, or exit code changed.
+
+v0.7.0 — `afr patterns` gains `--status <open|acknowledged|resolved>` and `--regressed` (Resolution cycle 1, ADR-006), plus a STATUS column that renders `REGRESSED` for a pattern that was resolved and then recurred.
 
 ## Development
 
