@@ -99,3 +99,82 @@ export async function regenerateRunExplanation(runId: string): Promise<RunExplan
   await client.action(convex.explanations.regenerateRunExplanation, { runId })
   return getRunExplanation(runId)
 }
+
+// ---------------------------------------------------------------------------
+// Batched "why" preview for run lists (Explainability Layer, cycle 2).
+//
+// There is no batch query on the Convex side yet — `run_explanations:*`
+// only exposes the single-run `getRunExplanation`. NEEDED FROM DATA TEAM:
+// a `run_explanations:getRunExplanationSummaries(runIds: string[])` batch
+// query (org-scoped, same null-collapsing semantics as the single-run one)
+// would let this fetch in one round-trip instead of N. Until that lands,
+// this falls back to per-run `getRunExplanation` calls — capped to
+// MAX_SUMMARY_BATCH and, more importantly, capped by the CALLER to only the
+// visible FAILED/timed_out rows on the current page (never the whole list),
+// which keeps the fan-out bounded to what's actually rendered.
+// ---------------------------------------------------------------------------
+
+/** Defensive upper bound on how many explanations this will fetch in one call, independent of what the caller passes. */
+const MAX_SUMMARY_BATCH = 25
+
+export type RunExplanationSummaryState =
+  | { status: 'ready'; summary: string; failureClass: string }
+  /** No explanation yet — could be still generating, or (per the coarse-null
+      gap documented on getRunExplanation) not actually eligible. Callers
+      should only request this for rows they already know are failed/timed_out,
+      so in practice this reads as "still analyzing". */
+  | { status: 'analyzing' }
+  /** The fetch for this run failed, or it will never have an explanation.
+      Render nothing — never a broken row. */
+  | { status: 'unavailable' }
+
+/**
+ * Batched (best-effort, per-row-fallback) fetch of explanation summaries for
+ * a set of run IDs — meant for the failed-runs-list "why" preview. Never
+ * throws: a per-run failure becomes `{ status: 'unavailable' }` for that run
+ * only, so one bad fetch can't blank the whole list. Callers MUST pre-filter
+ * to the visible FAILED/timed_out rows before calling this — it does not
+ * check run status itself, it only bounds the batch size defensively.
+ */
+export async function getRunExplanationSummaries(
+  runIds: string[],
+): Promise<Record<string, RunExplanationSummaryState>> {
+  const capped = runIds.slice(0, MAX_SUMMARY_BATCH)
+  if (capped.length === 0) return {}
+
+  // Preferred: one org-scoped batch round-trip (convex/run_explanations.ts
+  // getRunExplanationSummaries, Team A). It omits runs with no explanation
+  // yet, so any requested id missing from the result is still "analyzing".
+  try {
+    const client = await getAuthedClient()
+    const rows = (await client.query(convex.explanations.getRunExplanationSummaries, {
+      runIds: capped,
+    })) as Array<{ runId: string; summary: string; failureClass: string }>
+    const byId = new Map(rows.map((r) => [r.runId, r]))
+    const out: Record<string, RunExplanationSummaryState> = {}
+    for (const runId of capped) {
+      const row = byId.get(runId)
+      out[runId] = row
+        ? { status: 'ready', summary: row.summary, failureClass: row.failureClass }
+        : { status: 'analyzing' }
+    }
+    return out
+  } catch {
+    // Fallback (e.g. the batch query isn't deployed yet): per-run fetch,
+    // still bounded to the capped visible rows.
+    const settled = await Promise.allSettled(capped.map((id) => getRunExplanation(id)))
+    const out: Record<string, RunExplanationSummaryState> = {}
+    settled.forEach((result, i) => {
+      const runId = capped[i]
+      if (!runId) return
+      if (result.status === 'fulfilled') {
+        out[runId] = result.value
+          ? { status: 'ready', summary: result.value.summary, failureClass: result.value.failureClass }
+          : { status: 'analyzing' }
+      } else {
+        out[runId] = { status: 'unavailable' }
+      }
+    })
+    return out
+  }
+}

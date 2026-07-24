@@ -1,3 +1,4 @@
+import type { VersionNarrativeResult as VersionCompareNarrative } from '@/lib/versionNarrative'
 import type { AgentVersion } from '@agent-flight-recorder/contracts'
 
 import { convex } from '@/lib/convexFunctions'
@@ -158,6 +159,11 @@ export interface VersionCompareResultAvailable {
   versionA: VersionCohortStats
   versionB: VersionCohortStats
   comparison: CohortComparison
+  /** "What changed" narrative — Team C's `versionNarrative.ts` / the
+      `?explain=1` route. Absent/null is a normal, honest state (fetch
+      failed, or narrative generation itself is not yet wired up here) —
+      never rendered as an error. */
+  narrative?: VersionCompareNarrative | null
 }
 
 export interface VersionCompareResultUnavailable {
@@ -184,5 +190,43 @@ export async function compareVersions(
     return { available: true, ...r }
   } catch {
     return { available: false }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Version "what changed" narrative — Explainability Layer, cycle 2.
+//
+// Team C shipped this cycle: `GET /api/agents/[agentId]/versions/compare?
+// a=&b=&explain=1` (apps/web/app/api/agents/[agentId]/versions/compare/
+// route.ts), backed by the pure `@/lib/versionNarrative` narrative builder
+// plus the Convex I/O in `@/lib/services/versionCompareNarrative`
+// (`fetchVersionComparisonRaw` / `narrateVersionComparison`). Rather than
+// round-tripping this server action back through its own HTTP route, this
+// calls those same underlying functions directly — same code path the route
+// itself uses, no network hop, no cookie-forwarding needed.
+// ---------------------------------------------------------------------------
+
+export type { VersionCompareNarrative }
+
+/**
+ * Fetch the "what changed" narrative for a version comparison, using the same
+ * `fetchVersionComparisonRaw` + `narrateVersionComparison` pipeline as the
+ * `?explain=1` route. Non-fatal: any failure (auth, network, a version pair
+ * that doesn't resolve) returns `null` rather than throwing, so a narrative
+ * failure never blocks the cohort comparison itself.
+ */
+export async function getVersionCompareNarrative(
+  convexOrgId: string,
+  agentVersionIdA: string,
+  agentVersionIdB: string,
+) {
+  try {
+    const { fetchVersionComparisonRaw, narrateVersionComparison } = await import(
+      '@/lib/services/versionCompareNarrative'
+    )
+    const raw = await fetchVersionComparisonRaw(convexOrgId, agentVersionIdA, agentVersionIdB)
+    return narrateVersionComparison(raw)
+  } catch {
+    return null
   }
 }

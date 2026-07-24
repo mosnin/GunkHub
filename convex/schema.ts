@@ -527,6 +527,11 @@ export default defineSchema({
     generatedAt: v.number(),
     // Present only when kind === "llm" — the model identifier used, for audit/debugging.
     model: v.optional(v.string()),
+    // Present only when kind === "llm" — wall-clock ms spent in the provider
+    // call (convex/helpers/llm_provider.ts's HttpExplanationLLM.explain), a
+    // lightweight cost/latency note for observability/debugging. Never set
+    // for kind === "heuristic" (no external call was made).
+    generationMs: v.optional(v.number()),
     // Schema version of the explanation shape itself (RUN_EXPLANATION_SCHEMA_VERSION),
     // so a future shape change can be detected/migrated without guessing from field presence.
     version: v.number(),

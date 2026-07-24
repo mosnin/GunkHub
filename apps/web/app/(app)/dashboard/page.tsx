@@ -1,5 +1,6 @@
 import Link from 'next/link'
 
+import type { RunExplanationSummaryState } from '@/lib/services/explanations'
 import type { FailedVerification } from '@/lib/services/projection_verify'
 import type { Run } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
@@ -13,6 +14,7 @@ import { CodeBlock } from '@/components/ui/CodeBlock'
 import { ErrorState } from '@/components/ui/ErrorState'
 import { Reveal, RevealGroup, RevealItem } from '@/components/ui/Motion'
 import { getDashboardStats, getPerAgentDashboardStats, type DashboardRange } from '@/lib/services/dashboard'
+import { getRunExplanationSummaries } from '@/lib/services/explanations'
 import { getRecentFailedVerifications } from '@/lib/services/projection_verify'
 import { listRuns } from '@/lib/services/runs'
 import { truncateId, formatRelativeTime } from '@/lib/utils'
@@ -89,6 +91,18 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
   const failedRuns = runs.filter((r) => r.status === 'failed').length
   const activeRuns = runs.filter((r) => r.status === 'running').length
   const hasRuns = totalRuns > 0
+
+  // "Why did this fail?" preview for the Recent Runs list — capped to the
+  // FAILED/timed_out rows already on this (small, 20-row) page. Non-fatal:
+  // getRunExplanationSummaries never throws, and the list renders identically
+  // to before this feature when the map comes back empty.
+  let explanationSummaries: Record<string, RunExplanationSummaryState> = {}
+  const failedRunIds = runs
+    .filter((r) => r.status === 'failed' || r.status === 'timed_out')
+    .map((r) => r.id)
+  if (failedRunIds.length > 0) {
+    explanationSummaries = await getRunExplanationSummaries(failedRunIds)
+  }
 
   // Non-fatal: verification issues section is hidden if fetch fails
   try {
@@ -176,7 +190,7 @@ export default async function DashboardPage({ searchParams }: DashboardPageProps
               {/* Recent Runs list */}
               <Reveal className="mt-8">
                 <h2 className="text-sm font-semibold text-neutral-300 mb-4">Recent Runs</h2>
-                <RunList runs={runs} />
+                <RunList runs={runs} explanationSummaries={explanationSummaries} />
               </Reveal>
             </>
           ) : (

@@ -222,3 +222,12 @@ export const EXPLANATION_MAX_EVALS = 100;
 
 /** Current schema version stamped on every generated run_explanations row. */
 export const RUN_EXPLANATION_SCHEMA_VERSION = 1;
+
+/**
+ * Cap on `runIds` accepted by `getRunExplanationSummaries` (Cycle 2 —
+ * batched "why-preview" for a runs list, avoiding one round-trip per row).
+ * Generous for a single page of a runs list, small enough that a bounded
+ * `.first()` lookup per id stays cheap even if all 50 miss the by_run index
+ * cache.
+ */
+export const MAX_RUN_EXPLANATION_SUMMARY_BATCH = 50;

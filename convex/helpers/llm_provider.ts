@@ -52,11 +52,118 @@ export interface ExplanationLLMResult {
   suggestedFix?: string;
   /** Sequence numbers the model claims to be citing. Validated by the caller — never trusted as-is. */
   citedSeqNums: number[];
+  /** Wall-clock time spent in the provider call (ms), for the stored explanation's optional generationMs note. */
+  generationMs?: number;
 }
 
 export interface ExplanationLLM {
   /** Returns `undefined` if the provider could not produce a result (network error, bad response, not configured). Never throws. */
   explain(input: GroundedExplanationPrompt): Promise<ExplanationLLMResult | undefined>;
+}
+
+// ---------------------------------------------------------------------------
+// HttpExplanationLLM hardening constants
+// ---------------------------------------------------------------------------
+
+/** Request timeout for the HTTP provider call — a hung upstream must never stall explanation generation. */
+const LLM_REQUEST_TIMEOUT_MS = 20_000;
+
+/** At most one retry on a 5xx response or network error — bounded, never an infinite/backoff loop. */
+const LLM_MAX_ATTEMPTS = 2;
+
+/** Guard against an oversized/malicious response body before it is even JSON-parsed. */
+const LLM_MAX_RESPONSE_BYTES = 256 * 1024;
+
+/**
+ * Output string length caps applied to a raw provider response BEFORE it is
+ * handed back to the caller — belt-and-suspenders on top of
+ * run_explanations.ts's own truncateToBytes calls on the final stored value.
+ * A misbehaving/compromised provider returning e.g. a 100 KB "summary" must
+ * not be carried around in memory/logs any longer than necessary.
+ */
+const LLM_MAX_FIELD_CHARS = 8 * 1024;
+
+/** Cap on how many citedSeqNums we bother carrying out of the provider response — validateCitedSeqNums caps further, this just bounds a pathological array (e.g. 500 fake entries) before that. */
+const LLM_MAX_RAW_CITED_SEQ_NUMS = 100;
+
+function clampString(s: string, maxChars: number): string {
+  return s.length > maxChars ? s.slice(0, maxChars) : s;
+}
+
+/** Rejects/resolves with `undefined` after `ms` — paired with Promise.race, never leaves a dangling timer that matters (test/process teardown is fine since this is a one-shot generation action). */
+function timeoutAfter(ms: number): Promise<undefined> {
+  return new Promise((resolve) => setTimeout(() => resolve(undefined), ms));
+}
+
+/**
+ * Defensively extracts `{summary, rootCause, suggestedFix, citedSeqNums}` from
+ * an arbitrary parsed JSON value. Tolerates: prose wrapped around a JSON
+ * object (extracts the first balanced `{...}` substring), missing fields,
+ * extra/unknown fields, wrong types on individual fields (drops them rather
+ * than failing the whole parse). Returns `undefined` only if no usable
+ * summary+rootCause pair can be recovered at all.
+ */
+export function parseExplanationLLMResponse(raw: unknown): ExplanationLLMResult | undefined {
+  let body: unknown = raw;
+
+  // Tolerate the provider returning the JSON as a bare string (possibly with
+  // surrounding prose) instead of an already-parsed object.
+  if (typeof body === "string") {
+    const extracted = extractFirstJsonObject(body);
+    if (extracted === undefined) return undefined;
+    body = extracted;
+  }
+
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const b = body as Record<string, unknown>;
+
+  const summaryRaw = typeof b["summary"] === "string" ? b["summary"] : undefined;
+  const rootCauseRaw = typeof b["rootCause"] === "string" ? b["rootCause"] : undefined;
+  if (!summaryRaw || !rootCauseRaw || summaryRaw.trim().length === 0 || rootCauseRaw.trim().length === 0) {
+    return undefined;
+  }
+
+  const summary = clampString(summaryRaw, LLM_MAX_FIELD_CHARS);
+  const rootCause = clampString(rootCauseRaw, LLM_MAX_FIELD_CHARS);
+
+  const suggestedFixRaw = typeof b["suggestedFix"] === "string" ? b["suggestedFix"] : undefined;
+  const suggestedFix = suggestedFixRaw !== undefined ? clampString(suggestedFixRaw, LLM_MAX_FIELD_CHARS) : undefined;
+
+  const citedSeqNumsRaw = Array.isArray(b["citedSeqNums"]) ? b["citedSeqNums"] : [];
+  const citedSeqNums = citedSeqNumsRaw
+    .filter((n): n is number => typeof n === "number" && Number.isFinite(n))
+    .slice(0, LLM_MAX_RAW_CITED_SEQ_NUMS);
+
+  return { summary, rootCause, suggestedFix, citedSeqNums };
+}
+
+/**
+ * Best-effort extraction of the first balanced `{...}` substring from a
+ * string that may contain prose around a JSON object (e.g. "Sure, here you
+ * go: { ... } Hope that helps!"). Returns the parsed object, or `undefined`
+ * if no valid JSON object could be found/parsed. Never throws.
+ */
+function extractFirstJsonObject(s: string): unknown {
+  const start = s.indexOf("{");
+  if (start === -1) return undefined;
+
+  let depth = 0;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        const candidate = s.slice(start, i + 1);
+        try {
+          return JSON.parse(candidate);
+        } catch {
+          return undefined;
+        }
+      }
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -88,33 +195,88 @@ export class HttpExplanationLLM implements ExplanationLLM {
     private readonly apiKey?: string,
   ) {}
 
-  async explain(input: GroundedExplanationPrompt): Promise<ExplanationLLMResult | undefined> {
+  /**
+   * One attempt at the HTTP call, race'd against a hard timeout so a hung
+   * upstream can never stall explanation generation. Returns the TIMEOUT
+   * sentinel on timeout, `undefined` on any request/response-level failure
+   * that should NOT be retried (non-5xx failure, bad body), and `{ retry:
+   * true }` for a failure this caller should retry once (5xx / network
+   * error / timeout).
+   */
+  private async attempt(
+    input: GroundedExplanationPrompt,
+  ): Promise<{ ok: true; result: ExplanationLLMResult } | { ok: false; retryable: boolean }> {
+    const controller = new AbortController();
+    const hardTimeout = setTimeout(() => controller.abort(), LLM_REQUEST_TIMEOUT_MS);
+
     try {
-      const res = await fetch(this.endpoint, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
-        },
-        body: JSON.stringify({ prompt: input.prompt }),
-      });
-      if (!res.ok) return undefined;
+      const racedResult = await Promise.race([
+        fetch(this.endpoint, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
+          },
+          body: JSON.stringify({ prompt: input.prompt }),
+          signal: controller.signal,
+        }).then((res) => ({ kind: "response" as const, res })),
+        timeoutAfter(LLM_REQUEST_TIMEOUT_MS).then(() => ({ kind: "timeout" as const })),
+      ]);
 
-      const body: unknown = await res.json();
-      if (!body || typeof body !== "object") return undefined;
-      const b = body as Record<string, unknown>;
+      if (racedResult.kind === "timeout") {
+        return { ok: false, retryable: true };
+      }
 
-      const summary = typeof b["summary"] === "string" ? b["summary"] : undefined;
-      const rootCause = typeof b["rootCause"] === "string" ? b["rootCause"] : undefined;
-      if (!summary || !rootCause) return undefined;
+      const res = racedResult.res;
+      if (!res.ok) {
+        // Retry only on 5xx (transient upstream failure); a 4xx is our own
+        // request being wrong and retrying it would just repeat the failure.
+        return { ok: false, retryable: res.status >= 500 };
+      }
 
-      const suggestedFix = typeof b["suggestedFix"] === "string" ? b["suggestedFix"] : undefined;
-      const citedSeqNums = Array.isArray(b["citedSeqNums"])
-        ? b["citedSeqNums"].filter((n): n is number => typeof n === "number")
-        : [];
+      const text = await res.text();
+      if (new TextEncoder().encode(text).length > LLM_MAX_RESPONSE_BYTES) {
+        // Oversized response — do not attempt to JSON.parse an arbitrarily
+        // large payload; treat as a bad (non-retryable) response.
+        return { ok: false, retryable: false };
+      }
 
-      return { summary, rootCause, suggestedFix, citedSeqNums };
+      let parsedBody: unknown;
+      try {
+        parsedBody = JSON.parse(text);
+      } catch {
+        // Tolerate prose-wrapped JSON via the defensive extractor.
+        parsedBody = text;
+      }
+
+      const parsed = parseExplanationLLMResponse(parsedBody);
+      if (!parsed) return { ok: false, retryable: false };
+      return { ok: true, result: parsed };
     } catch {
+      // Network error, DNS failure, or AbortError from our own timeout.
+      return { ok: false, retryable: true };
+    } finally {
+      clearTimeout(hardTimeout);
+    }
+  }
+
+  async explain(input: GroundedExplanationPrompt): Promise<ExplanationLLMResult | undefined> {
+    const startedAt = Date.now();
+    try {
+      for (let attemptNum = 1; attemptNum <= LLM_MAX_ATTEMPTS; attemptNum++) {
+        const outcome = await this.attempt(input);
+        if (outcome.ok) {
+          return { ...outcome.result, generationMs: Date.now() - startedAt };
+        }
+        if (!outcome.retryable || attemptNum === LLM_MAX_ATTEMPTS) {
+          return undefined;
+        }
+        // Single bounded retry — no backoff loop, no unbounded retries.
+      }
+      return undefined;
+    } catch {
+      // Never throw out of the provider — any unexpected failure degrades to
+      // "no result" so the caller falls back to the heuristic explanation.
       return undefined;
     }
   }

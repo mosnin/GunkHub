@@ -1238,14 +1238,25 @@ export type HeuristicFailureClass =
   | "llm_error"
   | "assertion_failed"
   | "terminal_error"
+  | "cascading_tool_failure"
   | "incomplete"
   | "unknown";
 
-/** Minimal run shape this engine needs. Duplicated (not imported) from contracts/schema per this file's convention. */
+/**
+ * Minimal run shape this engine needs. Duplicated (not imported) from
+ * contracts/schema per this file's convention. `parentRunId`/`sessionId`
+ * (cycle 2, ADR-002) are read ONLY to name the relationship in the
+ * explanation text ("this run is a sub-run of run X") — this engine never
+ * reads or infers anything about what happened INSIDE a parent/child run,
+ * since that would violate the grounding guarantee (only THIS run's events
+ * are in scope).
+ */
 export interface HeuristicRunLike {
   status: string;
   startedAt: number;
   endedAt?: number;
+  parentRunId?: string | null;
+  sessionId?: string | null;
 }
 
 /** Minimal event shape this engine needs — a superset of EvalEventLike (adds sequenceNumber as required, not optional). */
@@ -1285,6 +1296,15 @@ export interface HeuristicExplanationInput {
   events: HeuristicEventLike[];
   failureSummary: HeuristicFailureSummaryLike;
   evals: HeuristicEvalLike[];
+  /**
+   * Caller-supplied "current time" (epoch ms), used ONLY to distinguish an
+   * `incomplete` run that is genuinely still in progress from one that looks
+   * abandoned/stuck (its last event is far in the past — see
+   * STUCK_THRESHOLD_MS). Optional: when omitted, an incomplete run is always
+   * described as "still in progress" (the pre-cycle-2 behavior), since we
+   * have no basis to call it stuck.
+   */
+  now?: number;
 }
 
 export interface ExplanationResult {
@@ -1307,6 +1327,18 @@ const EXPLANATION_MAX_CITED_SEQ_NUMS = 20;
 const EXPLANATION_MAX_EVENTS_SCANNED = 1000;
 /** Backward-search window (in array positions, not sequence-number distance) used when hunting for the tool.call/llm.request that preceded a failure. Generous relative to any realistic single-run event burst between a request and its failure. */
 const EXPLANATION_BACKWARD_WINDOW = 100;
+/**
+ * If an `incomplete` run's last observed event is older than this relative to
+ * the caller-supplied `now`, describe it as abandoned/stuck rather than
+ * "still in progress" — a run's SDK typically emits SOME event (even a
+ * heartbeat-adjacent tool/LLM event) far more often than every 15 minutes for
+ * any actively-running agent loop.
+ */
+const STUCK_THRESHOLD_MS = 15 * 60 * 1000;
+/** Minimum repeat count of the SAME tool failing before we call it a cascade/retry-storm rather than an isolated tool_error. */
+const CASCADE_MIN_COUNT = 2;
+/** Terminal event types — excluded from "contributing factor" lists since they mark the SAME failure being explained, not a separate upstream cause. */
+const TERMINAL_EVENT_TYPES = new Set(["run.failed", "run.completed", "run.cancelled"]);
 
 function truncateText(s: string, maxChars: number): string {
   return s.length > maxChars ? s.slice(0, maxChars) : s;
@@ -1415,6 +1447,175 @@ function looksLikeTimeout(text: string | undefined): boolean {
   return /\btime(d)?[\s-]?out\b/i.test(text);
 }
 
+/**
+ * Pull a human-readable duration SUBSTRING (e.g. "30s", "1500ms") directly
+ * out of a real error message, for a more specific suggestedFix ("raise the
+ * timeout beyond 30s"). Returns undefined rather than inventing a number when
+ * none is present in the text — the grounding guarantee applies to fix text
+ * too, not just citedSeqNums.
+ */
+function extractDurationText(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const m = /\d+(?:\.\d+)?\s*(?:milliseconds|ms|seconds|secs|sec|s|minutes|mins|min|m)\b/i.exec(text);
+  // m[0] is returned verbatim (not reassembled from capture groups) so the
+  // exact substring — including its original spacing — is what gets quoted
+  // back in the fix text, staying grounded in the real error message.
+  return m ? m[0] : undefined;
+}
+
+/**
+ * Tolerant, keyword-based classification of WHY an LLM call likely errored,
+ * read directly off the real error message text (never invented). Returns
+ * undefined when no recognized pattern is present — the fix text falls back
+ * to a generic phrasing rather than guessing.
+ */
+function classifyLlmErrorHint(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const m = text.toLowerCase();
+  if (/rate[\s-]?limit|\b429\b/.test(m)) return "rate limiting";
+  if (/context length|context window|maximum context|too many tokens/.test(m)) return "the request exceeding the model's context window";
+  if (/\bauth|api key|\b401\b|\b403\b|forbidden|unauthorized/.test(m)) return "an authentication/authorization problem";
+  if (/time(d)?[\s-]?out/.test(m)) return "the request timing out";
+  if (/overloaded|\b529\b|\b503\b|unavailable/.test(m)) return "the provider being overloaded or unavailable";
+  return undefined;
+}
+
+/**
+ * Parse the one eval-detail shape we know the exact wording of (see
+ * evaluateMaxDuration, convex/helpers/evals.ts: "Duration Xms exceeds the
+ * Yms limit.") into an explicit expected-vs-actual pair, so
+ * suggestedFix/rootCause can state numbers rather than just echoing the raw
+ * details string. Undefined for any other rule's details text — grounded
+ * parsing only, never a guessed number.
+ */
+function parseDurationExceeds(details: string | undefined): { actualMs: string; expectedMs: string } | undefined {
+  if (!details) return undefined;
+  const m = /Duration\s+(\d+)ms\s+exceeds\s+the\s+(\d+)ms\s+limit/i.exec(details);
+  return m ? { actualMs: `${m[1]}ms`, expectedMs: `${m[2]}ms` } : undefined;
+}
+
+/** Coarse, human-readable "~N minutes/hours ago" for a millisecond gap. Never negative, never throws. */
+function humanizeGap(ms: number): string {
+  const clamped = Math.max(0, ms);
+  const minutes = Math.round(clamped / 60_000);
+  if (minutes < 60) return `${Math.max(1, minutes)} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.round(minutes / 60);
+  return `${hours} hour${hours === 1 ? "" : "s"}`;
+}
+
+export interface ToolFailureCascade {
+  /** Resolved tool name shared by every failure in the cascade. */
+  toolName: string;
+  /** Count of tool.error events attributed to this tool. */
+  count: number;
+  /** The real sequenceNumbers of each tool.error event in the cascade, ascending. */
+  seqNums: number[];
+}
+
+/**
+ * Detect a repeated-failure loop: the SAME tool's tool.error events occurring
+ * >= CASCADE_MIN_COUNT times in this run's trace ("search_docs failed 4
+ * consecutive times" rather than just citing the last one). Tool name is
+ * resolved the same tolerant way as the single-failure branches (nearest
+ * preceding tool.call, matched by call_id when available). Returns the
+ * largest such group, or undefined if no tool failed more than once or no
+ * failing tool.error's name could be resolved.
+ */
+function detectToolFailureCascade(sorted: HeuristicEventLike[]): ToolFailureCascade | undefined {
+  const byTool = new Map<string, number[]>();
+  for (let i = 0; i < sorted.length; i++) {
+    const e = sorted[i]!;
+    if (e.type !== "tool.error") continue;
+    const callId = extractCallId(e.payload);
+    const toolCall = findPrecedingToolCall(sorted, i, callId);
+    const toolName = toolCall ? extractToolName(toolCall.payload) : undefined;
+    if (!toolName) continue; // unresolved tool name: cannot honestly "name it" as a cascade
+    const arr = byTool.get(toolName) ?? [];
+    arr.push(e.sequenceNumber);
+    byTool.set(toolName, arr);
+  }
+
+  let best: ToolFailureCascade | undefined;
+  for (const [toolName, seqNums] of byTool) {
+    if (seqNums.length >= CASCADE_MIN_COUNT && (!best || seqNums.length > best.count)) {
+      best = { toolName, count: seqNums.length, seqNums: [...seqNums].sort((a, b) => a - b) };
+    }
+  }
+  return best;
+}
+
+/**
+ * The failure points OTHER than the primary/proximate one, excluding
+ * terminal marker events (run.failed/run.completed/run.cancelled — those
+ * just restate the same outcome being explained, not a distinct contributing
+ * cause). Used to surface a multi-failure CHAIN ("failed after 3 tool errors
+ * culminating in a timeout") instead of only ever citing the last failure.
+ */
+function contributingFailurePoints(
+  failureSummary: HeuristicFailureSummaryLike | undefined,
+  primary: HeuristicFailurePointLike | null,
+): HeuristicFailurePointLike[] {
+  const points = failureSummary && Array.isArray(failureSummary.allFailurePoints) ? failureSummary.allFailurePoints : [];
+  return points
+    .filter((p): p is HeuristicFailurePointLike => !!p && typeof p.sequenceNumber === "number")
+    .filter((p) => p.sequenceNumber !== primary?.sequenceNumber && !TERMINAL_EVENT_TYPES.has(p.type))
+    .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+}
+
+/**
+ * Render contributing points as a short, grounded, comma-separated list for
+ * the narrative (e.g. `#6 (tool.error \`search_docs\`: boom), #9
+ * (llm.error)`). When `sorted` is supplied and a point is a `tool.error`, its
+ * tool name is resolved the same tolerant way as the primary-failure
+ * branches (nearest preceding tool.call, matched by call_id) so a
+ * contributing tool failure is named, not just typed.
+ */
+function describeContributing(points: HeuristicFailurePointLike[], sorted?: HeuristicEventLike[]): string {
+  return points
+    .map((p) => {
+      let toolName: string | undefined;
+      if (sorted && p.type === "tool.error") {
+        const idx = sorted.findIndex((e) => e.sequenceNumber === p.sequenceNumber);
+        if (idx >= 0) {
+          const callId = extractCallId(sorted[idx]!.payload);
+          const toolCall = findPrecedingToolCall(sorted, idx, callId);
+          toolName = toolCall ? extractToolName(toolCall.payload) : undefined;
+        }
+      }
+      const typeLabel = toolName ? `${p.type} \`${toolName}\`` : p.type;
+      return `#${p.sequenceNumber} (${typeLabel}${p.errorMessage ? `: ${truncateText(p.errorMessage, 120)}` : ""})`;
+    })
+    .join(", ");
+}
+
+/**
+ * The narrative prefix for a failure branch's summary: when there are
+ * earlier, distinct contributing failures in the trace, name them and the
+ * count explicitly and distinguish them from the proximate cause about to be
+ * described; otherwise the plain single-cause phrasing.
+ */
+function chainPrefix(contributing: HeuristicFailurePointLike[], sorted?: HeuristicEventLike[]): string {
+  if (contributing.length === 0) return "This run failed because ";
+  return `This run failed after ${contributing.length} earlier issue${contributing.length === 1 ? "" : "s"} in its trace (${describeContributing(contributing, sorted)}), with the proximate cause being that `;
+}
+
+/**
+ * Append sub-agent/session context to a summary, grounded ONLY in this run's
+ * own `parentRunId`/`sessionId` fields — never in anything about what
+ * actually happened in the parent run or other runs in the session (this
+ * function does not and must not read any other run's events).
+ */
+function appendRelationshipContext(summary: string, run: HeuristicRunLike): string {
+  let out = summary;
+  if (run.parentRunId) {
+    out += ` This run is a sub-run of run ${String(run.parentRunId)} — if the underlying cause originates upstream, check the parent run's own trace.`;
+  }
+  if (run.sessionId) {
+    out += ` This run is part of session "${String(run.sessionId)}", alongside any other runs sharing that session id.`;
+  }
+  return truncateText(out, EXPLANATION_SUMMARY_MAX_CHARS);
+}
+
 export interface FailureClassification {
   failureClass: HeuristicFailureClass;
   /** The raw event that is the strongest evidence for this classification, or null if none applies/was found. */
@@ -1450,6 +1651,18 @@ export function classifyFailure(input: HeuristicExplanationInput): FailureClassi
     const reason = primary.reason;
 
     if (reason === "failed_tool") {
+      // Prefer naming a repeated-failure loop over the single-most-recent
+      // failure when the SAME tool has failed >= CASCADE_MIN_COUNT times in
+      // this trace — see detectToolFailureCascade's doc comment.
+      const cascade = detectToolFailureCascade(sorted);
+      const evidenceIndex = evidenceEvent ? sorted.indexOf(evidenceEvent) : -1;
+      const evidenceCallId = evidenceEvent ? extractCallId(evidenceEvent.payload) : undefined;
+      const evidenceToolCall = evidenceIndex >= 0 ? findPrecedingToolCall(sorted, evidenceIndex, evidenceCallId) : undefined;
+      const evidenceToolName = evidenceToolCall ? extractToolName(evidenceToolCall.payload) : undefined;
+      if (cascade && (cascade.toolName === evidenceToolName || cascade.seqNums.includes(primary.sequenceNumber))) {
+        return { failureClass: "cascading_tool_failure", evidenceEvent };
+      }
+
       const isTimeout = looksLikeTimeout(primary.errorMessage) || looksLikeTimeout(stringField(asRecord(evidenceEvent?.payload), "message"));
       return { failureClass: isTimeout ? "tool_timeout" : "tool_error", evidenceEvent };
     }
@@ -1509,7 +1722,15 @@ function lastEventOf(sorted: HeuristicEventLike[]): HeuristicEventLike | undefin
  */
 export function buildHeuristicExplanation(input: HeuristicExplanationInput): ExplanationResult {
   try {
-    return buildHeuristicExplanationInner(input);
+    const raw = buildHeuristicExplanationInner(input);
+    // Sub-agent/session context is appended uniformly to every non-throwing
+    // result, in one place, rather than duplicated per branch — see
+    // appendRelationshipContext's doc comment for the grounding rule it
+    // upholds (this run's own fields only, never the parent/session's
+    // contents).
+    const run = input && typeof input === "object" ? input.run : undefined;
+    if (!run || typeof run !== "object") return raw;
+    return { ...raw, summary: appendRelationshipContext(raw.summary, run) };
   } catch {
     return buildUnknownFallback(input);
   }
@@ -1559,8 +1780,26 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
   const { failureClass, evidenceEvent } = classifyFailure(input);
 
   if (failureClass === "incomplete") {
+    const now = typeof input.now === "number" && Number.isFinite(input.now) ? input.now : undefined;
+    const lastTs = typeof terminal?.timestamp === "number" && Number.isFinite(terminal.timestamp) ? terminal.timestamp : undefined;
+    const gapMs = now !== undefined && lastTs !== undefined ? now - lastTs : undefined;
+    const stuck = gapMs !== undefined && gapMs > STUCK_THRESHOLD_MS;
+    const lastEventLabel = terminal ? `#${terminal.sequenceNumber} (${terminal.type})` : "not available";
+
+    if (stuck) {
+      const ago = humanizeGap(gapMs);
+      return {
+        summary: `This run has no terminal event recorded, and its last observed event, ${lastEventLabel}, is roughly ${ago} old — this looks abandoned/stuck rather than still actively in progress.`,
+        rootCause: `The run has no RUN_COMPLETED/RUN_FAILED/RUN_CANCELLED terminal event, and no new event has been recorded for ~${ago}.`,
+        suggestedFix:
+          "This run appears stalled: check whether the agent process crashed, was killed, or lost connectivity before its SDK could flush a terminal event. Once confirmed dead, consider marking the run failed/timed_out rather than leaving it perpetually \"running\".",
+        citedSeqNums: clampCitedSeqNums([terminal?.sequenceNumber], validSeqNums),
+        failureClass,
+      };
+    }
+
     return {
-      summary: `This run has no terminal event recorded yet — its last observed event is ${terminal ? `#${terminal.sequenceNumber} (${terminal.type})` : "not available"}. It is either still in progress or the SDK failed to emit a completion event.`,
+      summary: `This run has no terminal event recorded yet — its last observed event is ${lastEventLabel}. It is either still in progress or the SDK failed to emit a completion event.`,
       rootCause: "The run has no RUN_COMPLETED/RUN_FAILED/RUN_CANCELLED terminal event in its trace.",
       suggestedFix:
         "If the agent process has actually exited, check whether the SDK's terminal-event flush ran (e.g. an uncaught exception before the finally/completion hook). Otherwise this run may simply still be in progress.",
@@ -1580,6 +1819,8 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
     const errorMessage = primary?.errorMessage ?? stringField(asRecord(evidenceEvent?.payload), "message");
     const toolLabel = toolName ? `\`${toolName}\`` : "a tool";
     const lastSuccessEvent = evidenceIndex >= 0 ? sorted[evidenceIndex - 1] : undefined;
+    const contributing = contributingFailurePoints(failureSummary, primary);
+    const durationText = failureClass === "tool_timeout" ? extractDurationText(errorMessage) : undefined;
 
     const stepsNote =
       lastSuccessEvent !== undefined
@@ -1587,16 +1828,16 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
         : "";
     const verb = failureClass === "tool_timeout" ? "timed out" : "failed";
     const summary = truncateText(
-      `This run failed because the ${toolLabel} tool call ${verb}${failSeq !== undefined ? ` at event #${failSeq}` : ""}${errorMessage ? ` ("${truncateText(errorMessage, 300)}")` : ""}. ${stepsNote}the run was marked "${String(run.status)}"${terminal ? ` at event #${terminal.sequenceNumber}` : ""}.`,
+      `${chainPrefix(contributing, sorted)}the ${toolLabel} tool call ${verb}${failSeq !== undefined ? ` at event #${failSeq}` : ""}${errorMessage ? ` ("${truncateText(errorMessage, 300)}")` : ""}. ${stepsNote}the run was marked "${String(run.status)}"${terminal ? ` at event #${terminal.sequenceNumber}` : ""}.`,
       EXPLANATION_SUMMARY_MAX_CHARS,
     );
     const rootCause = truncateText(
-      `The ${toolLabel} tool call ${verb}${errorMessage ? `: ${errorMessage}` : ", with no error message recorded on the event."}`,
+      `The ${toolLabel} tool call ${verb}${errorMessage ? `: ${errorMessage}` : ", with no error message recorded on the event."}${contributing.length > 0 ? ` (preceded by ${contributing.length} earlier issue${contributing.length === 1 ? "" : "s"}: ${describeContributing(contributing, sorted)})` : ""}`,
       EXPLANATION_ROOT_CAUSE_MAX_CHARS,
     );
     const suggestedFix = truncateText(
       failureClass === "tool_timeout"
-        ? `Consider raising the timeout configured for ${toolLabel}, or adding a fallback/retry path for it.`
+        ? `Consider raising the timeout configured for ${toolLabel}${durationText ? ` beyond its current ${durationText}` : ""}, or adding a fallback/retry path for it.`
         : `Check the inputs given to ${toolLabel}${failSeq !== undefined ? ` at event #${failSeq}` : ""} — the tool reported an error rather than timing out.`,
       EXPLANATION_FIX_MAX_CHARS,
     );
@@ -1606,9 +1847,46 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
       rootCause,
       suggestedFix,
       citedSeqNums: clampCitedSeqNums(
-        [lastSuccessEvent?.sequenceNumber, toolCallEvent?.sequenceNumber, failSeq, terminal?.sequenceNumber],
+        [
+          lastSuccessEvent?.sequenceNumber,
+          toolCallEvent?.sequenceNumber,
+          failSeq,
+          terminal?.sequenceNumber,
+          ...contributing.map((p) => p.sequenceNumber),
+        ],
         validSeqNums,
       ),
+      failureClass,
+    };
+  }
+
+  if (failureClass === "cascading_tool_failure") {
+    const primary = failureSummary?.primaryFailure ?? null;
+    const cascade = detectToolFailureCascade(sorted);
+    const toolLabel = cascade?.toolName ? `\`${cascade.toolName}\`` : "a tool";
+    const count = cascade?.count ?? 0;
+    const cascadeSeqNums = cascade?.seqNums ?? (primary ? [primary.sequenceNumber] : []);
+    const errorMessage = primary?.errorMessage ?? stringField(asRecord(evidenceEvent?.payload), "message");
+    const failSeq = evidenceEvent?.sequenceNumber ?? primary?.sequenceNumber;
+
+    const summary = truncateText(
+      `This run failed after a repeated-failure loop: the ${toolLabel} tool call failed ${count} consecutive time${count === 1 ? "" : "s"} in this trace (events ${cascadeSeqNums.map((n) => `#${n}`).join(", ")})${errorMessage ? `, most recently: "${truncateText(errorMessage, 300)}"` : ""}. The run was marked "${String(run.status)}"${terminal ? ` at event #${terminal.sequenceNumber}` : ""}.`,
+      EXPLANATION_SUMMARY_MAX_CHARS,
+    );
+    const rootCause = truncateText(
+      `${toolLabel} failed ${count} times in a row${errorMessage ? `, most recently: ${errorMessage}` : ""} — a retry storm / repeated-failure loop, not a single isolated error.`,
+      EXPLANATION_ROOT_CAUSE_MAX_CHARS,
+    );
+    const suggestedFix = truncateText(
+      `Investigate why ${toolLabel} is failing repeatedly (upstream dependency health, rate limits, or a bad input being retried unchanged) rather than treating this as one isolated failure. Consider capping automatic retries for ${toolLabel} and surfacing the failure sooner instead of retrying blindly.`,
+      EXPLANATION_FIX_MAX_CHARS,
+    );
+
+    return {
+      summary,
+      rootCause,
+      suggestedFix,
+      citedSeqNums: clampCitedSeqNums([...cascadeSeqNums, failSeq, terminal?.sequenceNumber], validSeqNums),
       failureClass,
     };
   }
@@ -1622,17 +1900,19 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
     const errorMessage = primary?.errorMessage ?? stringField(asRecord(evidenceEvent?.payload), "message");
     const modelLabel = model ? `\`${model}\`` : "the model";
     const lastSuccessEvent = evidenceIndex >= 0 ? sorted[evidenceIndex - 1] : undefined;
+    const contributing = contributingFailurePoints(failureSummary, primary);
+    const hint = classifyLlmErrorHint(errorMessage);
 
     const summary = truncateText(
-      `This run failed because a call to ${modelLabel} errored${failSeq !== undefined ? ` at event #${failSeq}` : ""}${errorMessage ? ` ("${truncateText(errorMessage, 300)}")` : ""}. The run was marked "${String(run.status)}"${terminal ? ` at event #${terminal.sequenceNumber}` : ""}.`,
+      `${chainPrefix(contributing, sorted)}a call to ${modelLabel} errored${failSeq !== undefined ? ` at event #${failSeq}` : ""}${errorMessage ? ` ("${truncateText(errorMessage, 300)}")` : ""}. The run was marked "${String(run.status)}"${terminal ? ` at event #${terminal.sequenceNumber}` : ""}.`,
       EXPLANATION_SUMMARY_MAX_CHARS,
     );
     const rootCause = truncateText(
-      `The LLM call to ${modelLabel} errored${errorMessage ? `: ${errorMessage}` : ", with no error message recorded on the event."}`,
+      `The LLM call to ${modelLabel} errored${errorMessage ? `: ${errorMessage}` : ", with no error message recorded on the event."}${hint ? ` — consistent with ${hint}.` : ""}${contributing.length > 0 ? ` (preceded by ${contributing.length} earlier issue${contributing.length === 1 ? "" : "s"}: ${describeContributing(contributing, sorted)})` : ""}`,
       EXPLANATION_ROOT_CAUSE_MAX_CHARS,
     );
     const suggestedFix = truncateText(
-      `Review the request sent to ${modelLabel}${requestEvent ? ` at event #${requestEvent.sequenceNumber}` : ""} (prompt size, parameters, or provider-side incident) — the error was on the model call itself, not a tool.`,
+      `Review the request sent to ${modelLabel}${requestEvent ? ` at event #${requestEvent.sequenceNumber}` : ""}${hint ? ` — the error text suggests ${hint}` : " (prompt size, parameters, or a provider-side incident)"} — the error was on the model call itself, not a tool.`,
       EXPLANATION_FIX_MAX_CHARS,
     );
 
@@ -1641,7 +1921,13 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
       rootCause,
       suggestedFix,
       citedSeqNums: clampCitedSeqNums(
-        [lastSuccessEvent?.sequenceNumber, requestEvent?.sequenceNumber, failSeq, terminal?.sequenceNumber],
+        [
+          lastSuccessEvent?.sequenceNumber,
+          requestEvent?.sequenceNumber,
+          failSeq,
+          terminal?.sequenceNumber,
+          ...contributing.map((p) => p.sequenceNumber),
+        ],
         validSeqNums,
       ),
       failureClass,
@@ -1652,16 +1938,27 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
     const failedEval = evals.find((e) => e && e.passed === false);
     const evalName = failedEval?.name ?? "an eval";
     const details = failedEval?.details;
+    // Grounded expected-vs-actual extraction: only for the one details shape
+    // we know the exact wording of (max_duration_ms) — see
+    // parseDurationExceeds's doc comment. Falls back to the raw details text
+    // for every other rule kind, never a guessed number.
+    const durationExceeds = parseDurationExceeds(details);
+    const expectedVsActual = durationExceeds
+      ? ` (expected duration ${durationExceeds.expectedMs}, actual was ${durationExceeds.actualMs})`
+      : "";
+
     const summary = truncateText(
-      `This run's execution completed (status "${String(run.status)}"), but it failed the "${evalName}" eval${details ? `: ${truncateText(details, 300)}` : "."}${terminal ? ` The run's terminal event is #${terminal.sequenceNumber}.` : ""}`,
+      `This run's execution completed (status "${String(run.status)}"), but it failed the "${evalName}" eval${details ? `: ${truncateText(details, 300)}` : "."}${expectedVsActual}${terminal ? ` The run's terminal event is #${terminal.sequenceNumber}.` : ""}`,
       EXPLANATION_SUMMARY_MAX_CHARS,
     );
     const rootCause = truncateText(
-      `The "${evalName}" eval reported a failure${details ? `: ${details}` : ", with no further detail recorded."}`,
+      `The "${evalName}" eval reported a failure${details ? `: ${details}` : ", with no further detail recorded."}${expectedVsActual}`,
       EXPLANATION_ROOT_CAUSE_MAX_CHARS,
     );
     const suggestedFix = truncateText(
-      `Review the "${evalName}" rule's expected condition against this run's actual behavior${details ? ` (${details})` : ""}, and adjust either the rule or the agent to close the gap.`,
+      durationExceeds
+        ? `The run took ${durationExceeds.actualMs} against a ${durationExceeds.expectedMs} limit for "${evalName}" — either speed up the run (fewer/cheaper LLM calls, parallelize tool calls) or raise the rule's limit if ${durationExceeds.expectedMs} is unrealistically tight.`
+        : `Review the "${evalName}" rule's expected condition against this run's actual behavior${details ? ` (${details})` : ""}, and adjust either the rule or the agent to close the gap.`,
       EXPLANATION_FIX_MAX_CHARS,
     );
 
@@ -1680,14 +1977,16 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
     const errorMessage = primary?.errorMessage ?? stringField(asRecord(evidenceEvent?.payload), "message");
     const evidenceIndex = evidenceEvent ? sorted.indexOf(evidenceEvent) : -1;
     const lastSuccessEvent = evidenceIndex >= 0 ? sorted[evidenceIndex - 1] : undefined;
+    const contributing = contributingFailurePoints(failureSummary, primary);
+    const chainNote = contributing.length > 0 ? `After ${contributing.length} earlier issue${contributing.length === 1 ? "" : "s"} in its trace (${describeContributing(contributing, sorted)}), t` : "T";
 
     const summary = truncateText(
-      `This run was marked "${String(run.status)}"${failSeq !== undefined ? ` at event #${failSeq}` : ""}${errorMessage ? ` with the reported error: "${truncateText(errorMessage, 400)}"` : ", with no error message recorded on the terminal event."}`,
+      `${chainNote}his run was marked "${String(run.status)}"${failSeq !== undefined ? ` at event #${failSeq}` : ""}${errorMessage ? ` with the reported error: "${truncateText(errorMessage, 400)}"` : ", with no error message recorded on the terminal event."}`,
       EXPLANATION_SUMMARY_MAX_CHARS,
     );
     const rootCause = truncateText(
       errorMessage
-        ? `The run's terminal event reported: ${errorMessage}`
+        ? `The run's terminal event reported: ${errorMessage}${contributing.length > 0 ? ` (preceded by: ${describeContributing(contributing, sorted)})` : ""}`
         : `The run ended with status "${String(run.status)}" but no error message was recorded on the terminal event.`,
       EXPLANATION_ROOT_CAUSE_MAX_CHARS,
     );
@@ -1702,7 +2001,10 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
       summary,
       rootCause,
       ...(suggestedFix !== undefined && { suggestedFix }),
-      citedSeqNums: clampCitedSeqNums([lastSuccessEvent?.sequenceNumber, failSeq, terminal?.sequenceNumber], validSeqNums),
+      citedSeqNums: clampCitedSeqNums(
+        [lastSuccessEvent?.sequenceNumber, failSeq, terminal?.sequenceNumber, ...contributing.map((p) => p.sequenceNumber)],
+        validSeqNums,
+      ),
       failureClass,
     };
   }
@@ -1716,4 +2018,75 @@ function buildHeuristicExplanationInner(input: HeuristicExplanationInput): Expla
     citedSeqNums: clampCitedSeqNums([terminal?.sequenceNumber], validSeqNums),
     failureClass: "unknown",
   };
+}
+
+// ---------------------------------------------------------------------------
+// 7. explanationQualityScore — pure, deterministic structural completeness
+//    score for an ExplanationResult, for tests/monitoring (NOT an LLM judge,
+//    NOT a semantic-quality assessment — purely "does this result have the
+//    shape a good explanation should have").
+// ---------------------------------------------------------------------------
+
+/** Root-cause / summary phrases that indicate an HONEST "nothing more to say" state, where a missing suggestedFix is a correct choice, not a gap. */
+const NO_FIX_EXPECTED_ROOT_CAUSE_PHRASES = [
+  "no error message recorded",
+  "no error message was recorded",
+  "unable to determine a root cause",
+  "no failure detected",
+];
+
+/**
+ * Score how structurally complete a `buildHeuristicExplanation` result is,
+ * in [0, 1]. This is a fixed, deterministic rubric over the SHAPE of the
+ * result (does it have a real root cause? are its citations grounded? does
+ * it offer a fix where the failure class implies one should exist?) — it
+ * does not read or judge the prose quality/semantics the way an LLM judge
+ * would, and it must stay a pure function of `(result, input)` with no
+ * external calls.
+ *
+ * Five equally-weighted checks:
+ *   1. `rootCause` is present and not one of the generic fallback strings.
+ *   2. `summary` is non-trivially long (not just a short stub).
+ *   3. `citedSeqNums` is non-empty.
+ *   4. Every entry in `citedSeqNums` is a REAL sequenceNumber from
+ *      `input.events` (re-derives the grounding guarantee independently of
+ *      `buildHeuristicExplanation`'s own internal enforcement, so a
+ *      regression in that enforcement would also show up here).
+ *   5. `suggestedFix` is present when the failure class/rootCause implies a
+ *      concrete fix should exist; for classes/cases where an honest fix
+ *      cannot be offered (e.g. "unknown", or a terminal error with no
+ *      recorded message), the honest absence scores full marks too — this
+ *      check penalizes a MISSING fix where one was expected, not a
+ *      legitimately absent one.
+ */
+export function explanationQualityScore(result: ExplanationResult, input: HeuristicExplanationInput): number {
+  const checks: boolean[] = [];
+
+  const rootCause = typeof result?.rootCause === "string" ? result.rootCause : "";
+  const rootCauseLower = rootCause.toLowerCase();
+  checks.push(
+    rootCause.trim().length > 0 &&
+      !NO_FIX_EXPECTED_ROOT_CAUSE_PHRASES.some((p) => rootCauseLower === p || rootCauseLower.startsWith(p)),
+  );
+
+  const summary = typeof result?.summary === "string" ? result.summary : "";
+  checks.push(summary.trim().length >= 20);
+
+  const cited = Array.isArray(result?.citedSeqNums) ? result.citedSeqNums : [];
+  checks.push(cited.length > 0);
+
+  const validSeqNums = new Set(
+    (Array.isArray(input?.events) ? input.events : [])
+      .map((e) => e?.sequenceNumber)
+      .filter((n): n is number => typeof n === "number" && Number.isFinite(n)),
+  );
+  checks.push(cited.every((n) => validSeqNums.has(n)));
+
+  const fixNotExpected =
+    result?.failureClass === "unknown" || NO_FIX_EXPECTED_ROOT_CAUSE_PHRASES.some((p) => rootCauseLower.includes(p));
+  const hasFix = typeof result?.suggestedFix === "string" && result.suggestedFix.trim().length > 0;
+  checks.push(fixNotExpected || hasFix);
+
+  const passed = checks.filter(Boolean).length;
+  return checks.length > 0 ? passed / checks.length : 0;
 }

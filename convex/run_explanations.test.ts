@@ -244,7 +244,7 @@ describe('generateRunExplanation', () => {
 
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({
+      text: async () => JSON.stringify({
         summary: 'A fabricated summary.',
         rootCause: 'A fabricated root cause.',
         citedSeqNums: [9999], // does not exist on this run
@@ -276,7 +276,7 @@ describe('generateRunExplanation', () => {
 
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({
+      text: async () => JSON.stringify({
         summary: 'The LLM call failed because the provider was overloaded.',
         rootCause: 'Sequence 2 shows an llm.error with message "model overloaded".',
         suggestedFix: 'Retry with backoff.',
@@ -297,6 +297,47 @@ describe('generateRunExplanation', () => {
       expect(row?.kind).toBe('llm')
       expect(row?.model).toBe('test-model-v1')
       expect(row?.citedSequenceNumbers).toEqual([2])
+      // Cost/latency note: a successful LLM generation stamps generationMs.
+      expect(typeof row?.generationMs).toBe('number')
+      expect(row?.generationMs).toBeGreaterThanOrEqual(0)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('bounds an LLM response with a 100 KB summary and 500 fabricated citations to the stored write ceilings', async () => {
+    process.env['AFR_LLM_PROVIDER'] = 'http'
+    process.env['AFR_LLM_ENDPOINT'] = 'https://llm.example.test/explain'
+
+    const hugeSummary = 'A'.repeat(100 * 1024)
+    const fakeCites = Array.from({ length: 500 }, (_, i) => 50_000 + i)
+    // Include the one real sequence number (2) among the 500 fakes so the
+    // grounding gate's "cites >= 1 real event" check passes and the LLM
+    // result is actually accepted (kind: 'llm') — otherwise this test would
+    // only exercise the heuristic fallback path, not the bounding itself.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        summary: hugeSummary,
+        rootCause: 'Sequence 2 shows an llm.error.',
+        citedSeqNums: [2, ...fakeCites],
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const t = convexTest(schema, modules)
+      const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+      const runId = await seedRun(t, orgA, projectA, agentA, 'failed')
+
+      const result = await t.action(internal.run_explanations.generateRunExplanation, { runId })
+      expect(result).toEqual({ skipped: false, kind: 'llm', failureClass: 'llm_error' })
+
+      const row = await t.run((ctx) => ctx.db.query('run_explanations').withIndex('by_run', (q) => q.eq('runId', runId)).first())
+      // MAX_EXPLANATION_SUMMARY_BYTES is 2 KB — the 100 KB summary must be truncated well below its original size.
+      expect(new TextEncoder().encode(row!.summary).length).toBeLessThanOrEqual(2 * 1024)
+      // Only the one REAL sequence number survives validateCitedSeqNums — all 500 fakes are stripped.
+      expect(row!.citedSequenceNumbers).toEqual([2])
     } finally {
       vi.unstubAllGlobals()
     }
@@ -412,5 +453,138 @@ describe('regenerateRunExplanation', () => {
     const runId = await seedRun(t, orgA, projectA, agentA, 'completed')
     const asAdmin = t.withIdentity(identity('admin', 'a'))
     await expect(asAdmin.action(api.run_explanations.regenerateRunExplanation, { runId })).rejects.toThrow(/INVALID_ARGUMENT/)
+  })
+
+  it('a scheduler-triggered generate racing an admin regenerate never produces duplicate rows for one run', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedRun(t, orgA, projectA, agentA, 'failed')
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+
+    // Fire both "concurrently" — the scheduler's own non-forced generate call
+    // (idempotent no-op if a row already exists) and an admin's forced
+    // regenerate, in parallel. The by_run .first()-then-delete-then-insert
+    // upsert pattern in _upsertRunExplanation must still land at most one row
+    // per run regardless of interleaving.
+    await Promise.all([
+      t.action(internal.run_explanations.generateRunExplanation, { runId }),
+      asAdmin.action(api.run_explanations.regenerateRunExplanation, { runId }),
+    ])
+
+    const rows = await t.run((ctx) => ctx.db.query('run_explanations').withIndex('by_run', (q) => q.eq('runId', runId)).collect())
+    expect(rows.length).toBe(1)
+  })
+
+  it('regenerating an LLM-backed explanation with no LLM configured correctly falls back to heuristic', async () => {
+    process.env['AFR_LLM_PROVIDER'] = 'http'
+    process.env['AFR_LLM_ENDPOINT'] = 'https://llm.example.test/explain'
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        summary: 'An LLM-generated summary.',
+        rootCause: 'Sequence 2 shows an llm.error.',
+        citedSeqNums: [2],
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const t = convexTest(schema, modules)
+      const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+      const runId = await seedRun(t, orgA, projectA, agentA, 'failed')
+      const asAdmin = t.withIdentity(identity('admin', 'a'))
+
+      const first = await asAdmin.action(api.run_explanations.regenerateRunExplanation, { runId })
+      expect(first).toEqual({ skipped: false, kind: 'llm', failureClass: 'llm_error' })
+      const rowAfterLlm = await t.run((ctx) => ctx.db.query('run_explanations').withIndex('by_run', (q) => q.eq('runId', runId)).first())
+      expect(rowAfterLlm?.kind).toBe('llm')
+
+      // Now unconfigure the LLM and regenerate again.
+      vi.unstubAllGlobals()
+      delete process.env['AFR_LLM_PROVIDER']
+      delete process.env['AFR_LLM_ENDPOINT']
+
+      const second = await asAdmin.action(api.run_explanations.regenerateRunExplanation, { runId })
+      expect(second).toEqual({ skipped: false, kind: 'heuristic', failureClass: 'llm_error' })
+
+      const rows = await t.run((ctx) => ctx.db.query('run_explanations').withIndex('by_run', (q) => q.eq('runId', runId)).collect())
+      expect(rows.length).toBe(1) // still exactly one row, now heuristic
+      expect(rows[0]!.kind).toBe('heuristic')
+      expect(rows[0]!.model).toBeUndefined()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// getRunExplanationSummaries — batched "why-preview" for a runs list
+// ---------------------------------------------------------------------------
+describe('getRunExplanationSummaries', () => {
+  it('returns summaries only for the caller org, skipping runs without an explanation and cross-org runIds', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectA, agentA } = await seedTwoOrgs(t)
+
+    const runWithExplanation = await seedRun(t, orgA, projectA, agentA, 'failed')
+    const runWithoutExplanation = await seedRun(t, orgA, projectA, agentA, 'failed')
+
+    const { projectB, agentB } = await t.run(async (ctx) => {
+      const now = Date.now()
+      const projectB = await ctx.db.insert('projects', { orgId: orgB, name: 'PB', slug: 'pb', createdAt: now, updatedAt: now })
+      const agentB = await ctx.db.insert('agents', { orgId: orgB, projectId: projectB, name: 'Agent B', slug: 'b', createdAt: now, updatedAt: now })
+      return { projectB, agentB }
+    })
+    const crossOrgRun = await seedRun(t, orgB, projectB, agentB, 'failed')
+
+    await t.run(async (ctx) => {
+      await ctx.db.insert('run_explanations', {
+        orgId: orgA, runId: runWithExplanation, kind: 'heuristic', summary: 'It failed because X.',
+        rootCause: 'X happened.', citedSequenceNumbers: [2, 3], failureClass: 'llm_error', generatedAt: Date.now(), version: 1,
+      })
+      await ctx.db.insert('run_explanations', {
+        orgId: orgB, runId: crossOrgRun, kind: 'heuristic', summary: 'Org B secret failure.',
+        rootCause: 'Should never leak.', citedSequenceNumbers: [2, 3], failureClass: 'tool_error', generatedAt: Date.now(), version: 1,
+      })
+    })
+
+    const asMemberA = t.withIdentity(identity('member', 'a'))
+    const summaries = await asMemberA.query(api.run_explanations.getRunExplanationSummaries, {
+      runIds: [runWithExplanation, runWithoutExplanation, crossOrgRun],
+    })
+
+    expect(summaries).toEqual([{ runId: runWithExplanation, summary: 'It failed because X.', failureClass: 'llm_error', kind: 'heuristic' }])
+    // Cross-org run's explanation content never appears anywhere in the result.
+    expect(JSON.stringify(summaries)).not.toContain('Org B secret failure')
+  })
+
+  it('rejects an unauthenticated caller', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedRun(t, orgA, projectA, agentA, 'failed')
+    const t2 = convexTest(schema, modules)
+    await expect(t2.query(api.run_explanations.getRunExplanationSummaries, { runIds: [runId] })).rejects.toThrow(/Unauthorized/)
+  })
+
+  it('respects the MAX_RUN_EXPLANATION_SUMMARY_BATCH cap, ignoring extra ids rather than erroring', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+
+    const runIds: any[] = []
+    for (let i = 0; i < 55; i++) {
+      const runId = await seedRun(t, orgA, projectA, agentA, 'failed')
+      await t.run(async (ctx) => {
+        await ctx.db.insert('run_explanations', {
+          orgId: orgA, runId, kind: 'heuristic', summary: `Summary ${i}`,
+          rootCause: 'R', citedSequenceNumbers: [2, 3], failureClass: 'llm_error', generatedAt: Date.now(), version: 1,
+        })
+      })
+      runIds.push(runId)
+    }
+
+    const asMemberA = t.withIdentity(identity('member', 'a'))
+    const summaries = await asMemberA.query(api.run_explanations.getRunExplanationSummaries, { runIds })
+    // 55 requested, capped at 50 processed — no error, just a partial (bounded) result.
+    expect(summaries.length).toBe(50)
   })
 })

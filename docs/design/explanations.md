@@ -198,9 +198,56 @@ stored `run_explanations` row (already validated at write time) or `null`.
 - `generateRunExplanation` (the scheduler-triggered path from a terminal
   event) is non-blocking (`ctx.scheduler.runAfter(0, ...)`), so ordinary
   run-completion latency is unaffected regardless of LLM configuration.
-- `HttpExplanationLLM.explain()` never throws and has no retry logic — a
-  slow, down, or misconfigured endpoint degrades to "heuristic only" for
-  that generation, not a failed request.
+- **Bounded timeout + single retry (Cycle 2 hardening, `convex/helpers/llm_provider.ts`):**
+  `HttpExplanationLLM.explain()` still never throws, but is no longer a
+  bare unbounded `fetch`:
+  - Each attempt is raced against a **20s hard timeout**
+    (`LLM_REQUEST_TIMEOUT_MS`) via `AbortController` — a hung upstream can
+    delay `regenerateRunExplanation`'s response by at most this long per
+    attempt, never indefinitely.
+  - On a **5xx response, network error, or timeout**, the call is retried
+    **exactly once** (`LLM_MAX_ATTEMPTS = 2`, no backoff loop) before giving
+    up and returning `undefined` (heuristic fallback). A **4xx response is
+    never retried** — it means the request itself is malformed/unauthorized,
+    and retrying it would just repeat the same failure.
+  - **Worst-case added latency** from LLM generation is therefore ~2 ×
+    `LLM_REQUEST_TIMEOUT_MS` (~40s) before falling back to the heuristic —
+    budget for this if you set `AFR_LLM_PROVIDER=http` and call
+    `POST .../regenerate` from a UI that shows a spinner; consider it before
+    lowering the route's own request timeout below that.
+  - The response body is capped at **256 KB** (`LLM_MAX_RESPONSE_BYTES`)
+    before it is even JSON-parsed, and each string field returned
+    (`summary`/`rootCause`/`suggestedFix`) is clamped to **8 KB**
+    (`LLM_MAX_FIELD_CHARS`) — defense-in-depth against a misbehaving or
+    compromised endpoint returning an oversized payload, on top of
+    `run_explanations.ts`'s own storage-side `truncateToBytes` calls.
+  - A successful call now also reports `generationMs` (wall-clock time spent
+    in the provider call, including any retry) alongside the result, stored
+    as an informational note on the `run_explanations` row — useful for
+    spotting a slow/flaky endpoint without instrumenting anything else.
+
+## Cost note ($ per explanation)
+
+Enabling `AFR_LLM_PROVIDER=http` means **every** terminal event on a
+failed/timed_out/cancelled run triggers one real request to
+`AFR_LLM_ENDPOINT` (plus, per the retry policy above, occasionally two) —
+this is a per-run cost, not a one-time setup cost. Two implications worth
+sizing before turning it on for a busy org:
+
+- **Volume**: cost scales with your failure rate × run volume, not with how
+  often a human opens the explanation panel — generation happens
+  eagerly/non-blocking on every qualifying terminal event
+  (`generateRunExplanation`), independent of whether anyone ever looks at
+  the result.
+- **Per-call cost is whatever your endpoint bills you** — this repo's
+  `HttpExplanationLLM` is a generic HTTP-POST client with no vendor-specific
+  cost accounting; if you're fronting a metered vendor API (Anthropic,
+  OpenAI, etc. — see "Provider setup" below), track spend on that vendor's
+  side (e.g. the Anthropic Console's usage dashboard), not here.
+- The heuristic explanation (Team B, always-on, zero-config, zero external
+  calls) is a complete, real root-cause analysis on its own — treat the LLM
+  narrative as an upgrade for cases where the heuristic's classification
+  isn't precise enough, not a requirement for the feature to be useful.
 
 ## No-config default
 
@@ -219,3 +266,74 @@ default-to-noop pattern (`AFR_EMAIL_PROVIDER` in
 | `AFR_LLM_ENDPOINT` | Only if `AFR_LLM_PROVIDER=http` | Vendor-adapter URL; POSTed `{ prompt }`, expects `{ summary, rootCause, suggestedFix?, citedSeqNums }`. |
 | `AFR_LLM_API_KEY` | No | Sent as `Authorization: Bearer <value>` if set. Server-side only — never sent to the client, never logged. |
 | `AFR_LLM_MODEL` | No | Descriptive label only; not sent to the endpoint. |
+
+## Provider setup — pointing `AFR_LLM_ENDPOINT` at a real vendor
+
+`HttpExplanationLLM` is deliberately **vendor-agnostic**: it POSTs
+`{ "prompt": "<grounding prompt text>" }` as JSON to `AFR_LLM_ENDPOINT` and
+expects back `{ summary, rootCause, suggestedFix?, citedSeqNums }`. No
+real vendor's Messages/Chat Completions API speaks that exact request/
+response shape natively, so `AFR_LLM_ENDPOINT` must point at a **small
+adapter** (a Vercel/Cloudflare function, a Lambda, or any tiny HTTP service
+you control) that:
+
+1. accepts the `{ prompt }` POST body this repo sends,
+2. calls your chosen vendor's real API with that prompt (e.g. wraps it in a
+   single user message),
+3. asks the model to respond with (or parses its response into)
+   `{ summary, rootCause, suggestedFix?, citedSeqNums }` — a system prompt
+   instructing the model to reply with exactly that JSON shape is normally
+   enough; `parseExplanationLLMResponse` (see above) is tolerant of the
+   reply being wrapped in prose or returned as a JSON string, so the adapter
+   does not need to be perfectly strict.
+
+This repo does not ship that adapter — building/hosting it is an
+operator decision, not something `convex/helpers/llm_provider.ts` assumes.
+
+**Anthropic (Claude):**
+- Your adapter calls `POST https://api.anthropic.com/v1/messages` with your
+  Anthropic API key in the `x-api-key` header, a `model` (e.g.
+  `claude-opus-4-6-20261001` — check the Anthropic Console for the current
+  model roster before hardcoding one), and the grounding prompt as the
+  message content, instructing the model to answer in the required JSON
+  shape.
+- Set `AFR_LLM_ENDPOINT` to your adapter's URL (not `api.anthropic.com`
+  directly — this repo's request/response contract doesn't match
+  Anthropic's Messages API shape).
+- Set `AFR_LLM_API_KEY` to whatever bearer token your **adapter** expects
+  from this app (a secret you mint yourself for the adapter-to-app hop) —
+  your real Anthropic key lives only in the adapter's own environment, never
+  in this app's env vars, so it is never in this app's process, logs, or
+  Convex environment.
+- Optionally set `AFR_LLM_MODEL` to a descriptive label (e.g.
+  `claude-opus-4-6-via-adapter`) purely for display on the stored
+  explanation — it is never sent to the endpoint or used to select
+  behavior.
+
+**OpenAI-compatible endpoints** (OpenAI itself, or any Chat-Completions-
+compatible self-hosted/proxy service):
+- Same pattern: your adapter calls the vendor's real chat/completions
+  endpoint with your real API key, and translates the response into
+  `{ summary, rootCause, suggestedFix?, citedSeqNums }` before responding to
+  this app.
+- Set `AFR_LLM_ENDPOINT` to your adapter's URL, `AFR_LLM_API_KEY` to the
+  adapter-facing secret (not the vendor key), `AFR_LLM_MODEL` to a display
+  label.
+
+**Security note — keys stay server-side, always:**
+- `AFR_LLM_API_KEY` (and, transitively, whatever real vendor key your
+  adapter holds) must **never** be a `NEXT_PUBLIC_*` variable and must never
+  be read from client-side code — it is only ever read by
+  `convex/helpers/llm_provider.ts`, which runs in the Convex backend action
+  pipeline (`run_explanations.ts`), not in the browser or in `apps/web`'s
+  client bundle.
+- Nothing in the response path echoes the raw prompt or a raw provider
+  response back to the browser (see "Never echoed unvalidated" above) — even
+  if your adapter's own logs are compromised, the worst a caller sees
+  through this app is the already-validated, already-clamped `summary` /
+  `rootCause` / `suggestedFix` fields on a stored `run_explanations` row.
+- Rotate `AFR_LLM_API_KEY` (the adapter-facing secret) the same way you'd
+  rotate any other server secret in this repo — it has no built-in rotation
+  window like `CONVEX_WEBHOOK_SECRET`'s comma-pair format, so a rotation
+  means a coordinated single-value update on both the adapter and this
+  app's env.

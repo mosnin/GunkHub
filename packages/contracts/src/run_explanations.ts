@@ -25,6 +25,16 @@ export interface RunExplanation {
   generatedAt: number;
   /** Present only when kind === "llm". */
   model?: string;
+  /** Present only when kind === "llm" — wall-clock ms spent in the provider call, for cost/latency observability. */
+  generationMs?: number;
   /** Schema version of this explanation shape. */
   version: number;
+}
+
+/** Lightweight batched "why-preview" shape returned by `getRunExplanationSummaries` — NOT the full explanation, just what a one-line list preview needs. */
+export interface RunExplanationSummary {
+  runId: string;
+  summary: string;
+  failureClass: string;
+  kind: RunExplanationKind;
 }

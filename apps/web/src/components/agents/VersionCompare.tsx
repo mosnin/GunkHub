@@ -2,7 +2,11 @@
 
 import { useState, useTransition } from 'react'
 
-import type { VersionCompareResult, VersionCohortStats } from '@/lib/services/agent_versions'
+import type {
+  VersionCompareResult,
+  VersionCohortStats,
+  VersionCompareNarrative,
+} from '@/lib/services/agent_versions'
 import type { AgentVersion } from '@agent-flight-recorder/contracts'
 
 import { Card } from '@/components/ui/Card'
@@ -17,6 +21,28 @@ const VERDICT_STYLE: Record<string, { label: string; className: string }> = {
   likely_improvement: { label: 'Likely improvement', className: 'bg-success-900 text-success-400 border-success-700' },
   inconclusive: { label: 'Inconclusive', className: 'bg-graphite text-cloud border-graphite-light' },
   insufficient_data: { label: 'Insufficient data', className: 'bg-graphite text-pewter border-graphite-light' },
+}
+
+/** Tone for the plain-English "what changed" narrative — honest, not decorative:
+    destructive for a real regression, neon only for a real improvement,
+    neutral pewter for anything the data can't yet support a strong claim about. */
+const NARRATIVE_STYLE: Record<VersionCompareNarrative['significance'], { label: string; textClassName: string }> = {
+  likely_regression: { label: 'Likely regression', textClassName: 'text-destructive-400' },
+  likely_improvement: { label: 'Likely improvement', textClassName: 'text-neon-glow' },
+  inconclusive: { label: 'Inconclusive', textClassName: 'text-pewter' },
+  insufficient_data: { label: 'Insufficient data', textClassName: 'text-pewter' },
+}
+
+function NarrativeCallout({ narrative }: { narrative: VersionCompareNarrative }) {
+  const style = NARRATIVE_STYLE[narrative.significance] ?? NARRATIVE_STYLE.inconclusive
+  return (
+    <div className="rounded-[4px] border border-graphite bg-graphite-deep px-4 py-3">
+      <p className="text-xs font-mono uppercase tracking-wider text-pewter mb-1.5">
+        What changed · <span className={style.textClassName}>{style.label}</span>
+      </p>
+      <p className="text-sm leading-relaxed text-whiteout">{narrative.narrative}</p>
+    </div>
+  )
 }
 
 function CohortCard({ label, stats }: { label: string; stats: VersionCohortStats }) {
@@ -136,6 +162,7 @@ export function VersionCompare({ versions }: VersionCompareProps) {
 
         {result?.available && (
           <div className="flex flex-col gap-3">
+            {result.narrative && <NarrativeCallout narrative={result.narrative} />}
             <div className="flex flex-wrap gap-3">
               <CohortCard label="Version A" stats={result.versionA} />
               <CohortCard label="Version B" stats={result.versionB} />

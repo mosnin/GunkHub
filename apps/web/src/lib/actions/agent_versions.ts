@@ -5,10 +5,19 @@ import { auth } from '@clerk/nextjs/server'
 import type { AgentVersion } from '@agent-flight-recorder/contracts'
 
 import { resolveConvexOrgId } from '@/lib/convexServer'
-import { compareVersions, createAgentVersion, type VersionCompareResult } from '@/lib/services/agent_versions'
+import {
+  compareVersions,
+  createAgentVersion,
+  getVersionCompareNarrative,
+  type VersionCompareResult,
+} from '@/lib/services/agent_versions'
 
 /** Server action backing VersionCompare.tsx's picker — resolves the caller's
-    Convex orgId then delegates to services/agent_versions.ts `compareVersions`. */
+    Convex orgId then delegates to services/agent_versions.ts `compareVersions`.
+    Also fetches the "what changed" narrative (Team C's `versionNarrative.ts`
+    pipeline) alongside the cohort numbers — additive and non-fatal, a
+    missing or failed narrative fetch never blocks the cohort comparison
+    itself. */
 export async function compareVersionsAction(
   versionAId: string,
   versionBId: string,
@@ -17,7 +26,10 @@ export async function compareVersionsAction(
   if (!clerkOrgId) return { available: false }
   try {
     const convexOrgId = await resolveConvexOrgId(clerkOrgId)
-    return await compareVersions(convexOrgId, versionAId, versionBId)
+    const result = await compareVersions(convexOrgId, versionAId, versionBId)
+    if (!result.available) return result
+    const narrative = await getVersionCompareNarrative(convexOrgId, versionAId, versionBId)
+    return { ...result, narrative }
   } catch {
     return { available: false }
   }

@@ -139,6 +139,9 @@ export const convex = {
   // for the "coarse null" caveat this implies for the GET route).
   explanations: {
     getRunExplanation: makeFunctionReference<Q>('run_explanations:getRunExplanation'),
+    // Batched, org-scoped summaries for the failed-runs-list "why" preview
+    // (Team A, this cycle) — one round-trip instead of N single-run fetches.
+    getRunExplanationSummaries: makeFunctionReference<Q>('run_explanations:getRunExplanationSummaries'),
     // Team C (action layer) — admin-gated regeneration, backing
     // POST /api/runs/[id]/explanation/regenerate. This is an ACTION (not a
     // mutation) in convex/run_explanations.ts — it runs the full

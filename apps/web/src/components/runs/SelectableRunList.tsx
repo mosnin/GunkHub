@@ -1,11 +1,13 @@
 'use client'
 
 import Link from 'next/link'
-import { useState, useTransition } from 'react'
+import { Fragment, useState, useTransition } from 'react'
 
+import type { RunExplanationSummaryState } from '@/lib/services/explanations'
 import type { VerificationStatus } from '@/lib/services/projection_verify'
 import type { Run } from '@agent-flight-recorder/contracts'
 
+import { ExplanationPreview } from '@/components/runs/ExplanationPreview'
 import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
 import { EnvironmentChip, TriageChip } from '@/components/runs/RunMetaChips'
 import { Badge } from '@/components/ui/Badge'
@@ -17,10 +19,18 @@ import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
 /** Run statuses that are eligible for on-demand reverification. */
 const TERMINAL_STATUSES = new Set<string>(['completed', 'failed', 'cancelled', 'timed_out'])
 
+/** Run statuses eligible for the "why did this fail?" list preview. */
+const FAILED_STATUSES = new Set<string>(['failed', 'timed_out'])
+
+/** Table has 9 columns: checkbox, Run ID, Status, Integrity, Agent, Version, Started, Duration, Tags. */
+const COLUMN_COUNT = 9
+
 interface SelectableRunListProps {
   runs?: Run[]
   agentVersionLabels?: Record<string, string>
   verificationStatuses?: Record<string, VerificationStatus>
+  /** "Why did this fail?" one-line preview, keyed by run ID — only meaningful for FAILED/timed_out rows. */
+  explanationSummaries?: Record<string, RunExplanationSummaryState>
 }
 
 /**
@@ -32,6 +42,7 @@ export function SelectableRunList({
   runs,
   agentVersionLabels = {},
   verificationStatuses = {},
+  explanationSummaries,
 }: SelectableRunListProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [bulkResult, setBulkResult] = useState<BulkReverifyResult | null>(null)
@@ -202,20 +213,25 @@ export function SelectableRunList({
               </th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-neutral-800 bg-neutral-950">
+          <tbody className="bg-neutral-950">
             {runs.map((run) => {
               const verificationStatus = verificationStatuses[run.id]
               const isEligible = TERMINAL_STATUSES.has(run.status)
               const isSelected = selectedIds.has(run.id)
               const wasSucceeded = bulkResult?.succeeded.includes(run.id) ?? false
               const wasFailed = bulkResult?.failed.includes(run.id) ?? false
+              const previewState = FAILED_STATUSES.has(run.status)
+                ? explanationSummaries?.[run.id]
+                : undefined
+              const showPreview = previewState !== undefined && previewState.status !== 'unavailable'
 
               return (
+                <Fragment key={run.id}>
                 <tr
-                  key={run.id}
                   className={[
                     'hover:bg-neutral-900 transition-colors duration-100 group',
                     isSelected ? 'bg-neutral-900/50' : '',
+                    showPreview ? '' : 'border-b border-neutral-800',
                   ].join(' ')}
                 >
                   <td className="px-3 py-3">
@@ -330,6 +346,14 @@ export function SelectableRunList({
                     </div>
                   </td>
                 </tr>
+                {showPreview && previewState && (
+                  <tr className="border-b border-neutral-800 bg-neutral-950">
+                    <td colSpan={COLUMN_COUNT} className="px-4 pb-2 pt-0">
+                      <ExplanationPreview state={previewState} />
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
               )
             })}
           </tbody>

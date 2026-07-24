@@ -1,5 +1,6 @@
 import Link from 'next/link'
 
+import type { RunExplanationSummaryState } from '@/lib/services/explanations'
 import type { Agent } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
@@ -199,6 +200,21 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
     verificationStatuses = await batchGetRunVerificationStatuses(
       runs.runs.map((r) => r.id),
     )
+  }
+
+  // "Why did this fail?" list preview — capped to the visible FAILED/timed_out
+  // rows on this page only (never the whole list) to bound the per-run fetch
+  // fan-out. See services/explanations.ts for the batch-query gap this papers
+  // over. Non-fatal by construction — getRunExplanationSummaries never throws.
+  let explanationSummaries: Record<string, RunExplanationSummaryState> = {}
+  if (runs?.runs && runs.runs.length > 0) {
+    const failedRunIds = runs.runs
+      .filter((r) => r.status === 'failed' || r.status === 'timed_out')
+      .map((r) => r.id)
+    if (failedRunIds.length > 0) {
+      const { getRunExplanationSummaries } = await import('@/lib/services/explanations')
+      explanationSummaries = await getRunExplanationSummaries(failedRunIds)
+    }
   }
 
   // "failed"/"passed"/"unverified" are already exactly right from
@@ -412,6 +428,7 @@ export default async function RunsPage({ searchParams }: RunsPageProps) {
             runs={filteredRuns}
             agentVersionLabels={agentVersionLabels}
             verificationStatuses={verificationStatuses}
+            explanationSummaries={explanationSummaries}
           />
         )}
       </div>

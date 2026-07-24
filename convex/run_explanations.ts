@@ -35,7 +35,7 @@ import { v } from "convex/values";
 
 import { action, internalAction, internalMutation, internalQuery, query } from "./_generated/server.js";
 import { recordAuditEvent } from "./audit.js";
-import { requireOrgMembership } from "./auth.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
 import { afrError } from "./helpers/errors.js";
 import {
   buildFailureSummary,
@@ -51,11 +51,12 @@ import {
   MAX_EXPLANATION_ROOT_CAUSE_BYTES,
   MAX_EXPLANATION_SUGGESTED_FIX_BYTES,
   MAX_EXPLANATION_SUMMARY_BYTES,
+  MAX_RUN_EXPLANATION_SUMMARY_BATCH,
   RUN_EXPLANATION_SCHEMA_VERSION,
 } from "./helpers/pagination.js";
 import * as insightsModule from "./insights.js";
 
-import type { Doc } from "./_generated/dataModel.js";
+import type { Doc, Id } from "./_generated/dataModel.js";
 // Type-only import of Team B's landed shapes — safe even while insights.ts is
 // still their active-cycle file: this has zero runtime effect (erased at
 // compile time) and cannot create a coupling/mutation hazard. The runtime
@@ -202,6 +203,7 @@ export const _upsertRunExplanation = internalMutation({
     citedSequenceNumbers: v.array(v.number()),
     failureClass: v.string(),
     model: v.optional(v.string()),
+    generationMs: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     // Run-existence guard, same rationale as projection_verify's
@@ -231,6 +233,7 @@ export const _upsertRunExplanation = internalMutation({
       failureClass: args.failureClass,
       generatedAt: Date.now(),
       model: args.model,
+      generationMs: args.generationMs,
       version: RUN_EXPLANATION_SCHEMA_VERSION,
     });
   },
@@ -438,6 +441,7 @@ export const generateRunExplanation = internalAction({
         : undefined;
     let citedSequenceNumbers = validateCitedSeqNums(heuristic.citedSeqNums, availableSeqNums);
     let model: string | undefined;
+    let generationMs: number | undefined;
     const failureClass = heuristic.failureClass;
 
     // Opt-in LLM augmentation. Never a hard dependency: any failure to
@@ -476,6 +480,7 @@ export const generateRunExplanation = internalAction({
               : undefined;
           citedSequenceNumbers = validatedCites;
           model = process.env["AFR_LLM_MODEL"];
+          generationMs = llmResult.generationMs;
         }
       }
     } catch (err) {
@@ -497,6 +502,7 @@ export const generateRunExplanation = internalAction({
       citedSequenceNumbers,
       failureClass,
       model,
+      generationMs,
     });
 
     return { skipped: false, kind, failureClass };
@@ -528,6 +534,58 @@ export const getRunExplanation = query({
       .first();
     if (!explanation || explanation.orgId !== run.orgId) return null;
     return explanation;
+  },
+});
+
+export interface RunExplanationSummary {
+  runId: Id<"runs">;
+  summary: string;
+  failureClass: string;
+  kind: "heuristic" | "llm";
+}
+
+/**
+ * Batched "why-preview" lookup for a runs list (avoids one round-trip per
+ * row). Member-gated: org is resolved from the CALLER (getAuthContext +
+ * requireOrgMembership), never a client-supplied orgId — a runId belonging
+ * to a different org is silently OMITTED from the result (never returned,
+ * never a distinguishable error, so a caller cannot use this to probe
+ * whether a foreign runId exists). `runIds` is capped at
+ * MAX_RUN_EXPLANATION_SUMMARY_BATCH; extra ids beyond the cap are ignored
+ * rather than erroring, so a slightly-too-long list still returns a partial,
+ * useful result. Runs with no generated explanation yet are omitted (not
+ * represented with a null placeholder) — the caller distinguishes "no
+ * explanation" from "not in my org" the same way (both: just absent from the
+ * result array).
+ */
+export const getRunExplanationSummaries = query({
+  args: { runIds: v.array(v.id("runs")) },
+  handler: async (ctx, args): Promise<RunExplanationSummary[]> => {
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
+    const boundedRunIds = args.runIds.slice(0, MAX_RUN_EXPLANATION_SUMMARY_BATCH);
+
+    const results: RunExplanationSummary[] = [];
+    for (const runId of boundedRunIds) {
+      const run = await ctx.db.get(runId);
+      if (!run || run.orgId !== orgId) continue; // cross-org or missing: silently omitted
+
+      const explanation = await ctx.db
+        .query("run_explanations")
+        .withIndex("by_run", (q) => q.eq("runId", runId))
+        .first();
+      if (!explanation || explanation.orgId !== orgId) continue;
+
+      results.push({
+        runId,
+        summary: explanation.summary,
+        failureClass: explanation.failureClass,
+        kind: explanation.kind,
+      });
+    }
+
+    return results;
   },
 });
 
