@@ -173,7 +173,20 @@ export default defineConfig({
   // point the suite at a server they already have running locally (dev or
   // start) without waiting for a rebuild.
   webServer: {
-    command: 'pnpm --filter @agent-flight-recorder/web run build && pnpm --filter @agent-flight-recorder/web run start',
+    // `turbo run build`, not `pnpm --filter ... run build`. The pnpm form runs
+    // ONLY apps/web's own build script; it does not build the workspace
+    // packages web imports. On a clean checkout that means `next build` fails
+    // with "Can't resolve '@agent-flight-recorder/contracts'", because that
+    // package's dist/ was never produced. turbo's `build` task declares
+    // `dependsOn: ["^build"]`, so it builds contracts (and anything else web
+    // depends on) first, in dependency order.
+    //
+    // This only ever failed in CI: any earlier local build leaves the dist/
+    // behind, so the missing step is invisible on a developer machine. The e2e
+    // job's `needs: [build]` does not help — that orders JOBS, and each job
+    // gets a fresh runner with no artifacts from the previous one.
+    command:
+      'pnpm exec turbo run build --filter=@agent-flight-recorder/web && pnpm --filter @agent-flight-recorder/web run start',
     url: BASE_URL,
     reuseExistingServer: !process.env.CI,
     timeout: 180_000,
