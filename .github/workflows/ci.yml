@@ -725,11 +725,25 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Report integration test configuration
+        id: integration-config
         shell: bash
+        env:
+          CONVEX_TEST_URL: ${{ secrets.CONVEX_TEST_URL }}
         run: |
-          if [ -n "${{ secrets.CONVEX_TEST_URL }}" ]; then
+          # The `secrets` context is NOT available in any `if:` expression —
+          # not at job level and not at step level. Only `github`, `needs`,
+          # `vars`, `inputs`, `env`, `steps` and friends are. Referencing
+          # `secrets.*` in an `if:` is an invalid-expression STARTUP FAILURE:
+          # GitHub refuses to schedule the workflow at all, so every job
+          # silently never runs and the run reports failure with zero jobs.
+          # That is exactly what happened here — CI was dead for six commits
+          # while the local gate was green. So the presence check is resolved
+          # into a step OUTPUT, which `if:` may read.
+          if [ -n "$CONVEX_TEST_URL" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
             echo "::notice title=Integration Tests::Secrets are present — real-Convex integration tests WILL run."
           else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "::warning title=Integration Tests::CONVEX_TEST_URL secret is not set. Real-Convex integration tests will be SKIPPED. See docs/ops/ci_setup.md to provision secrets."
           fi
 
@@ -744,7 +758,7 @@ jobs:
         run: pnpm --filter @agent-flight-recorder/tests test -- --reporter=verbose integration/api.test.ts
 
       - name: Verify integration tests were not silently skipped on main
-        if: github.ref == 'refs/heads/main' && secrets.CONVEX_TEST_URL == ''
+        if: github.ref == 'refs/heads/main' && steps.integration-config.outputs.configured == 'false'
         shell: bash
         run: |
           echo "::error title=Release Gate::Merging to main requires real-Convex integration tests. CONVEX_TEST_URL is not set. See docs/ops/ci_setup.md."
