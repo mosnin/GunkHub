@@ -40,7 +40,11 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          version: 9
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
           run_install: false
 
       - name: Get pnpm store directory
