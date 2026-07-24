@@ -7,6 +7,7 @@ import type { Metadata } from 'next'
 import { adaptFailurePatternDetail } from '@/components/patterns/adapt'
 import { PatternDetail } from '@/components/patterns/PatternDetail'
 import { ErrorState } from '@/components/ui/ErrorState'
+import { getCurrentAuth } from '@/lib/auth'
 import { getRunExplanationSummaries, withAnalyzingGracePeriod } from '@/lib/services/explanations'
 import { getFailurePatternDetail } from '@/lib/services/failurePatterns'
 import { getRun } from '@/lib/services/runs'
@@ -30,6 +31,12 @@ interface PatternDetailPageProps {
  */
 export default async function PatternDetailPage({ params }: PatternDetailPageProps) {
   const { fingerprint } = params
+
+  // Mirrors settings/alerts/page.tsx's isAdmin check — gates the mute/unmute
+  // control (cycle 3). This page is only reachable from within the (app)
+  // route group, which already requires an authenticated org context, so
+  // this is safe to call unguarded here (same posture as the alerts page).
+  const isAdmin = getCurrentAuth().orgRole === 'admin'
 
   let raw: Awaited<ReturnType<typeof getFailurePatternDetail>> | null = null
   let error: string | null = null
@@ -112,6 +119,7 @@ export default async function PatternDetailPage({ params }: PatternDetailPagePro
         trend={detail.trend}
         agentVersions={agentVersions}
         topRunExplanation={topRunExplanation}
+        isAdmin={isAdmin}
       />
     </div>
   )

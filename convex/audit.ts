@@ -42,6 +42,9 @@ export const AUDIT_ACTIONS = [
   "webhook.deleted",
   // ADR-004 — run explanations.
   "run_explanation.regenerated",
+  // ADR-005 Cycle 3 — failure pattern muting.
+  "failure_pattern.muted",
+  "failure_pattern.unmuted",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

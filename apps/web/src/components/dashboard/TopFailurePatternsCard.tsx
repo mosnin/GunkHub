@@ -2,6 +2,7 @@ import Link from 'next/link'
 
 import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
 
+import { MutedBadge } from '@/components/patterns/MutedBadge'
 import { SpikeBadge } from '@/components/patterns/SpikeBadge'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { ErrorState } from '@/components/ui/ErrorState'
@@ -99,8 +100,12 @@ export function TopFailurePatternsCard({ patterns, error }: TopFailurePatternsCa
                 <SpikeBadge
                   isSpiking={pattern.lastSpikeAssessment?.isSpiking === true}
                   assessed={pattern.hasSpikeAssessment}
+                  mutedAlerts={pattern.muted}
                   className="shrink-0"
                 />
+                {pattern.muted && pattern.lastSpikeAssessment?.isSpiking !== true && (
+                  <MutedBadge mutedAt={pattern.mutedAt} className="shrink-0" />
+                )}
               </Link>
             </li>
           ))}

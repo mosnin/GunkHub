@@ -2,6 +2,7 @@ import Link from 'next/link'
 
 import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
 
+import { MutedBadge } from '@/components/patterns/MutedBadge'
 import { SpikeBadge } from '@/components/patterns/SpikeBadge'
 import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { formatRelativeTime, truncateId } from '@/lib/utils'
@@ -73,8 +74,9 @@ export function PatternRow({ pattern }: PatternRowProps) {
         </Link>
       </td>
       <td className="px-4 py-3">
-        <Link href={href} tabIndex={-1} aria-hidden className="inline-flex">
-          <SpikeBadge isSpiking={isSpiking} assessed={pattern.hasSpikeAssessment} />
+        <Link href={href} tabIndex={-1} aria-hidden className="inline-flex items-center gap-1.5">
+          <SpikeBadge isSpiking={isSpiking} assessed={pattern.hasSpikeAssessment} mutedAlerts={pattern.muted} />
+          {pattern.muted && !isSpiking && <MutedBadge mutedAt={pattern.mutedAt} />}
         </Link>
       </td>
     </tr>

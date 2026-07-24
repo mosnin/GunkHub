@@ -70,6 +70,17 @@ function mapFailurePattern(doc: Record<string, unknown>): FailurePattern {
     representativeRunIds: stringArray(doc['representativeRunIds']),
     affectedAgentVersionIds: stringArray(doc['affectedAgentVersionIds']),
     ...(spike !== undefined && { lastSpikeAssessment: spike }),
+    // Mute state (cycle 3): the admin-gated mutePattern/unmutePattern
+    // mutations (convex/failure_patterns.ts) patch `muted`/`mutedAt` onto the
+    // rollup doc; the contract declares both as optional (0.7.9). Surface them
+    // so list/detail responses (and the mute route's own echo) carry the muted
+    // state the UI/CLI render. Only emit `muted` when actually true — an
+    // unmuted pattern omits the key rather than sending `muted: false`.
+    ...(doc['muted'] === true && { muted: true }),
+    ...(typeof doc['mutedAt'] === 'number' && { mutedAt: doc['mutedAt'] }),
+    ...(typeof doc['lastPatternSpikeAlertFiredAt'] === 'number' && {
+      lastPatternSpikeAlertFiredAt: doc['lastPatternSpikeAlertFiredAt'],
+    }),
   }
 }
 
@@ -162,4 +173,51 @@ export async function getFailurePatternDetail(
     recentOccurrences,
     trend,
   }
+}
+
+/**
+ * Mute a failure pattern by fingerprint hash, scoped to the caller's org
+ * (cycle 3 — replaces the mute route/service removed in cycle 2 because the
+ * Convex mutation didn't exist yet; "a throwing stub is worse than nothing").
+ *
+ * Calls `convex/failure_patterns.ts`'s `mutePattern({ orgId, fingerprintHash })`
+ * — an org-scoped, ADMIN-GATED, AUDITED mutation (Team A). This service layer
+ * does not duplicate the admin check or the audit-log write: it only resolves
+ * the caller's org and surfaces whatever Convex returns/throws, exactly like
+ * `getFailurePatternDetail` above and `updateAlertRule`/`deleteAlertRule` in
+ * services/alerts.ts. A non-admin caller gets Convex's `FORBIDDEN: ...` throw,
+ * which the route maps via `mapApiError` to a clean 403 (never a 500).
+ *
+ * Returns `null` for the same reason `getFailurePatternDetail` does: a
+ * fingerprint that does not exist IN THIS ORG must be indistinguishable from
+ * one that belongs to a different org, so the route can return an identical
+ * generic 404 in both cases and never leak cross-org existence.
+ */
+export async function mutePattern(fingerprintHash: string): Promise<FailurePattern | null> {
+  const { convexOrgId } = await requireOrgContext()
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await withConvexTimeout(
+    client.mutation(convex.failure_patterns.mutePattern, {
+      orgId: convexOrgId,
+      fingerprintHash,
+    }),
+  )
+  if (!doc || typeof doc !== 'object') return null
+  return mapFailurePattern(doc as Record<string, unknown>)
+}
+
+/** Unmute — same contract/tenancy posture as `mutePattern` above, see its doc comment. */
+export async function unmutePattern(fingerprintHash: string): Promise<FailurePattern | null> {
+  const { convexOrgId } = await requireOrgContext()
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await withConvexTimeout(
+    client.mutation(convex.failure_patterns.unmutePattern, {
+      orgId: convexOrgId,
+      fingerprintHash,
+    }),
+  )
+  if (!doc || typeof doc !== 'object') return null
+  return mapFailurePattern(doc as Record<string, unknown>)
 }

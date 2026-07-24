@@ -4,6 +4,8 @@ import type { AdaptedFailurePattern } from '@/components/patterns/adapt'
 import type { RunExplanationSummaryState } from '@/lib/services/explanations'
 import type { FailurePatternOccurrence, FailurePatternTrendPoint } from '@agent-flight-recorder/contracts'
 
+import { MutedBadge } from '@/components/patterns/MutedBadge'
+import { PatternMuteControl } from '@/components/patterns/PatternMuteControl'
 import { PatternTrendSparkline } from '@/components/patterns/PatternTrendSparkline'
 import { SpikeBadge } from '@/components/patterns/SpikeBadge'
 import { ExplanationPreview } from '@/components/runs/ExplanationPreview'
@@ -29,6 +31,8 @@ interface PatternDetailProps {
   trend: FailurePatternTrendPoint[]
   agentVersions: Record<string, ResolvedAgentVersion | undefined>
   topRunExplanation?: TopRunExplanationPreview | null
+  /** Resolved server-side by the detail page from `getCurrentAuth().orgRole === 'admin'` — gates the mute/unmute control (cycle 3). See PatternMuteControl. */
+  isAdmin: boolean
 }
 
 function formatFailureClass(cls: string): string {
@@ -49,6 +53,7 @@ export function PatternDetail({
   trend,
   agentVersions,
   topRunExplanation,
+  isAdmin,
 }: PatternDetailProps) {
   const spike = pattern.lastSpikeAssessment
   const isSpiking = spike?.isSpiking === true
@@ -72,7 +77,18 @@ export function PatternDetail({
               </div>
             </div>
           </div>
-          <SpikeBadge isSpiking={isSpiking} assessed={pattern.hasSpikeAssessment} />
+          <div className="flex flex-col items-end gap-2 shrink-0">
+            <div className="flex items-center gap-1.5">
+              <SpikeBadge isSpiking={isSpiking} assessed={pattern.hasSpikeAssessment} mutedAlerts={pattern.muted} />
+              {pattern.muted && !isSpiking && <MutedBadge mutedAt={pattern.mutedAt} />}
+            </div>
+            <PatternMuteControl
+              fingerprintHash={pattern.fingerprintHash}
+              muted={pattern.muted}
+              mutedAt={pattern.mutedAt}
+              isAdmin={isAdmin}
+            />
+          </div>
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-4 pt-4 border-t border-graphite">

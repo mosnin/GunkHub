@@ -196,3 +196,106 @@ only has a raw occurrence list in hand, but is no longer used by either query.
 - No read-facing API route or UI surface for `pattern_spike` rules/events is
   added this cycle (Team C/D/E, as with Cycle 1's `listFailurePatterns`/
   `getFailurePattern`).
+
+## Cycle 3 (HARDEN + close deferrals) — mute, webhook pattern context, cooldown fix
+
+This cycle closes the last deferral this feature carried (Cycle 2 shipped a
+throwing `mutePattern`/`unmutePattern` stub deliberately removed before
+ship — "a throwing stub is worse than nothing") and a gap the cross-cutting
+audit flagged in the webhook envelope, plus a subtler cooldown bug the same
+audit found. None of these changes touch the invariants above: occurrences
+remain append-only, the rollup remains a derived/regeneratable aggregate,
+and every mutation remains org-scoped.
+
+**1. Mute, implemented end-to-end.** `failure_patterns` gains two additive,
+optional fields: `muted?: boolean` and `mutedAt?: number`. Two new
+mutations, `mutePattern`/`unmutePattern`
+(`{ orgId, fingerprintHash } => Doc<"failure_patterns"> | null`), are
+org-scoped, **admin-gated** (`requireOrgMembership(ctx, orgId, { minimumRole:
+"admin" })` — the same tier as alert-rule mutations, since muting suppresses
+org-wide alerting) and **audited** (`failure_pattern.muted`/
+`failure_pattern.unmuted`, added to `AUDIT_ACTIONS`). Both return `null`
+(never throw) when the fingerprint does not exist in the caller's org — the
+same "never existed" / "belongs to a different org" collapse
+`getFailurePattern` already uses, so a caller-facing layer can map both to
+one generic 404 without this mutation leaking which case it was. Neither
+mutation touches `failure_pattern_occurrences` (still append-only,
+untouched) or stops `recordFailurePatternOccurrence`/
+`assessPatternSpikesCron`'s own assessment bookkeeping — muting suppresses
+exactly one thing: `assessPatternSpikesCron`'s call to
+`firePatternSpikeAlert` on a rising-edge transition. A muted pattern still
+gets `lastSpikeAssessment` computed and stored on every cron tick
+(observability is unaffected); it just never reaches `alert_events`/webhook/
+email delivery while `muted` is true. `mutedAt` is not cleared on unmute —
+it is a "last muted at" historical marker, not a "currently muted since"
+field; `muted: false` alone is the live suppression flag. See
+`convex/failure_patterns.test.ts`'s "mutePattern / unmutePattern" suite,
+which proves a muted pattern spiking fires zero `alert_events` rows and that
+unmuting followed by a fresh rising edge (drop-then-respike, same pattern
+Cycle 2's cooldown tests already used) fires again.
+
+**2. Webhook pattern context.** A `pattern_spike`-driven `alert_events` row
+already carried `patternFingerprintHash`/`metadata` (Cycle 2), but
+`convex/webhook_engine.ts`'s `deliverPendingWebhooks` built its envelope from
+only `{apiVersion, event, orgId, run, firedAt}` and never read that row —
+a pattern-spike webhook delivery lost all pattern context (fingerprint,
+class, label, recentCount, deep link), leaving only the generic `alert.fired`
+event name and a representative run. `WebhookEnvelope` (contracts) gains an
+optional `pattern?: WebhookEnvelopePattern` field
+(`{fingerprintHash, class, label, recentCount, deepLink}`); `webhook_engine.ts`
+now looks up the delivery's `alert_events` row (a new `getAlertEventForEnvelope`
+internal query) and reattaches this context when `patternFingerprintHash` is
+set, leaving it absent for every other alert kind. HMAC signing is unchanged
+in mechanism — it already signs `JSON.stringify(payload)` over whatever the
+envelope object contains, so the new field is covered by the same signature
+with no separate signing logic needed (see
+`convex/action_layer.test.ts`'s "carries pattern context ... signed over the
+full payload" test, which recomputes the expected signature independently
+and compares).
+
+   **Deep-link absolutization (ADR-003 constraint):** ADR-003 requires an
+   external webhook's deep link to be absolute, not a bare relative path.
+   `convex/alerts.ts` already had exactly the seam this needs:
+   `AFR_WEB_BASE_URL` (`.env.example`), the same optional Convex env var
+   `alert_engine.ts`'s `buildRunUrl` already uses for the "View run" link in
+   alert emails. `firePatternSpikeAlert`'s new `buildPatternDeepLink` helper
+   prefixes `/patterns/[fingerprintHash]` with `AFR_WEB_BASE_URL` when set,
+   falling back to the bare relative path when it is not (most deployments
+   have no operator-facing setup step for this env var yet). No new env var
+   was introduced — this reuses the one seam already documented for exactly
+   this purpose, rather than inventing a second one. The relative-path
+   fallback is a documented, not silent, limitation: `WebhookEnvelopePattern`'s
+   doc comment and this ADR both flag it, and an external consumer that needs
+   an absolute URL in that case can construct one from `fingerprintHash` plus
+   its own known app origin.
+
+**3. Cooldown-advance fix (cross-cutting audit finding).** Cycle 2's
+`assessPatternSpikesCron` advanced `lastPatternSpikeAlertFiredAt` (the
+per-pattern anti-flap cooldown clock) whenever a fire was merely *attempted*
+(`transition.shouldFire === true`), even when the org had zero enabled
+`pattern_spike` rules to receive it. Consequence: an org whose pattern spiked
+before any rule was configured would silently start its cooldown timer, so
+the first rule an admin added later could miss that still-ongoing spike for
+up to a full cooldown window (default 6h). Fixed: the cooldown now only
+advances when `firePatternSpikeAlert`'s own `{ fired }` count is `> 0` — i.e.
+a fire that actually reached at least one enabled rule. A muted pattern is
+treated the same way (the fire is skipped entirely, so the cooldown clock
+does not advance either) — this is also the mechanism that lets unmuting,
+followed by a later genuine rising edge, fire again. See
+`convex/failure_patterns.test.ts`'s "AUDIT FIX (cycle 3)" test.
+
+**Contracts/schema summary:**
+- `packages/contracts/src/failure_patterns.ts`: `FailurePattern` gains
+  optional `muted`/`mutedAt` (and the previously-undeclared
+  `lastPatternSpikeAlertFiredAt`, a Cycle 2 field that had been left off the
+  contract — added now for schema/contract parity).
+- `packages/contracts/src/webhooks.ts`: new `WebhookEnvelopePattern`
+  interface; `WebhookEnvelope` gains optional `pattern`. Version 0.7.8 →
+  0.7.9 (both changes are additive).
+- `convex/schema.ts`: `failure_patterns` gains optional `muted`/`mutedAt`. No
+  existing field changes shape — migration is a no-op.
+- `convex/audit.ts`: `AUDIT_ACTIONS` gains `failure_pattern.muted`/
+  `failure_pattern.unmuted`.
+- Mutation contract for other teams (Team C's mute route/service, Team E's
+  mute UI, Team D's CLI):
+  `failure_patterns:mutePattern`/`unmutePattern({ orgId, fingerprintHash }) => Doc<"failure_patterns"> | null`.

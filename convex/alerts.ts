@@ -336,6 +336,32 @@ async function findOrCreateAlertWebhookTarget(
   });
 }
 
+/**
+ * Cycle 3 (docs/adr/005-failure-patterns.md "Cycle 3" / ADR-003 constraint
+ * that an EXTERNAL webhook's deep link must be absolute, not a bare relative
+ * path): builds the pattern detail deep link, prefixed with `AFR_WEB_BASE_URL`
+ * when that Convex env var is configured — the SAME optional env var
+ * `convex/alert_engine.ts`'s `buildRunUrl` already uses for the "View run"
+ * link in alert emails (see .env.example's `AFR_WEB_BASE_URL` doc comment).
+ * No separate app-base-URL env var is introduced; this reuses the one seam
+ * that already exists for exactly this purpose.
+ *
+ * DOCUMENTED FALLBACK: most deployments this cycle have no operator-facing
+ * setup step for `AFR_WEB_BASE_URL` yet, so it is commonly unset. When unset,
+ * this returns the bare relative path `/patterns/[fingerprintHash]` — still
+ * usable inside the app (relative links resolve fine in the web UI's own
+ * fetch/render context) but NOT a valid absolute URL for an external webhook
+ * consumer or a plain-text email client. `fingerprintHash` is always present
+ * in the metadata/summary alongside `deepLink` specifically so an external
+ * consumer that needs an absolute URL can construct one from its own known
+ * app origin even when this fallback path is what shipped.
+ */
+function buildPatternDeepLink(fingerprintHash: string): string {
+  const base = process.env["AFR_WEB_BASE_URL"];
+  const path = `/patterns/${fingerprintHash}`;
+  return base ? `${base.replace(/\/$/, "")}${path}` : path;
+}
+
 /** Plain-text email body for a fired pattern_spike alert. Deliberately simple (no HTML) — mirrors renderAlertEmailText's plain-text convention. */
 function renderPatternSpikeEmailText(args: {
   orgName: string;
@@ -437,7 +463,7 @@ export const firePatternSpikeAlert = internalMutation({
 
     const org = await ctx.db.get(args.orgId);
     const orgName = org?.name ?? "unknown organization";
-    const deepLink = `/patterns/${args.fingerprintHash}`;
+    const deepLink = buildPatternDeepLink(args.fingerprintHash);
     const summary =
       `Failure pattern "${args.label}" is spiking (${String(args.recentCount)} recent occurrences) — ${deepLink}`;
 

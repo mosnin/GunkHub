@@ -43,6 +43,19 @@ export interface AdaptedFailurePattern extends FailurePattern {
   hasAffectedVersions: boolean
   /** True when `lastSpikeAssessment` came from the service, not a default (a missing assessment must never render as "not spiking" with false confidence — it renders as "spike status unknown" instead). */
   hasSpikeAssessment: boolean
+  /**
+   * True when an admin has muted alerts for this pattern (cycle 3 mute
+   * control — POST/DELETE `/api/patterns/[fingerprint]/mute`, Team C; the
+   * `muted`/`mutedAt` fields on the contract itself, Team A). Declared here
+   * on the ADAPTED type rather than relying on the base `FailurePattern`
+   * contract already having landed them, so this UI doesn't hard-depend on
+   * contract/service timing this cycle — defaults to `false` (never muted)
+   * when the field isn't present on the raw object yet, which is the honest
+   * "alerts are not known to be muted" reading, not a fabricated state.
+   */
+  muted: boolean
+  /** Epoch ms the pattern was muted, when known. Undefined if never muted or the service doesn't supply it yet. */
+  mutedAt?: number
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -85,6 +98,10 @@ export function adaptFailurePattern(raw: unknown): AdaptedFailurePattern {
       }
     : undefined
 
+  const muted = r['muted'] === true
+  const mutedAtRaw = r['mutedAt']
+  const mutedAt = typeof mutedAtRaw === 'number' && Number.isFinite(mutedAtRaw) ? mutedAtRaw : undefined
+
   return {
     id: str(r['id']),
     orgId: str(r['orgId']),
@@ -101,6 +118,8 @@ export function adaptFailurePattern(raw: unknown): AdaptedFailurePattern {
     hasRepresentativeRuns: Array.isArray(r['representativeRunIds']),
     hasAffectedVersions: Array.isArray(r['affectedAgentVersionIds']),
     hasSpikeAssessment: lastSpikeAssessment !== undefined,
+    muted,
+    ...(mutedAt !== undefined && { mutedAt }),
   }
 }
 

@@ -45,8 +45,9 @@
 import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
-import { internalMutation, internalQuery, query } from "./_generated/server.js";
-import { requireOrgMembership } from "./auth.js";
+import { internalMutation, internalQuery, mutation, query } from "./_generated/server.js";
+import { recordAuditEvent } from "./audit.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
 import * as insightsModule from "./insights.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
@@ -640,6 +641,106 @@ export function buildTrendFromOccurrences(
 }
 
 // ---------------------------------------------------------------------------
+// Mute / unmute — Cycle 3 (docs/adr/005-failure-patterns.md "Cycle 3").
+// ADMIN-gated (same tier as alert-rule mutations — muting suppresses
+// org-wide alerting for this fingerprint) and AUDITED. Muting does NOT touch
+// failure_pattern_occurrences (append-only, untouched) or stop
+// recordFailurePatternOccurrence / assessPatternSpikesCron's own assessment
+// bookkeeping — it only suppresses the one thing assessPatternSpikesCron does
+// on a spike transition: calling alerts.ts's firePatternSpikeAlert. See that
+// cron's doc comment below for the exact suppression point.
+// ---------------------------------------------------------------------------
+
+async function findRollup(
+  ctx: MutationCtx,
+  orgId: Id<"organizations">,
+  fingerprintHash: string,
+): Promise<Doc<"failure_patterns"> | null> {
+  return await ctx.db
+    .query("failure_patterns")
+    .withIndex("by_org_fingerprint", (q) => q.eq("orgId", orgId).eq("fingerprintHash", fingerprintHash))
+    .first();
+}
+
+/**
+ * Mute a fingerprint: `assessPatternSpikesCron` will still compute and store
+ * `lastSpikeAssessment` for this pattern on every tick (observability is
+ * unaffected), but will never call `firePatternSpikeAlert` for it while
+ * `muted` is true — no `alert_events` row, no webhook/email delivery.
+ *
+ * Returns the updated rollup doc, or `null` when `fingerprintHash` does not
+ * exist IN THIS ORG. Deliberately a null return, not a thrown error — same
+ * posture as `getFailurePattern` above: "never existed" and "belongs to a
+ * different org" must be indistinguishable (both are just "not found for
+ * this org"), so a caller-facing layer (apps/web's mute route) can collapse
+ * both into one generic 404 without this mutation itself leaking which case
+ * it was.
+ *
+ * Contract for other teams (Team C's mute route/service, Team E's mute UI,
+ * Team D's CLI):
+ *   `failure_patterns:mutePattern({ orgId, fingerprintHash }) => Doc<"failure_patterns"> | null`
+ * (the full updated rollup — `muted`/`mutedAt` are on it, alongside every
+ * other rollup field already exposed by listFailurePatterns/getFailurePattern).
+ */
+export const mutePattern = mutation({
+  args: { orgId: v.id("organizations"), fingerprintHash: v.string() },
+  handler: async (ctx, args): Promise<Doc<"failure_patterns"> | null> => {
+    const { userId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "admin" });
+
+    const pattern = await findRollup(ctx, args.orgId, args.fingerprintHash);
+    if (!pattern) return null;
+
+    const mutedAt = Date.now();
+    await ctx.db.patch(pattern._id, { muted: true, mutedAt });
+
+    await recordAuditEvent(ctx, {
+      orgId: args.orgId,
+      actorClerkUserId: userId,
+      action: "failure_pattern.muted",
+      targetType: "failure_pattern",
+      targetId: args.fingerprintHash,
+      metadata: { fingerprintHash: args.fingerprintHash, class: pattern.class, label: pattern.label },
+    });
+
+    return await ctx.db.get(pattern._id);
+  },
+});
+
+/**
+ * Unmute a fingerprint: re-enables `assessPatternSpikesCron` firing for
+ * future spike transitions. `mutedAt` is intentionally left untouched — it
+ * is a "last muted at" historical marker, not a "currently muted since"
+ * field; `muted: false` alone is the live suppression flag.
+ *
+ * Same null-on-not-found / contract shape as mutePattern:
+ *   `failure_patterns:unmutePattern({ orgId, fingerprintHash }) => Doc<"failure_patterns"> | null`
+ */
+export const unmutePattern = mutation({
+  args: { orgId: v.id("organizations"), fingerprintHash: v.string() },
+  handler: async (ctx, args): Promise<Doc<"failure_patterns"> | null> => {
+    const { userId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "admin" });
+
+    const pattern = await findRollup(ctx, args.orgId, args.fingerprintHash);
+    if (!pattern) return null;
+
+    await ctx.db.patch(pattern._id, { muted: false });
+
+    await recordAuditEvent(ctx, {
+      orgId: args.orgId,
+      actorClerkUserId: userId,
+      action: "failure_pattern.unmuted",
+      targetType: "failure_pattern",
+      targetId: args.fingerprintHash,
+      metadata: { fingerprintHash: args.fingerprintHash, class: pattern.class, label: pattern.label },
+    });
+
+    return await ctx.db.get(pattern._id);
+  },
+});
+
+// ---------------------------------------------------------------------------
 // Spike-rollup cron — internalMutation, scheduled from convex/crons.ts.
 // ---------------------------------------------------------------------------
 
@@ -680,12 +781,22 @@ export const _listActivePatternsForSpikeAssessment = internalQuery({
  * fires for orgs with at least one ENABLED `pattern_spike` alert_rule (an org
  * with no such rule gets its assessment stored, same as cycle 1, but no
  * alert_events row, exactly mirroring how every other alert kind is a no-op
- * when no matching enabled rule exists). `lastPatternSpikeAlertFiredAt` is
- * only advanced when a fire was actually ATTEMPTED (the transition said
- * `shouldFire: true`), regardless of whether any rule existed to receive
- * it — so the cooldown/anti-flap state tracks "did this pattern's spike
- * assessment just transition," not "did a human get notified," which keeps
- * the pure transition logic independent of alert-rule configuration.
+ * when no matching enabled rule exists).
+ *
+ * AUDIT FIX (cycle 3): `lastPatternSpikeAlertFiredAt` (the cooldown clock) is
+ * advanced ONLY when a fire was both attempted AND actually reached at least
+ * one enabled rule (`firePatternSpikeAlert`'s own `{ fired }` count > 0) —
+ * NOT merely when the pure transition said `shouldFire: true`. The previous
+ * (cycle 2) behavior advanced the cooldown on every attempted fire
+ * regardless of whether any rule existed to receive it, which meant an org
+ * that spiked before configuring any `pattern_spike` rule would silently
+ * start its cooldown timer — so the first rule an admin added later could
+ * miss that still-ongoing spike for up to a full cooldown window. Now the
+ * cooldown means exactly what it says: "an alert was actually fired this
+ * recently." A muted pattern (cycle 3 — see mutePattern/unmutePattern above)
+ * is treated the same way: the fire is skipped entirely (not attempted), so
+ * the cooldown clock does not advance either — this is also what lets
+ * unmuting, followed by a later genuine rising edge, fire again.
  */
 export const assessPatternSpikesCron = internalMutation({
   // `now` is optional/injectable (default Date.now()) — same de-flake pattern
@@ -711,19 +822,15 @@ export const assessPatternSpikesCron = internalMutation({
         cooldownMs: DEFAULT_PATTERN_SPIKE_ALERT_COOLDOWN_MS,
       });
 
-      await ctx.db.patch(pattern._id, {
-        lastSpikeAssessment: {
-          assessedAt: now,
-          isSpiking: assessment.isSpiking,
-          recentCount: assessment.recentCount,
-          baselineMean: assessment.baselineMean,
-          z: Number.isFinite(assessment.z) ? assessment.z : Number.MAX_SAFE_INTEGER,
-        },
-        ...(transition.shouldFire ? { lastPatternSpikeAlertFiredAt: now } : {}),
-      });
-      if (assessment.isSpiking) spiking += 1;
-
-      if (transition.shouldFire) {
+      // MUTE SUPPRESSION (cycle 3, docs/adr/005-failure-patterns.md "Cycle
+      // 3"): a muted pattern's spike assessment is still computed and stored
+      // below exactly as normal — muting never affects OBSERVABILITY. Muting
+      // suppresses exactly one thing: calling firePatternSpikeAlert on a
+      // rising-edge transition. `firedForThisPattern` (not merely
+      // `transition.shouldFire`) also gates whether the cooldown timestamp
+      // advances — see the patch below.
+      let firedForThisPattern = 0;
+      if (transition.shouldFire && !pattern.muted) {
         const result = await ctx.runMutation(_firePatternSpikeAlertRef, {
           orgId: pattern.orgId,
           fingerprintHash: pattern.fingerprintHash,
@@ -732,8 +839,34 @@ export const assessPatternSpikesCron = internalMutation({
           recentCount: assessment.recentCount,
           representativeRunId: pattern.representativeRunIds[0],
         });
+        firedForThisPattern = result.fired;
         fired += result.fired;
       }
+
+      await ctx.db.patch(pattern._id, {
+        lastSpikeAssessment: {
+          assessedAt: now,
+          isSpiking: assessment.isSpiking,
+          recentCount: assessment.recentCount,
+          baselineMean: assessment.baselineMean,
+          z: Number.isFinite(assessment.z) ? assessment.z : Number.MAX_SAFE_INTEGER,
+        },
+        // AUDIT FIX (cycle 3): only advance the cooldown clock when a fire
+        // was genuinely ATTEMPTED AGAINST AT LEAST ONE ENABLED, UNMUTED RULE
+        // (firedForThisPattern > 0) — not merely when the pure transition
+        // said shouldFire. Previously this advanced on every
+        // transition.shouldFire, even when the org had zero enabled
+        // pattern_spike rules: an org that spikes before any rule is
+        // configured would silently start its cooldown timer, so the FIRST
+        // rule an admin adds later could miss the pattern's next rising edge
+        // for up to a full cooldown window. The cooldown now only means what
+        // it says: "a real alert was fired this recently." (Muting has the
+        // same effect as "no rule": no fire attempted, no cooldown advance —
+        // this is also what lets unmuting + a later genuine rising edge fire
+        // again, see failure_patterns.test.ts.)
+        ...(firedForThisPattern > 0 ? { lastPatternSpikeAlertFiredAt: now } : {}),
+      });
+      if (assessment.isSpiking) spiking += 1;
     }
 
     return { assessed: patterns.length, spiking, fired };

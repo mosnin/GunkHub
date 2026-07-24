@@ -297,17 +297,37 @@ export const apiGetExplanation = mutation({
 // row, not worth a dedicated index for what is an observability-grade,
 // derived filter). `spiking: false` (or omitted) returns all patterns,
 // unfiltered by spike status.
+//
+// `muted` (PREVENTION cycle 3, "mute reflection" — sdk_quality) is the same
+// shape of filter again, this time over the `muted` flag an org admin sets
+// via the (separate, Clerk-authed, audited) admin mute route — NOT a write
+// this key-authed surface exposes. `muted: true` narrows to muted patterns,
+// `muted: false` to active/unmuted ones, omitted returns all regardless of
+// mute state.
+function isPatternMuted(pattern: Doc<"failure_patterns">): boolean {
+  return pattern.muted === true;
+}
+
 export const apiListFailurePatterns = mutation({
   args: {
     apiKeyHash: v.string(),
     agentId: v.optional(v.string()),
     spiking: v.optional(v.boolean()),
+    muted: v.optional(v.boolean()),
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
-    const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+    // AUDIT FIX (cycle 3): clamp below 1 as well as above MAX_PAGE_SIZE — an
+    // unclamped non-positive `limit` (e.g. `--limit -5`, or `0`) used to be
+    // passed straight to `.paginate({ numItems })` unvalidated, which is at
+    // best a confusing empty/degenerate page and at worst an unhandled
+    // Convex-side error surfaced as a raw 500. Every caller-supplied `limit`
+    // on this key-authed surface should produce either "the request was
+    // rejected in a well-understood way" or "a valid, bounded page" — never
+    // an unbounded or negative page size reaching the database layer.
+    const limit = Math.max(1, Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE));
 
     let agentVersionIds: Set<string> | undefined;
     if (args.agentId !== undefined) {
@@ -338,6 +358,10 @@ export const apiListFailurePatterns = mutation({
 
     if (args.spiking === true) {
       patterns = patterns.filter((pattern) => pattern.lastSpikeAssessment?.isSpiking === true);
+    }
+
+    if (args.muted !== undefined) {
+      patterns = patterns.filter((pattern) => isPatternMuted(pattern) === args.muted);
     }
 
     return {

@@ -47,7 +47,7 @@ export function PatternList({ patterns }: PatternListProps) {
             <th className="px-4 py-2.5 text-right text-xs font-medium text-pewter uppercase tracking-wider min-w-[90px]">
               Versions
             </th>
-            <th className="px-4 py-2.5 text-left text-xs font-medium text-pewter uppercase tracking-wider min-w-[110px]">
+            <th className="px-4 py-2.5 text-left text-xs font-medium text-pewter uppercase tracking-wider min-w-[150px]">
               Spike
             </th>
           </tr>

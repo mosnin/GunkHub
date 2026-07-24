@@ -55,6 +55,17 @@ export interface FailurePattern {
   /** Bounded (<= 20), deduped set of agent versions this fingerprint has been seen on. */
   affectedAgentVersionIds: string[];
   lastSpikeAssessment?: FailurePatternSpikeAssessment;
+  /** Epoch ms of the last time a `pattern_spike` alert was fired for this pattern (cooldown state — see docs/adr/005-failure-patterns.md Cycle 2). */
+  lastPatternSpikeAlertFiredAt?: number;
+  /**
+   * Cycle 3: admin-gated, org-wide suppression of alert-firing for this
+   * fingerprint. Does NOT stop occurrence recording or spike assessment —
+   * only suppresses `assessPatternSpikesCron`'s call to fire an alert on a
+   * spike transition. Absent/false = not muted.
+   */
+  muted?: boolean;
+  /** Epoch ms of the most recent mute. Not cleared on unmute (a "last muted at" marker, not "muted since"). */
+  mutedAt?: number;
 }
 
 /** `getFailurePattern`'s full detail shape: the rollup, a bounded recent-occurrences sample, and a 14-day trend. */

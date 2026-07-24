@@ -91,6 +91,15 @@ export interface V1GetExplanationData {
 // recency. See `getFailurePatterns()` below for the full contract.
 // ---------------------------------------------------------------------------
 
+// PREVENTION cycle 3 ("mute reflection"): `FailurePattern` (contracts) now
+// carries `muted`/`mutedAt` — admin-gated, org-wide suppression of alert
+// firing for a fingerprint, set via a separate Clerk-authed admin route.
+// This read surface (`FlightReader` / `afr patterns`) only ever REFLECTS that
+// state (it comes through unchanged as part of `FailurePattern`); it never
+// mutates it — there is deliberately no key-authed "mute" write here (see
+// `getFailurePatterns`'s doc and `packages/cli/src/commands/patterns.ts` for
+// the full reasoning).
+
 export interface V1ListFailurePatternsData {
   patterns: FailurePattern[]
   nextCursor?: string
@@ -107,6 +116,15 @@ export interface ListFailurePatternsParams {
    * excluded when this is `true`. Omit (or pass `false`) to see all patterns.
    */
   spiking?: boolean
+  /**
+   * Mute-aware filter (PREVENTION cycle 3): pass `true` to see only muted
+   * patterns, `false` to see only active (unmuted) ones. Omit to see all
+   * patterns regardless of mute state. This is purely a read-side filter —
+   * it has no effect on whether alerts fire; that is governed entirely by
+   * the `muted` flag an org admin sets through the (Clerk-authed) admin
+   * route, not by this parameter.
+   */
+  muted?: boolean
   limit?: number
   cursor?: string
 }
@@ -329,8 +347,14 @@ export class FlightReader {
    *
    * @param filters - optional `agentId` (narrows to patterns seen on at
    *   least one version of that agent), `spiking` (narrows to patterns whose
-   *   `lastSpikeAssessment.isSpiking === true`) plus `limit`/`cursor` pagination.
+   *   `lastSpikeAssessment.isSpiking === true`), `muted` (narrows to
+   *   muted/active patterns — a read-side filter only, see
+   *   {@link ListFailurePatternsParams.muted}) plus `limit`/`cursor` pagination.
    * @returns `{ patterns, nextCursor }` — pass `nextCursor` back as `cursor` to page.
+   *   Each pattern carries `muted`/`mutedAt` when set (PREVENTION cycle 3) —
+   *   there is no method on this class to change mute state; that is an
+   *   admin-only, Clerk-authed write on the web app, not part of this
+   *   key-authed read surface.
    * @throws {@link V1ApiError} on any auth/rate-limit/server/network failure.
    */
   getFailurePatterns(filters: ListFailurePatternsParams = {}): Promise<V1ListFailurePatternsData> {
@@ -340,6 +364,7 @@ export class FlightReader {
       {
         agentId: filters.agentId,
         ...(filters.spiking !== undefined && { spiking: filters.spiking }),
+        ...(filters.muted !== undefined && { muted: filters.muted }),
         limit: filters.limit,
         cursor: filters.cursor,
       },

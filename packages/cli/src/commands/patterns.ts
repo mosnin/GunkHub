@@ -25,14 +25,27 @@ Options:
   --spiking           Only patterns currently flagged as spiking
                        (lastSpikeAssessment.isSpiking === true) — proactive
                        prevention (PREVENTION cycle 2)
+  --muted             Only patterns an org admin has muted
+  --active            Only patterns that are NOT muted (the default view is
+                       unfiltered — this excludes muted patterns explicitly)
   --limit <n>         Max number of patterns to return
   --json              Print the raw API response as JSON
   --help              Show this message
+
+Note: this command only REFLECTS mute state (a MUTED column, and the
+--muted/--active filters above). There is no 'afr patterns mute' — muting is
+an admin, audited, Clerk-authed org action taken in the web app, not a
+key-authed read-API action. A muted, spiking pattern still shows up as
+spiking here (mute suppresses future alerts, not visibility).
 `
 
 export interface PatternsArgs {
   agent?: string
   spiking?: boolean
+  /** Raw `--muted` flag, as typed. Combine with `active` via `resolveMutedFilter` — do not read this directly for filtering. */
+  muted?: boolean
+  /** Raw `--active` flag, as typed. Combine with `muted` via `resolveMutedFilter` — do not read this directly for filtering. */
+  active?: boolean
   limit?: number
   json?: boolean
   help?: boolean
@@ -46,6 +59,8 @@ export function parsePatternsArgs(argv: string[]): PatternsArgs {
     options: {
       agent: { type: 'string' },
       spiking: { type: 'boolean' },
+      muted: { type: 'boolean' },
+      active: { type: 'boolean' },
       limit: { type: 'string' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -54,10 +69,28 @@ export function parsePatternsArgs(argv: string[]): PatternsArgs {
   const result: PatternsArgs = {}
   if (values['agent']) result.agent = values['agent']
   if (values['spiking']) result.spiking = true
+  if (values['muted']) result.muted = true
+  if (values['active']) result.active = true
   if (values['limit']) result.limit = Number(values['limit'])
   if (values['json']) result.json = true
   if (values['help']) result.help = true
   return result
+}
+
+/**
+ * Resolve `--muted`/`--active` (the tri-state mute filter: only-muted /
+ * only-active / unfiltered) into the single `muted` param the read API
+ * takes, or a `CommandFailure` (exit 1 — usage) when both are passed, since
+ * that is a contradictory request rather than one this command can silently
+ * resolve one way.
+ */
+function resolveMutedFilter(args: PatternsArgs): { muted?: boolean } | CommandFailure {
+  if (args.muted && args.active) {
+    return { ok: false, exitCode: 1, message: '--muted and --active are mutually exclusive — pass at most one.' }
+  }
+  if (args.muted) return { muted: true }
+  if (args.active) return { muted: false }
+  return {}
 }
 
 export type PatternsResult = (V1ListFailurePatternsData & { ok: true }) | CommandFailure
@@ -71,12 +104,16 @@ export async function runPatterns(
   const config = resolveApiConfig(env)
   if (isCommandFailure(config)) return config
 
+  const mutedFilter = resolveMutedFilter(args)
+  if (isCommandFailure(mutedFilter)) return mutedFilter
+
   try {
     const data = await listFailurePatterns(
       config,
       {
         ...(args.agent !== undefined && { agentId: args.agent }),
         ...(args.spiking !== undefined && { spiking: args.spiking }),
+        ...(mutedFilter.muted !== undefined && { muted: mutedFilter.muted }),
         ...(args.limit !== undefined && { limit: args.limit }),
       },
       fetchImpl
@@ -107,19 +144,29 @@ export function printPatterns(
     return
   }
 
-  const rows = result.patterns.map((pattern) => [
-    truncateId(pattern.id),
-    pattern.class,
-    pattern.label,
-    String(pattern.count),
-    formatTimestamp(pattern.firstSeenAt),
-    formatTimestamp(pattern.lastSeenAt),
-    pattern.lastSpikeAssessment?.isSpiking
-      ? `yes (${pattern.lastSpikeAssessment.recentCount})`
-      : '-',
-  ])
-  log(renderTable(['ID', 'CLASS', 'LABEL', 'COUNT', 'FIRST SEEN', 'LAST SEEN', 'SPIKING'], rows))
+  const rows = result.patterns.map((pattern) => {
+    const isSpiking = pattern.lastSpikeAssessment?.isSpiking === true
+    const isMuted = pattern.muted === true
+    // Mute suppresses future ALERTS, not visibility (CLAUDE.md / ADR-005) —
+    // a muted, spiking pattern must stay visibly distinct from an active
+    // spiking one, so the spike marker itself is annotated rather than
+    // hidden or left indistinguishable.
+    const spikingCell = isSpiking
+      ? `yes (${pattern.lastSpikeAssessment?.recentCount})${isMuted ? ' [muted]' : ''}`
+      : '-'
+    return [
+      truncateId(pattern.id),
+      pattern.class,
+      pattern.label,
+      String(pattern.count),
+      formatTimestamp(pattern.firstSeenAt),
+      formatTimestamp(pattern.lastSeenAt),
+      spikingCell,
+      isMuted ? 'yes' : '-',
+    ]
+  })
+  log(renderTable(['ID', 'CLASS', 'LABEL', 'COUNT', 'FIRST SEEN', 'LAST SEEN', 'SPIKING', 'MUTED'], rows))
   if (result.nextCursor) {
-    log('\n(more results available — narrow with --agent/--spiking/--limit to see fewer pages)')
+    log('\n(more results available — narrow with --agent/--spiking/--muted/--active/--limit to see fewer pages)')
   }
 }

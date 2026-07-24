@@ -1801,6 +1801,111 @@ describe('deriveFailureFingerprint', () => {
     const b = deriveFailureFingerprint({ heuristicClass: 'tool_error', failingToolName: '阅读工具' })
     expect(a.hash).not.toBe(b.hash)
   })
+
+  // -------------------------------------------------------------------------
+  // Cycle 3 (HARDEN) — auditor-flagged CHURN fix: tool name casing.
+  // -------------------------------------------------------------------------
+  it('CHURN FIX: the same tool reported with different casing collapses to ONE fingerprint', () => {
+    const a = deriveFailureFingerprint({ heuristicClass: 'tool_timeout', failingToolName: 'search_web' })
+    const b = deriveFailureFingerprint({ heuristicClass: 'tool_timeout', failingToolName: 'Search_Web' })
+    const c = deriveFailureFingerprint({ heuristicClass: 'tool_timeout', failingToolName: 'SEARCH_WEB' })
+    expect(a.hash).toBe(b.hash)
+    expect(b.hash).toBe(c.hash)
+    expect(a.salientKey).toBe('search_web')
+  })
+
+  // -------------------------------------------------------------------------
+  // Cycle 3 (HARDEN) — FALSE MERGE fixes.
+  // -------------------------------------------------------------------------
+  it('FALSE MERGE FIX: distinct HTTP-status-shaped errors with no other distinguishing words no longer collapse (bare numeric codes are no longer dead text — they were stripped to <n> BEFORE the class check ran)', () => {
+    const notFound = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'HTTP 404 Not Found' })
+    const internal = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'HTTP 500 Internal Server Error' })
+    const badGateway = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'HTTP 502' })
+    expect(notFound.hash).not.toBe(internal.hash)
+    expect(internal.hash).not.toBe(badGateway.hash)
+    expect(notFound.salientKey).toBe('not_found')
+    expect(internal.salientKey).toBe('internal_error')
+    expect(badGateway.salientKey).toBe('bad_gateway')
+  })
+
+  it('FALSE MERGE FIX: bare numeric status codes (no keyword phrase) are still recognized, e.g. a lone "429"', () => {
+    const rateLimited = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'Error: 429' })
+    const unauthorized = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'Error: 401' })
+    expect(rateLimited.salientKey).toBe('rate_limited')
+    expect(unauthorized.salientKey).toBe('auth_error')
+    expect(rateLimited.hash).not.toBe(unauthorized.hash)
+  })
+
+  it('two 404s that differ only in a request id/timestamp still collapse to the SAME fingerprint (regression guard for the fix above)', () => {
+    const a = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'HTTP 404 Not Found for request 3f29a1c4-8b2d-4e11-9c3a-7d6f5e4b3a21' })
+    const b = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: 'HTTP 404 Not Found for request 00000000-0000-4000-8000-000000000000' })
+    expect(a.hash).toBe(b.hash)
+  })
+
+  it('FALSE MERGE FIX: two long tool names sharing a >100-char prefix but differing after it no longer collide (hash uses the full bounded key, not the 100-char display clamp)', () => {
+    const prefix = 'a'.repeat(120)
+    const a = deriveFailureFingerprint({ heuristicClass: 'tool_error', failingToolName: `${prefix}_one` })
+    const b = deriveFailureFingerprint({ heuristicClass: 'tool_error', failingToolName: `${prefix}_two` })
+    // Their DISPLAY keys (clamped to 100 chars) are identical...
+    expect(a.salientKey).toBe(b.salientKey)
+    // ...but the hash must still distinguish them, since they are genuinely different tools.
+    expect(a.hash).not.toBe(b.hash)
+  })
+
+  it('ADVERSARIAL: an errorSignature that is entirely variable (pure digits) produces a stable, CLASS-SCOPED fingerprint, not a cross-class collision bucket', () => {
+    const llmA = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: '424242' })
+    const llmB = deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: '999999999' })
+    const toolErr = deriveFailureFingerprint({ heuristicClass: 'tool_error', errorSignature: '424242' })
+    // Same class, both pure-digit signatures -> same degenerate token, stable.
+    expect(llmA.hash).toBe(deriveFailureFingerprint({ heuristicClass: 'llm_error', errorSignature: '424242' }).hash)
+    expect(llmA.hash).toBe(llmB.hash)
+    // Different class with the exact same raw text -> MUST NOT collide (class-scoped).
+    expect(llmA.hash).not.toBe(toolErr.hash)
+  })
+
+  it('ADVERSARIAL: a windows path and a unix path for the SAME logical file collapse to the same fingerprint (no path-convention churn)', () => {
+    const unix = deriveFailureFingerprint({ heuristicClass: 'tool_error', errorSignature: 'failed to read /home/user/data/output.txt: permission denied' })
+    const windows = deriveFailureFingerprint({ heuristicClass: 'tool_error', errorSignature: 'failed to read C:\\Users\\user\\output.txt: permission denied' })
+    expect(unix.hash).toBe(windows.hash)
+  })
+
+  it('CHURN FIX: two different hostnames for the same underlying network failure now collapse (hostnames are stripped to <host>)', () => {
+    const a = deriveFailureFingerprint({ heuristicClass: 'tool_error', errorSignature: 'prod-worker-7.us-east-1.internal did not respond' })
+    const b = deriveFailureFingerprint({ heuristicClass: 'tool_error', errorSignature: 'prod-worker-9.us-east-1.internal did not respond' })
+    expect(a.hash).toBe(b.hash)
+    // A plain single-dot filename-shaped token must NOT be treated as a hostname (leading token differs: "host" vs "output").
+    const file = deriveFailureFingerprint({ heuristicClass: 'tool_error', errorSignature: 'output.txt did not respond' })
+    expect(file.hash).not.toBe(a.hash)
+  })
+
+  it('CHURN FIX: two different mixed-letter-and-digit request ids for the same failure now collapse (stripped to <id>)', () => {
+    const a = deriveFailureFingerprint({ heuristicClass: 'tool_error', errorSignature: 'request req8f3xk2z9 failed unexpectedly' })
+    const b = deriveFailureFingerprint({ heuristicClass: 'tool_error', errorSignature: 'request reqa1b2c3d4 failed unexpectedly' })
+    expect(a.hash).toBe(b.hash)
+  })
+
+  it('CHURN FIX: two different base64-looking blobs for the same failure now collapse (stripped to <b64>)', () => {
+    const a = deriveFailureFingerprint({
+      heuristicClass: 'llm_error',
+      errorSignature: 'token validation failed for payload eyjhbgcioijiuzi1niisinr5cci6ikpxvcj9==',
+    })
+    const b = deriveFailureFingerprint({
+      heuristicClass: 'llm_error',
+      errorSignature: 'token validation failed for payload zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz==',
+    })
+    expect(a.hash).toBe(b.hash)
+  })
+
+  it('is still deterministic after the cycle-3 normalization changes: repeated calls produce the same hash', () => {
+    const input: FailureFingerprintInput = {
+      heuristicClass: 'tool_error',
+      failingToolName: 'Search_Web',
+      errorSignature: 'HTTP 404 for host api.example.com, request req8f3xk2z9',
+    }
+    const hashes = new Set<string>()
+    for (let i = 0; i < 10; i++) hashes.add(deriveFailureFingerprint(input).hash)
+    expect(hashes.size).toBe(1)
+  })
 })
 
 describe('assessPatternSpike', () => {
@@ -1902,6 +2007,74 @@ describe('assessPatternSpike', () => {
     expect(typeof result.recentCount).toBe('number')
     expect(typeof result.baselineMean).toBe('number')
     expect(typeof result.z).toBe('number')
+  })
+
+  // -------------------------------------------------------------------------
+  // Cycle 3 (HARDEN) — z-score division-by-zero / NaN / Infinity guards.
+  // -------------------------------------------------------------------------
+  it('BUG FIX: an all-equal (zero-variance) baseline never produces NaN/Infinity in z, even with a huge spike on top', () => {
+    const t = trend([5, 5, 5, 5, 5, 5, 5, 500, 500, 500])
+    const result = assessPatternSpike(t)
+    expect(Number.isFinite(result.z)).toBe(true)
+    expect(Number.isNaN(result.z)).toBe(false)
+    expect(result.isSpiking).toBe(true)
+  })
+
+  it('BUG FIX: minBaselineDays <= 0 no longer lets an EMPTY baseline slide through and divide by zero (z stays 0, never NaN)', () => {
+    // Only 3 days total, all consumed by the default recentDays=3 window -> baseline is empty.
+    const t = trend([10, 10, 10])
+    expect(() => assessPatternSpike(t, { minBaselineDays: 0 })).not.toThrow()
+    const zero = assessPatternSpike(t, { minBaselineDays: 0 })
+    expect(zero.z).toBe(0)
+    expect(Number.isNaN(zero.z)).toBe(false)
+    expect(zero.isSpiking).toBe(false)
+
+    expect(() => assessPatternSpike(t, { minBaselineDays: -5 })).not.toThrow()
+    const negative = assessPatternSpike(t, { minBaselineDays: -5 })
+    expect(negative.z).toBe(0)
+    expect(Number.isNaN(negative.z)).toBe(false)
+  })
+
+  it('window alignment: recentCount always reflects exactly the trailing recentDays window, contiguous with the baseline (no gap, no overlap, no off-by-one)', () => {
+    // 10 days: baseline days 0-6 (7 days), recent days 7-9 (3 days) by default.
+    const t = trend([1, 1, 1, 1, 1, 1, 1, 9, 9, 9])
+    const result = assessPatternSpike(t)
+    // recentCount must be exactly the sum of the LAST 3 points (27), not 2 or 4 of them.
+    expect(result.recentCount).toBe(27)
+    // baselineMean must reflect exactly the first 7 points (all 1s), not bleed into the recent window.
+    expect(result.baselineMean).toBeCloseTo(1, 10)
+  })
+
+  it('window alignment: a spike confined to exactly the boundary day (last baseline day) is NOT counted as recent (no off-by-one leak across the window boundary)', () => {
+    // The single elevated day sits as the LAST baseline day, not in the recent window.
+    const t = trend([1, 1, 1, 1, 1, 1, 100, 1, 1, 1])
+    const result = assessPatternSpike(t)
+    expect(result.recentCount).toBe(3) // last 3 days are [1, 1, 1]
+    expect(result.isSpiking).toBe(false)
+  })
+
+  it('ADVERSARIAL: huge (but finite) counts never produce NaN/Infinity in the assessment', () => {
+    const HUGE = 1e15
+    const t = trend([1, 1, 1, 1, 1, HUGE, HUGE, HUGE])
+    expect(() => assessPatternSpike(t)).not.toThrow()
+    const result = assessPatternSpike(t)
+    expect(Number.isFinite(result.z)).toBe(true)
+    expect(Number.isFinite(result.recentCount)).toBe(true)
+    expect(Number.isFinite(result.baselineMean)).toBe(true)
+  })
+
+  it('ADVERSARIAL: Infinity/NaN counts in the input are dropped by the finite-count filter, not propagated', () => {
+    const malformed: PatternTrendPoint[] = [
+      { day: '2026-07-01', count: 1 },
+      { day: '2026-07-02', count: Infinity },
+      { day: '2026-07-03', count: -Infinity },
+      { day: '2026-07-04', count: NaN },
+      { day: '2026-07-05', count: 2 },
+    ]
+    expect(() => assessPatternSpike(malformed)).not.toThrow()
+    const result = assessPatternSpike(malformed)
+    expect(Number.isFinite(result.z)).toBe(true)
+    expect(Number.isFinite(result.recentCount)).toBe(true)
   })
 })
 
@@ -2033,6 +2206,71 @@ describe('assessPatternSpikeTransition', () => {
     expect(typeof decision.shouldFire).toBe('boolean')
     expect(typeof decision.reason).toBe('string')
   })
+
+  // -------------------------------------------------------------------------
+  // Cycle 3 (HARDEN) — transition edge cases.
+  // -------------------------------------------------------------------------
+  it('ADVERSARIAL: prev === curr by object identity (sustained spike represented by the same reference) is still suppressed, not double-counted as a rising edge', () => {
+    const same = stored(true)
+    const decision = assessPatternSpikeTransition(same, same, { nowMs: 1000 })
+    expect(decision).toEqual({ shouldFire: false, reason: 'still_spiking_suppressed' })
+  })
+
+  it("prev.assessedAt being stale/ancient does not affect the decision — only prev.isSpiking and the cooldown timestamps matter", () => {
+    const staleProof = stored(true, /* assessedAt */ -1_000_000_000)
+    const fresh = stored(true, /* assessedAt */ 1_000_000_000)
+    const nowMs = 5000
+    const a = assessPatternSpikeTransition(staleProof, stored(true), { nowMs })
+    const b = assessPatternSpikeTransition(fresh, stored(true), { nowMs })
+    expect(a).toEqual(b)
+    expect(a).toEqual({ shouldFire: false, reason: 'still_spiking_suppressed' })
+  })
+
+  it('ADVERSARIAL: negative cooldownMs never suppresses a rising edge (never throws, never traps every future fire)', () => {
+    const decision = assessPatternSpikeTransition(stored(false), stored(true), {
+      nowMs: 1000,
+      lastFiredAt: 999,
+      cooldownMs: -1000,
+    })
+    expect(() =>
+      assessPatternSpikeTransition(stored(false), stored(true), { nowMs: 1000, lastFiredAt: 999, cooldownMs: -1000 }),
+    ).not.toThrow()
+    expect(decision).toEqual({ shouldFire: true, reason: 'entered_spiking' })
+  })
+
+  it('ADVERSARIAL: cooldownMs === 0 disables the cooldown entirely (a rising edge always fires, even immediately after a previous fire)', () => {
+    const decision = assessPatternSpikeTransition(stored(false), stored(true), {
+      nowMs: 1000,
+      lastFiredAt: 1000,
+      cooldownMs: 0,
+    })
+    expect(decision).toEqual({ shouldFire: true, reason: 'entered_spiking' })
+  })
+
+  it('ADVERSARIAL: an enormous cooldownMs never throws or overflows, and correctly suppresses indefinitely', () => {
+    const HUGE_COOLDOWN = Number.MAX_SAFE_INTEGER
+    expect(() =>
+      assessPatternSpikeTransition(stored(false), stored(true), { nowMs: 1000, lastFiredAt: 500, cooldownMs: HUGE_COOLDOWN }),
+    ).not.toThrow()
+    const decision = assessPatternSpikeTransition(stored(false), stored(true), {
+      nowMs: 1000,
+      lastFiredAt: 500,
+      cooldownMs: HUGE_COOLDOWN,
+    })
+    expect(decision).toEqual({ shouldFire: false, reason: 'cooldown_active' })
+  })
+
+  it('ADVERSARIAL: lastFiredAt in the FUTURE (clock skew) is treated conservatively as "still in cooldown", not as a negative-duration escape hatch', () => {
+    const decision = assessPatternSpikeTransition(stored(false), stored(true), {
+      nowMs: 1000,
+      lastFiredAt: 5000, // "fired" 4000ms in the future relative to nowMs
+      cooldownMs: 6 * HOUR_MS,
+    })
+    expect(() =>
+      assessPatternSpikeTransition(stored(false), stored(true), { nowMs: 1000, lastFiredAt: 5000, cooldownMs: 6 * HOUR_MS }),
+    ).not.toThrow()
+    expect(decision).toEqual({ shouldFire: false, reason: 'cooldown_active' })
+  })
 })
 
 describe('classifyPatternEpisode', () => {
@@ -2141,5 +2379,54 @@ describe('classifyPatternEpisode', () => {
     const nowMs = 100 * DAY_MS_LOCAL
     const result = classifyPatternEpisode({ firstSeenAt: nowMs, lastSeenAt: nowMs, count: 1 }, nowMs)
     expect(['new', 'regressed', 'ongoing']).toContain(result)
+  })
+
+  // -------------------------------------------------------------------------
+  // Cycle 3 (HARDEN) — adversarial firstSeenAt/lastSeenAt/count/nowMs combos.
+  // -------------------------------------------------------------------------
+  it('ADVERSARIAL: nowMs BEFORE firstSeenAt (backward clock skew) never throws and reads as "new" rather than negative-age garbage', () => {
+    const firstSeenAt = 100 * DAY_MS_LOCAL
+    const nowMs = 50 * DAY_MS_LOCAL // now is "before" firstSeenAt
+    expect(() => classifyPatternEpisode({ firstSeenAt, lastSeenAt: firstSeenAt, count: 1 }, nowMs)).not.toThrow()
+    expect(classifyPatternEpisode({ firstSeenAt, lastSeenAt: firstSeenAt, count: 1 }, nowMs)).toBe('new')
+  })
+
+  it('ADVERSARIAL: an enormous count never throws or produces NaN/Infinity leaking out as something other than a valid label', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 20 * DAY_MS_LOCAL, lastSeenAt: nowMs - 2 * DAY_MS_LOCAL, count: Number.MAX_SAFE_INTEGER }
+    expect(() => classifyPatternEpisode(pattern, nowMs)).not.toThrow()
+    // Astronomically frequent (avgGap ~ 0) -> reads as "ongoing", never garbage.
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('ongoing')
+  })
+
+  it('ADVERSARIAL: negative count is clamped to the same "no meaningful history" treatment as count 0, never throws or divides by a negative number', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const pattern = { firstSeenAt: nowMs - 10 * DAY_MS_LOCAL, lastSeenAt: nowMs - 5 * DAY_MS_LOCAL, count: -7 }
+    expect(() => classifyPatternEpisode(pattern, nowMs)).not.toThrow()
+    expect(classifyPatternEpisode(pattern, nowMs)).toBe('regressed')
+  })
+
+  it('ADVERSARIAL: Infinity/NaN count falls back to the "no meaningful average gap" treatment, never throws or leaks NaN', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const infPattern = { firstSeenAt: nowMs - 10 * DAY_MS_LOCAL, lastSeenAt: nowMs - 5 * DAY_MS_LOCAL, count: Infinity }
+    const nanPattern = { firstSeenAt: nowMs - 10 * DAY_MS_LOCAL, lastSeenAt: nowMs - 5 * DAY_MS_LOCAL, count: NaN }
+    expect(() => classifyPatternEpisode(infPattern, nowMs)).not.toThrow()
+    expect(() => classifyPatternEpisode(nanPattern, nowMs)).not.toThrow()
+    expect(['new', 'regressed', 'ongoing']).toContain(classifyPatternEpisode(infPattern, nowMs))
+    expect(['new', 'regressed', 'ongoing']).toContain(classifyPatternEpisode(nanPattern, nowMs))
+  })
+
+  it('is stable/class-scoped across a whole battery of malformed inputs run in a loop (never throws, always returns a valid label)', () => {
+    const nowMs = 100 * DAY_MS_LOCAL
+    const battery = [
+      { firstSeenAt: NaN, lastSeenAt: NaN, count: NaN },
+      { firstSeenAt: Infinity, lastSeenAt: -Infinity, count: -1 },
+      { firstSeenAt: 0, lastSeenAt: 0, count: 0 },
+      { firstSeenAt: nowMs + 1e15, lastSeenAt: nowMs - 1e15, count: 1e15 },
+    ] as Array<{ firstSeenAt: number; lastSeenAt: number; count: number }>
+    for (const pattern of battery) {
+      expect(() => classifyPatternEpisode(pattern, nowMs)).not.toThrow()
+      expect(['new', 'regressed', 'ongoing']).toContain(classifyPatternEpisode(pattern, nowMs))
+    }
   })
 })

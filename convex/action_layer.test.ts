@@ -8,7 +8,7 @@ import { convexTest } from 'convex-test'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import schema from './schema'
 import { api, internal } from './_generated/api'
-import { assertSafeWebhookUrl, deliverWebhook, computeBackoff } from './helpers/delivery'
+import { assertSafeWebhookUrl, deliverWebhook, computeBackoff, signWebhookPayload } from './helpers/delivery'
 
 const modules = import.meta.glob('./**/*.ts')
 
@@ -373,6 +373,94 @@ describe('webhook_engine.deliverPendingWebhooks', () => {
     delivery = await t.run((ctx) => ctx.db.get(deliveryId))
     expect(delivery!.status).toBe('failed')
     expect(delivery!.attempts).toBe(6) // WEBHOOK_MAX_ATTEMPTS
+  })
+
+  // Cycle 3 (docs/adr/005-failure-patterns.md "Cycle 3"): a pattern_spike
+  // alert's webhook delivery must carry pattern context (fingerprint/class/
+  // label/recentCount/deepLink) in the envelope, not just the generic
+  // {apiVersion, event, orgId, run, firedAt} shape — see toEnvelopePattern
+  // in webhook_engine.ts. A run_failed delivery (seeded in the tests above)
+  // has no such context and must NOT carry a `pattern` key at all.
+  it('a pattern_spike-driven delivery carries pattern context in the envelope, signed over the full payload', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    await asAdmin.mutation(api.alerts.createAlertRule, {
+      orgId: orgA, name: 'pattern spikes', kind: 'pattern_spike',
+      channels: [{ type: 'webhook', target: 'https://example.com/hook' }],
+    })
+
+    // Seed a failure_patterns rollup with a 13-day flat baseline + a spiking
+    // "today", same fixture shape as failure_patterns.test.ts's
+    // seedPatternWithSpikeTrend, then run the spike cron to actually fire.
+    const now = Date.parse('2026-07-24T12:00:00.000Z')
+    const oneDayMs = 24 * 60 * 60 * 1000
+    await t.run(async (ctx) => {
+      await ctx.db.insert('failure_patterns', {
+        orgId: orgA, fingerprintHash: 'env-spike', class: 'tool_error', label: 'Tool Error: search_web',
+        salientKey: 'search_web', count: 53, firstSeenAt: now - 13 * oneDayMs, lastSeenAt: now,
+        representativeRunIds: [], affectedAgentVersionIds: [],
+      })
+      for (let i = 13; i >= 1; i--) {
+        const d = new Date(now - i * oneDayMs).toISOString().slice(0, 10)
+        await ctx.db.insert('failure_pattern_daily_counts', { orgId: orgA, fingerprintHash: 'env-spike', day: d, count: 1 })
+      }
+      const today = new Date(now).toISOString().slice(0, 10)
+      await ctx.db.insert('failure_pattern_daily_counts', { orgId: orgA, fingerprintHash: 'env-spike', day: today, count: 40 })
+    })
+
+    const cronResult = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now })
+    expect(cronResult.fired).toBe(1)
+
+    // NOTE: deliberately NOT passing the pinned `now` from the spike cron
+    // above — the webhook_deliveries row's `nextAttemptAt` was set from the
+    // REAL wall clock at enqueue time (enqueuePatternSpikeDeliveries), which
+    // can be well after the fixed `2026-07-24T12:00:00Z` used to control the
+    // spike assessment/trend above. Draining with the real current time (the
+    // default) is what production does; only the spike-trend math needed a
+    // pinned clock.
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue(new Response('ok', { status: 200 }))
+    const result = await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+    expect(result.delivered).toBe(1)
+
+    const [, init] = fetchSpy.mock.calls[0]!
+    const body = JSON.parse((init as RequestInit).body as string)
+    expect(body.event).toBe('alert.fired')
+    expect(body.pattern).toEqual({
+      fingerprintHash: 'env-spike',
+      class: 'tool_error',
+      label: 'Tool Error: search_web',
+      recentCount: expect.any(Number),
+      deepLink: '/patterns/env-spike', // AFR_WEB_BASE_URL unset in tests — documented relative fallback
+    })
+    // HMAC signing covers the FULL payload including the new `pattern` key —
+    // not just verifying a header is present, but that the signature is a
+    // function of the exact serialized body containing `pattern`.
+    const headers = (init as RequestInit).headers as Record<string, string>
+    const sigMatch = /^t=(\d+),v1=([0-9a-f]+)$/.exec(headers['x-afr-signature']!)
+    expect(sigMatch).not.toBeNull()
+    const [, ts, sig] = sigMatch!
+    const target = await t.run((ctx) => ctx.db.query('webhook_targets').withIndex('by_org', (q) => q.eq('orgId', orgA)).first())
+    const expectedSig = signWebhookPayload(target!.secret, JSON.stringify(body), Number(ts))
+    expect(`t=${ts},v1=${sig}`).toBe(expectedSig)
+  })
+
+  it('a non-pattern (run_failed) delivery has no `pattern` key in its envelope', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    await asAdmin.mutation(api.alerts.createAlertRule, {
+      orgId: orgA, name: 'fails', kind: 'run_failed',
+      channels: [{ type: 'webhook', target: 'https://example.com/hook' }],
+    })
+    const runId = await seedFailedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.alert_engine.evaluateAlertsForRun, { runId })
+
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue(new Response('ok', { status: 200 }))
+    await t.action(internal.webhook_engine.deliverPendingWebhooks, {})
+    const [, init] = fetchSpy.mock.calls[0]!
+    const body = JSON.parse((init as RequestInit).body as string)
+    expect('pattern' in body).toBe(false)
   })
 })
 

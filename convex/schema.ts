@@ -653,6 +653,20 @@ export default defineSchema({
     // local fallback) so a pattern hovering at the spike threshold cannot
     // fire on every 15-minute cron tick.
     lastPatternSpikeAlertFiredAt: v.optional(v.number()),
+    // Cycle 3 (docs/adr/005-failure-patterns.md "Cycle 3"): admin-gated,
+    // org-wide suppression of alert-firing for this fingerprint. Muting does
+    // NOT stop occurrence recording, rollup upkeep, or spike ASSESSMENT — it
+    // only suppresses the one action assessPatternSpikesCron takes on a
+    // rising-edge transition (calling alerts.ts's firePatternSpikeAlert).
+    // See assessPatternSpikesCron's doc comment for the exact suppression
+    // point. Written only by mutePattern/unmutePattern (both admin-gated,
+    // audited). Absent/false = not muted (the default for every pre-cycle-3
+    // row and every newly-created rollup).
+    muted: v.optional(v.boolean()),
+    // Epoch ms of the most recent mutePattern call. Not cleared on unmute —
+    // it is a "last muted at" historical marker, not a "currently muted
+    // since" field (muted itself is the live suppression flag).
+    mutedAt: v.optional(v.number()),
   })
     // One row per (orgId, fingerprintHash): recordFailurePatternOccurrence
     // always resolves the existing rollup (if any) via this index before

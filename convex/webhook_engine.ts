@@ -19,6 +19,7 @@ import type { Doc } from "./_generated/dataModel.js";
 const _getPendingDeliveries = makeFunctionReference<"query">("webhook_engine:getPendingDeliveries");
 const _getWebhookTarget = makeFunctionReference<"query">("webhook_engine:getWebhookTargetForDelivery");
 const _getRunForEnvelope = makeFunctionReference<"query">("webhook_engine:getRunForEnvelope");
+const _getAlertEventForEnvelope = makeFunctionReference<"query">("webhook_engine:getAlertEventForEnvelope");
 const _markDelivered = makeFunctionReference<"mutation">("webhook_engine:markDelivered");
 const _markFailed = makeFunctionReference<"mutation">("webhook_engine:markFailed");
 const _markRetry = makeFunctionReference<"mutation">("webhook_engine:markRetry");
@@ -54,6 +55,53 @@ function toEnvelopeRun(run: Doc<"runs">): EnvelopeRun {
     sdkVersion: run.sdkVersion,
     // Deliberately excludes `metadata` — may contain customer-supplied
     // free-form data of unbounded size/sensitivity, per action_layer.md.
+  };
+}
+
+/**
+ * Cycle 3 (docs/adr/005-failure-patterns.md "Cycle 3"): the pattern context
+ * carried by a pattern_spike-driven webhook delivery — see
+ * packages/contracts/src/webhooks.ts's `WebhookEnvelopePattern`. Mirrors that
+ * contract type exactly (kept in sync manually, same convention as
+ * `EnvelopeRun`/`WebhookEnvelopeRun` above).
+ */
+interface EnvelopePattern {
+  fingerprintHash: string;
+  class: string;
+  label: string;
+  recentCount: number;
+  deepLink: string;
+}
+
+/**
+ * Reattach pattern context (fingerprint/class/label/recentCount/deepLink) to
+ * a delivery whose firing `alert_events` row is a `pattern_spike` fire (see
+ * convex/alerts.ts's `firePatternSpikeAlert`, which stamps
+ * `patternFingerprintHash` + a `metadata` object of exactly this shape onto
+ * the row it inserts). Returns `undefined` for every other alert kind/event
+ * type — a plain `webhook_deliveries` row has no pattern context of its own,
+ * only its (optional) `alertEventId` back-reference to look this up from.
+ *
+ * `alertEvent.metadata` is `v.any()` (the one justified exception documented
+ * in schema.ts, mirroring audit_log.metadata) — every field read here is
+ * defensively type-checked rather than cast, so a malformed/legacy metadata
+ * shape degrades to a safe fallback instead of corrupting the envelope or
+ * throwing mid-batch.
+ */
+function toEnvelopePattern(alertEvent: Doc<"alert_events"> | null): EnvelopePattern | undefined {
+  if (!alertEvent?.patternFingerprintHash) return undefined;
+  const fingerprintHash = alertEvent.patternFingerprintHash;
+  const meta = (alertEvent.metadata ?? {}) as Record<string, unknown>;
+  return {
+    fingerprintHash,
+    class: typeof meta["class"] === "string" ? meta["class"] : "unknown",
+    label: typeof meta["label"] === "string" ? meta["label"] : fingerprintHash,
+    recentCount: typeof meta["recentCount"] === "number" ? meta["recentCount"] : 0,
+    // Same absolute-if-configured/relative-fallback seam as
+    // convex/alerts.ts's buildPatternDeepLink (AFR_WEB_BASE_URL) — the value
+    // stored in metadata.deepLink at fire time already reflects that, so
+    // this only needs a safe fallback for a malformed/legacy row.
+    deepLink: typeof meta["deepLink"] === "string" ? meta["deepLink"] : `/patterns/${fingerprintHash}`,
   };
 }
 
@@ -117,6 +165,17 @@ export const getWebhookTargetForDelivery = internalQuery({
 export const getRunForEnvelope = internalQuery({
   args: { runId: v.id("runs") },
   handler: async (ctx, args) => await ctx.db.get(args.runId),
+});
+
+/**
+ * Cycle 3 (docs/adr/005-failure-patterns.md "Cycle 3" gap): a pattern_spike
+ * delivery's `alert_events` row carries `patternFingerprintHash`/`metadata`
+ * that a `webhook_deliveries` row alone does not — see `toEnvelopePattern`
+ * below, which reads this row to reattach that context to the envelope.
+ */
+export const getAlertEventForEnvelope = internalQuery({
+  args: { alertEventId: v.id("alert_events") },
+  handler: async (ctx, args) => await ctx.db.get(args.alertEventId),
 });
 
 /** The ONE sanctioned patch on a terminally-resolved delivery: bookkeeping fields only. */
@@ -276,12 +335,27 @@ export const deliverPendingWebhooks = internalAction({
           ? await ctx.runQuery(_getRunForEnvelope, { runId: delivery.runId })
           : null;
 
+        // Cycle 3: reattach pattern context for a pattern_spike-driven
+        // delivery (see toEnvelopePattern's doc comment). Every delivery
+        // that came from alert-firing carries `alertEventId`; this is a
+        // no-op extra read for every other alert kind (toEnvelopePattern
+        // returns undefined when patternFingerprintHash is unset).
+        const alertEvent: Doc<"alert_events"> | null = delivery.alertEventId
+          ? await ctx.runQuery(_getAlertEventForEnvelope, { alertEventId: delivery.alertEventId })
+          : null;
+        const pattern = toEnvelopePattern(alertEvent);
+
         const envelope = {
           apiVersion: WEBHOOK_ENVELOPE_API_VERSION,
           event: delivery.event,
           orgId: String(delivery.orgId),
           run: run ? toEnvelopeRun(run) : null,
           firedAt: now,
+          // Omitted entirely (not `pattern: undefined`) for every non-
+          // pattern_spike delivery — JSON.stringify drops an undefined-
+          // valued key, so a plain object literal here (rather than a
+          // conditional spread) already produces the right wire shape.
+          pattern,
         };
 
         const result = await deliverWebhook({

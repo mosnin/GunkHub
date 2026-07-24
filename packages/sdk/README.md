@@ -497,11 +497,11 @@ See `examples/read_back.ts` for the full runnable version.
 
 `filters` for `listRuns`: `status`, `agentId`, `environment`, `sessionId`, `limit`, `cursor` (all optional).
 
-`filters` for `getFailurePatterns`: `agentId`, `spiking`, `limit`, `cursor` (all optional).
+`filters` for `getFailurePatterns`: `agentId`, `spiking`, `muted`, `limit`, `cursor` (all optional).
 
-### `getFailurePatterns(filters?)` — recurring failure patterns (PREVENTION cycle 1, ADR-005; `spiking` filter added cycle 2)
+### `getFailurePatterns(filters?)` — recurring failure patterns (PREVENTION cycle 1, ADR-005; `spiking` filter added cycle 2; `muted` field/filter added cycle 3)
 
-Lists recurring failure fingerprints for the key's organization, most-recently-seen first — a durable memory of failures that keep recurring across runs, derived from `RunExplanation`s. Each `FailurePattern` carries `class`, `label`, `count`, `firstSeenAt`/`lastSeenAt`, a bounded sample of `representativeRunIds`, the `affectedAgentVersionIds` it's been seen on, and an optional `lastSpikeAssessment` (`isSpiking`, `recentCount`, `baselineMean`, `z`) from the periodic spike-rollup cron.
+Lists recurring failure fingerprints for the key's organization, most-recently-seen first — a durable memory of failures that keep recurring across runs, derived from `RunExplanation`s. Each `FailurePattern` carries `class`, `label`, `count`, `firstSeenAt`/`lastSeenAt`, a bounded sample of `representativeRunIds`, the `affectedAgentVersionIds` it's been seen on, an optional `lastSpikeAssessment` (`isSpiking`, `recentCount`, `baselineMean`, `z`) from the periodic spike-rollup cron, and optional `muted`/`mutedAt` — whether an org admin has muted future alerts for this fingerprint.
 
 ```typescript
 const { patterns } = await reader.getFailurePatterns({ agentId: 'agent_123', limit: 20 })
@@ -511,9 +511,15 @@ for (const pattern of patterns) {
 
 // Proactive prevention (cycle 2): only patterns the spike-rollup cron currently flags as spiking.
 const { patterns: spiking } = await reader.getFailurePatterns({ spiking: true })
+
+// Mute reflection (cycle 3): only patterns an admin has muted, or only active (unmuted) ones.
+const { patterns: muted } = await reader.getFailurePatterns({ muted: true })
+const { patterns: active } = await reader.getFailurePatterns({ muted: false })
 ```
 
 Pass `spiking: true` to narrow to patterns whose `lastSpikeAssessment.isSpiking === true` — patterns with no assessment yet, or a non-spiking one, are excluded. Omit it (or pass `false`) to see all patterns regardless of spike status.
+
+Pass `muted: true`/`muted: false` to narrow to muted/active patterns; omit it to see all patterns regardless of mute state. **This is a read-only filter.** There is no method on `FlightReader` to mute or unmute a pattern — muting is an admin-only, audited, Clerk-authed action taken through the web app, not a key-authed write. Mute suppresses future *alerts* for a fingerprint; it never hides the pattern from `getFailurePatterns` — a muted, spiking pattern still reports `lastSpikeAssessment.isSpiking === true` alongside `muted: true`.
 
 Like every other query surface in this system (CLAUDE.md), this is **observability-grade derived data, never source of truth** — the event log and each run's own `RunExplanation` remain the only facts about what happened on any single run. `@agent-flight-recorder/cli`'s `afr patterns` is a thin wrapper over this method.
 
@@ -689,6 +695,8 @@ this pattern (including the tool-error path).
 ---
 
 ## Version
+
+v0.10.0 — `FlightReader.getFailurePatterns(filters?)` gains a `muted` filter (PREVENTION cycle 3, "mute reflection"): pass `true`/`false` to narrow to muted/active patterns, forwarded as a `muted=true`/`muted=false` query param; omit for all patterns regardless of mute state. `FailurePattern` (contracts) now carries `muted`/`mutedAt`, passed through unchanged — this method only ever reflects mute state, it does not set it (muting is an admin-only, Clerk-authed, audited write elsewhere, not part of this key-authed read surface). Additive/optional — existing callers are unaffected. Backs `afr patterns --muted`/`--active` and the MUTED column in its table output.
 
 v0.9.0 — `FlightReader.getFailurePatterns(filters?)` gains a `spiking` filter (PREVENTION cycle 2): narrows the result to patterns whose `lastSpikeAssessment.isSpiking === true`, forwarded as a `spiking=true` query param. Additive/optional — existing callers are unaffected. Backs `afr patterns --spiking`.
 

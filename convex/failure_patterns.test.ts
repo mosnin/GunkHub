@@ -652,4 +652,185 @@ describe('pattern_spike alert firing', () => {
     expect(eventsA[0]!.orgId).toBe(orgA)
     expect(eventsB.length).toBe(0)
   })
+
+  it('AUDIT FIX (cycle 3): does not advance the cooldown clock when no enabled pattern_spike rule exists, so the first rule added later still catches the ongoing spike', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    // No alert_rules seeded for orgA yet.
+
+    const now = Date.parse('2026-07-24T12:00:00.000Z')
+    await seedPatternWithSpikeTrend(t, { orgId: orgA, fingerprintHash: 'no-rule-yet', now, todayCount: 40 })
+
+    const first = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now })
+    expect(first.spiking).toBe(1)
+    expect(first.fired).toBe(0)
+
+    let pattern = await t.run((ctx) => ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'no-rule-yet')).first())
+    // The cooldown clock must NOT have advanced: no rule existed, so no fire
+    // was genuinely attempted, even though the pure transition said fire.
+    expect(pattern!.lastPatternSpikeAlertFiredAt).toBeUndefined()
+
+    // An admin adds a pattern_spike rule shortly after (well within what
+    // would have been a stale 6h cooldown had it wrongly started above)...
+    await createPatternSpikeRule(t, orgA)
+    const secondTick = now + 30 * 60 * 1000 // 30 minutes later
+    const second = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: secondTick })
+    // The pattern is STILL spiking (nothing dropped/re-triggered) — the
+    // transition itself is "already_spiking" (not a fresh rising edge), so
+    // this correctly does not fire again for THIS reason. Prove the more
+    // important thing instead: a genuinely fresh rising edge after the rule
+    // exists is not blocked by a stale cooldown that never should have
+    // started.
+    expect(second.fired).toBe(0)
+    pattern = await t.run((ctx) => ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'no-rule-yet')).first())
+    expect(pattern!.lastPatternSpikeAlertFiredAt).toBeUndefined()
+
+    // Drop back to baseline, then re-spike — a genuine fresh rising edge,
+    // immediately after the rule was added. With the fix, nothing suppresses
+    // this (no stale cooldown); with the bug, `first`'s attempted-but-ruleless
+    // fire would have started a 6h cooldown that still had ~5.5h left here.
+    await t.run(async (ctx) => {
+      const todayRow = await ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'no-rule-yet').eq('day', dayNDaysAgo(secondTick, 0))).first()
+      await ctx.db.patch(todayRow!._id, { count: 1 })
+    })
+    const dropTick = secondTick + 15 * 60 * 1000
+    const drop = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: dropTick })
+    expect(drop.spiking).toBe(0)
+
+    await t.run(async (ctx) => {
+      const todayRow = await ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'no-rule-yet').eq('day', dayNDaysAgo(dropTick, 0))).first()
+      await ctx.db.patch(todayRow!._id, { count: 40 })
+    })
+    const respikeTick = dropTick + 15 * 60 * 1000
+    const respike = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: respikeTick })
+    expect(respike.spiking).toBe(1)
+    expect(respike.fired).toBe(1) // not suppressed by a stale, never-should-have-started cooldown
+
+    pattern = await t.run((ctx) => ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'no-rule-yet')).first())
+    expect(pattern!.lastPatternSpikeAlertFiredAt).toBe(respikeTick)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cycle 3 — mutePattern / unmutePattern
+// ---------------------------------------------------------------------------
+
+describe('mutePattern / unmutePattern', () => {
+  it('admin can mute, which sets muted/mutedAt and records an audit event; member/viewer cannot', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedRun(t, orgA, projectA, agentA)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgA, runId, agentId: agentA, fingerprintHash: 'mute-me', class: 'tool_error', label: 'L', salientKey: 'a',
+    })
+    await t.run(async (ctx) => {
+      await ctx.db.insert('user_memberships', { clerkUserId: 'admin_a', orgId: orgA, role: 'admin', joinedAt: Date.now() })
+    })
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    await expect(asMember.mutation(api.failure_patterns.mutePattern, { orgId: orgA, fingerprintHash: 'mute-me' })).rejects.toThrow()
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const muted = await asAdmin.mutation(api.failure_patterns.mutePattern, { orgId: orgA, fingerprintHash: 'mute-me' })
+    expect(muted.muted).toBe(true)
+    expect(typeof muted.mutedAt).toBe('number')
+
+    const auditRows = await t.run((ctx) => ctx.db.query('audit_log').withIndex('by_org', (q) => q.eq('orgId', orgA)).collect())
+    const muteRows = auditRows.filter((r) => r.action === 'failure_pattern.muted' && r.targetId === 'mute-me')
+    expect(muteRows.length).toBe(1)
+
+    const unmuted = await asAdmin.mutation(api.failure_patterns.unmutePattern, { orgId: orgA, fingerprintHash: 'mute-me' })
+    expect(unmuted.muted).toBe(false)
+    // mutedAt is a "last muted at" historical marker — not cleared on unmute.
+    expect(typeof unmuted.mutedAt).toBe('number')
+
+    const auditRows2 = await t.run((ctx) => ctx.db.query('audit_log').withIndex('by_org', (q) => q.eq('orgId', orgA)).collect())
+    const unmuteRows = auditRows2.filter((r) => r.action === 'failure_pattern.unmuted' && r.targetId === 'mute-me')
+    expect(unmuteRows.length).toBe(1)
+  })
+
+  it('mutating an unknown fingerprint returns null, not a thrown error (same "not found for this org" posture as getFailurePattern)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    await t.run(async (ctx) => {
+      await ctx.db.insert('user_memberships', { clerkUserId: 'admin_a', orgId: orgA, role: 'admin', joinedAt: Date.now() })
+    })
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const muteResult = await asAdmin.mutation(api.failure_patterns.mutePattern, { orgId: orgA, fingerprintHash: 'does-not-exist' })
+    expect(muteResult).toBeNull()
+    const unmuteResult = await asAdmin.mutation(api.failure_patterns.unmutePattern, { orgId: orgA, fingerprintHash: 'does-not-exist' })
+    expect(unmuteResult).toBeNull()
+  })
+
+  it('cross-org isolation: an admin in org A cannot mute a pattern that only exists in org B (returns null, not a leak)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectB, agentB } = await seedTwoOrgs(t)
+    const runB = await seedRun(t, orgB, projectB, agentB)
+    await t.mutation(internal.failure_patterns.recordFailurePatternOccurrence, {
+      orgId: orgB, runId: runB, agentId: agentB, fingerprintHash: 'org-b-only', class: 'tool_error', label: 'L', salientKey: 'a',
+    })
+    await t.run(async (ctx) => {
+      await ctx.db.insert('user_memberships', { clerkUserId: 'admin_a', orgId: orgA, role: 'admin', joinedAt: Date.now() })
+    })
+    const asAdminA = t.withIdentity(identity('admin', 'a'))
+    const result = await asAdminA.mutation(api.failure_patterns.mutePattern, { orgId: orgA, fingerprintHash: 'org-b-only' })
+    expect(result).toBeNull()
+
+    const orgBPattern = await t.run((ctx) => ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgB).eq('fingerprintHash', 'org-b-only')).first())
+    expect(orgBPattern!.muted).toBeUndefined() // untouched
+  })
+
+  it('REAL SUPPRESSION: a muted pattern spiking fires NO alert_event, and unmuting + a fresh rising edge re-enables firing', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA } = await seedTwoOrgs(t)
+    await createPatternSpikeRule(t, orgA)
+    await t.run(async (ctx) => {
+      await ctx.db.insert('user_memberships', { clerkUserId: 'admin_a', orgId: orgA, role: 'admin', joinedAt: Date.now() })
+    })
+
+    const now = Date.parse('2026-07-24T12:00:00.000Z')
+    await seedPatternWithSpikeTrend(t, { orgId: orgA, fingerprintHash: 'muted-spike', now, todayCount: 40 })
+
+    const asAdmin = t.withIdentity(identity('admin', 'a'))
+    const muted = await asAdmin.mutation(api.failure_patterns.mutePattern, { orgId: orgA, fingerprintHash: 'muted-spike' })
+    expect(muted.muted).toBe(true)
+
+    // A fresh rising edge occurs while muted — assessment is computed/stored
+    // (observability unaffected), but no alert fires.
+    const firstTick = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now })
+    expect(firstTick.spiking).toBe(1)
+    expect(firstTick.fired).toBe(0)
+
+    let events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(0)
+
+    const patternAfterMutedSpike = await t.run((ctx) => ctx.db.query('failure_patterns').withIndex('by_org_fingerprint', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'muted-spike')).first())
+    expect(patternAfterMutedSpike!.lastSpikeAssessment!.isSpiking).toBe(true) // still computed/stored
+    expect(patternAfterMutedSpike!.lastPatternSpikeAlertFiredAt).toBeUndefined() // no fire was attempted
+
+    // Drop to baseline while still muted...
+    const dropTick = now + 15 * 60 * 1000
+    await t.run(async (ctx) => {
+      const todayRow = await ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'muted-spike').eq('day', dayNDaysAgo(dropTick, 0))).first()
+      await ctx.db.patch(todayRow!._id, { count: 1 })
+    })
+    await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: dropTick })
+
+    // ...then unmute...
+    const unmuted = await asAdmin.mutation(api.failure_patterns.unmutePattern, { orgId: orgA, fingerprintHash: 'muted-spike' })
+    expect(unmuted.muted).toBe(false)
+
+    // ...and re-spike: a genuine fresh rising edge after unmuting fires.
+    const respikeTick = dropTick + 15 * 60 * 1000
+    await t.run(async (ctx) => {
+      const todayRow = await ctx.db.query('failure_pattern_daily_counts').withIndex('by_org_fingerprint_day', (q) => q.eq('orgId', orgA).eq('fingerprintHash', 'muted-spike').eq('day', dayNDaysAgo(respikeTick, 0))).first()
+      await ctx.db.patch(todayRow!._id, { count: 40 })
+    })
+    const respike = await t.mutation(internal.failure_patterns.assessPatternSpikesCron, { now: respikeTick })
+    expect(respike.spiking).toBe(1)
+    expect(respike.fired).toBe(1)
+
+    events = await t.run((ctx) => ctx.db.query('alert_events').withIndex('by_org_fired', (q) => q.eq('orgId', orgA)).collect())
+    expect(events.length).toBe(1)
+  })
 })

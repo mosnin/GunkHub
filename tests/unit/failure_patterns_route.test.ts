@@ -25,11 +25,18 @@ import { mapApiError } from '../../apps/web/src/lib/apiErrorMapping.js'
 import { isValidFingerprint } from '../../apps/web/src/lib/services/fingerprintValidation.js'
 
 describe('patterns routes — auth passthrough', () => {
-  it('GET /api/patterns and GET /api/patterns/[fingerprint] both use hasOrgAuthContext', () => {
+  it('every /api/patterns/** route uses hasOrgAuthContext', () => {
     // Documents the contract: if a new patterns route is added without
     // routing through this guard, this list (and this test) must be updated.
-    const routesUsingThisGuard = ['GET /api/patterns', 'GET /api/patterns/[fingerprint]']
-    expect(routesUsingThisGuard).toHaveLength(2)
+    // POST/DELETE /api/patterns/[fingerprint]/mute added cycle 3 — see
+    // failure_patterns_mute_route.test.ts for their dedicated coverage.
+    const routesUsingThisGuard = [
+      'GET /api/patterns',
+      'GET /api/patterns/[fingerprint]',
+      'POST /api/patterns/[fingerprint]/mute',
+      'DELETE /api/patterns/[fingerprint]/mute',
+    ]
+    expect(routesUsingThisGuard).toHaveLength(4)
   })
 
   it('rejects an authenticated user with no org context (matches every other management route)', () => {

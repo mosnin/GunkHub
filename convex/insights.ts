@@ -2249,19 +2249,32 @@ function fnv1a64Hex(input: string): string {
 }
 
 /**
- * Normalize a raw error message/class string so that two errors differing
- * only in their VARIABLE parts (a latency in ms, a uuid, a hex request id, a
- * timestamp, a quoted value, a filesystem path, or any other digit run)
- * collapse to the same normalized text. This is the key property tested in
- * insights.test.ts: "Timeout after 3021ms calling search_web" and "Timeout
- * after 118ms calling search_web" must normalize identically.
+ * First pass of error-signature normalization: lowercases, bounds length, and
+ * strips every VOLATILE-but-non-numeric token (quoted strings, uuids, 0x/bare
+ * hex ids, timestamps, unix/windows paths, hostnames/domains, base64 blobs,
+ * mixed-letter-and-digit ids) down to a stable placeholder. Digit-only runs
+ * are DELIBERATELY left untouched here — the trailing catch-all digit-run
+ * strip happens one step later (the inline `.replace(/\d+/g, "<n>")` in
+ * deriveFailureFingerprint), AFTER `errorClassToken` has had a chance to look
+ * for specific numeric status/error codes (429, 404, 500, ...) in this
+ * intermediate text.
  *
- * Order matters: quoted-string/uuid/hex/path stripping runs BEFORE the
- * trailing catch-all digit-run stripping, so (e.g.) a uuid's hyphenated
+ * That split exists to fix a real FALSE-MERGE bug: previously the digit
+ * catch-all ran unconditionally before errorClassToken saw the text, so the
+ * numeric-code checks in errorClassToken (`\b429\b`, `\b401\b`, etc.) were
+ * being tested against a string where "429"/"401"/etc. had ALREADY become
+ * "<n>" — those checks could never match. Two genuinely different errors like
+ * "HTTP 404 Not Found" and "HTTP 500 Internal Server Error" (no other
+ * distinguishing keyword) both fell through to the same generic first-word
+ * token ("http") and collapsed into ONE fingerprint. See errorClassToken.
+ *
+ * Order matters within this function too: quoted-string/uuid/hex/timestamp/
+ * path/hostname/base64/id stripping all run BEFORE anything that could be
+ * fooled by a partially-stripped token (e.g. a uuid's hyphenated
  * digit-and-letter groups collapse to a single `<uuid>` token rather than a
- * scattering of `<n>` tokens with the letters left behind.
+ * scattering of leftover fragments).
  */
-function normalizeErrorSignature(raw: string): string {
+function stripVolatileTokens(raw: string): string {
   let s = truncateText(raw, FINGERPRINT_MAX_INPUT_CHARS).toLowerCase();
 
   // Quoted strings (single or double) — collapse the whole literal.
@@ -2273,45 +2286,84 @@ function normalizeErrorSignature(raw: string): string {
   s = s.replace(/\b0x[0-9a-f]+\b/g, "<hex>");
   // ISO-8601-ish timestamps, e.g. 2026-07-24t12:03:00.123z (already lowercased above).
   s = s.replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z?\b/g, "<ts>");
-  // Filesystem paths (unix-style with >=2 segments, or windows drive-letter paths).
+  // Filesystem paths (unix-style with >=2 segments, or windows drive-letter
+  // paths) — collapses BOTH conventions for the SAME logical file to one
+  // placeholder, so a unix-vs-windows report of the same failure doesn't churn.
   s = s.replace(/(?:\/[\w.-]+){2,}/g, "<path>");
   s = s.replace(/[a-z]:\\(?:[\w.-]+\\)*[\w.-]+/g, "<path>");
+  // Hostnames/domains: 2+ dot-separated labels before a TLD-like final label
+  // (i.e. 3+ labels total) — e.g. "prod-worker-7.us-east-1.internal" or
+  // "api.example.com". Deliberately requires 2+ dots (not 1) so a plain
+  // "file.txt"-style token is left alone; a volatile hostname that differs
+  // per-instance for the SAME logical failure would otherwise churn the
+  // fingerprint on every occurrence.
+  s = s.replace(/\b(?:[a-z0-9-]+\.){2,}[a-z]{2,}\b/g, "<host>");
+  // Base64-ish blobs (long runs of base64-alphabet chars, optionally
+  // '='-padded) — e.g. an embedded JWT or encoded payload chunk.
+  s = s.replace(/\b[a-z0-9+/]{20,}={0,2}/g, "<b64>");
   // Bare hex-looking runs (request ids, short hashes) of 6+ hex chars.
   s = s.replace(/\b[0-9a-f]{6,}\b/g, "<hex>");
-  // Catch-all: any remaining digit run (latencies, ports, counts, ids).
-  s = s.replace(/\d+/g, "<n>");
+  // Mixed letter+digit ids (request/trace ids using a full alphanumeric
+  // alphabet, not just hex) — requires at least one letter AND one digit,
+  // 8+ chars total, e.g. "req8f3xk2z9".
+  s = s.replace(/\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{8,}\b/g, "<id>");
   // Collapse whitespace introduced by the substitutions above.
-  s = s.replace(/\s+/g, " ").trim();
-
-  return s;
+  return s.replace(/\s+/g, " ").trim();
 }
 
 /**
- * Extract a stable error CLASS token from an already-normalized error
- * string. Recognized keyword patterns (rate limiting, context-window
- * overflow, auth failures, timeouts, provider overload) are checked FIRST so
- * that semantically-equivalent wording ("rate limited", "429 too many
- * requests") collapses to the same token; anything unrecognized falls back
- * to the first word-ish token of the normalized text, which — because the
- * text was already normalized — is still stable across runs that only
+ * Extract a stable error CLASS token from a failure's error text.
+ *
+ * `preDigits` (stripVolatileTokens' output — volatile tokens stripped, but
+ * digit runs still intact) is what the specific numeric-code / keyword checks
+ * below run against, so that e.g. a bare "429" or "404" in the original text
+ * is still visible to these checks (see stripVolatileTokens' doc comment for
+ * why this two-stage split matters — testing these patterns against the
+ * fully-digit-stripped text was a real, silent false-merge bug). Recognized
+ * patterns are checked FIRST so that semantically-equivalent wording ("rate
+ * limited", "429 too many requests") OR a bare status code collapses to the
+ * same token; anything unrecognized falls back to the first word-ish token of
+ * `normalized` (the fully normalized text, digits included), which — because
+ * the text was already normalized — is still stable across runs that only
  * differ in their variable parts.
  */
-function errorClassToken(normalized: string): string {
-  if (/rate[\s-]?limit|\b429\b/.test(normalized)) return "rate_limited";
-  if (/context (?:length|window)|maximum context|too many tokens/.test(normalized)) return "context_exceeded";
-  if (/\bauth|api key|\b401\b|\b403\b|forbidden|unauthorized/.test(normalized)) return "auth_error";
-  if (/time(?:d)?[\s-]?out/.test(normalized)) return "timeout";
-  if (/overloaded|\b529\b|\b503\b|unavailable/.test(normalized)) return "provider_unavailable";
-  if (/connection reset|econnreset|network/.test(normalized)) return "network_error";
-  if (/assert/.test(normalized)) return "assertion_error";
+function errorClassToken(preDigits: string, normalized: string): string {
+  if (/rate[\s-]?limit|\b429\b/.test(preDigits)) return "rate_limited";
+  if (/context (?:length|window)|maximum context|too many tokens/.test(preDigits)) return "context_exceeded";
+  if (/\bauth|api key|\b401\b|\b403\b|forbidden|unauthorized/.test(preDigits)) return "auth_error";
+  if (/time(?:d)?[\s-]?out/.test(preDigits)) return "timeout";
+  if (/overloaded|\b529\b|\b503\b|unavailable/.test(preDigits)) return "provider_unavailable";
+  if (/connection reset|econnreset|network/.test(preDigits)) return "network_error";
+  if (/assert/.test(preDigits)) return "assertion_error";
+  // HTTP-status-shaped classes — checked against preDigits (digits intact) so
+  // a bare status code (with no accompanying keyword) still discriminates.
+  if (/\b404\b|not found/.test(preDigits)) return "not_found";
+  if (/\b409\b|conflict/.test(preDigits)) return "conflict";
+  if (/\b422\b/.test(preDigits)) return "validation_error";
+  if (/\b500\b/.test(preDigits)) return "internal_error";
+  if (/\b502\b|bad gateway/.test(preDigits)) return "bad_gateway";
+  if (/\b400\b|bad request/.test(preDigits)) return "bad_request";
 
   const m = /[a-z][a-z_]*/.exec(normalized);
   const token = m ? m[0] : normalized;
   return truncateText(token, 32).replace(/\s+/g, "_") || "error";
 }
 
+/** Display-only clamp (100 chars) — NEVER fed into the hash; see deriveFailureFingerprint. */
 function clampKey(s: string): string {
   return truncateText(s.trim(), FINGERPRINT_MAX_KEY_CHARS) || "unknown";
+}
+
+/**
+ * Normalize a failing tool name for fingerprinting: bound length, trim, and
+ * lowercase (case is not a discriminating signal for "which tool failed" —
+ * without this, the SAME tool reported as "search_web" by one SDK/agent
+ * version and "Search_Web" by another would salt-hash to two different
+ * fingerprints and the same recurring failure would silently split into two
+ * diluted failure_patterns rows).
+ */
+function normalizeToolName(raw: string): string {
+  return truncateText(raw, FINGERPRINT_MAX_INPUT_CHARS).trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 /**
@@ -2341,35 +2393,48 @@ export function deriveFailureFingerprint(input: FailureFingerprintInput): Failur
 
   const toolName =
     typeof input?.failingToolName === "string" && input.failingToolName.trim().length > 0
-      ? input.failingToolName.trim()
+      ? normalizeToolName(input.failingToolName)
       : undefined;
   const rawSignature =
     typeof input?.errorSignature === "string" && input.errorSignature.trim().length > 0
       ? input.errorSignature
       : undefined;
-  const errorClass = rawSignature ? errorClassToken(normalizeErrorSignature(rawSignature)) : undefined;
+  let errorClass: string | undefined;
+  if (rawSignature) {
+    const preDigits = stripVolatileTokens(rawSignature);
+    const normalized = preDigits.replace(/\d+/g, "<n>").replace(/\s+/g, " ").trim();
+    errorClass = errorClassToken(preDigits, normalized);
+  }
   const terminalType =
     typeof input?.terminalEventType === "string" && input.terminalEventType.trim().length > 0
-      ? input.terminalEventType.trim()
+      ? truncateText(input.terminalEventType.trim(), FINGERPRINT_MAX_INPUT_CHARS)
       : undefined;
 
   const isToolClass = TOOL_FAILURE_CLASSES.has(heuristicClass);
 
-  let salientKey: string;
+  // `rawKey` is bounded (FINGERPRINT_MAX_INPUT_CHARS, ~4000 chars — see every
+  // branch above) but deliberately NOT clamped to the much smaller
+  // FINGERPRINT_MAX_KEY_CHARS (100) display width. The hash is computed from
+  // THIS unclamped value. Hashing the 100-char-clamped key instead (as a
+  // previous version of this function did) was a real FALSE-MERGE bug: two
+  // genuinely different, long salient keys (e.g. two long tool names) sharing
+  // only their first 100 characters would clamp to an identical display key
+  // and therefore hash identically, even though they are different failures.
+  let rawKey: string;
   if (isToolClass && toolName) {
-    salientKey = toolName;
+    rawKey = toolName;
   } else if (errorClass) {
-    salientKey = errorClass;
+    rawKey = errorClass;
   } else if (toolName) {
-    salientKey = toolName;
+    rawKey = toolName;
   } else if (terminalType) {
-    salientKey = terminalType;
+    rawKey = terminalType;
   } else {
-    salientKey = heuristicClass;
+    rawKey = heuristicClass;
   }
-  salientKey = clampKey(salientKey);
 
-  const hash = fnv1a64Hex(`${heuristicClass}|${salientKey}`);
+  const hash = fnv1a64Hex(`${heuristicClass}|${rawKey}`);
+  const salientKey = clampKey(rawKey);
 
   const classLabel = FINGERPRINT_CLASS_LABEL[heuristicClass] ?? "Unknown failure";
   const label =
@@ -2432,10 +2497,14 @@ const SPIKE_DEFAULT_MIN_RECENT_COUNT = 3;
  * `z` is pinned to 0 rather than computed from too little data).
  *
  * Otherwise: `z = (recentMeanDaily - baselineMean) / max(baselineStd, 1)`
- * (the `max(..., 1)` guards a near-zero-variance baseline from producing a
- * wild z off a tiny denominator). `isSpiking` requires BOTH `recentCount >=
- * minRecentCount` (default 3 — a "spike" of one extra failure isn't a
- * pattern) AND `z >= zThreshold` (default 2).
+ * (the `max(..., 1)` guards a near-zero-variance/all-equal baseline from
+ * producing a wild — or divide-by-zero — z off a tiny denominator).
+ * `isSpiking` requires BOTH `recentCount >= minRecentCount` (default 3 — a
+ * "spike" of one extra failure isn't a pattern) AND `z >= zThreshold`
+ * (default 2). The "not enough baseline" bailout above also guards against a
+ * caller passing `minBaselineDays <= 0`: the effective minimum is clamped to
+ * at least 1, so an empty baseline slice can never reach the mean/variance
+ * division below and leak `NaN`/`Infinity` into `z`.
  *
  * Deterministic and side-effect-free: no Date.now(), no randomness — the
  * same `trend` array always produces the same assessment.
@@ -2459,7 +2528,14 @@ export function assessPatternSpike(trend: PatternTrendPoint[], opts?: AssessPatt
   const recentCount = recentSlice.reduce((sum, p) => sum + p.count, 0);
 
   const baselineSlice = sorted.slice(0, Math.max(0, n - recentDays));
-  if (baselineSlice.length < minBaselineDays || recentSlice.length === 0) {
+  // ADVERSARIAL GUARD: `baselineSlice.length < minBaselineDays` alone is not
+  // enough — a caller-supplied `minBaselineDays <= 0` would let an EMPTY
+  // baseline slide past this check, and every division below
+  // (baselineMean, variance) would then divide by zero and leak NaN into the
+  // returned `z`. Clamping the effective minimum to at least 1 guarantees
+  // baselineDays > 0 whenever we proceed past this point, regardless of what
+  // opts.minBaselineDays was set to.
+  if (baselineSlice.length < Math.max(minBaselineDays, 1) || recentSlice.length === 0) {
     return { isSpiking: false, recentCount, baselineMean: 0, z: 0 };
   }
 

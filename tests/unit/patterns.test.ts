@@ -69,6 +69,14 @@ describe('afr patterns — arg parsing', () => {
       json: true,
     })
   })
+
+  it('parses --muted', () => {
+    expect(parsePatternsArgs(['--muted'])).toEqual({ muted: true })
+  })
+
+  it('parses --active', () => {
+    expect(parsePatternsArgs(['--active'])).toEqual({ active: true })
+  })
 })
 
 describe('afr patterns — happy path', () => {
@@ -179,6 +187,78 @@ describe('afr patterns — happy path', () => {
     await runPatterns({ agent: 'agent_1' }, env, fetchImpl)
     const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
     expect(url).toContain('agentId=agent_1')
+  })
+
+  it('shows "yes" in the MUTED column for a muted pattern', async () => {
+    const muted = makePattern({ muted: true, mutedAt: Date.now() })
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [muted] } })
+    )
+    const result = await runPatterns({}, env, fetchImpl)
+    const log = vi.fn()
+    printPatterns({}, result, log)
+    const output = log.mock.calls.map((c) => c[0] as string).join('\n')
+    expect(output).toContain('MUTED')
+    expect(output).toMatch(/yes/)
+  })
+
+  it('shows "-" in the MUTED column for an active (unmuted) pattern', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [makePattern()] } })
+    )
+    const result = await runPatterns({}, env, fetchImpl)
+    const log = vi.fn()
+    printPatterns({}, result, log)
+    const output = log.mock.calls.map((c) => c[0] as string).join('\n')
+    expect(output).not.toMatch(/yes/)
+  })
+
+  it('marks a muted, spiking pattern as distinguishable from an active spiking one', async () => {
+    const mutedSpiking = makePattern({
+      muted: true,
+      lastSpikeAssessment: { assessedAt: Date.now(), isSpiking: true, recentCount: 7, baselineMean: 1, z: 3 },
+    })
+    const fetchImpl: ApiFetchLike = vi.fn(async () =>
+      jsonResponse(200, { apiVersion: 'v1', data: { patterns: [mutedSpiking] } })
+    )
+    const result = await runPatterns({}, env, fetchImpl)
+    const log = vi.fn()
+    printPatterns({}, result, log)
+    const output = log.mock.calls.map((c) => c[0] as string).join('\n')
+    // Still visibly spiking (mute suppresses alerts, not visibility)...
+    expect(output).toContain('yes (7)')
+    // ...but annotated as muted, distinct from an active spiking row.
+    expect(output).toContain('[muted]')
+  })
+
+  it('--muted forwards muted=true as a query param', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    await runPatterns({ muted: true }, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('muted=true')
+  })
+
+  it('--active forwards muted=false as a query param', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    await runPatterns({ active: true }, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('muted=false')
+  })
+
+  it('omits the muted query param when neither --muted nor --active is passed', async () => {
+    const fetchImpl: ApiFetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    await runPatterns({}, env, fetchImpl)
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).not.toContain('muted')
+  })
+
+  it('--muted and --active together fail as a usage error (exit 1) rather than silently picking one', async () => {
+    const result = await runPatterns({ muted: true, active: true }, env)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.exitCode).toBe(1)
+      expect(result.message).toContain('mutually exclusive')
+    }
   })
 
   it('prints a "more results available" hint when nextCursor is present', async () => {

@@ -303,6 +303,37 @@ describe('FlightReader.getFailurePatterns', () => {
     expect(url).not.toContain('spiking')
   })
 
+  it('sends muted=true as a query param when muted:true is passed', async () => {
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    const reader = new FlightReader(config, fetchImpl)
+    await reader.getFailurePatterns({ muted: true })
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('muted=true')
+  })
+
+  it('sends muted=false as a query param when muted:false is passed (not omitted)', async () => {
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    const reader = new FlightReader(config, fetchImpl)
+    await reader.getFailurePatterns({ muted: false })
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).toContain('muted=false')
+  })
+
+  it('omits the muted query param when muted is not passed', async () => {
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data: { patterns: [] } }))
+    const reader = new FlightReader(config, fetchImpl)
+    await reader.getFailurePatterns()
+    const url = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string
+    expect(url).not.toContain('muted')
+  })
+
+  it('resolves patterns carrying muted/mutedAt without throwing (mute reflection, cycle 3)', async () => {
+    const data = { patterns: [makePattern({ muted: true, mutedAt: 1_700_000_600_000 })] }
+    const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data }))
+    const reader = new FlightReader(config, fetchImpl)
+    await expect(reader.getFailurePatterns()).resolves.toEqual(data)
+  })
+
   it('resolves an empty list without throwing when the org has no patterns', async () => {
     const data = { patterns: [] }
     const fetchImpl: V1FetchLike = vi.fn(async () => jsonResponse(200, { apiVersion: 'v1', data }))

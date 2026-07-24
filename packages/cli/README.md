@@ -103,12 +103,13 @@ Options: `--json` (prints the raw, derived `{ ok, status, ... }` result).
 
 ### `afr patterns`
 
-Lists recurring failure patterns for your organization — a durable memory of fingerprinted, recurring failures derived from failed runs (PREVENTION cycle 1, ADR-005). Each row is a rollup: a class, a human label, how many times it has recurred, first/last seen timestamps, and whether the periodic spike-rollup cron currently flags it as spiking (and, when spiking, its `recentCount`).
+Lists recurring failure patterns for your organization — a durable memory of fingerprinted, recurring failures derived from failed runs (PREVENTION cycle 1, ADR-005). Each row is a rollup: a class, a human label, how many times it has recurred, first/last seen timestamps, whether the periodic spike-rollup cron currently flags it as spiking (and, when spiking, its `recentCount`), and whether an org admin has muted it (PREVENTION cycle 3).
 
 ```bash
 $ afr patterns
-ID            CLASS        LABEL                                  COUNT  FIRST SEEN                LAST SEEN                 SPIKING
-fp_a1b2c3d4e…  tool_error   lookup_order tool call times out       12     2026-07-10T09:00:00.000Z  2026-07-24T14:32:00.000Z  yes (9)
+ID            CLASS        LABEL                                  COUNT  FIRST SEEN                LAST SEEN                 SPIKING       MUTED
+fp_a1b2c3d4e…  tool_error   lookup_order tool call times out       12     2026-07-10T09:00:00.000Z  2026-07-24T14:32:00.000Z  yes (9)       -
+fp_f6e5d4c3b…  tool_error   flaky_search tool call 5xx             40     2026-06-01T09:00:00.000Z  2026-07-23T11:00:00.000Z  yes (6) [muted]  yes
 
 $ afr patterns --agent agent_support --limit 10 --json
 {
@@ -119,9 +120,14 @@ $ afr patterns --agent agent_support --limit 10 --json
 
 $ afr patterns --spiking
 # only patterns whose lastSpikeAssessment.isSpiking === true (PREVENTION cycle 2 — proactive prevention)
+
+$ afr patterns --muted     # only patterns an org admin has muted
+$ afr patterns --active    # only patterns that are NOT muted
 ```
 
-Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--spiking` (only patterns currently flagged as spiking), `--limit <n>`, `--json` (prints the raw API response).
+Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--spiking` (only patterns currently flagged as spiking), `--muted` / `--active` (mute-aware filter — mutually exclusive, passing both is a usage error, exit 1), `--limit <n>`, `--json` (prints the raw API response, including `muted`/`mutedAt`).
+
+**Mute suppresses alerts, not visibility.** A muted, spiking pattern still shows `yes (N)` in the SPIKING column — it is annotated `[muted]` rather than hidden, so it stays visibly distinct from an active spiking pattern. There is deliberately no `afr patterns mute`/`unmute` command: muting a pattern is an admin-only, audited, Clerk-authed org action taken in the web app, not a key-authed read-API action — this command only ever *reflects* mute state.
 
 Like every other read here, this is derived, observability-grade data (CLAUDE.md) — never a substitute for a single run's own event log or `afr explain <runId>`.
 

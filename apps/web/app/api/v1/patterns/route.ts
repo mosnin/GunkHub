@@ -9,13 +9,19 @@ import { apiListFailurePatterns } from '@/lib/services/api_v1'
 // ---------------------------------------------------------------------------
 // GET /api/v1/patterns — public read API, x-api-key auth (`read` scope).
 //
-// Query params: agentId, spiking, limit, cursor. Recurring failure patterns for the
-// key's org (PREVENTION cycle 1, ADR-005) — a durable memory of
-// fingerprinted, recurring failures derived from failed runs, most-recently-
-// seen first. Wraps convex/read_api.ts `apiListFailurePatterns` (sdk_quality
-// team) — the function enforces org scoping and the `read` scope for the
-// resolved key; this route only hashes the raw key and forwards filters.
+// Query params: agentId, spiking, muted, limit, cursor. Recurring failure
+// patterns for the key's org (PREVENTION cycle 1, ADR-005) — a durable memory
+// of fingerprinted, recurring failures derived from failed runs, most-
+// recently-seen first. Wraps convex/read_api.ts `apiListFailurePatterns`
+// (sdk_quality team) — the function enforces org scoping and the `read`
+// scope for the resolved key; this route only hashes the raw key and
+// forwards filters.
 // Powers `afr patterns` and the SDK's `FlightReader.getFailurePatterns`.
+//
+// `muted` (PREVENTION cycle 3, "mute reflection"): a READ-side filter only —
+// there is no mutation on this route or `apiListFailurePatterns` that sets
+// `muted`. Setting mute state is an admin-only, Clerk-authed, audited action
+// on a separate route; this key-authed v1 surface can only reflect it.
 // ---------------------------------------------------------------------------
 export const GET = withApiHandler(
   '/api/v1/patterns',
@@ -32,11 +38,18 @@ export const GET = withApiHandler(
     // other value (including "false" or garbage) is treated as unset, same
     // permissive-parsing posture as `limit` above.
     const spiking = sp.get('spiking') === 'true' ? true : undefined
+    // --muted/--active (PREVENTION cycle 3): tri-state, parsed the same
+    // permissive way as `spiking` — only the exact strings "true"/"false" opt
+    // in; anything else (missing, garbage, mixed case) is treated as unset
+    // rather than rejected, consistent with every other filter on this route.
+    const rawMuted = sp.get('muted')
+    const muted = rawMuted === 'true' ? true : rawMuted === 'false' ? false : undefined
 
     try {
       const result = await apiListFailurePatterns(hashApiKey(apiKey), {
         ...(sp.get('agentId') !== null && { agentId: sp.get('agentId') as string }),
         ...(spiking !== undefined && { spiking }),
+        ...(muted !== undefined && { muted }),
         ...(limit !== undefined && { limit }),
         ...(sp.get('cursor') !== null && { cursor: sp.get('cursor') as string }),
       })
