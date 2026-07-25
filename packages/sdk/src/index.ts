@@ -129,6 +129,8 @@ export type {
   AgentDivergenceParams,
   V1RunDivergenceData,
   V1AgentDivergenceData,
+  FleetHealthParams,
+  V1FleetHealthData,
 } from './reader.js'
 export type { V1ApiConfig, V1FetchLike, V1ApiErrorKind, V1Envelope } from './v1-client.js'
 
@@ -152,6 +154,7 @@ export type {
   FixConfidenceLimit,
   FixVersionAttribution,
   PatternResolutionEvidence,
+  ResolutionHealthSummary,
   PatternResolutionMetadata,
   PatternResolutionExposure,
   PatternLifecycleTransition,
@@ -196,6 +199,36 @@ export type {
   DeclaredPrompt,
   DeclaredCapabilities,
   DeclarationCompleteness,
+  // Fleet health ("what is wrong across everything?"). The observed/hypothesis
+  // separation is STRUCTURAL, exactly as proven/speculative is one altitude
+  // down: `ObservedCorrelation` and `HypothesisedCause` are mutually
+  // unassignable, share no text field, and a hypothesis additionally cannot
+  // exist without a base-rate measurement and an observation under it. NOT
+  // collapsed into a convenience union, for the reasons written up in
+  // `packages/contracts/src/fleet_health.ts`.
+  FleetHealthReport,
+  FleetHealthScan,
+  FleetHealthVerdict,
+  FleetHealthVerdictInput,
+  AgentHealthEntry,
+  AgentHealthState,
+  CorrelationBasis,
+  ObservedCorrelation,
+  ObservedCorrelationKind,
+  FleetObservationEvidence,
+  FailureOccurrenceCitation,
+  DeclaredAttributeCitation,
+  HypothesisedCause,
+  HypothesisedCauseKind,
+  FleetShareMeasurement,
+  ShareDiscrimination,
+  UnansweredFleetQuestion,
+  UnansweredFleetQuestionKind,
+  CorrelationIncoherence,
+  FleetIncoherenceFinding,
+  UnusableReason,
+  UnusableFieldFinding,
+  BaseRateUsability,
 } from '@agent-flight-recorder/contracts'
 
 // Divergence verdict/coverage RULES (runtime). One implementation of "is this
@@ -216,8 +249,48 @@ export {
   MAX_DIVERGENCE_REPRESENTATIVE_RUNS,
   // Snapshot readers — one tolerant parser, shared, so nothing invents a
   // second opinion about what a stored blob declares.
+  // Blast radius and org health, rendered honestly in ONE place: a saturated
+  // affected-agent set reads "20+", and an org with no patterns has NO health
+  // score rather than a perfect one. Same rule in both — an unmeasured
+  // quantity is not a measured extreme.
+  affectedAgentCountLabel,
+  healthScoreLabel,
+  MAX_AFFECTED_AGENT_IDS,
   readAgentConfigSnapshot,
   declaredDimensions,
   supportsProof,
   AGENT_CONFIG_SNAPSHOT_SCHEMA,
+  // Fleet health RULES (runtime). Same single-definition posture: one
+  // completeness predicate, one verdict rule, one ranking, one base-rate
+  // interpretation — shared by `afr fleet`, the web UI, the MCP surface and
+  // `FlightReader`'s own response verification.
+  computeFleetHealthVerdict,
+  fleetHealthReportVerdict,
+  isFleetHealthAnalysisComplete,
+  isFleetHealthScanComplete,
+  rankFleetCorrelations,
+  hypothesesFor,
+  orphanHypotheses,
+  isCorrelationSelfConsistent,
+  // Cross-field coherence — "do the report's own numbers agree WITH EACH
+  // OTHER?". `fleetReportIncoherences` is the one a GATE calls: it is the only
+  // entry point holding both the correlation and the `burstWindowMs` it was
+  // computed under, so it is the only one that can catch a "four-minute burst"
+  // that actually spans a day.
+  fleetReportIncoherences,
+  // "Is what arrived something arithmetic can be done with?" — asked at the
+  // boundary, BEFORE any coherence check or verdict, because those do
+  // arithmetic and arithmetic on a string does not throw.
+  fleetReportUnusableFields,
+  baseRateUsability,
+  correlationIncoherences,
+  citedAgentCount,
+  // The hypothesis sentence is COMPOSED, never transmitted — the mood is a
+  // property of the type rather than of whoever wrote the engine. Render this,
+  // never a string from the wire.
+  hypothesisQuestion,
+  SHARED_ATTRIBUTE_HYPOTHESIS_KINDS,
+  discriminationOf,
+  FLEET_DISCRIMINATION_MARGIN,
+  MAX_FLEET_CORRELATION_AGENTS,
 } from '@agent-flight-recorder/contracts'

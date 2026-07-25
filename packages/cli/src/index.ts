@@ -14,6 +14,7 @@ import { COMPAT_HELP, exitCodeForCompat, parseCompatArgs, printCompat, runCompat
 import { printConfigCheck, runConfigCheck } from './commands/config-check.js'
 import { EXPLAIN_HELP, parseExplainArgs, printExplain, runExplain } from './commands/explain.js'
 import { EXPORT_HELP, parseExportArgs, printExport, runExport } from './commands/export.js'
+import { FLEET_HELP, exitCodeForFleet, parseFleetArgs, printFleet, runFleet } from './commands/fleet.js'
 import { INIT_HELP, parseInitArgs, printInit, runInit } from './commands/init.js'
 import {
   PATTERNS_EVIDENCE_HELP,
@@ -51,6 +52,18 @@ export type {
   CompatFleetResult,
   CompatFailOn,
 } from './commands/compat.js'
+export {
+  parseFleetArgs,
+  runFleet,
+  printFleet,
+  exitCodeForFleet,
+  FLEET_EXIT_CORRELATED,
+  FLEET_EXIT_INDETERMINATE,
+  DEFAULT_FLEET_FAIL_ON,
+  DEFAULT_SINCE_HOURS,
+  DEFAULT_BURST_WINDOW_MINUTES,
+} from './commands/fleet.js'
+export type { FleetArgs, FleetCommandResult, FleetResult, FleetFailOn } from './commands/fleet.js'
 export { runConfigCheck, printConfigCheck } from './commands/config-check.js'
 export type { ConfigCheck, ConfigCheckResult, FetchLike } from './commands/config-check.js'
 export { runRecordDemo, printRecordDemo } from './commands/record-demo.js'
@@ -97,6 +110,11 @@ Usage:
 
 Commands:
   afr triage                    START HERE: what is wrong right now, and what to look at first
+  afr fleet                     Org-wide sweep: is something wrong ACROSS agents right now?
+                                 Roster health plus cross-agent correlations (same
+                                 fingerprint on N agents; N agents failing inside one
+                                 window). 'compat --agent' is one agent over many runs;
+                                 this is many agents at one moment.
   afr init                      Zero-to-recorded-run onboarding: check config, write a starter file, print next steps
   afr record demo              Run a small demo agent end-to-end against your configured backend
   afr config check             Validate AFR_API_KEY / AFR_BASE_URL and ping /api/health
@@ -201,6 +219,21 @@ export async function main(argv: string[], log: (line: string) => void = console
       // --fail-on threshold. Exit 0 is unreachable on an incomplete analysis
       // unless --fail-on none was passed, which is not a gate.
       return result.ok ? exitCodeForCompat(result) : result.exitCode
+    }
+
+    case 'fleet': {
+      const args = parseFleetArgs(afterCommand)
+      if (args.help) {
+        log(FLEET_HELP)
+        return 0
+      }
+      const result = await runFleet(args)
+      printFleet(args, result, log)
+      // Same shape as `compat`: transport/usage failures keep the shared 0-4
+      // convention; a SUCCESSFUL sweep maps its own contents to 0/10/11
+      // through the explicit --fail-on threshold. Exit 0 is unreachable on an
+      // incomplete sweep unless --fail-on none was passed, which is not a gate.
+      return result.ok ? exitCodeForFleet(result) : result.exitCode
     }
 
     case 'explain': {

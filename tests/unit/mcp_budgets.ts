@@ -437,7 +437,11 @@ export function fatPattern(i: number, overrides: PatternOverrides = {}): Failure
     lastSeenAt: FROZEN_NOW - (i % 7) * HOUR,
     representativeRunIds: Array.from({ length: 5 }, (_, r) => `run_${String(i)}${String(r)}`),
     affectedAgentVersionIds: Array.from({ length: 20 }, (_, v) => `ver_${String(i)}_${String(v)}`),
-    affectedAgentIds: ['agent_a1', 'agent_b2'],
+    // Filled to the documented bound (MAX_AFFECTED_AGENT_IDS = 20) and flagged
+    // truncated, because a fixture below its contract's bound measures a
+    // payload smaller than the contract permits and understates the ceiling.
+    affectedAgentIds: Array.from({ length: 20 }, (_, a) => `agent_${String(i)}_${String(a)}`),
+    affectedAgentIdsTruncated: true,
     lastSpikeAssessment: {
       assessedAt: FROZEN_NOW - HOUR,
       isSpiking: i % 2 === 0,

@@ -243,13 +243,33 @@ export const INVALID_RESOLUTION_VERSION_MESSAGE =
  *   deriveFailureFingerprint(input: DeriveFailureFingerprintInput) => DerivedFailureFingerprint
  *   assessPatternSpike(trend: {day:string,count:number}[], opts?) => PatternSpikeAssessment
  *
- * Both PURE, never throw. This file does not call either via a static value
- * import — only via the guarded dynamic lookups below — so it keeps
- * typechecking and shipping regardless of exactly when/whether Team B's
- * exports land; today they are NOT present, so the thin local fallbacks
- * (below) are what actually runs. TODO(Team B): once
- * `deriveFailureFingerprint`/`assessPatternSpike` land in insights.ts with
- * this signature, this file picks them up with zero code change.
+ * Both PURE, never throw.
+ *
+ * CORRECTION (this cycle). The paragraph that stood here said the insights.ts
+ * exports were "NOT present, so the thin local fallbacks are what actually
+ * runs". THAT WAS STALE AND IT WAS BACKWARDS: `insights.ts` exports both, so
+ * the probes below have been resolving to the REAL implementations, and the
+ * fallbacks have been dead in production while the comment told every reader
+ * the opposite.
+ *
+ * That mattered because the two implementations DISAGREE, and not subtly. On
+ * the trend `[5,5,5,5,5,5,6]` the real one returns
+ * `{isSpiking: false, recentCount: 16, z: 0.33}` and the fallback returns
+ * `{isSpiking: true, recentCount: 6, z: Infinity}` — opposite verdicts, and
+ * `recentCount` IN DIFFERENT UNITS (a 3-day sum versus a single day's value)
+ * written into the same stored field and rendered by the CLI as an unlabelled
+ * "spiking (N)". Which one you got was decided by a runtime property probe, and
+ * the comment describing that choice was wrong.
+ *
+ * The probe is therefore gone: the real implementations are imported directly
+ * below, so the selection is decided at build time and is visible in the import
+ * list. The fallbacks remain EXPORTED but are no longer reachable from any
+ * production path — they are retained solely because the adversarial suite in
+ * `tests/` pins them, which is outside this boundary to change.
+ *
+ * REMAINING WORK, NOT DONE HERE: two implementations of one decision still
+ * exist. Deleting `assessPatternSpikeFallback` requires updating the tests that
+ * pin it, which live in `tests/` and belong to another team.
  */
 export interface DeriveFailureFingerprintInput {
   heuristicClass: string;
@@ -283,16 +303,36 @@ type AssessPatternSpikeFn = (
   opts?: { recentDays?: number; zThreshold?: number },
 ) => PatternSpikeAssessment;
 
+/**
+ * The canonical implementations, selected at BUILD time.
+ *
+ * These were runtime property probes over the imported module namespace. A
+ * probe cannot fail loudly: if the export were ever renamed, it would silently
+ * fall back to a DIFFERENT detector with different units, and the only symptom
+ * would be a stored number changing meaning. A static reference turns that same
+ * mistake into a compile error.
+ */
 function getDeriveFailureFingerprint(): DeriveFailureFingerprintFn {
-  const candidate = (insightsModule as unknown as Record<string, unknown>)["deriveFailureFingerprint"];
-  return typeof candidate === "function"
-    ? (candidate as DeriveFailureFingerprintFn)
-    : deriveFailureFingerprintFallback;
+  // THE PROBE WAS HIDING A REAL TYPE MISMATCH, and removing it surfaced one on
+  // the first compile: the canonical implementation narrows `heuristicClass` to
+  // the `HeuristicFailureClass` union, while this module's callers compute it
+  // as an open `string`. The old `as DeriveFailureFingerprintFn` cast silenced
+  // that difference wholesale, across every parameter, forever.
+  //
+  // The widening is now explicit, in ONE place, and confined to the single
+  // field it applies to — so any FUTURE divergence in any other parameter is a
+  // compile error rather than another thing the cast absorbs. It is sound at
+  // runtime: `deriveFailureFingerprint` is pure, never throws, and folds an
+  // unrecognised class into its "unknown" branch rather than assuming one.
+  return (input) =>
+    insightsModule.deriveFailureFingerprint({
+      ...input,
+      heuristicClass: input.heuristicClass as insightsModule.HeuristicFailureClass,
+    });
 }
 
 function getAssessPatternSpike(): AssessPatternSpikeFn {
-  const candidate = (insightsModule as unknown as Record<string, unknown>)["assessPatternSpike"];
-  return typeof candidate === "function" ? (candidate as AssessPatternSpikeFn) : assessPatternSpikeFallback;
+  return insightsModule.assessPatternSpike;
 }
 
 /**

@@ -306,10 +306,10 @@ resolves `@agent-flight-recorder/sdk` and `/contracts` to their `dist/`.
 | `afr_triage` typical | **332** | 450 | a full 50-pattern scan of maximal `FailurePattern`s, nothing degraded |
 | `afr_triage` worst case | **435** | 450 | truncated scan + unevaluated + every item muted |
 | `afr_triage` `verdict: "clear"` | **32** | 450 | an org with nothing to report |
-| `afr_list_failure_patterns`, 10 | **294** | 300 | 10 maximal rollups — the published tier-1 figure (12.8x unprojected) |
-| `afr_list_failure_patterns`, 20 | **561** | 600 | a default page (13.5x) |
-| `afr_list_failure_patterns`, 100 | **2,681** | 2,800 | a saturated page at `MAX_LIMIT` (14.2x) |
-| `afr_get_pattern_evidence` | **423** | 450 | one pattern, 100 inbound lifecycle transitions, capped to 10 (34.7x) |
+| `afr_list_failure_patterns`, 10 | **294** | 300 | 10 maximal rollups — the published tier-1 figure (15.0x unprojected) |
+| `afr_list_failure_patterns`, 20 | **561** | 600 | a default page (15.9x) |
+| `afr_list_failure_patterns`, 100 | **2,681** | 2,800 | a saturated page at `MAX_LIMIT` (16.8x) |
+| `afr_get_pattern_evidence` | **423** | 450 | one pattern, 100 inbound lifecycle transitions, capped to 10 (34.8x) |
 | `afr_explain_run` realistic | **121** | 200 | a realistic `RunExplanation` |
 | `afr_explain_run` contract-maximal | **198** | 200 | 2 KB summary + 1 KB root cause + 1 KB fix |
 | `afr_explain_run` 20 six-digit citations | **198** | 200 | the same explanation on a 100k-event run — what makes `CITED_SEQUENCE_BYTE_CAP`'s "any count, any width" claim falsifiable |

@@ -2464,7 +2464,17 @@ export interface SpikeAssessment {
   recentCount: number;
   /** Mean daily count over the baseline window preceding the recent window. */
   baselineMean: number;
-  /** (recentMeanDaily - baselineMean) / max(baselineStd, 1). 0 if there isn't enough baseline data. */
+  /**
+   * (recentMeanDaily - baselineMedian) / max(scaledBaselineMAD, 1). 0 if there
+   * isn't enough baseline data.
+   *
+   * ROBUST BY CONSTRUCTION — median and MAD, not mean and standard deviation.
+   * See the rationale in {@link assessPatternSpike}: the baseline is drawn from
+   * the same trend as the recent window, so an ongoing incident contaminates
+   * its own baseline, and with a mean the detector reported CALM the longer an
+   * outage ran. Deliberately NOT derivable from `baselineMean`, which remains
+   * the descriptive arithmetic mean.
+   */
   z: number;
 }
 
@@ -2540,12 +2550,68 @@ export function assessPatternSpike(trend: PatternTrendPoint[], opts?: AssessPatt
   }
 
   const baselineDays = baselineSlice.length;
-  const baselineMean = baselineSlice.reduce((sum, p) => sum + p.count, 0) / baselineDays;
-  const variance = baselineSlice.reduce((sum, p) => sum + (p.count - baselineMean) ** 2, 0) / baselineDays;
-  const baselineStd = Math.sqrt(variance);
+  const baselineCounts = baselineSlice.map((p) => p.count);
+  const baselineMean = baselineCounts.reduce((sum, c) => sum + c, 0) / baselineDays;
+
+  // ---------------------------------------------------------------------
+  // ROBUST BASELINE (median + MAD), NOT MEAN + STANDARD DEVIATION.
+  //
+  // THIS IS THE FIX FOR TWO DEFECTS THAT INVERTED THE PRODUCT'S PROMISE, and
+  // both came from the same root: mean and standard deviation have a
+  // BREAKDOWN POINT OF ZERO, so a single contaminated observation moves them
+  // arbitrarily far. The baseline window is drawn from the same trend as the
+  // recent window, so an ongoing incident CONTAMINATES ITS OWN BASELINE.
+  //
+  //   1. SUSTAINED OUTAGE READ AS CALM. 20 failures/day for 7 days inside a
+  //      14-day trend: the mean baseline absorbs the four outage days it
+  //      contains (mean 7.27, std 9.62), z falls to 1.32, and `isSpiking`
+  //      flips to FALSE around day 6 — while the outage is still running.
+  //      THE LONGER AN OUTAGE RAN, THE MORE CONFIDENTLY THE DASHBOARD
+  //      REPORTED CALM. For an autonomous fleet that is the worst possible
+  //      failure: the incident nobody is watching is the one that has been
+  //      going long enough to look normal.
+  //
+  //      With the median the same trend has baseline median 0 (seven of its
+  //      eleven days are quiet), MAD 0, and z = 20 — still spiking, correctly,
+  //      on day 7 exactly as on day 3.
+  //
+  //   2. A SMOOTH RAMP REPORTED AS A SPIKE. `[1,2,...,10]` — no discontinuity
+  //      anywhere — gave z = 2.5 and `isSpiking: true`, so a fleet that is
+  //      GROWING looked like a fleet that is BREAKING. The MAD of a linear
+  //      ramp is proportionally large, so z falls to ~1.69 and the ramp is
+  //      correctly not a spike, while a genuine step change still is.
+  //
+  // The median tolerates contamination up to half the baseline window, so an
+  // outage is detected until it has run for more than half of the trend
+  // window. THAT LIMIT IS REAL AND IS NOT REMOVABLE HERE: an outage longer
+  // than the window it is measured against is indistinguishable from the new
+  // normal by any method that only sees this window. It is a property of the
+  // 14-day trend, not of the statistic, and it needs a longer reference
+  // series to fix rather than a cleverer estimator.
+  //
+  // `baselineMean` is still the ARITHMETIC mean and still reported: it is
+  // descriptive (what the baseline averaged), it is what the stored snapshot
+  // and the CLI have always shown, and changing its meaning underneath
+  // existing rows would be its own silent defect. Only `z` — the decision
+  // quantity — is computed robustly.
+  // ---------------------------------------------------------------------
+  const sortedBaseline = [...baselineCounts].sort((a, b) => a - b);
+  const median = (xs: number[]): number => {
+    const mid = Math.floor(xs.length / 2);
+    return xs.length % 2 === 0 ? (xs[mid - 1]! + xs[mid]!) / 2 : xs[mid]!;
+  };
+  const baselineCenter = median(sortedBaseline);
+  const absoluteDeviations = sortedBaseline.map((c) => Math.abs(c - baselineCenter)).sort((a, b) => a - b);
+  // 1.4826 rescales the MAD to be a consistent estimator of the standard
+  // deviation for normally distributed data, so `zThreshold` keeps the meaning
+  // it has always had and callers passing an explicit threshold are unaffected.
+  const baselineSpread = 1.4826 * median(absoluteDeviations);
 
   const recentMeanDaily = recentCount / recentSlice.length;
-  const z = (recentMeanDaily - baselineMean) / Math.max(baselineStd, 1);
+  // The floor of 1 is unchanged and is doing the same job as before: these are
+  // COUNTS, so a spread below one occurrence per day is noise, and dividing by
+  // it would manufacture an enormous z out of a quiet baseline.
+  const z = (recentMeanDaily - baselineCenter) / Math.max(baselineSpread, 1);
 
   const isSpiking = recentCount >= minRecentCount && z >= zThreshold;
 

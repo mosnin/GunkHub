@@ -93,11 +93,27 @@ function GearIcon() {
   )
 }
 
+/** Several nodes, one of them alight — the cross-agent view. */
+function FleetIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="3.5" cy="3.5" r="1.75" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="12.5" cy="3.5" r="1.75" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="3.5" cy="12.5" r="1.75" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="12.5" cy="12.5" r="1.75" fill="currentColor" />
+      <path d="M5.25 3.5h5.5M3.5 5.25v5.5M12.5 5.25v5.5M5.25 12.5h5.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 const navItems: NavItem[] = [
   { label: 'Dashboard', href: '/dashboard', icon: <GridIcon /> },
   { label: 'Projects', href: '/projects', icon: <FolderIcon /> },
   { label: 'Agents', href: '/agents', icon: <CpuIcon /> },
   { label: 'Runs', href: '/runs', icon: <PlayIcon /> },
+  // Placed directly above Patterns: Patterns is the per-fingerprint memory,
+  // Fleet is the cross-agent view of the same failures during an incident.
+  { label: 'Fleet', href: '/fleet', icon: <FleetIcon /> },
   { label: 'Patterns', href: '/patterns', icon: <TrendIcon /> },
   { label: 'Search', href: '/search', icon: <SearchIcon /> },
   { label: 'Compare', href: '/diff', icon: <ColumnsIcon /> },

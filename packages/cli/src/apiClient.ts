@@ -17,12 +17,14 @@ import { FlightReader, V1ApiError } from '@agent-flight-recorder/sdk'
 
 import type {
   AgentDivergenceParams,
+  FleetHealthParams,
   ListEventsParams,
   ListFailurePatternsParams,
   ListRunsParams,
   RunDivergenceParams,
   V1AgentDivergenceData,
   V1ApiErrorKind,
+  V1FleetHealthData,
   V1FetchLike,
   V1RunDivergenceData,
   V1GetExplanationData,
@@ -122,6 +124,8 @@ export type {
   V1AgentDivergenceData,
   RunDivergenceParams,
   AgentDivergenceParams,
+  V1FleetHealthData,
+  FleetHealthParams,
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +230,27 @@ export async function getAgentDivergence(
 ): Promise<V1AgentDivergenceData> {
   try {
     return await new FlightReader(config, fetchImpl).getAgentDivergence(agentId, params)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/**
+ * "What is wrong across everything?" — the org-wide sweep behind `afr fleet`.
+ *
+ * Thin `FlightReader` wrapper, and the reader's refusals matter more here than
+ * anywhere else in this file: an ignored `burstWindowMs`, a correlation citing
+ * evidence outside its own window, or a hypothesis with no base rate all
+ * arrive as `ApiClientError` with `kind: 'invalid_response'` and therefore
+ * exit code 4 — a wire failure, never a clean sweep and never a fleet event.
+ */
+export async function getFleetHealth(
+  config: ApiClientConfig,
+  params: FleetHealthParams,
+  fetchImpl?: ApiFetchLike
+): Promise<V1FleetHealthData> {
+  try {
+    return await new FlightReader(config, fetchImpl).getFleetHealth(params)
   } catch (err) {
     toApiClientError(err)
   }

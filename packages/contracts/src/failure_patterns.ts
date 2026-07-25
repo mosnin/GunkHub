@@ -64,6 +64,38 @@ export interface FailurePattern {
    * readers fall back to deriving the set from occurrences meanwhile.
    */
   affectedAgentIds?: string[];
+  /**
+   * True when {@link FailurePattern.affectedAgentIds} hit its cap and the set
+   * is a FLOOR, not the whole blast radius.
+   *
+   * ---------------------------------------------------------------------
+   * WHY THIS FIELD HAD TO EXIST
+   * ---------------------------------------------------------------------
+   *
+   * The set is capped on write at 20, most-recent-first — so a saturated
+   * "20" is indistinguishable from a real 20 to everything downstream, and
+   * the number an operator reads mid-incident is the blast radius. It
+   * UNDERCOUNTS PRECISELY ON THE WIDEST-SPREADING FAILURES, which are the
+   * ones worth knowing about: the more agents a failure reaches, the more
+   * confidently this field understates it.
+   *
+   * It also CHURNS, which is the less obvious half. Most-recent-first dedup
+   * means two reads seconds apart can return different members, so a
+   * saturated set is not merely incomplete, it is UNSTABLE — a list an
+   * operator is comparing against a screenshot from five minutes ago.
+   *
+   * The same interface already carries `runCountTruncated` for the run scan
+   * (see {@link PatternResolutionExposure}), which is what made the absence
+   * here an inconsistency rather than a considered omission of the whole
+   * design.
+   *
+   * Absent means "not known to be truncated" — every row written before this
+   * field existed, which self-heals on that pattern's next occurrence. It
+   * therefore may NOT be read as "definitely complete"; use
+   * {@link affectedAgentCountLabel}, which renders the honest string in both
+   * cases rather than leaving each surface to remember.
+   */
+  affectedAgentIdsTruncated?: boolean;
   lastSpikeAssessment?: FailurePatternSpikeAssessment;
   /** Epoch ms of the last time a `pattern_spike` alert was fired for this pattern (cooldown state — see docs/adr/005-failure-patterns.md Cycle 2). */
   lastPatternSpikeAlertFiredAt?: number;
@@ -353,4 +385,112 @@ export interface FailurePatternDetail {
   recentOccurrences: FailurePatternOccurrence[];
   /** Daily counts for the trailing 14 UTC calendar days (inclusive of today), oldest first. */
   trend: FailurePatternTrendPoint[];
+}
+
+// ---------------------------------------------------------------------------
+// Rendering the blast radius honestly
+// ---------------------------------------------------------------------------
+
+/** Cap applied to {@link FailurePattern.affectedAgentIds} on write. A set at this size may be a floor. */
+export const MAX_AFFECTED_AGENT_IDS = 20;
+
+/**
+ * How many agents this fingerprint has been seen on, as a string an operator
+ * can trust — `"20+"` when the set saturated, `"7"` when it did not.
+ *
+ * ONE IMPLEMENTATION, because this is a number read during an incident and a
+ * CLI that says "20" while a dashboard says "20+" is two answers to one
+ * question. Surfaces should call this rather than `affectedAgentIds.length`.
+ *
+ * Treats a set AT the cap as truncated even when `affectedAgentIdsTruncated`
+ * is absent, and that conservatism is deliberate: the flag is optional and
+ * missing on every row written before it existed, so trusting its absence
+ * would render exactly the pre-existing rows as exact — the ones most likely
+ * to be wrong.
+ */
+export function affectedAgentCountLabel(pattern: FailurePattern): string {
+  const ids = pattern.affectedAgentIds ?? [];
+  const saturated = pattern.affectedAgentIdsTruncated === true || ids.length >= MAX_AFFECTED_AGENT_IDS;
+  return saturated ? `${ids.length}+` : String(ids.length);
+}
+
+// ---------------------------------------------------------------------------
+// Org-level resolution health — and the one number that must be able to say
+// "there is no number"
+// ---------------------------------------------------------------------------
+
+/**
+ * The org-wide rollup over pattern lifecycle state, computed by
+ * `convex/insights.ts`'s `summarizeResolutionHealth`.
+ *
+ * CANONICAL DECLARATION, per CLAUDE.md ("all shared entity types live in
+ * packages/contracts only") — the engine previously declared this shape inline
+ * at its return site, which is exactly how the `FixConfidence*` unions came to
+ * be mirrored in four places.
+ *
+ * ---------------------------------------------------------------------------
+ * `healthScore: number | null` — WHY THE NULL IS THE WHOLE POINT
+ * ---------------------------------------------------------------------------
+ *
+ * An org with no patterns at all scored **100: PERFECT HEALTH**. An org whose
+ * pattern ingestion is silently BROKEN presents identically to an org with
+ * nothing wrong — and the broken one is the case you would most want the
+ * number to shout about.
+ *
+ * There is no number that correctly represents "we have no data", and every
+ * candidate fails in a direction:
+ *   - `0` reads as catastrophe, and would page someone over an empty org.
+ *   - `100` reads as perfect, which is the bug.
+ *   - a sentinel (`-1`) gets rendered as a number by whoever forgets, which
+ *     is the same failure with an extra step.
+ *
+ * So the type says there is no score. `null` is not a hedge and not a magic
+ * value — it is the absence of a measurement, and a consumer cannot format it
+ * as a percentage without deciding what to do about it.
+ *
+ * THIS IS THE SAME RULE AS `FleetShareMeasurement.unaffectedSharing` in
+ * `fleet_health.ts`: **an unmeasured quantity is not a measured extreme.**
+ * That distinction was the strongest thing in the fleet contract and it
+ * generalises — it is worth reaching for whenever a summary statistic has an
+ * empty input, because the empty input is the one nobody writes a test for and
+ * the one ordinary operation produces most often.
+ *
+ * `total` remains the input a consumer should branch on; `null` is what makes
+ * forgetting to impossible to render.
+ */
+export interface ResolutionHealthSummary {
+  total: number;
+  open: number;
+  acknowledged: number;
+  resolved: number;
+  regressed: number;
+  regressionRate: number;
+  /** Null when no resolution has a measurable time-to-resolution. Already correct; the model for the scores below. */
+  avgTimeToResolutionMs: number | null;
+  medianTimeToResolutionMs: number | null;
+  /** 0..100, or NULL when `total === 0` — there is no health score for an org with no patterns. */
+  healthScore: number | null;
+  confirmedResolutions: number;
+  provingResolutions: number;
+  unprovenResolutions: number;
+  resolutionsWithoutEvidence: number;
+  confirmationRate: number;
+  /**
+   * `healthScore` recomputed with each resolution contributing only the credit
+   * its EVIDENCE earned. Null on exactly the same condition, for exactly the
+   * same reason — and the GAP between the two numbers is only readable when
+   * both are numbers.
+   */
+  provenHealthScore: number | null;
+}
+
+/**
+ * Render a health score for a human, or say why there is none.
+ *
+ * Exists so no surface has to decide for itself what `null` looks like — the
+ * decision that turns "no data" back into a number is exactly the one being
+ * removed.
+ */
+export function healthScoreLabel(score: number | null): string {
+  return score === null ? "no data" : String(score);
 }

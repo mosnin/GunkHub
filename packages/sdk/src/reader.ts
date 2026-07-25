@@ -19,7 +19,15 @@
  * Uses only the native `fetch` — no HTTP framework dependency, consistent
  * with the rest of the SDK.
  */
-import { divergenceReportVerdict, fleetDivergenceVerdict } from '@agent-flight-recorder/contracts'
+import {
+  divergenceReportVerdict,
+  fleetDivergenceVerdict,
+  SHARED_ATTRIBUTE_HYPOTHESIS_KINDS,
+  fleetHealthReportVerdict,
+  fleetReportIncoherences,
+  fleetReportUnusableFields,
+  orphanHypotheses,
+} from '@agent-flight-recorder/contracts'
 
 import { warnIfInsecureEndpoint } from './transport.js'
 import { fetchV1, V1ApiError } from './v1-client.js'
@@ -33,6 +41,7 @@ import type {
   FailureSummary,
   FixConfidenceState,
   FleetDivergenceReport,
+  FleetHealthReport,
   PatternResolutionEvidence,
   ReplayProjection,
   Run,
@@ -984,6 +993,317 @@ function assertVerdictConsistent(served: unknown, computed: string, context: str
   )
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/v1/fleet/health
+//
+// "What is wrong across everything, and what is it that is actually wrong?" —
+// the org-wide altitude. Report types are contracts'
+// (`packages/contracts/src/fleet_health.ts`); the engine is Team A's.
+//
+// SERVER SUPPORT: the route does not exist yet at the time of writing. The
+// method is written against the exact contract shape, so wiring the route
+// should require no SDK change. Until then, calling it surfaces a
+// `V1ApiError` with `kind: 'not_found'`.
+// ---------------------------------------------------------------------------
+
+/** Parameters for {@link FlightReader.getFleetHealth}. */
+export interface FleetHealthParams {
+  /**
+   * Lower bound (inclusive) on the observation window, epoch ms. REQUIRED —
+   * there is deliberately no implicit "last 24 hours". A monitoring loop whose
+   * window is implicit changes meaning the day a server default is retuned,
+   * and the change is invisible in the alert it produces.
+   */
+  since: number
+  /** Upper bound (inclusive), epoch ms. REQUIRED, same reasoning. Echoed and verified. */
+  until: number
+  /**
+   * Width, in ms, inside which failures on different agents count as
+   * coincident. REQUIRED, echoed, and VERIFIED — see
+   * {@link assertFleetHealthReportTrustworthy} point 2. A server that drops it
+   * answers about a different window than the one asked about, and the answer
+   * is a burst that may be a whole day of unrelated failures.
+   */
+  burstWindowMs: number
+  /** Max agents in this roster page. Server-capped; hitting the cap sets `scan.scanTruncated`. */
+  limit?: number
+  /**
+   * Continue a previous roster page.
+   *
+   * THERE IS NO MERGE HELPER, ON PURPOSE. Cross-agent correlation does not
+   * compose across pages — see `CorrelationBasis` in contracts. Paging is for
+   * seeing the whole ROSTER; a report whose `scan.correlationBasis` is
+   * `page_local` can never be complete however many pages are fetched.
+   */
+  cursor?: string
+}
+
+/** Response shape for `GET /api/v1/fleet/health`. */
+export interface V1FleetHealthData {
+  report: FleetHealthReport
+}
+
+/**
+ * Refuse a fleet health report that cannot be trusted at 3am.
+ *
+ * SAME POSTURE AS {@link assertDivergenceReportTrustworthy}, ONE ALTITUDE UP,
+ * AND WITH HIGHER STAKES. A divergence report is read before a deploy by
+ * someone with time to think. This one is read during an incident by someone
+ * deciding what to roll back. Every check below is one where the wrong answer
+ * looks exactly like the right one to a caller reading
+ * `report.correlations.length === 0` or reading the top hypothesis aloud.
+ *
+ * 1. MISSING `scan`. `correlations: []` means "nothing is wrong across the
+ *    fleet" or "we looked at nothing", and the scan record is the only thing
+ *    that distinguishes them. A report without it is not a weaker answer; it
+ *    is an unreadable one.
+ *
+ * 2. IGNORED WINDOW PARAMETERS (`since` / `until` / `burstWindowMs`). This is
+ *    the ignored-parameter tell, the same lie {@link
+ *    FlightReader.getRunEventWindow} catches on `fromSequence` and
+ *    {@link assertFleetDivergenceReportTrustworthy} catches on `since`. The
+ *    burst width is the dangerous one: a deployment that predates the
+ *    parameter drops it and correlates over its own — typically far wider —
+ *    default, so a "burst" it reports may be a day of ordinary background
+ *    failure rendered as four minutes of one incident. That is a confidently
+ *    worded wrong answer, produced at the exact moment someone is looking for
+ *    permission to roll something back. Absent is as fatal as mismatched:
+ *    absence proves nothing was honored either.
+ *
+ * 3. CONTENTS THAT ARE NOT USABLE AT ALL. Checked FIRST, because every check
+ *    after it does arithmetic. A field being PRESENT is not the same as its
+ *    contents being something arithmetic can be done with, and a guard written
+ *    as a comparison (`x <= 0`, `if (x.truncated)`) does not reject a
+ *    non-number — it silently takes the other branch, and whether that branch
+ *    is the safe one is luck. That produced a base-rate measurement whose
+ *    counts arrived as the STRINGS `'0'` and `'188'` and returned
+ *    `discriminating`, and one whose `measurementTruncated` flag was simply
+ *    DROPPED and so compared floors as totals — both promoting a guess to
+ *    "read this first" from unvalidated wire data. Contracts'
+ *    `fleetReportUnusableFields` asks the question directly, once, for every
+ *    field that feeds a verdict, a gate or the ranking.
+ *
+ * 4. NUMBERS THAT DO NOT AGREE WITH EACH OTHER. This is a CLASS, not a check,
+ *    and naming it is what closed four separate holes: verifying that a field
+ *    is PRESENT and internally well-formed is not the same as verifying that
+ *    the numbers it carries agree with the other numbers in the same report.
+ *    Point 2 above confirms the server HONOURED `burstWindowMs`; it says
+ *    nothing about whether the burst it returned actually FITS that width, and
+ *    a "burst" echoing four minutes while spanning twenty-four hours passed
+ *    every check this class was added to catch. Likewise `agentCount` — the
+ *    number that decides what an operator reads first — was never compared to
+ *    the agents listed or cited. All of it is decidable from the report's own
+ *    contents at no extra request, and contracts'
+ *    `fleetReportIncoherences` is the single enumeration of it.
+ *
+ * 5. A HYPOTHESIS SERVED AS AN OBSERVATION, or vice versa. The type system
+ *    makes this impossible in OUR code (contracts' three certainty bands are
+ *    mutually unassignable by construction). It cannot make it impossible in a
+ *    JSON body: TypeScript's guarantee stops at the wire. So the segregation is
+ *    re-checked here, before any caller can render a guess as a fact. An
+ *    observation with an empty `observedBy` is the same defect in its purest
+ *    form.
+ *
+ * 6. AN ORPHAN HYPOTHESIS — one resting on a `correlationKey` this report does
+ *    not contain. On a dashboard a free-floating "model m-4 may be degrading"
+ *    is pixel-identical to one backed by twelve cited occurrences. Refusing
+ *    the response is the only place that difference can still be enforced.
+ *
+ * 7. A HYPOTHESIS WITH NO DENOMINATOR SHAPE. `sharedBy` is required by the
+ *    contract; a wire body can omit it, and a hypothesis without a base rate
+ *    is exactly the "all 12 failing agents use m-4" statement that reads as
+ *    damning when 198 of 200 agents use m-4.
+ *
+ * 8. A `verdict` THAT CONTRADICTS THE REPORT'S OWN CONTENTS.
+ *
+ * NOT CHECKED, deliberately: `scanTruncated`, a `page_local`
+ * `correlationBasis`, `nextCursor`, unmeasured base rates. Those are the
+ * server TELLING THE TRUTH in a field, and the correct response is a verdict of
+ * `indeterminate` — which the contract already produces — plus a gate that
+ * declines to pass it. That decision belongs to the gate; `afr fleet` makes it
+ * (exit 11).
+ */
+function assertFleetHealthReportTrustworthy(report: FleetHealthReport, params: FleetHealthParams): void {
+  const context = 'getFleetHealth'
+
+  const scan = (report as { scan?: unknown }).scan
+  if (
+    scan === null ||
+    typeof scan !== 'object' ||
+    typeof (scan as { scanTruncated?: unknown }).scanTruncated !== 'boolean' ||
+    typeof (scan as { agentsAssessed?: unknown }).agentsAssessed !== 'number' ||
+    typeof (scan as { correlationBasis?: unknown }).correlationBasis !== 'string'
+  ) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the report carried no usable \`scan\`. Without it there is no way to tell a sweep that ` +
+        `assessed the whole roster from one that assessed nothing, and "no correlations found" would read as a ` +
+        `fleet-wide all-clear. Refusing to report an unmeasured fleet as healthy.`
+    )
+  }
+
+  assertEchoedWindow(scan as Record<string, unknown>, 'since', params.since, context)
+  assertEchoedWindow(scan as Record<string, unknown>, 'until', params.until, context)
+  assertEchoedWindow(scan as Record<string, unknown>, 'burstWindowMs', params.burstWindowMs, context)
+
+  if (!Array.isArray(report.correlations) || !Array.isArray(report.hypotheses) || !Array.isArray(report.unanswered)) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the report's findings were not arrays. An absent \`correlations\` list reads as "nothing is ` +
+        `wrong across the fleet", and an absent \`unanswered\` list reads as "nothing went unchecked" — both ` +
+        `wrong in the one direction that ends an incident investigation early. Refusing.`
+    )
+  }
+
+  for (const correlation of report.correlations) {
+    const c = correlation as { certainty?: unknown; observedBy?: unknown; correlationKey?: unknown }
+    if (c?.certainty !== 'observed') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: an entry in \`correlations\` declares certainty ${JSON.stringify(c?.certainty)}. A hypothesis ` +
+          `served in the observed list would be rendered as something that demonstrably happened across the ` +
+          `fleet — the exact conflation this contract is built to make impossible, and the one that gets a ` +
+          `healthy dependency rolled back. Refusing.`
+      )
+    }
+    if (!Array.isArray(c.observedBy) || c.observedBy.length === 0) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: the correlation ${JSON.stringify(c.correlationKey)} cites no evidence (\`observedBy\`). An ` +
+          `observed co-occurrence that cannot cite the recorded failures it is made of is not an observation. Refusing.`
+      )
+    }
+  }
+
+  for (const hypothesis of report.hypotheses) {
+    const h = hypothesis as {
+      certainty?: unknown
+      kind?: unknown
+      restingOn?: unknown
+      sharedBy?: unknown
+      hypothesisKey?: unknown
+    }
+    if (h?.certainty !== 'hypothesis') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: an entry in \`hypotheses\` declares certainty ${JSON.stringify(h?.certainty)}. An observation ` +
+          `filed as a hypothesis buries a fact among the guesses; a guess filed as an observation is worse. Refusing.`
+      )
+    }
+    if (!Array.isArray(h.restingOn) || h.restingOn.length === 0) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: the hypothesis ${JSON.stringify(h.hypothesisKey)} rests on no observation. A free-floating ` +
+          `explanation renders identically to one backed by twelve cited occurrences, and nothing on the screen ` +
+          `tells them apart. Refusing.`
+      )
+    }
+    // THE MOOD OF THE SENTENCE IS A PROPERTY OF THE TYPE, AND THE WIRE MUST
+    // NOT REOPEN IT. Contracts removed the free-prose headline so that
+    // `hypothesisQuestion()` composes an always-interrogative sentence from
+    // `kind` + `sharedValue` — an engine can no longer write "model m-4 is
+    // failing", which is a compiling, contract-valid hypothesis that reads as
+    // a finding no matter what chrome surrounds it. A JSON body can still
+    // carry an extra prose field and tempt a consumer into rendering it, so
+    // the absence is checked here, at the one layer every consumer passes
+    // through (the CLI, the MCP tool and any SDK caller get the raw object;
+    // only the web surface had a local defence).
+    for (const banned of ['candidateExplanation', 'message', 'summary', 'title', 'description', 'headline']) {
+      if (banned in (hypothesis as unknown as Record<string, unknown>)) {
+        throw new V1ApiError(
+          'invalid_response',
+          `${context}: the hypothesis ${JSON.stringify(h.hypothesisKey)} carries a prose headline ` +
+            `(\`${banned}\`). A hypothesis has no headline field: its sentence is COMPOSED by contracts' ` +
+            `hypothesisQuestion() from \`kind\` and \`sharedValue\`, so it is always a question. A transmitted ` +
+            `sentence is the one route left by which an engine — rather than a forgetful consumer — turns a ` +
+            `guess into a finding, and during an incident that sentence is what someone acts on. Refusing.`
+        )
+      }
+    }
+    if (
+      (SHARED_ATTRIBUTE_HYPOTHESIS_KINDS as readonly unknown[]).includes(h.kind) &&
+      typeof (hypothesis as { sharedValue?: unknown }).sharedValue !== 'string'
+    ) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: the hypothesis ${JSON.stringify(h.hypothesisKey)} is about a shared attribute but names no ` +
+          `\`sharedValue\`. It would compose to "Could the shared model explain this?" — a question about nothing ` +
+          `in particular, spending the one line an operator will read. Refusing.`
+      )
+    }
+    if (h.sharedBy === null || typeof h.sharedBy !== 'object') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: the hypothesis ${JSON.stringify(h.hypothesisKey)} carries no base-rate measurement ` +
+          `(\`sharedBy\`). "All 12 failing agents use model m-4" is not evidence when 198 of the org's 200 agents ` +
+          `use model m-4, and the denominator is the only thing that separates those two readings. Refusing.`
+      )
+    }
+  }
+
+  // USABILITY BEFORE ANY ARITHMETIC. Everything below this line — the
+  // coherence sweep, the completeness predicates, the verdict recomputation —
+  // computes with these numbers, and arithmetic on a string or a NaN does not
+  // throw, it quietly produces an answer. This is the check that makes the
+  // others mean anything. It runs AFTER the structural checks above so that a
+  // conflated finding is reported as the conflation it is, rather than as the
+  // missing-field symptom of one — an operator debugging a bad deployment
+  // needs the cause, and "hypotheses[h1].sharedBy (unusable_measurement)" is a
+  // worse answer than "a hypothesis was served in the observed list".
+  const unusable = fleetReportUnusableFields(report)
+  if (unusable.length > 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the report carries fields whose contents cannot be used — ` +
+        unusable.map((f) => `${f.path} (${f.reason})`).join('; ') +
+        `. A field being present is not the same as its contents being a number: a base rate whose counts arrive ` +
+        `as strings compares as though it were measured, and a dropped truncation flag reads as "not truncated" ` +
+        `and compares floors as totals. Both promote a guess to the top of an incident screen from data nothing ` +
+        `vouched for. Refusing.`
+    )
+  }
+
+  // The whole cross-field arithmetic sweep, checked against the SCAN — which
+  // is the half `isCorrelationSelfConsistent` structurally cannot see, and
+  // therefore the half where the burst-span lie lives.
+  const incoherences = fleetReportIncoherences(report)
+  if (incoherences.length > 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the report's own numbers contradict each other — ` +
+        incoherences.map((f) => `${f.correlationKey}: ${f.incoherence}`).join('; ') +
+        `. A correlation whose declared span is wider than the burst width it was computed under is a day of ` +
+        `ordinary background failure wearing an incident's clothes; one whose claimed breadth exceeds the agents ` +
+        `it lists or cites is an unvalidated number deciding what gets read first at 3am. Both are wrong in the ` +
+        `direction that gets something rolled back. Refusing.`
+    )
+  }
+
+  const orphans = orphanHypotheses(report)
+  if (orphans.length > 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: ${orphans.length} hypothes${orphans.length === 1 ? 'is rests' : 'es rest'} on correlation ` +
+        `key(s) [${orphans.flatMap((h) => h.restingOn).join(', ')}] that this report does not contain. An ` +
+        `explanation whose observation is missing cannot be checked by the person reading it. Refusing.`
+    )
+  }
+
+  assertVerdictConsistent(report.verdict, fleetHealthReportVerdict(report), context)
+}
+
+/** The window echo is the ignored-parameter tell — see {@link assertFleetHealthReportTrustworthy} point 2. */
+function assertEchoedWindow(scan: Record<string, unknown>, field: string, requested: number, context: string): void {
+  if (scan[field] === requested) return
+  throw new V1ApiError(
+    'invalid_response',
+    `${context}: asked for ${field}=${requested} but the scan reports ${JSON.stringify(scan[field] ?? null)}. This ` +
+      `deployment ignored the parameter (an older deployment silently drops an unknown query parameter and ` +
+      `answers over its own default window), so this report describes a different question than the one asked. ` +
+      `A burst measured over the wrong width is ordinary background failure rendered as one incident. Refusing.`
+  )
+}
+
 /**
  * Read-only client over the v1 read API.
  *
@@ -1553,6 +1873,92 @@ export class FlightReader {
       this.fetchImpl
     )
     assertFleetDivergenceReportTrustworthy(data.report, params, agentId)
+    return data
+  }
+
+  /**
+   * "What is wrong across everything, and what is it that is actually wrong?"
+   * — the org-wide altitude, for an operator running hundreds of agents.
+   *
+   * Returns a roster of agents with a health state, plus CROSS-AGENT
+   * correlations observed inside the window: the same failure fingerprint on N
+   * agents, or N agents beginning to fail inside `burstWindowMs` of one
+   * another. That second one is what catches a model provider degrading or a
+   * shared tool changing shape, because those rarely produce one tidy
+   * fingerprint — they produce twelve different ones at once, and every
+   * per-agent view in this product shows twelve unrelated problems.
+   *
+   * **CORRELATION IS NOT CAUSATION, AND THE TYPES ENFORCE IT.**
+   * `report.correlations` holds things that DEMONSTRABLY HAPPENED, each citing
+   * the recorded failures it is made of. `report.hypotheses` holds proposed
+   * READINGS of those — "these twelve all call model `m-4`" — and they are a
+   * different, mutually unassignable type with no shared text field, each
+   * carrying a required base-rate measurement (how many HEALTHY agents also
+   * call `m-4`) and a required test that would refute it. A hypothesis cannot
+   * move the verdict, cannot fail a monitoring loop, and cannot be handed to
+   * anything expecting an observation. See
+   * `packages/contracts/src/fleet_health.ts`.
+   *
+   * **Never trusts an answer it cannot verify.** An ignored window parameter,
+   * a missing `scan` record, a correlation citing evidence outside its own
+   * window, a hypothesis in the observed list, a hypothesis with no base rate
+   * or no observation under it, or a `verdict` contradicting the report's own
+   * contents each throw rather than resolve. The one thing NOT refused is an
+   * honestly-declared incomplete scan — that already produces a verdict of
+   * `indeterminate`, and deciding what an unfinished sweep means is the gate's
+   * call, not the client's.
+   *
+   * **ONE CALL RETURNS ONE ROSTER PAGE, AND THERE IS NO MERGE HELPER.** Unlike
+   * {@link getAgentDivergence}, whose reasons are run-independent and compose
+   * exactly across pages, a cross-agent correlation does NOT compose: a burst
+   * of twelve agents split across two roster pages is a cluster of four and a
+   * cluster of eight to a page-local engine, both possibly under threshold, so
+   * the incident is invisible on every page and in any merge of them. That is
+   * why `scan.correlationBasis` is declared, and why `page_local` can never be
+   * complete. Page to see the whole roster; do not page to assemble a verdict.
+   *
+   * **Server-side status:** `GET /api/v1/fleet/health` does not exist yet.
+   * This method is written against the contract shape, so no SDK change should
+   * be needed once it is wired. Calling it today surfaces a
+   * {@link V1ApiError} with `kind: 'not_found'`.
+   *
+   * @param params - `{ since, until, burstWindowMs }` (all required — there is
+   *   no implicit window, because a monitoring loop whose window is implicit
+   *   changes meaning invisibly the day a server default is retuned), plus
+   *   optional `limit` / `cursor`.
+   * @returns `{ report }` — a `FleetHealthReport`.
+   * @throws {@link V1ApiError} with `kind: 'not_found'` if the deployment does
+   *   not serve this route.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if the response
+   *   cannot be trusted (see above).
+   * @throws {RangeError} if the window arguments are not positive integers or
+   *   `until` precedes `since` — caller bugs, surfaced before any request.
+   */
+  async getFleetHealth(params: FleetHealthParams): Promise<V1FleetHealthData> {
+    assertPositiveInteger(params.since, 'since', 'getFleetHealth')
+    assertPositiveInteger(params.until, 'until', 'getFleetHealth')
+    assertPositiveInteger(params.burstWindowMs, 'burstWindowMs', 'getFleetHealth')
+    assertPositiveInteger(params.limit, 'limit', 'getFleetHealth')
+    if (params.until < params.since) {
+      throw new RangeError(
+        `getFleetHealth: until (${params.until}) precedes since (${params.since}) — an inverted window would be ` +
+          `served as an empty one, and an empty sweep reports every agent as unobserved rather than as healthy.`
+      )
+    }
+
+    const data = await fetchV1<V1FleetHealthData>(
+      this.config,
+      '/api/v1/fleet/health',
+      {
+        since: params.since,
+        until: params.until,
+        burstWindowMs: params.burstWindowMs,
+        ...(params.limit !== undefined && { limit: params.limit }),
+        ...(params.cursor !== undefined && { cursor: params.cursor }),
+      },
+      this.fetchImpl
+    )
+    assertFleetHealthReportTrustworthy(data.report, params)
     return data
   }
 }
