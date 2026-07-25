@@ -13,7 +13,8 @@
 import { z } from 'zod'
 
 import { toMcpError } from '../errors.js'
-import { toListPatternsResult } from '../projections.js'
+import { withFieldProjection } from '../field-projection.js'
+import { PATTERN_REQUEST_FIELDS, toListPatternsResult } from '../projections.js'
 
 import { jsonResult } from './shared.js'
 
@@ -79,7 +80,19 @@ export function registerListFailurePatterns(server: McpServer, reader: AfrReader
         ...(args.cursor !== undefined && { cursor: args.cursor }),
       }
       try {
-        const data = await reader.getFailurePatterns(filters)
+        // Ask the server for exactly the columns this tool emits.
+        // PATTERN_REQUEST_FIELDS is DERIVED from the same column table the
+        // columnar header comes from, so the request cannot drift from what is
+        // projected below.
+        //
+        // The client-side projection still runs, and still matters:
+        // `confidenceState`/`confidenceStale` are joined from the response's
+        // `fixConfidence` envelope rather than the pattern document, and a
+        // deployment without `?fields=` returns full patterns (see
+        // `withFieldProjection`). It is defense in depth, not leftovers.
+        const data = await withFieldProjection(PATTERN_REQUEST_FIELDS, (fields) =>
+          reader.getFailurePatterns({ ...filters, ...(fields !== undefined && { fields }) }),
+        )
         return jsonResult(toListPatternsResult(data.patterns, data.fixConfidence, data.nextCursor))
       } catch (err) {
         throw toMcpError(err, 'pattern')

@@ -255,6 +255,89 @@ Deliberately omits the `metadata` bag, `tags`, `labels`, token counters,
 caller-supplied JSON, which would make row size unpredictable — exactly what a
 compact list must not be.
 
+## Server-side field projection
+
+The projections above are what an agent *sees*. Until the read API grew a
+`fields` selector (`convex/read_api.ts` §FIELD PROJECTION, `?fields=a,b,c` on
+the v1 routes, `fields?: string[]` on `FlightReader`), they were also all this
+package did: it fetched the whole thirty-field document and threw most of it
+away. That saved the context window and nothing else — the wire bytes, the JSON
+serialization and the backend read were already paid.
+
+Each tool now asks for exactly the columns it will emit:
+
+| Tool | Table | `fields` sent |
+|---|---|---|
+| `afr_list_failure_patterns` | `failure_patterns` | `class, label, count, lastSeenAt, status` |
+| `afr_list_runs` | `runs` | `agentId, status, startedAt, endedAt, environment, sessionId` |
+| `afr_get_run_events` | `events` | `type, timestamp, payload` |
+| `afr_get_pattern_evidence` | — | none: a composed envelope, not a projectable document |
+| `afr_explain_run` | — | none, same reason |
+
+**The list is DERIVED, never written twice.** Each projection declares its
+columns once as a `ProjectedColumn[]` table pairing the emitted column with the
+document field it reads; the columnar header (`PATTERN_FIELDS`, `RUN_FIELDS`)
+and the request (`PATTERN_REQUEST_FIELDS`, …) both come out of that one table.
+Two hand-maintained lists would drift, and the two directions fail differently:
+a column emitted but not requested reads `undefined` on every row and is then
+silently dropped by the all-null-column rule, while a name requested but not
+real is a **hard 422** — read API rule 2 never silently ignores an unknown
+field; Convex raises `INVALID_ARGUMENT` and the v1 error mapping renders it as
+422, distinct from the route's own 400 for a malformed `?fields=` (empty,
+padded, duplicated, or repeated). `tests/unit/mcp_fields.test.ts` checks every requested name against the
+live `convex/schema.ts`.
+
+Identity fields are never requested: the read API returns `_id` /
+`sequenceNumber` / `fingerprintHash` regardless (rule 3), and `getRunEventWindow`
+adds `sequenceNumber` itself so its ignored-floor check stays armed.
+
+**The client-side projections stay, as a backstop.** They are no longer the
+mechanism, but they are not redundant: `fields` is opt-in and an older
+deployment ignores it; the byte budgets (payload previews, prose caps,
+transition cap) are enforced only client-side, because no field selection bounds
+the *size* of a field it did return; and several emitted columns are not
+document fields at all (`confidenceState` is joined from the `fixConfidence`
+envelope, the artifact pointer is read out of an externalized payload). A server
+that ignores `fields` still yields a correct, budgeted response. Do not delete
+them as dead code.
+
+**Projection is an optimization, never a dependency.** `FlightReader` refuses to
+hand back a full document dressed as a projection — right for a generic caller,
+wrong here, where the response is re-projected anyway and a full document is a
+correct input. So `withFieldProjection` retries once without the selection when
+a deployment cannot honor it, and tier 4 retries the *window* un-projected
+before it drops to client-side paging. A 422 for an unknown field name is
+never retried: that is a bug in the column table and must surface.
+
+### Measured
+
+Contract-maximal fixtures, `bytes/4` token estimate — the same estimator and the
+same fat inputs as `tests/unit/mcp_progressive_disclosure.test.ts`.
+
+| Tier | Case | Client tokens before → after | Wire bytes before → after |
+|---|---|---|---|
+| 1 `list_failure_patterns` | 10 patterns | 284 → 284 | 15 813 → 2 323 (**−85.3%**) |
+| 2 `get_pattern_evidence` | 100 transitions | 423 → 423 | 58 668 → 58 668 (0%) |
+| 3 `explain_run` | realistic | 121 → 121 | 581 → 581 (0%) |
+| 3 `explain_run` | contract-max | 192 → 192 | 4 379 → 4 379 (0%) |
+| 4 `get_run_events` | 50 externalized | 3 838 → 3 838 | 19 862 → 17 112 (−13.8%) |
+| 4 `get_run_events` | 50 near-threshold | 3 384 → 3 384 | 512 962 → 510 212 (−0.5%) |
+| — `list_runs` | 20 runs | 475 → 475 | 111 111 → 2 891 (**−97.4%**) |
+
+**The client-visible numbers do not move, and that is the honest result** — the
+projections were already dropping those fields, so there was never a client-side
+win available here. The win is upstream, and it is where the shape predicts:
+huge on the list tiers, where a fat document is reduced to five or six scalars
+and multiplied by page size; small on tier 4, where the payload *is* the cost and
+no selection can remove it; zero on tiers 2 and 3, which compose an envelope
+rather than return a document and have no `fields` vocabulary to use.
+
+The byte budgets are unchanged. Server-side projection removes fields nobody
+reads; it is not licence to loosen a bound. Tier 4's 50-event cap, 400-byte
+per-payload cap, 8 KB window budget and truncation marker all stand exactly as
+they were — as the near-threshold row above shows, that tier is bounded by
+`budgetEventRows` and by nothing else.
+
 ## Startup validation
 
 The process refuses to start — rather than starting and failing every call —

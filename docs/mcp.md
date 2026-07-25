@@ -34,10 +34,16 @@ run and which sequence range you care about.
 >   not from a successful launch.
 > - Anything about live latency or real-world response sizes.
 >
-> The two `/api/v1/patterns**` endpoints behind tiers 1 and 2 are additionally
-> **not yet documented in `docs/api_reference.md`** — that document covers runs,
-> events, replay, and explanation only. This page is currently their only
-> reference.
+> The two `/api/v1/patterns**` endpoints behind tiers 1 and 2 are **now documented
+> in `docs/api_reference.md`** (§1), which is their canonical HTTP contract —
+> query params, response shapes, the `fixConfidence` envelope, and the
+> paginate-then-filter behavior a client has to page around. This page covers only
+> what an MCP caller needs; prefer the API reference for the wire detail.
+>
+> **Server-side field projection (`?fields=`) landed while this page was being written**
+> and is read from the working tree, not from a design document. See
+> [Server-side field projection](#server-side-field-projection) for what it does and does
+> not buy an MCP caller — the short version is that it saves bandwidth, not context.
 
 ---
 
@@ -131,6 +137,143 @@ Stop as soon as the question is answered. Most investigations should end at tier
   place (Event Log Rule 3) — those events carry an **artifact pointer** (blob URL +
   SHA-256 checksum), and this server returns the pointer, never the blob. If you need
   the bytes, fetch the artifact yourself, outside the model's context if you can.
+
+---
+
+## Server-side field projection
+
+> **Status: landed across all four layers.** Read from the working tree, not from a design
+> document, and — like everything else on this page — **never executed**.
+> `convex/read_api.ts` accepts a `fields` argument on all five read functions; all five
+> document-returning HTTP routes parse `?fields=`; `FlightReader` sends it and verifies it
+> was honored; this server derives its field lists from its column tables and degrades
+> gracefully when a deployment cannot project. Full contract: `docs/api_reference.md` §1
+> ("Field projection — `?fields=`").
+
+The change is that the v1 API returns a narrowed record (`?fields=a,b,c`) instead of the
+whole document, and this server asks for only the fields it uses.
+
+**Be clear about where the win is, because it is easy to overstate.**
+
+### It does not meaningfully reduce what the agent sees
+
+`packages/mcp/src/projections.ts` **already** discards these fields, client-side, before
+anything reaches a tool result. That file is the tool surface's actual output shape, and
+it is unchanged by where the discarding happens:
+
+| Tool | Upstream shape | Columns kept | Document fields actually requested |
+|------|----------------|--------------|------------------------------------|
+| `afr_list_runs` | `Run` — 21 declared fields | 7 (`RUN_COLUMNS`) | 6 — `runId` has a `null` source |
+| `afr_list_failure_patterns` | `FailurePattern` — ~30 declared fields | 8 (`PATTERN_COLUMNS`) | 5 — `fingerprintHash`, `confidenceState`, `confidenceStale` have `null` sources |
+| `afr_get_run_events` | `Event` — 8 fields | 7 (`EVENT_COLUMNS`) | 3 — four columns all read `payload`, and `sequenceNumber` has a `null` source |
+
+The dropped fields include the expensive ones — `run.metadata` (an unbounded
+`Record<string, unknown>`), `run.searchText`, `run.tags`, and a failure pattern's
+`representativeRunIds` / `affectedAgentVersionIds` / `lastSpikeAssessment`. They are
+already not in the agent's context.
+
+So: **moving projection server-side leaves the agent-visible token count essentially
+unchanged.** If the tool output shifts at all after this lands, that is a bug, not a
+saving. Do not sell this change as a context win — the context win was already taken, by
+`projections.ts`, and taking it twice is not possible.
+
+The tier costs in the table above are unaffected for the same reason. Tier 4 is doubly
+unaffected: an event's bulk is its `payload`, which the tool needs and therefore still
+requests, and the agent-visible cost of a window is already bounded by
+`WINDOW_PAYLOAD_BYTE_BUDGET` (8 000 bytes) regardless of what the server sends.
+
+### Where the win actually is
+
+- **Wire bytes, AFR → this server.** A tier-1 page of 50 patterns currently transfers
+  ~30 fields per row to use 6. That reduction is real and it is the bulk of the benefit.
+- **Backend read and serialization cost** in Convex, on the same ratio.
+- **Latency**, to whatever degree those two dominate — unmeasured, see below.
+
+### Where there is no win
+
+- **Agent context.** As above.
+- **Rate-limit headroom.** The v1 rate class is 300 **requests** per minute per key
+  (`{ rateLimit: { key: 'apiKey', limitPerMin: 300 } }` on every v1 route). It counts
+  requests, not bytes. Smaller responses buy no additional calls.
+- **Artifact payloads.** Externalized payloads were never inlined (Event Log Rule 3); the
+  pointer is already all that crosses.
+
+An honest summary: **this saves bandwidth and backend work, not context.**
+
+### The drift risk, and how it is handled
+
+`toColumnar` **drops any column that is null in every row** and reports only the surviving
+columns in its `fields` header. Good compression — but it means an absent field and a
+never-requested field are indistinguishable in the output. If a requested field list were
+ever *narrower* than what a projection function reads, the column would not error and
+would not come back empty: it would silently vanish from the header, and a caller indexing
+by name would find nothing. The failure would surface far from its cause.
+
+That class of drift is closed structurally rather than by discipline. Each projection is
+declared as a `ProjectedColumn` table (`RUN_COLUMNS`, `PATTERN_COLUMNS`, `EVENT_COLUMNS`)
+pairing every emitted column with the document field it reads, and the request lists are
+**derived** from those tables by `requestFieldsOf` rather than maintained alongside them.
+Adding a column that reads a new field therefore extends the request automatically.
+
+A `source: null` means the value does not come from the projected document — either an
+identity field the server returns whether or not it was asked for (contract rule 3:
+`_id` / `sequenceNumber` / `fingerprintHash`), or a value joined in from a separate
+envelope (`confidenceState` and `confidenceStale` come from `fixConfidence`, not from the
+pattern document). Those are deliberately *not* requested. Note this makes the tools
+**depend on the always-return-identity guarantee**: if the server ever stopped honoring
+it, `runId` / `sequenceNumber` / `fingerprintHash` would disappear from the header and
+every "handle into the next tier" would break at once.
+
+See `CONTRIBUTING.md` → "Add a Field to a Projected Resource".
+
+### Degrading to a deployment that cannot project
+
+`FlightReader` refuses to hand back a full document dressed as a projection: if a response
+carries a field nobody requested, the deployment silently dropped the unknown `?fields=`
+parameter, and the SDK throws `V1ApiError('invalid_response')` rather than let a caller
+read "field absent" when the truth is "never projected."
+
+That refusal is right for a generic caller and **wrong for this server**, which
+re-projects every response client-side anyway — a full document is a *correct* input here,
+merely an expensive one. Letting it propagate would mean adopting server-side projection
+turned working tools into failing ones against every deployment predating it.
+
+So `packages/mcp/src/field-projection.ts` wraps each projected read in
+`withFieldProjection`: ask with the field list, and on that one specific refusal, ask again
+without it. One wasted round trip on a deployment that was going to be the expensive path
+regardless, and **the tool's output is byte-identical either way**.
+
+The retry is deliberately narrow. It fires only on `V1ApiError` with
+`kind: 'invalid_response'` **and no `status`** — the SDK's client-side refusal. A
+server-side rejection of a bad field name carries an HTTP status and is rethrown
+untouched, so a typo in a column table still fails loudly, as contract rule 2 requires.
+
+> One inaccuracy worth knowing while reading that file: its comment calls the bad-field-name
+> rejection "an HTTP 400 [carrying] `status: 400`". It is a **422** — unknown field names
+> are raised by Convex, not the route (`tests/unit/field_projection_route.test.ts` asserts
+> 422; the 400s are the route's own shape guards). The logic is unaffected, since it
+> discriminates on `status === undefined`, but the comment misdescribes the code below it.
+
+### The identity-spelling question
+
+`RUN_COLUMNS` gives `runId` a `null` source, so this server never requests the runs
+identity field and relies entirely on the always-returned guarantee. The backend returns
+it as `_id` (raw Convex document); `packages/contracts`' `Run` declares `id`. The SDK
+sidesteps the disagreement by treating **both** spellings as legitimate identity keys
+rather than resolving it. `docs/api_reference.md` → "Known gap: `id` vs `_id` on runs" is
+the record; it is not settled, and `toRunRow` reads `run.id`.
+
+### Not verified
+
+- **Any byte or latency figure.** The field counts above are read from
+  `packages/contracts/src/`, `convex/schema.ts` and `packages/mcp/src/projections.ts`, and
+  are accurate as *declarations*. The bytes they correspond to depend on your data and
+  have not been measured; no before/after comparison exists anywhere in the repo.
+- **That tool output is byte-identical before and after projection.** That is the intended
+  invariant, not a tested one, and gaps 1 and 2 above are reasons to doubt it currently
+  holds. Worth an explicit test.
+- **Everything in the two gaps above**, which are read from source and not from a running
+  system.
 
 ---
 
@@ -338,8 +481,10 @@ seeded org — the server has no fixture or offline mode.
 
 ## Further reading
 
-- `docs/api_reference.md` — the v1 read API contract (runs, events, replay, explanation;
-  the pattern endpoints are not yet covered there)
+- `docs/api_reference.md` — the v1 read API contract (runs, events, replay, explanation,
+  and both pattern endpoints), plus the `?fields=` projection contract
+- `CONTRIBUTING.md` — "Add a Field to a Projected Resource," the multi-boundary checklist
+  for making a new field reachable through this server
 - `docs/adr/005-failure-patterns.md` — why failure patterns exist and their
   observability-grade constraints
 - `docs/adr/006-failure-resolution.md` — the resolution lifecycle and the fix-confidence

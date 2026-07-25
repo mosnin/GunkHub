@@ -167,6 +167,7 @@ List runs for the key's organization.
 | `session`     | string | Filter to one `sessionId` (ADR-002 session grouping) |
 | `limit`       | number | Page size, server-capped |
 | `cursor`      | string | Opaque pagination cursor from a previous response's `nextCursor` |
+| `fields`      | string | Comma-separated projection — see [Field projection](#field-projection--fields). `_id` always returned. Omit for the full document. |
 
 ```
 GET /api/v1/runs?status=failed&agentId=agent_abc&limit=25
@@ -197,6 +198,9 @@ others if both are supplied) — see `convex/read_api.ts` `apiListRuns`.
 
 #### `GET /api/v1/runs/{runId}`
 
+Accepts `?fields=` — see [Field projection](#field-projection--fields). It projects `run`
+only; `eventCount` and `artifactCount` are computed, not run fields, and are unaffected.
+
 ```json
 {
   "apiVersion": "2026-07-19",
@@ -217,6 +221,9 @@ Paginated event log, in `sequenceNumber` order (Event Log Rule 4).
 |-------------|--------|
 | `limit`     | number |
 | `cursor`    | string |
+
+Also accepts `?fields=` — see [Field projection](#field-projection--fields). The identity
+field for events is **`sequenceNumber`**, not `_id`, and it is always returned.
 
 ```json
 {
@@ -289,6 +296,352 @@ configured and its result passed grounding validation — see ADR-004).
 log; every number in that array is guaranteed to correspond to a real event
 this key's org can already read via `GET /api/v1/runs/{runId}/events` — no
 citation in a stored explanation can point to a fabricated event.
+
+#### `GET /api/v1/patterns`
+
+Recurring failure patterns for the key's organization (ADR-005), most-recently-seen
+first. A pattern is a **rollup over explanation-derived fingerprints** — observability-
+grade derived data, regeneratable at any time. It is never source of truth; the event
+log remains the only fact about what happened on any single run.
+
+Powers `afr patterns`, `FlightReader.getFailurePatterns`, and the MCP server's
+`afr_list_failure_patterns`.
+
+| Query param | Type   | Notes |
+|-------------|--------|-------|
+| `agentId`   | string | Narrow to patterns observed on one agent's versions. An agent that does not exist in the key's org is an error, not an empty page. |
+| `spiking`   | string | Only the exact string `true` opts in. Anything else — including `false` — is treated as unset. |
+| `muted`     | string | Tri-state: exactly `true` or `false` opts in; anything else is unset. Read-side filter only. |
+| `status`    | string | Exactly one of `open`, `acknowledged`, `resolved`. Any other value is treated as unset. |
+| `regressed` | string | Only the exact string `true` opts in. |
+| `state`     | string | Fix-confidence grade: exactly one of `unproven`, `proving`, `confirmed`, `regressed`. Any other value is treated as unset. |
+| `limit`     | number | Clamped server-side to `1..200`; defaults to `50`. |
+| `cursor`    | string | Opaque cursor from the previous response's `nextCursor`. |
+
+Also accepts `?fields=` — see [Field projection](#field-projection--fields) — which
+projects the `patterns[]` documents. The identity field is **`fingerprintHash`**, always
+returned. The `fixConfidence` envelope is computed, not a document field, and is
+unaffected.
+
+> **Unrecognized filter values are ignored, not rejected.** Every filter on this route
+> is parsed permissively: a typo (`status=Resolved`, `spiking=yes`) silently yields an
+> *unfiltered* result for that dimension rather than a `400`/`422`. This is deliberate
+> and consistent across the v1 filter surface, but it means a client cannot rely on the
+> server to catch a misspelled filter — validate before sending if that matters.
+> (`apps/web/app/api/v1/patterns/route.ts`.)
+
+```json
+{
+  "apiVersion": "2026-07-19",
+  "data": {
+    "patterns": [
+      {
+        "fingerprintHash": "a1b2c3d4",
+        "class": "tool_error",
+        "label": "tool_error on search_docs",
+        "count": 47,
+        "firstSeenAt": 1753000000000,
+        "lastSeenAt": 1753315200000,
+        "status": "resolved",
+        "...": "..."
+      }
+    ],
+    "nextCursor": "eyJ...",
+    "fixConfidence": {
+      "stalenessBoundMs": 21600000,
+      "entries": [
+        {
+          "fingerprintHash": "a1b2c3d4",
+          "state": "unproven",
+          "score": 0.12,
+          "computedAt": 1753310000000,
+          "ageMs": 5200000,
+          "stale": false,
+          "basis": "snapshot"
+        }
+      ],
+      "staleCount": 0,
+      "unevaluated": []
+    }
+  },
+  "requestId": "req_abc123"
+}
+```
+
+`patterns[]` entries are the full `failure_patterns` documents (see `FailurePattern` in
+`packages/contracts`), not a reduced row shape — the CLI, SDK reader, and MCP server
+each project them down themselves.
+
+**The `fixConfidence` envelope is always present**, filtered or not. It exists so a
+reader can distinguish a fresh verdict from a stale one, and "does not match the filter"
+from "was never evaluated":
+
+- `stalenessBoundMs` — the deployment's staleness bound, transported rather than
+  hardcoded per client. Currently 6 hours (`FIX_CONFIDENCE_SNAPSHOT_STALE_AFTER_MS`,
+  `convex/failure_patterns.ts`).
+- `entries[]` — one entry per **returned** pattern, in the same order. `state`, `score`,
+  `computedAt` and `ageMs` are `null` and `basis` is `"none"` when no usable snapshot
+  exists; otherwise `basis` is `"snapshot"`. Match entries **by `fingerprintHash`**, not
+  by array index — the index alignment is documented but the identifier cannot silently
+  mislabel a verdict if it ever drifts.
+- `staleCount` — how many returned entries are served from a snapshot older than the bound.
+- `unevaluated[]` — fingerprints on this page with a live resolution but no usable
+  snapshot, so they could not be graded at all. Computed **before** the `state` filter
+  runs, so a caller filtering by `state` still learns about them.
+
+Do not present a snapshot verdict as current without checking its age.
+
+> **Pagination happens before filtering — page to exhaustion, not to the first empty page.**
+> `convex/read_api.ts` `apiListFailurePatterns` paginates the org-scoped
+> `by_org_lastSeenAt` index first, then applies `agentId`/`spiking`/`muted`/`status`/
+> `regressed`/`state` **in memory over that page** (there is no secondary index for any
+> of them). Consequences a client must handle:
+>
+> - A page can contain **fewer rows than `limit`, or zero rows**, while `nextCursor` is
+>   still present and later pages still contain matches.
+> - `nextCursor` reflects the underlying unfiltered scan, not the filtered result.
+>
+> Stop only when `nextCursor` is absent. Treating a short or empty page as the end of the
+> result set will silently under-report.
+
+#### `GET /api/v1/patterns/{fingerprintHash}/evidence`
+
+"Did the fix actually hold?" (ADR-006). A resolution on its own is an unearned human
+assertion; this endpoint returns the evidence that grades it.
+
+Powers `afr patterns evidence <fingerprint>`, `FlightReader.getFailurePatternEvidence`,
+and the MCP server's `afr_get_pattern_evidence`.
+
+Also accepts `?fields=`, which projects the `pattern` document only — `resolution`,
+`exposure`, `transitions` and `confidence` are computed and unaffected. See
+[Field projection](#field-projection--fields).
+
+`{fingerprintHash}` must match `/^[a-f0-9]{8,64}$/i`. A value that does not is rejected
+with **`400 INVALID_ARGUMENT`** ("Invalid fingerprint hash") *before any backend call*
+(`apps/web/src/lib/services/fingerprintValidation.ts`). Note this is a **400**, whereas
+`INVALID_ARGUMENT` from the backend is a **422** — see [Error codes](#error-codes).
+
+```json
+{
+  "apiVersion": "2026-07-19",
+  "data": {
+    "pattern": { "fingerprintHash": "a1b2c3d4", "class": "tool_error", "...": "..." },
+    "resolution": {
+      "resolvedAt": 1753000000000,
+      "resolvedByUserId": "user_1",
+      "resolutionNote": "Pinned search_docs to v2.",
+      "resolutionRef": "https://example.com/pr/412",
+      "resolvedInVersionId": "ver_5",
+      "resolvedInVersion": "1.6",
+      "resolvedAtOccurrenceCount": 47,
+      "resolvedAtRunCount": 310
+    },
+    "exposure": {
+      "since": 1753000000000,
+      "runCount": 0,
+      "runCountTruncated": false,
+      "recurrenceCount": 0,
+      "baselineRunCount": 310,
+      "agentIds": ["agent_1"],
+      "heldSoFar": true
+    },
+    "transitions": [
+      { "action": "failure_pattern.resolved", "actorClerkUserId": "user_1", "timestamp": 1753000000000, "metadata": {} }
+    ],
+    "confidence": { "score": 0.05, "state": "unproven", "...": "..." }
+  },
+  "requestId": "req_abc123"
+}
+```
+
+- `resolution`, `exposure` and `confidence` are **all `null` together** exactly when the
+  pattern has no live resolution — never resolved, or manually reopened (which clears
+  `resolvedAt`). A fabricated `"unproven"` there would read as a judgment about a fix
+  rather than the absence of one, so none is emitted.
+- The regression guard's **automatic** reopen deliberately *keeps* `resolvedAt`, so a
+  pattern with `status: "open"` and a non-null `exposure` is valid and expected, not a bug.
+- `exposure.heldSoFar: true` with `runCount: 0` means **untested, not proven** — which is
+  why `confidence.state` reads `unproven` there. Read `runCount` as a floor when
+  `runCountTruncated` is `true`.
+- `confidence.score` is a `0..0.95` fraction — never a percentage, never `1.0`. For a CI
+  gate, branch on `state === "regressed"`, not on `exposure.heldSoFar`.
+- `transitions[]` is **oldest-first**, reconstructed from the append-only `audit_log`
+  (not a mutable history table), bounded to the 100 most recent
+  (`MAX_PATTERN_LIFECYCLE_TRANSITIONS`). It includes the regression guard's own automatic
+  `failure_pattern.regressed` rows, whose actor is the system rather than a person.
+
+An unknown fingerprint returns **404**, not `200` with a null body. "Never existed" and
+"belongs to another org" are deliberately indistinguishable, so this endpoint cannot be
+used as an existence oracle for another org's data.
+
+> **Envelope deviation on this route's own guards.** The `400` (malformed fingerprint)
+> and `404` (unknown fingerprint) responses are constructed in the route handler as
+> `{ error: { code, message }, requestId }` — `requestId` is a **sibling** of `error`,
+> and there is **no `apiVersion` field**. This differs from both the documented v1 error
+> envelope and the flat-`ApiError` fallback described above. A client parsing errors from
+> this route must tolerate a third shape. (Verified in
+> `apps/web/app/api/v1/patterns/[fingerprintHash]/evidence/route.ts`; errors that come
+> back from Convex through `mapApiErrorV1` do use the standard envelope.)
+
+### Field projection — `?fields=`
+
+`fields` narrows each returned **stored document** to an allowlisted subset of its keys,
+so the unwanted fields are never read, serialized, or put on the wire.
+
+```
+GET /api/v1/runs?status=failed&fields=status,startedAt,agentId
+```
+
+> ## :warning: Verification status
+>
+> Read from the implementation on this working tree (uncommitted, on top of HEAD
+> `2cf9128`), not from a design document. **Nothing here has been executed:** no Convex
+> deployment has ever existed for this project, so every statement below is "this is what
+> the code says," never "this is what was observed." Two concrete inconsistencies found
+> while reading it are called out in [Known gaps](#known-gaps-field-projection) — check
+> those before building a client.
+
+#### Where it is wired
+
+| Endpoint | Projected resource | Identity field |
+|----------|--------------------|----------------|
+| `GET /api/v1/runs` | `runs` | `_id` |
+| `GET /api/v1/runs/{runId}` | `runs` (projects `run` only) | `_id` |
+| `GET /api/v1/runs/{runId}/events` | `events` | `sequenceNumber` |
+| `GET /api/v1/patterns` | `failure_patterns` | `fingerprintHash` |
+| `GET /api/v1/patterns/{fingerprintHash}/evidence` | `failure_patterns` (projects `pattern` only) | `fingerprintHash` |
+| `GET /api/v1/runs/{runId}/replay` | — computed projection, not a stored document | n/a |
+| `GET /api/v1/runs/{runId}/explanation` | — computed narrative, not a stored document | n/a |
+
+All five document-returning routes import `parseFieldsParam`
+(`apps/web/app/api/v1/_lib/fieldsParam.ts`) and forward the parsed list to the matching
+`convex/read_api.ts` function.
+
+On `GET /api/v1/runs/{runId}` and the evidence route, projection applies **only to the
+stored document** in the response — `eventCount`/`artifactCount`, and the evidence route's
+`resolution`/`exposure`/`transitions`/`confidence`, are computed values, not document
+fields, and are unaffected.
+
+#### Contract
+
+| Input | Behavior |
+|-------|----------|
+| `fields` omitted | Full document, byte-identical to before projection existed. Purely opt-in. |
+| `?fields=a,b,c` | Each record narrowed to those keys, plus the identity field. |
+| Unknown field name | **`422 INVALID_ARGUMENT`** — names the offending field and lists every valid one. Never silently ignored. |
+| `?fields=` (empty) | **`400 INVALID_ARGUMENT`**. Not "all fields" — rejected. |
+| Empty entry — `?fields=a,,b`, `?fields=a,` | **`400`**. A stray comma is a caller-serializer bug; dropping the slot would hide it. |
+| Whitespace-padded entry — `?fields=%20status` | **`400`**. Never trimmed: two different query strings must not mean the same request. |
+| Whitespace-only entry | **`400`**. |
+| Duplicate entry — `?fields=a,b,a` | **`400`**. Never de-duplicated. |
+| Repeated param — `?fields=a&fields=b` | **`400`**. Ambiguous; silently using the first occurrence is refused. |
+
+**Reject, never coerce.** Every ambiguous input above is an error rather than a
+normalization, because a coerced value returns a different answer than the caller asked
+for and — unlike an error — the caller cannot tell.
+
+Two invariants:
+
+1. **The identity field is always returned**, requested or not, and it is **not always
+   `_id`** (`IDENTITY_FIELD`, `convex/read_api.ts`):
+
+   | Resource | Identity field |
+   |----------|----------------|
+   | `runs` | `_id` |
+   | `events` | `sequenceNumber` (Event Log Rule 4 — an event is addressed by its sequence within its run) |
+   | `failure_patterns` | `fingerprintHash` (what every pattern-scoped endpoint takes as its key) |
+
+   Requesting it explicitly is harmless — the selection is a set.
+
+2. **Projection is applied after org filtering and cannot change which records come
+   back.** Every filter, index range, cursor and org check runs against complete
+   documents; `projectDoc` is the last thing to touch a row. `pageSize` is computed from
+   the pre-projection array for exactly this reason. Field-name validation runs *before*
+   any record lookup, so an unknown-field error is byte-identical whether the addressed
+   record is in the key's org, does not exist, or belongs to another org — it is not a
+   cross-org existence oracle.
+
+#### Valid field names
+
+The allowlist is **derived from the live Convex schema**, not restated — 
+`[...SYSTEM_FIELDS, ...Object.keys(schema.tables[table].validator.fields)].sort()`. So the
+accepted names are the **Convex document field names** plus the two system fields `_id`
+and `_creationTime`, sorted (the sort makes the error message's "valid fields are: …" list
+stable across deployments).
+
+For `runs`, that is currently:
+
+```
+_creationTime, _id, agentId, agentVersionId, endedAt, environment, labels,
+metadata, modelsSeen, orgId, parentRunId, projectId, sdkVersion, searchText,
+sessionId, startedAt, status, tags, tokensIn, tokensOut, triageState, triggeredBy
+```
+
+Because the list is schema-derived, it changes automatically when the table changes —
+do not hardcode it in a client. Ask for a field you are unsure of and read the valid set
+out of the `422`.
+
+#### Error bodies
+
+The two failure classes are raised in different layers and **do not share a shape**:
+
+- **Shape errors** (empty, stray comma, whitespace, duplicate, repeated param) are caught
+  in the route before any backend call and return **400** as
+  `{ error: { code: 'INVALID_ARGUMENT', message }, requestId }` — no `apiVersion`, and
+  `requestId` a sibling of `error` (`fieldsInvalidArgument`). This matches the existing
+  inline idiom the `fromSequence` guard already uses.
+- **Unknown field names and an empty array** are raised by Convex
+  (`validateFieldSelection`) and travel back through `mapApiErrorV1`, so they use the
+  **standard v1 error envelope** and map to **422** (`INVALID_ARGUMENT: 422` in
+  `apps/web/src/lib/apiErrorMapping.ts`).
+
+A client must therefore handle a `400` and a `422`, in two different body shapes, for what
+is conceptually one class of error.
+
+#### Known gap: `id` vs `_id` on runs
+
+**The identity field's spelling on the wire is unresolved**, and this section is the
+record of that.
+
+The v1 runs endpoints return **raw Convex documents** — no layer on the path (the route,
+`apps/web/src/lib/services/api_v1.ts`, or `apiV1Envelope.ts`) renames anything. A Convex
+document's key is `_id`, and `_id` is what `IDENTITY_FIELD.runs` guarantees is always
+returned. The `runs` allowlist is schema-derived and therefore contains `_id` and **not**
+`id`, so `?fields=id` on a run is a `422`.
+
+But `packages/contracts`' `Run` interface declares `id: string`, and the
+`GET /api/v1/runs` success example earlier in this section shows `"id": "run_1"`. Those
+predate this cycle. Reading the code, the wire carries `_id`; confirming it requires
+running the endpoint, which is not currently possible, so the example is left as-is rather
+than silently "corrected" on inference alone.
+
+Downstream this is handled defensively rather than resolved:
+`packages/sdk/src/reader.ts` allows **both** spellings —
+`PROJECTION_IDENTITY_FIELDS = { runs: ['id', '_id'], … }` — so its ignored-projection
+check accepts either as a legitimate unrequested key. That is a deliberate widening of the
+*guard*, not an answer to the naming question, and it does not weaken detection (a
+deployment that dropped `?fields=` returns the whole document, not one extra key).
+
+**What a client should do today:** request `_id` if you need the identity key by name, and
+tolerate either spelling on the way back. **What the owning teams should do:** pick one
+and make the contract type, the example above, and the wire agree.
+
+#### One inaccuracy in a neighbouring comment
+
+`packages/mcp/src/field-projection.ts` describes a rejected field name as "an HTTP 400
+[that] carries `status: 400`". It is a **422** (unknown field names are raised by Convex,
+not the route — see [Error bodies](#error-bodies), and
+`tests/unit/field_projection_route.test.ts` asserts 422). The code itself is unaffected —
+it discriminates on `status === undefined`, which holds for any defined status — but the
+comment will mislead the next reader.
+
+> **`fields` is stricter than every other v1 filter, deliberately.** `status`, `spiking`,
+> `muted`, `state` and `limit` are all parsed permissively — a junk value is treated as
+> unset (see the note under [`GET /api/v1/patterns`](#get-apiv1patterns)). `fields`
+> rejects instead, because a misspelled *filter* returns too much data and the caller
+> notices, whereas a misspelled *projection* returns a record missing the key the caller
+> was about to read — indistinguishable on the wire from that data being legitimately
+> absent. Do not "fix" the inconsistency by making `fields` permissive.
 
 ### Rate limits
 
@@ -609,10 +962,11 @@ adds no server-side behavior, uses the same `x-api-key` header, needs the same
 **`read`** scope, and shares the same 300 req/min per-key rate class — give it
 its own key rather than sharing the CLI's.
 
-Its five tools map onto the endpoints above, plus the two failure-pattern
+Its five tools map onto the endpoints above, including the two failure-pattern
 endpoints (`GET /api/v1/patterns` and
-`GET /api/v1/patterns/{fingerprintHash}/evidence`) that this document does not
-yet cover:
+`GET /api/v1/patterns/{fingerprintHash}/evidence`), which are now documented in
+[section 1](#get-apiv1patterns) — until this cycle `docs/mcp.md` was their only
+reference:
 
 | MCP tool                      | Calls |
 |-------------------------------|-------|
@@ -623,6 +977,6 @@ yet cover:
 | `afr_list_runs`               | `GET /api/v1/runs` |
 
 The tools are deliberately tiered by token cost, and the ordering matters —
-see `docs/mcp.md`, which is currently also the only reference for the two
-pattern endpoints and carries a verification-status banner for what in it has
-and has not been exercised.
+see `docs/mcp.md`, which carries a verification-status banner for what in it has
+and has not been exercised, and explains where server-side field projection does
+and does not save an MCP caller anything.

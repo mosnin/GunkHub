@@ -22,11 +22,38 @@ import type {
   V1PatternEvidenceData,
 } from '@agent-flight-recorder/sdk'
 
-/** The subset of `FlightReader` this server uses. */
+/**
+ * The subset of `FlightReader` this server uses.
+ *
+ * SERVER-SIDE FIELD PROJECTION. `ListRunsParams`, `ListFailurePatternsParams`
+ * and `EventWindowParams` all extend the SDK's `ProjectionParams`, so `fields`
+ * rides along on the existing param objects — this package adds no signature of
+ * its own. Each tool sends a selection DERIVED from its projection's column
+ * table (`PATTERN_REQUEST_FIELDS` / `RUN_REQUEST_FIELDS` /
+ * `EVENT_REQUEST_FIELDS` in `projections.ts`).
+ *
+ * The identity field is never spent on a slot: the SDK guarantees `id` comes
+ * back regardless, and `getRunEventWindow` adds `sequenceNumber` itself so its
+ * ignored-floor check stays armed.
+ *
+ * A deployment that predates `?fields=` drops the unknown query param and
+ * returns full documents; the client-side projections then produce exactly the
+ * same tool output, one tier more expensively. Nothing here depends on the
+ * server honoring the selection.
+ */
 export interface AfrReader {
   listRuns(filters?: ListRunsParams): Promise<V1ListRunsData>
   getFailurePatterns(filters?: ListFailurePatternsParams): Promise<V1ListFailurePatternsData>
+  /**
+   * Tier 2 takes NO field selection, deliberately. `apiGetFailurePatternEvidence`
+   * composes a resolution/exposure/confidence/transitions envelope rather than
+   * returning one projectable document, so there is no `fields` vocabulary for
+   * it — and a Convex function rejects an argument it does not declare, so
+   * sending one speculatively would break the call rather than be ignored.
+   * Tier 2's budget is enforced entirely by `toPatternEvidenceResult`.
+   */
   getFailurePatternEvidence(fingerprintHash: string): Promise<V1PatternEvidenceData>
+  /** Tier 3 takes no field selection either, for the same reason as tier 2. */
   getExplanation(runId: string): Promise<V1GetExplanationData>
   /**
    * Server-side windowed event read, addressed by `sequenceNumber`. Optional so

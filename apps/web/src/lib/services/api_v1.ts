@@ -46,9 +46,38 @@ import { getPublicClient, withConvexTimeout } from '@/lib/convexServer'
 // GET /api/v1/runs -> apiListRuns
 // ---------------------------------------------------------------------------
 
+/**
+ * `ApiListRunsRequest` (contracts) plus the web-layer-only `fields`
+ * projection selector. `fields` is deliberately NOT added to the contracts
+ * type: it is a transport concern of the HTTP read API (a `?fields=` query
+ * param), not part of the logical list-runs request, and adding it to
+ * contracts would drag every consumer through a version bump for a param
+ * only this route forwards.
+ *
+ * FORWARDING HAZARD (the reason the param-table test exists — see the note on
+ * `ApiV1ListFailurePatternsParams` below): these args cross a hand-maintained
+ * `makeFunctionReference` string ref, so a param declared here but omitted
+ * from the spread below is NOT a type error. A dropped `fields` returns the
+ * FULL document — which looks exactly like a correct response to a caller who
+ * asked for a projection, and is precisely the wrong-but-plausible answer that
+ * `spiking`/`muted` produced for weeks. Pinned by
+ * tests/unit/field_projection_route_params.test.ts.
+ */
+export interface ApiV1ListRunsParams extends ApiListRunsRequest {
+  /**
+   * Projected field names, already shape-validated by the route
+   * (apps/web/app/api/v1/_lib/fieldsParam.ts) and forwarded VERBATIM. Which
+   * names are valid is convex/read_api.ts's business alone — this layer never
+   * filters, trims, sorts, or de-duplicates the list, so an unknown name
+   * reaches the one component that owns the field vocabulary and can name the
+   * offender. Absent => full document, unchanged.
+   */
+  fields?: string[]
+}
+
 export async function apiListRuns(
   apiKeyHash: string,
-  params: ApiListRunsRequest,
+  params: ApiV1ListRunsParams,
 ): Promise<ApiListRunsResponse> {
   const client = getPublicClient()
   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -61,6 +90,7 @@ export async function apiListRuns(
       ...(params.sessionId !== undefined && { sessionId: params.sessionId }),
       ...(params.limit !== undefined && { limit: params.limit }),
       ...(params.cursor !== undefined && { cursor: params.cursor }),
+      ...(params.fields !== undefined && { fields: params.fields }),
     }),
   )
   const typed = result as ApiListRunsResponse
@@ -75,11 +105,31 @@ export async function apiListRuns(
 // GET /api/v1/runs/[runId] -> apiGetRun
 // ---------------------------------------------------------------------------
 
-export async function apiGetRun(apiKeyHash: string, runId: string): Promise<ApiGetRunResponse> {
+/**
+ * Params object (rather than the previous positional `runId`) so this
+ * forwarder is covered by the same `Record<keyof Params, true>` exhaustiveness
+ * table as the other v1 forwarders — a positional signature has no key set to
+ * assert over, and a second positional arg silently dropped from the spread is
+ * exactly the bug class that table exists to stop.
+ */
+export interface ApiV1GetRunParams {
+  runId: string
+  /** See `ApiV1ListRunsParams.fields` — same contract, same verbatim forwarding. */
+  fields?: string[]
+}
+
+export async function apiGetRun(
+  apiKeyHash: string,
+  params: ApiV1GetRunParams,
+): Promise<ApiGetRunResponse> {
   const client = getPublicClient()
   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const result = await withConvexTimeout(
-    client.mutation(convex.read_api.apiGetRun, { apiKeyHash, runId }),
+    client.mutation(convex.read_api.apiGetRun, {
+      apiKeyHash,
+      runId: params.runId,
+      ...(params.fields !== undefined && { fields: params.fields }),
+    }),
   )
   return result as ApiGetRunResponse
 }
@@ -107,6 +157,8 @@ export interface ApiV1ListEventsParams {
    * looks exactly like a correct one.
    */
   fromSequence?: number
+  /** See `ApiV1ListRunsParams.fields` — projects each returned EVENT. */
+  fields?: string[]
 }
 
 export async function apiGetRunEvents(
@@ -122,6 +174,7 @@ export async function apiGetRunEvents(
       ...(params.limit !== undefined && { limit: params.limit }),
       ...(params.cursor !== undefined && { cursor: params.cursor }),
       ...(params.fromSequence !== undefined && { fromSequence: params.fromSequence }),
+      ...(params.fields !== undefined && { fields: params.fields }),
     }),
   )
   return result as ApiGetRunEventsResponse
@@ -228,6 +281,8 @@ export interface ApiV1ListFailurePatternsParams {
   state?: FixConfidenceState
   limit?: number
   cursor?: string
+  /** See `ApiV1ListRunsParams.fields` — projects each returned PATTERN document. */
+  fields?: string[]
 }
 
 export async function apiListFailurePatterns(
@@ -247,6 +302,7 @@ export async function apiListFailurePatterns(
       ...(params.state !== undefined && { state: params.state }),
       ...(params.limit !== undefined && { limit: params.limit }),
       ...(params.cursor !== undefined && { cursor: params.cursor }),
+      ...(params.fields !== undefined && { fields: params.fields }),
     }),
   )
   // `fixConfidence` (the staleness envelope, ADR-006 cycle 3) is declared on
@@ -279,6 +335,13 @@ export async function apiListFailurePatterns(
  */
 export interface ApiV1GetFailurePatternEvidenceParams {
   fingerprintHash: string
+  /**
+   * See `ApiV1ListRunsParams.fields`. Projects the EMBEDDED `pattern`
+   * document only — the resolution claim, measured exposure, transition
+   * history and graded `confidence` verdict alongside it are derived, not
+   * pattern fields, and are always returned.
+   */
+  fields?: string[]
 }
 
 export async function apiGetFailurePatternEvidence(
@@ -291,6 +354,7 @@ export async function apiGetFailurePatternEvidence(
     client.mutation(convex.read_api.apiGetFailurePatternEvidence, {
       apiKeyHash,
       ...(params.fingerprintHash !== undefined && { fingerprintHash: params.fingerprintHash }),
+      ...(params.fields !== undefined && { fields: params.fields }),
     }),
   )
   return result as PatternResolutionEvidence | null

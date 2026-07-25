@@ -228,7 +228,7 @@ export interface V1ListFailurePatternsData {
  */
 export type V1PatternEvidenceData = PatternResolutionEvidence
 
-export interface ListFailurePatternsParams {
+export interface ListFailurePatternsParams extends ProjectionParams {
   /** Narrow to patterns that have been seen on at least one version of this agent. */
   agentId?: string
   /**
@@ -300,7 +300,94 @@ export interface ListFailurePatternsParams {
   cursor?: string
 }
 
-export interface ListRunsParams {
+// ---------------------------------------------------------------------------
+// Field projection (`?fields=a,b,c`) — shared by every document-returning read
+// ---------------------------------------------------------------------------
+
+/**
+ * The identity field(s) a projected document carries back whether or not they
+ * were requested — the server adds them so a projected row is always
+ * re-identifiable (`docs/api_reference.md` §`fields`, `convex/read_api.ts`
+ * §FIELD PROJECTION rule 3).
+ *
+ * IT IS NOT `id` EVERYWHERE, which is the whole reason this is a table:
+ * a run is keyed by its document id, an EVENT by its `sequenceNumber` within
+ * its run (CLAUDE.md event-log rule 4), and a failure pattern by its
+ * `fingerprintHash` (the key every pattern-scoped endpoint takes).
+ *
+ * EACH ENTRY IS A SET, NOT A NAME, and that is deliberate. The v1 surface has
+ * historically exposed a run's key as `id` while the backend projects on the
+ * raw Convex document, whose key is `_id`; `docs/api_reference.md` records
+ * that naming as explicitly unresolved. This table is consumed by
+ * {@link FlightReader}'s ignored-projection check ONLY — it decides which
+ * unrequested keys are legitimate rather than evidence of an ignored
+ * parameter — so listing every plausible identity spelling costs nothing and
+ * a false accusation costs a working call. Detection is unweakened: a server
+ * that dropped `?fields=` returns the entire document, not one extra key.
+ */
+export const PROJECTION_IDENTITY_FIELDS = {
+  runs: ['id', '_id'],
+  events: ['sequenceNumber', 'id', '_id'],
+  patterns: ['fingerprintHash', 'id', '_id'],
+} as const satisfies Record<string, readonly string[]>
+
+/** Resources {@link ProjectionParams.fields} can project. */
+export type ProjectableResource = keyof typeof PROJECTION_IDENTITY_FIELDS
+
+/**
+ * Opt-in field projection, mixed into every `FlightReader` read that returns
+ * stored documents ({@link FlightReader.listRuns}, {@link FlightReader.getRun},
+ * {@link FlightReader.getRunEvents}, {@link FlightReader.getRunEventWindow},
+ * {@link FlightReader.getFailurePatterns}).
+ *
+ * Ask for less and less comes back — the point is bytes off the wire for a
+ * caller that only needs `status` and `startedAt` out of a 25-field run, or
+ * `type` and `sequenceNumber` out of a page of events whose payloads dominate
+ * the response.
+ */
+export interface ProjectionParams {
+  /**
+   * Request only these fields on each returned document, forwarded verbatim as
+   * `?fields=a,b,c`.
+   *
+   * **Omit it for the full document.** Omitting is the backward-compatible
+   * default and is what every pre-projection caller already does.
+   *
+   * **THE IDENTITY FIELD ALWAYS COMES BACK**, whether or not you name it —
+   * the server adds it so a projected row is always re-identifiable. Do not
+   * spend a slot asking for it. It is NOT `id` on every resource: see
+   * {@link PROJECTION_IDENTITY_FIELDS} — runs are keyed by their document id,
+   * events by `sequenceNumber` (event-log rule 4), failure patterns by
+   * `fingerprintHash`.
+   *
+   * **The field vocabulary is the SERVER's, and is never re-validated here.**
+   * This SDK does not hold a second copy of the projectable field list to
+   * check yours against: a client-side copy inevitably drifts from the
+   * server's and starts rejecting fields a newer deployment supports. An
+   * unknown field is answered by the server with HTTP 400 `INVALID_ARGUMENT`,
+   * naming the offender, which surfaces as a {@link V1ApiError} with
+   * `kind: 'invalid_response'` and `status: 400` — the same bad-request
+   * mapping every other 4xx gets.
+   *
+   * **Malformed lists are REJECTED, never repaired**, matching the wire
+   * contract exactly (`docs/api_reference.md` §`fields`): an empty list, an
+   * empty or whitespace-padded entry, an entry containing a comma, or a
+   * duplicate all throw a `RangeError` before any request goes out. These are
+   * SHAPE rules, not vocabulary — silently trimming `' status '` or deduping
+   * would hide a caller whose field list was built wrong, and the server
+   * rejects the same inputs anyway. Rejecting here just fails sooner and says
+   * so more clearly.
+   *
+   * **Typing caveat:** the returned documents are still typed as the full
+   * entity (`Run`, `Event`, `FailurePattern`) so that adding this parameter
+   * broke no existing signature. When you project, treat the result as
+   * `Partial<T>` plus the identity field — the fields you did not ask for are
+   * absent at runtime even though the type says otherwise.
+   */
+  fields?: readonly string[]
+}
+
+export interface ListRunsParams extends ProjectionParams {
   status?: RunStatus
   agentId?: string
   environment?: string
@@ -309,7 +396,10 @@ export interface ListRunsParams {
   cursor?: string
 }
 
-export interface ListEventsParams {
+/** Options for {@link FlightReader.getRun} — projection only, so far. */
+export type GetRunParams = ProjectionParams
+
+export interface ListEventsParams extends ProjectionParams {
   limit?: number
   cursor?: string
 }
@@ -331,7 +421,23 @@ export const DEFAULT_EVENT_WINDOW_SIZE = 100
  * caller error and throws). Omitting both reads from the head of the log,
  * i.e. `fromSequence: 1`.
  */
-export interface EventWindowParams {
+export interface EventWindowParams extends ProjectionParams {
+  /**
+   * Project the returned events down to these fields — see
+   * {@link ProjectionParams.fields} for the general contract (the identity
+   * field always comes back; the vocabulary is the server's; omit for the
+   * full document).
+   *
+   * **`sequenceNumber` is always requested alongside your fields, whether or
+   * not you name it.** This method's ignored-floor check reads
+   * `events[0].sequenceNumber` to prove the server honored `fromSequence`;
+   * projecting it away would silently disarm that check and hand back the head
+   * of the log as though it were the requested window — the exact failure this
+   * method exists to refuse. It is also the events resource's identity field,
+   * so the server returns it anyway; asking explicitly means this method's own
+   * guarantee does not rest on that.
+   */
+  fields?: readonly string[]
   /**
    * Lower bound (inclusive) on `sequenceNumber`. Positive integer.
    * Continue forward by re-calling with `fromSequence = last.sequenceNumber + 1` —
@@ -398,6 +504,114 @@ function assertPositiveInteger(value: number | undefined, name: string): void {
 }
 
 /**
+ * Check a caller's `fields` list for the malformations the `?fields=` wire
+ * contract rejects, before spending a request to be told so.
+ *
+ * SHAPE ONLY. This deliberately does NOT look at what the field NAMES are:
+ * the projectable vocabulary belongs to the server (it derives it from the
+ * live schema), and a second copy of it living here would drift and start
+ * rejecting fields a newer deployment happily supports. An unknown name is the
+ * server's 400 to give, not ours.
+ *
+ * REJECT, NEVER REPAIR — the same stance the route takes
+ * (`apps/web/app/api/v1/_lib/fieldsParam.ts`), for the same reason. Trimming
+ * `' status '`, dropping an empty slot, or deduping would accept a field list
+ * the caller's code built WRONG and hide the bug behind a plausible-looking
+ * response. An entry containing a comma is rejected for the sharper version of
+ * that: joined into the query string it would silently become two fields.
+ *
+ * @returns the list, or `undefined` when no projection was requested.
+ */
+function assertWellFormedFields(
+  fields: readonly string[] | undefined,
+  method: string
+): readonly string[] | undefined {
+  if (fields === undefined) return undefined
+  if (fields.length === 0) {
+    throw new RangeError(
+      `${method}: fields must name at least one field — omit it entirely to request the full document.`
+    )
+  }
+  const seen = new Set<string>()
+  for (const field of fields) {
+    if (field.length === 0 || field.trim() !== field) {
+      throw new RangeError(
+        `${method}: fields entries must not be empty or whitespace-padded (got ${JSON.stringify(field)}). ` +
+          `The server rejects the same list; nothing is trimmed for you, because a padded name usually means ` +
+          `the list was built or joined wrong.`
+      )
+    }
+    if (field.includes(',')) {
+      throw new RangeError(
+        `${method}: a fields entry must not contain a comma (got ${JSON.stringify(field)}) — entries are ` +
+          `joined into ?fields=a,b,c, so an embedded comma would silently become two field names. Pass them ` +
+          `as separate array entries.`
+      )
+    }
+    if (seen.has(field)) {
+      throw new RangeError(
+        `${method}: fields must not repeat a name (got ${JSON.stringify(field)} twice). The server rejects ` +
+          `duplicates rather than deduping them, because a repeat usually means two field sets were merged wrong.`
+      )
+    }
+    seen.add(field)
+  }
+  return fields
+}
+
+/**
+ * Prove the server actually applied the projection, instead of trusting that
+ * it did.
+ *
+ * A deployment that predates `?fields=` silently DROPS the unknown query
+ * parameter and returns the full document — which is indistinguishable, to a
+ * caller reading `run.status`, from a projection that happened to include
+ * everything it looked at. That is the same silent-wrong-answer class
+ * {@link FlightReader.getRunEventWindow} refuses for `fromSequence`, and it is
+ * refused the same way here: if a returned document carries any field OUTSIDE
+ * `requested ∪ identity` (see {@link PROJECTION_IDENTITY_FIELDS}), the server
+ * did not honor the request, and we say so.
+ *
+ * The check is one-directional on purpose, because only one direction is
+ * evidence:
+ *   - EXTRA fields are proof the projection was ignored. A server that applied
+ *     it cannot emit a field nobody asked for.
+ *   - MISSING fields are NOT proof of anything and are never flagged. Most
+ *     entity fields are optional (`endedAt`, `sessionId`, `muted`, ...), so a
+ *     correctly projected document routinely lacks fields that were requested.
+ *
+ * And it stays silent where it has no evidence at all:
+ *   - no `fields` requested — nothing to verify;
+ *   - an empty page / absent document — an old server returns the FULL
+ *     document, so zero documents means zero information either way;
+ *   - a non-object entry — nothing to inspect.
+ */
+function assertProjectionHonored(
+  fields: readonly string[] | undefined,
+  resource: ProjectableResource,
+  documents: readonly unknown[],
+  context: string,
+  endpoint: string
+): void {
+  if (fields === undefined) return
+  const allowed = new Set<string>([...PROJECTION_IDENTITY_FIELDS[resource], ...fields])
+
+  for (const doc of documents) {
+    if (doc === null || typeof doc !== 'object') continue
+    const unrequested = Object.keys(doc as Record<string, unknown>).filter((key) => !allowed.has(key))
+    if (unrequested.length === 0) continue
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: requested fields=[${fields.join(', ')}] but the response carried unrequested ` +
+        `field(s) [${unrequested.join(', ')}]. This deployment's ${endpoint} does not support field ` +
+        `projection yet — an older deployment silently drops an unknown query parameter and returns the ` +
+        `full document, which looks exactly like a projection that included everything. Refusing to ` +
+        `return a full document as though it were the requested projection.`
+    )
+  }
+}
+
+/**
  * Read-only client over the v1 read API.
  *
  * ```ts
@@ -430,12 +644,18 @@ export class FlightReader {
   /**
    * List runs for the key's organization, most-recent-first.
    *
-   * @param filters - optional `status`/`agentId`/`environment`/`sessionId` filters plus `limit`/`cursor` pagination.
+   * @param filters - optional `status`/`agentId`/`environment`/`sessionId` filters, `limit`/`cursor`
+   *   pagination, and `fields` projection (see {@link ProjectionParams.fields} — `id` always comes
+   *   back; omit for the full run).
    * @returns `{ runs, nextCursor }` — pass `nextCursor` back as `cursor` to page.
    * @throws {@link V1ApiError} on any auth/not-found/rate-limit/server/network failure.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if `fields` was requested and the
+   *   server ignored it (deployment predates field projection).
+   * @throws {RangeError} if `fields` is present but names nothing — a caller bug, before any request.
    */
-  listRuns(filters: ListRunsParams = {}): Promise<V1ListRunsData> {
-    return fetchV1<V1ListRunsData>(
+  async listRuns(filters: ListRunsParams = {}): Promise<V1ListRunsData> {
+    const fields = assertWellFormedFields(filters.fields, 'listRuns')
+    const data = await fetchV1<V1ListRunsData>(
       this.config,
       '/api/v1/runs',
       {
@@ -445,35 +665,63 @@ export class FlightReader {
         sessionId: filters.sessionId,
         limit: filters.limit,
         cursor: filters.cursor,
+        ...(fields !== undefined && { fields: fields.join(',') }),
       },
       this.fetchImpl
     )
+    assertProjectionHonored(fields, 'runs', data.runs ?? [], 'listRuns', 'GET /api/v1/runs')
+    return data
   }
 
   /**
    * Fetch a single run by id, along with its event and artifact counts.
    *
    * @param runId - the run's id.
+   * @param options - optional `fields` projection applied to `run` (see
+   *   {@link ProjectionParams.fields} — `id` always comes back; omit for the full run).
+   *   `eventCount`/`artifactCount` are computed, not run fields, and are unaffected.
    * @throws {@link V1ApiError} with `kind: 'not_found'` if the run does not exist or does not belong to the key's org.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if `fields` was requested and the
+   *   server ignored it (deployment predates field projection).
    */
-  getRun(runId: string): Promise<V1GetRunData> {
-    return fetchV1<V1GetRunData>(this.config, `/api/v1/runs/${encodeURIComponent(runId)}`, {}, this.fetchImpl)
+  async getRun(runId: string, options: GetRunParams = {}): Promise<V1GetRunData> {
+    const fields = assertWellFormedFields(options.fields, 'getRun')
+    const data = await fetchV1<V1GetRunData>(
+      this.config,
+      `/api/v1/runs/${encodeURIComponent(runId)}`,
+      { ...(fields !== undefined && { fields: fields.join(',') }) },
+      this.fetchImpl
+    )
+    assertProjectionHonored(fields, 'runs', [data.run], 'getRun', 'GET /api/v1/runs/:id')
+    return data
   }
 
   /**
    * Fetch one page of a run's event log, in `sequenceNumber` order.
    *
    * @param runId - the run's id.
-   * @param options - `limit` (page size) and `cursor` (opaque, from a previous page's `nextCursor`).
+   * @param options - `limit` (page size), `cursor` (opaque, from a previous page's `nextCursor`),
+   *   and `fields` projection (see {@link ProjectionParams.fields} — `id` always comes back; omit
+   *   for the full event). Projecting away `payload` is the cheap win here: it is the field that
+   *   dominates an event page's size.
    * @returns `{ events, nextCursor }` — `nextCursor` is absent once the last page has been fetched.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if `fields` was requested and the
+   *   server ignored it (deployment predates field projection).
    */
-  getRunEvents(runId: string, options: ListEventsParams = {}): Promise<V1ListEventsData> {
-    return fetchV1<V1ListEventsData>(
+  async getRunEvents(runId: string, options: ListEventsParams = {}): Promise<V1ListEventsData> {
+    const fields = assertWellFormedFields(options.fields, 'getRunEvents')
+    const data = await fetchV1<V1ListEventsData>(
       this.config,
       `/api/v1/runs/${encodeURIComponent(runId)}/events`,
-      { ...(options.limit !== undefined && { limit: options.limit }), ...(options.cursor !== undefined && { cursor: options.cursor }) },
+      {
+        ...(options.limit !== undefined && { limit: options.limit }),
+        ...(options.cursor !== undefined && { cursor: options.cursor }),
+        ...(fields !== undefined && { fields: fields.join(',') }),
+      },
       this.fetchImpl
     )
+    assertProjectionHonored(fields, 'events', data.events ?? [], 'getRunEvents', 'GET /api/v1/runs/:id/events')
+    return data
   }
 
   /**
@@ -510,17 +758,27 @@ export class FlightReader {
    * artifact pointer and SHA-256 checksum in the payload, and the bytes are
    * fetched separately and deliberately.
    *
+   * **Field projection composes with the window** — `fields` narrows each
+   * event in it, exactly as on {@link getRunEvents}, and is verified the same
+   * way (see {@link ProjectionParams.fields}). One wrinkle, documented on
+   * {@link EventWindowParams.fields}: `sequenceNumber` is always requested
+   * alongside whatever you name, because the ignored-floor check below reads
+   * it — a projection that removed it would silently disarm the very guarantee
+   * this method is built around.
+   *
    * @param runId - the run's id.
-   * @param options - `fromSequence` OR `aroundSequence` (not both), plus `limit`.
+   * @param options - `fromSequence` OR `aroundSequence` (not both), plus `limit` and `fields`.
    * @returns `{ events, fromSequence, nextCursor? }`. An empty `events` means
    *   the run has nothing at or after the floor — not an error.
    * @throws {@link V1ApiError} with `kind: 'not_found'` if the run does not
    *   exist or does not belong to the key's org — the two are deliberately
    *   indistinguishable, exactly as on every other method here.
    * @throws {@link V1ApiError} with `kind: 'invalid_response'` if the server
-   *   ignored `fromSequence` (deployment predates windowed reads).
+   *   ignored `fromSequence` (deployment predates windowed reads) or ignored
+   *   `fields` (deployment predates field projection).
    * @throws {RangeError} if the arguments are self-contradictory or not
-   *   positive integers — a caller bug, surfaced before any request is made.
+   *   positive integers, or `fields` is present but names nothing — a caller
+   *   bug, surfaced before any request is made.
    */
   async getRunEventWindow(runId: string, options: EventWindowParams = {}): Promise<V1EventWindowData> {
     const { fromSequence, aroundSequence, limit } = options
@@ -533,6 +791,18 @@ export class FlightReader {
     assertPositiveInteger(fromSequence, 'fromSequence')
     assertPositiveInteger(aroundSequence, 'aroundSequence')
     assertPositiveInteger(limit, 'limit')
+
+    // `sequenceNumber` is forced into the projection: the ignored-floor check
+    // below reads it, and a caller who projected it away would silently get
+    // that check disabled rather than get a smaller response. Deduped so the
+    // wire form does not repeat a field the caller already named.
+    const requestedFields = assertWellFormedFields(options.fields, 'getRunEventWindow')
+    const fields =
+      requestedFields === undefined
+        ? undefined
+        : requestedFields.includes('sequenceNumber')
+          ? requestedFields
+          : [...requestedFields, 'sequenceNumber']
 
     // `aroundSequence` is resolved to a floor here rather than sent as its own
     // server parameter: centering is pure arithmetic over a width the caller
@@ -550,6 +820,7 @@ export class FlightReader {
       {
         fromSequence: effectiveFrom,
         ...(effectiveLimit !== undefined && { limit: effectiveLimit }),
+        ...(fields !== undefined && { fields: fields.join(',') }),
       },
       this.fetchImpl
     )
@@ -566,6 +837,10 @@ export class FlightReader {
           `reads yet. Refusing to return the head of the log as though it were the requested window.`
       )
     }
+
+    // Second capability check, same principle as the first: an ignored
+    // `fields` is a full document wearing a projection's clothes.
+    assertProjectionHonored(fields, 'events', events, 'getRunEventWindow', 'GET /api/v1/runs/:id/events')
 
     return {
       events,
@@ -689,7 +964,11 @@ export class FlightReader {
    *   lifecycle status — 'open' | 'acknowledged' | 'resolved', see
    *   {@link ListFailurePatternsParams.status}), `regressed` (narrows to
    *   patterns with `regressedAt` set, see
-   *   {@link ListFailurePatternsParams.regressed}) plus `limit`/`cursor` pagination.
+   *   {@link ListFailurePatternsParams.regressed}) plus `limit`/`cursor` pagination
+   *   and `fields` projection (see {@link ProjectionParams.fields} — `id` always comes back;
+   *   omit for the full pattern). NOTE: the response's `fixConfidence.entries` are keyed by
+   *   `fingerprintHash` and are NOT projected — keep `fingerprintHash` in your field list if you
+   *   intend to join them back to the patterns they grade.
    * @returns `{ patterns, nextCursor }` — pass `nextCursor` back as `cursor` to page.
    *   Each pattern carries `muted`/`mutedAt` when set (PREVENTION cycle 3),
    *   and `status`/`acknowledgedAt`/`acknowledgedByUserId`/`resolvedAt`/
@@ -699,9 +978,12 @@ export class FlightReader {
    *   Clerk-authed, audited writes on the web app, not part of this
    *   key-authed read surface.
    * @throws {@link V1ApiError} on any auth/rate-limit/server/network failure.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if `fields` was requested and the
+   *   server ignored it (deployment predates field projection).
    */
-  getFailurePatterns(filters: ListFailurePatternsParams = {}): Promise<V1ListFailurePatternsData> {
-    return fetchV1<V1ListFailurePatternsData>(
+  async getFailurePatterns(filters: ListFailurePatternsParams = {}): Promise<V1ListFailurePatternsData> {
+    const fields = assertWellFormedFields(filters.fields, 'getFailurePatterns')
+    const data = await fetchV1<V1ListFailurePatternsData>(
       this.config,
       '/api/v1/patterns',
       {
@@ -713,9 +995,12 @@ export class FlightReader {
         ...(filters.state !== undefined && { state: filters.state }),
         limit: filters.limit,
         cursor: filters.cursor,
+        ...(fields !== undefined && { fields: fields.join(',') }),
       },
       this.fetchImpl
     )
+    assertProjectionHonored(fields, 'patterns', data.patterns ?? [], 'getFailurePatterns', 'GET /api/v1/patterns')
+    return data
   }
 
   /**

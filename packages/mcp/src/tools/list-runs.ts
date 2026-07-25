@@ -13,7 +13,8 @@
 import { z } from 'zod'
 
 import { toMcpError } from '../errors.js'
-import { toListRunsResult } from '../projections.js'
+import { withFieldProjection } from '../field-projection.js'
+import { RUN_REQUEST_FIELDS, toListRunsResult } from '../projections.js'
 
 import { jsonResult } from './shared.js'
 
@@ -71,7 +72,18 @@ export function registerListRuns(server: McpServer, reader: AfrReader): void {
         ...(args.cursor !== undefined && { cursor: args.cursor }),
       }
       try {
-        const data = await reader.listRuns(filters)
+        // RUN_REQUEST_FIELDS is DERIVED from RUN_COLUMNS — the same table
+        // `RUN_FIELDS` comes from — so the request and the emitted header
+        // cannot disagree. `metadata`, `tags`, `labels`, `searchText` and the
+        // token counters are now never read, never serialized and never sent.
+        //
+        // `toListRunsResult` still drops them: `fields` is opt-in and a
+        // deployment that predates it returns whole runs (see
+        // `withFieldProjection`), and the emitted `runId` is a RENAME of the
+        // document's `id` that only the projection performs.
+        const data = await withFieldProjection(RUN_REQUEST_FIELDS, (fields) =>
+          reader.listRuns({ ...filters, ...(fields !== undefined && { fields }) }),
+        )
         return jsonResult(toListRunsResult(data.runs, data.nextCursor))
       } catch (err) {
         throw toMcpError(err, 'run')

@@ -76,6 +76,13 @@ const PARAM_TABLE: { name: keyof ApiV1ListFailurePatternsParams; value: unknown 
   { name: 'state', value: 'regressed' },
   { name: 'limit', value: 25 },
   { name: 'cursor', value: 'cursor_abc' },
+  // Server-side field projection (`?fields=` on GET /api/v1/patterns). Added
+  // to this table in the SAME commit as the param itself. A dropped `fields`
+  // returns the FULL pattern document — a well-formed response the caller
+  // cannot distinguish from a projection that happened to include everything.
+  // Route-level parsing and its tenancy properties are covered separately in
+  // tests/unit/field_projection_route.test.ts.
+  { name: 'fields', value: ['fingerprintHash', 'count'] },
 ]
 
 describe('apiListFailurePatterns — every declared param reaches the Convex mutation call', () => {
@@ -100,6 +107,7 @@ describe('apiListFailurePatterns — every declared param reaches the Convex mut
       state: 'regressed',
       limit: 10,
       cursor: 'cursor_xyz',
+      fields: ['fingerprintHash', 'count'],
     }
     await apiListFailurePatterns('hashed_key', params)
 
@@ -114,6 +122,7 @@ describe('apiListFailurePatterns — every declared param reaches the Convex mut
       state: 'regressed',
       limit: 10,
       cursor: 'cursor_xyz',
+      fields: ['fingerprintHash', 'count'],
     })
   })
 

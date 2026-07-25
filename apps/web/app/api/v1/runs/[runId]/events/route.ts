@@ -1,10 +1,13 @@
 import { type NextRequest, NextResponse } from 'next/server'
 
+import { fieldsInvalidArgument, parseFieldsParam } from '../../../_lib/fieldsParam'
+
 import { mapApiErrorV1, v1UnauthorizedNoKey } from '@/lib/apiErrorMapping'
 import { withApiHandler } from '@/lib/apiHandler'
 import { apiV1Envelope } from '@/lib/apiV1Envelope'
 import { hashApiKey } from '@/lib/convexServer'
 import { apiGetRunEvents } from '@/lib/services/api_v1'
+
 
 interface RouteParams {
   params: { runId: string }
@@ -59,12 +62,24 @@ export const GET = withApiHandler(
       fromSequence = parsed
     }
 
+    // `fields` (optional) projects each returned EVENT — same reject-never-
+    // coerce posture as `fromSequence` above, for the same reason: a coerced
+    // projection returns a well-formed document that answers a different
+    // question. Both are validated before any Convex call, so a request that
+    // is malformed in both ways fails on shape either way — neither error
+    // reveals anything about the run.
+    const fields = parseFieldsParam(sp)
+    if (!fields.ok) {
+      return fieldsInvalidArgument(fields.message, ctx.requestId)
+    }
+
     try {
       const result = await apiGetRunEvents(hashApiKey(apiKey), {
         runId: params.runId,
         ...(limit !== undefined && { limit }),
         ...(fromSequence !== undefined && { fromSequence }),
         ...(sp.get('cursor') !== null && { cursor: sp.get('cursor') as string }),
+        ...(fields.fields !== undefined && { fields: fields.fields }),
       })
       return NextResponse.json(apiV1Envelope(result, ctx.requestId))
     } catch (err) {

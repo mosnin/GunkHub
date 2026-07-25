@@ -26,6 +26,26 @@
  *     precisely because they were over 10 KB; re-inlining one here would put a
  *     10 KB+ blob into a context window to answer a question the pointer
  *     already answers.
+ *
+ * THE PROJECTIONS HERE ARE A BACKSTOP, NOT DEAD CODE. As of the server-side
+ * `fields` work (convex/read_api.ts §FIELD PROJECTION) each tool ALSO asks the
+ * read API for exactly the columns it will emit, so the unwanted fields are no
+ * longer paid for on the wire. That does not make these functions redundant and
+ * they must not be deleted as such:
+ *
+ *   - `fields` is opt-in and a deployment that predates it IGNORES the
+ *     parameter and returns the full document. The projection is what keeps the
+ *     response budgeted against such a server.
+ *   - The byte budgets (payload previews, prose caps, transition cap) are
+ *     enforced HERE and nowhere else. No server-side field selection bounds the
+ *     size of a field it did return.
+ *   - Several emitted columns are not document fields at all (confidence state
+ *     is joined from a separate envelope; the artifact pointer is read out of
+ *     an externalized payload), so the shaping has to happen client-side
+ *     regardless.
+ *
+ * Server-side projection is defense in depth's cheap half. This file is the
+ * half that is load-bearing.
  */
 import type {
   Event,
@@ -96,6 +116,67 @@ export function toColumnar<T extends object>(records: T[], fields: readonly (key
 }
 
 // ---------------------------------------------------------------------------
+// Column tables — the single declaration of what each projection emits AND
+// what it therefore asks the server for
+// ---------------------------------------------------------------------------
+
+/**
+ * One column of a projection, paired with the SOURCE DOCUMENT FIELD it reads.
+ *
+ * WHY THE PAIRING EXISTS. Every tool here now asks the read API for exactly the
+ * columns it will emit (`fields` — convex/read_api.ts §FIELD PROJECTION). The
+ * requested list and the emitted list are the same fact stated twice, and two
+ * lists that can disagree are precisely the drift this pairing exists to
+ * prevent:
+ *
+ *   - a column added to the projection but not to the request reads
+ *     `undefined` on every row, and an all-`undefined` column is dropped by
+ *     {@link toColumnar} — so it disappears silently rather than failing;
+ *   - a name that is wrong in the other direction is worse than silent: the
+ *     read API's rule 2 makes an UNKNOWN FIELD A HARD ERROR, so a stale entry
+ *     fails the whole call rather than one column.
+ *
+ * So the list is written ONCE, per projection, and both the columnar header
+ * ({@link columnsOf}) and the request ({@link requestFieldsOf}) are derived
+ * from it. Neither is ever written out by hand a second time.
+ */
+export interface ProjectedColumn<C extends string> {
+  /** The column name this projection emits. */
+  readonly column: C
+  /**
+   * The document field this column's value is read from, or `null` when the
+   * value does not come from the projected document at all — an identity field
+   * the server returns whether or not it was asked for (read API rule 3), or a
+   * value joined in from a separate envelope. A `null` source is never
+   * requested: asking for the identity field would be redundant, and asking for
+   * a field the document does not have would be the hard error above.
+   */
+  readonly source: string | null
+}
+
+/** The emitted column names, in order. The columnar header. */
+export function columnsOf<C extends string>(columns: readonly ProjectedColumn<C>[]): C[] {
+  return columns.map((column) => column.column)
+}
+
+/**
+ * The `fields` selection to send for a projection: every distinct non-null
+ * source, deduped (several columns can read one field — the artifact pointer,
+ * `originalType` and `errorSummary` all come out of `payload`).
+ *
+ * Order is declaration order, deduped. It is not sorted: the read API accepts
+ * any order, and preserving declaration order keeps a request diff readable
+ * against the column table it came from.
+ */
+export function requestFieldsOf(columns: readonly ProjectedColumn<string>[]): string[] {
+  const sources = new Set<string>()
+  for (const column of columns) {
+    if (column.source !== null) sources.add(column.source)
+  }
+  return [...sources]
+}
+
+// ---------------------------------------------------------------------------
 // Tier 1 — failure pattern rows
 // ---------------------------------------------------------------------------
 
@@ -152,17 +233,36 @@ export function toPatternRow(pattern: FailurePattern, confidence?: FixConfidence
 /** How many `unevaluated` fingerprints to name before falling back to a bare count. */
 export const UNEVALUATED_SAMPLE_CAP = 10
 
-/** Column order for the tier-1 columnar response. Append-only — never reorder. */
-export const PATTERN_FIELDS = [
-  'fingerprintHash',
-  'class',
-  'label',
-  'count',
-  'lastSeenAt',
-  'status',
-  'confidenceState',
-  'confidenceStale',
-] as const
+/**
+ * Tier 1's column table. Append-only — never reorder (a caller indexes by name,
+ * but the header order is still part of what it reads).
+ *
+ * The `null` sources are load-bearing, not omissions:
+ *   - `fingerprintHash` is the `failure_patterns` identity field, which the
+ *     read API returns whether or not it was requested (rule 3).
+ *   - `confidenceState` / `confidenceStale` are joined from the response's
+ *     `fixConfidence` envelope, which is not part of the pattern document and
+ *     is not selectable through `fields`.
+ */
+export const PATTERN_COLUMNS = [
+  { column: 'fingerprintHash', source: null },
+  { column: 'class', source: 'class' },
+  { column: 'label', source: 'label' },
+  { column: 'count', source: 'count' },
+  { column: 'lastSeenAt', source: 'lastSeenAt' },
+  { column: 'status', source: 'status' },
+  { column: 'confidenceState', source: null },
+  { column: 'confidenceStale', source: null },
+] as const satisfies readonly ProjectedColumn<keyof PatternRow>[]
+
+/** Column order for the tier-1 columnar response. DERIVED from {@link PATTERN_COLUMNS}. */
+export const PATTERN_FIELDS: readonly (keyof PatternRow)[] = columnsOf(PATTERN_COLUMNS)
+
+/**
+ * The `fields` selection `afr_list_failure_patterns` sends. DERIVED from
+ * {@link PATTERN_COLUMNS} — it cannot drift from the header above.
+ */
+export const PATTERN_REQUEST_FIELDS: readonly string[] = requestFieldsOf(PATTERN_COLUMNS)
 
 /** Tier 1 response. Columnar — see {@link Columnar} for why. */
 export interface ListPatternsResult extends Columnar {
@@ -497,6 +597,41 @@ export interface EventRow {
   errorSummary?: string
 }
 
+/**
+ * Tier 4's column table.
+ *
+ * Tier 4 is not columnar (a window is a handful of self-describing objects, so
+ * key names do not compound the way they do on a 100-row list), but the same
+ * derivation applies: this is where the tier's `fields` selection comes from.
+ *
+ * `sequenceNumber` has a `null` source because it is the `events` identity
+ * field — Event Log Rule 4 addresses an event by its sequence within a run, and
+ * the read API returns it unconditionally (rule 3).
+ *
+ * `artifact`, `originalType` and `errorSummary` all read `payload`: an
+ * externalized payload carries the pointer INSIDE itself, so the three columns
+ * cost one field on the wire. {@link requestFieldsOf} dedupes them.
+ *
+ * What is deliberately NOT requested: `runId` (the caller passed it in and it
+ * is echoed from the argument), `orgId` (never emitted — the tenancy boundary
+ * is the key's, not a value to hand an agent) and `parentEventId`.
+ */
+export const EVENT_COLUMNS = [
+  { column: 'sequenceNumber', source: null },
+  { column: 'type', source: 'type' },
+  { column: 'timestamp', source: 'timestamp' },
+  { column: 'payload', source: 'payload' },
+  { column: 'artifact', source: 'payload' },
+  { column: 'originalType', source: 'payload' },
+  { column: 'errorSummary', source: 'payload' },
+] as const satisfies readonly ProjectedColumn<keyof EventRow>[]
+
+/** The columns tier 4 emits. DERIVED from {@link EVENT_COLUMNS}. */
+export const EVENT_FIELDS: readonly (keyof EventRow)[] = columnsOf(EVENT_COLUMNS)
+
+/** The `fields` selection `afr_get_run_events` sends. DERIVED from {@link EVENT_COLUMNS}. */
+export const EVENT_REQUEST_FIELDS: readonly string[] = requestFieldsOf(EVENT_COLUMNS)
+
 function isExternalized(payload: unknown): payload is ExternalizedPayload {
   return (
     typeof payload === 'object' &&
@@ -618,8 +753,30 @@ export interface RunRow {
   sessionId?: string
 }
 
-/** Column order for the `afr_list_runs` columnar response. Append-only — never reorder. */
-export const RUN_FIELDS = ['runId', 'agentId', 'status', 'startedAt', 'endedAt', 'environment', 'sessionId'] as const
+/**
+ * `afr_list_runs`'s column table. Append-only — never reorder.
+ *
+ * `runId` has a `null` source for two reasons at once: it is the `runs`
+ * identity field, which the read API always returns (rule 3), and it is also
+ * RENAMED on the way out (`id` on the wire, `runId` in the response) — so the
+ * emitted name is not a field name the server would recognize. Requesting it
+ * would be both redundant and wrong.
+ */
+export const RUN_COLUMNS = [
+  { column: 'runId', source: null },
+  { column: 'agentId', source: 'agentId' },
+  { column: 'status', source: 'status' },
+  { column: 'startedAt', source: 'startedAt' },
+  { column: 'endedAt', source: 'endedAt' },
+  { column: 'environment', source: 'environment' },
+  { column: 'sessionId', source: 'sessionId' },
+] as const satisfies readonly ProjectedColumn<keyof RunRow>[]
+
+/** Column order for the `afr_list_runs` columnar response. DERIVED from {@link RUN_COLUMNS}. */
+export const RUN_FIELDS: readonly (keyof RunRow)[] = columnsOf(RUN_COLUMNS)
+
+/** The `fields` selection `afr_list_runs` sends. DERIVED from {@link RUN_COLUMNS}. */
+export const RUN_REQUEST_FIELDS: readonly string[] = requestFieldsOf(RUN_COLUMNS)
 
 /** `afr_list_runs` response. Columnar for the same reason tier 1 is — see {@link Columnar}. */
 export interface ListRunsResult extends Columnar {

@@ -1,15 +1,19 @@
 import { type NextRequest, NextResponse } from 'next/server'
 
+import { fieldsInvalidArgument, parseFieldsParam } from '../_lib/fieldsParam'
+
 import { mapApiErrorV1, v1UnauthorizedNoKey } from '@/lib/apiErrorMapping'
 import { withApiHandler } from '@/lib/apiHandler'
 import { apiV1Envelope } from '@/lib/apiV1Envelope'
 import { hashApiKey } from '@/lib/convexServer'
 import { apiListFailurePatterns } from '@/lib/services/api_v1'
 
+
 // ---------------------------------------------------------------------------
 // GET /api/v1/patterns — public read API, x-api-key auth (`read` scope).
 //
-// Query params: agentId, spiking, muted, limit, cursor. Recurring failure
+// Query params: agentId, spiking, muted, status, regressed, state, limit,
+// cursor, fields. Recurring failure
 // patterns for the key's org (PREVENTION cycle 1, ADR-005) — a durable memory
 // of fingerprinted, recurring failures derived from failed runs, most-
 // recently-seen first. Wraps convex/read_api.ts `apiListFailurePatterns`
@@ -86,6 +90,22 @@ export const GET = withApiHandler(
         ? rawState
         : undefined
 
+    // `fields` (optional) projects each returned PATTERN document. NOTE the
+    // deliberate asymmetry with every other param on this route: the filters
+    // above parse PERMISSIVELY (a junk value is treated as unset) because an
+    // unrecognized filter value can only ever widen the result set, which is
+    // visible to the caller. `fields` is the opposite — a silently ignored or
+    // coerced projection NARROWS the document and looks exactly like a
+    // correct response. So it is rejected, never coerced. See
+    // ../_lib/fieldsParam.ts.
+    //
+    // The `fixConfidence` envelope alongside the patterns is derived, not a
+    // pattern field, and is unaffected by the projection.
+    const fields = parseFieldsParam(sp)
+    if (!fields.ok) {
+      return fieldsInvalidArgument(fields.message, ctx.requestId)
+    }
+
     try {
       const result = await apiListFailurePatterns(hashApiKey(apiKey), {
         ...(sp.get('agentId') !== null && { agentId: sp.get('agentId') as string }),
@@ -96,6 +116,7 @@ export const GET = withApiHandler(
         ...(state !== undefined && { state }),
         ...(limit !== undefined && { limit }),
         ...(sp.get('cursor') !== null && { cursor: sp.get('cursor') as string }),
+        ...(fields.fields !== undefined && { fields: fields.fields }),
       })
       return NextResponse.json(apiV1Envelope(result, ctx.requestId))
     } catch (err) {

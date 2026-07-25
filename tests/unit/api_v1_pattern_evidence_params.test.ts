@@ -58,6 +58,12 @@ beforeEach(() => {
 /** Every param the interface declares, with a representative value to assert on. */
 const PARAM_TABLE: { name: keyof ApiV1GetFailurePatternEvidenceParams; value: unknown }[] = [
   { name: 'fingerprintHash', value: 'abc123def456' },
+  // Server-side field projection of the EMBEDDED pattern document
+  // (`?fields=` on GET /api/v1/patterns/[fingerprintHash]/evidence). Added in
+  // the same commit as the param; route-level parsing and the "unknown field
+  // error is not a cross-org existence oracle" property are covered in
+  // tests/unit/field_projection_route.test.ts.
+  { name: 'fields', value: ['fingerprintHash', 'count'] },
 ]
 
 describe('apiGetFailurePatternEvidence — every declared param reaches the Convex mutation call', () => {
@@ -71,11 +77,25 @@ describe('apiGetFailurePatternEvidence — every declared param reaches the Conv
   })
 
   it('forwards apiKeyHash plus every param at once, with none dropped', async () => {
-    const params: ApiV1GetFailurePatternEvidenceParams = { fingerprintHash: 'abc123def456' }
+    const params: ApiV1GetFailurePatternEvidenceParams = {
+      fingerprintHash: 'abc123def456',
+      fields: ['fingerprintHash', 'count'],
+    }
     await apiGetFailurePatternEvidence('hashed_key', params)
 
     const [, args] = mutationMock.mock.calls[0]!
+    expect(args).toEqual({
+      apiKeyHash: 'hashed_key',
+      fingerprintHash: 'abc123def456',
+      fields: ['fingerprintHash', 'count'],
+    })
+  })
+
+  it('omits fields entirely when absent (never a stray `undefined` key)', async () => {
+    await apiGetFailurePatternEvidence('hashed_key', { fingerprintHash: 'abc123def456' })
+    const [, args] = mutationMock.mock.calls[0]!
     expect(args).toEqual({ apiKeyHash: 'hashed_key', fingerprintHash: 'abc123def456' })
+    expect('fields' in args).toBe(false)
   })
 
   /**
@@ -88,6 +108,7 @@ describe('apiGetFailurePatternEvidence — every declared param reaches the Conv
   it('covers every key the params interface declares', () => {
     const fullyPopulated: Required<ApiV1GetFailurePatternEvidenceParams> = {
       fingerprintHash: 'abc123def456',
+      fields: ['fingerprintHash', 'count'],
     }
     expect(Object.keys(fullyPopulated).sort()).toEqual(PARAM_TABLE.map((p) => String(p.name)).sort())
   })

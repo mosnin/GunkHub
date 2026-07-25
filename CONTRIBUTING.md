@@ -242,6 +242,60 @@ key's own `orgId` — see `resolveApiKey` and the cross-org checks throughout th
 
 ---
 
+## How To: Add a Field to a Projected Resource
+
+The v1 read API supports server-side projection (`?fields=a,b,c`) on the `runs`, `events`
+and `failure_patterns` documents, so **a field existing is no longer the same as a field
+being reachable.** Adding one to the schema is necessary but not sufficient: a caller that
+names its fields gets exactly what it named, and adding a field upstream does nothing for
+it until its own list changes.
+
+Full contract: `docs/api_reference.md` §1 ("Field projection — `?fields=`").
+
+1. **`convex/schema.ts`** — add the field to the table validator (`convex/` boundary).
+   **This is also what makes it projectable**: the allowlist is derived from the live
+   schema (`Object.keys(schema.tables[table].validator.fields)` in `convex/read_api.ts`),
+   not maintained by hand, so there is no separate allowlist to update and no way for the
+   two to drift.
+2. **`packages/contracts/src/`** — add it to the entity interface and bump the package
+   version per `CLAUDE.md` → Contracts versioning. Prefer optional (`field?: T`) for
+   anything added to an existing table; documents written before the change will not
+   have it.
+3. **Check the route forwards `fields`.** All five document-returning v1 routes call
+   `parseFieldsParam` (`apps/web/app/api/v1/_lib/fieldsParam.ts`) and forward the list. A
+   new route returning stored documents must do the same, or projection is silently
+   unavailable on it. That helper validates **shape only** — it deliberately does not know
+   which names are valid, so there is exactly one source of truth for the allowlist.
+4. **Every client that passes an explicit `fields` list**, if the new field should reach
+   it:
+   - `packages/mcp/src/projections.ts` — add a `ProjectedColumn` entry to the relevant
+     `*_COLUMNS` table. The request lists (`RUN_REQUEST_FIELDS`, `PATTERN_REQUEST_FIELDS`,
+     `EVENT_REQUEST_FIELDS`) are **derived** from those tables by `requestFieldsOf`, so
+     declaring the column's `source` is all that is needed — do not maintain a parallel
+     list.
+   - `packages/sdk/src/reader.ts` — `FlightReader` forwards whatever the caller passes;
+     nothing to add unless a default list exists.
+   - `packages/cli/src/apiClient.ts` — if the CLI requests narrowed records.
+
+**Use the `source` field honestly.** A `ProjectedColumn` with `source: null` is never
+requested, and that is reserved for two cases: an identity field the server returns
+regardless (`_id` for runs, `sequenceNumber` for events, `fingerprintHash` for failure
+patterns), or a value joined in from a separate envelope rather than the document. Giving
+a real document field a `null` source silently removes it from the request.
+
+**The silent failure this prevents.** `toColumnar` drops any column that is null across
+every row and reports only the surviving columns in its `fields` header. So a column whose
+source field was never requested does not throw and does not come back as nulls — it
+vanishes from the header entirely, and a consumer indexing by name finds nothing. Deriving
+the request list from the column table is what keeps that from happening; do not
+short-circuit it.
+
+The column tables are **append-only — never reorder**, because rows are positionally
+aligned with the header. Adding a column is safe; moving one is a breaking change for any
+consumer that cached an index.
+
+---
+
 ## How To: Add a New UI Surface
 
 Any change to `apps/web` components, pages, styles, layout, motion, or graphics **must**

@@ -28,6 +28,8 @@
 import { V1ApiError } from '@agent-flight-recorder/sdk'
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js'
 
+import { EVENT_REQUEST_FIELDS } from './projections.js'
+
 import type { EventRow } from './projections.js'
 import type { Event } from '@agent-flight-recorder/contracts'
 
@@ -48,7 +50,7 @@ export interface EventSource {
   /** Server-side windowed read. Optional so an older reader implementation still satisfies the interface. */
   getRunEventWindow?: (
     runId: string,
-    options: { fromSequence?: number; limit?: number },
+    options: { fromSequence?: number; limit?: number; fields?: string[] },
   ) => Promise<{ events: Event[]; fromSequence: number; nextCursor?: string }>
   iterateEvents(runId: string, options?: { pageSize?: number; maxPages?: number }): AsyncIterable<Event>
 }
@@ -126,19 +128,45 @@ export async function fetchEventWindow(
 ): Promise<EventWindow> {
   const start = Math.max(1, Math.floor(fromSequence))
 
-  if (source.getRunEventWindow !== undefined) {
-    try {
-      // Ask for one more than the window so the presence of a further event —
-      // and therefore `nextFromSequence` — is a fact rather than a guess.
-      const data = await source.getRunEventWindow(runId, { fromSequence: start, limit: limit + 1 })
+  const windowRead = source.getRunEventWindow
+  if (windowRead !== undefined) {
+    // Ask for one more than the window so the presence of a further event —
+    // and therefore `nextFromSequence` — is a fact rather than a guess.
+    const read = async (fields: string[] | undefined): Promise<EventWindow> => {
+      const data = await windowRead(runId, {
+        fromSequence: start,
+        limit: limit + 1,
+        ...(fields !== undefined && { fields }),
+      })
       const events = data.events.slice(0, limit)
       const overflow = data.events[limit]
-      return overflow === undefined
-        ? { events }
-        : { events, nextFromSequence: overflow.sequenceNumber }
+      return overflow === undefined ? { events } : { events, nextFromSequence: overflow.sequenceNumber }
+    }
+
+    try {
+      // `fields` is DERIVED from tier 4's column table (`EVENT_COLUMNS`), so
+      // the server serializes only the fields `toEventRow` reads. Sent only on
+      // this primary path: the fallback pages through `iterateEvents`, whose
+      // options are the SDK's and carry no selection. Either way
+      // `budgetEventRows` still applies the byte budgets — a field selection
+      // bounds WHICH fields come back, never how big one of them is.
+      return await read([...EVENT_REQUEST_FIELDS])
     } catch (err) {
       if (!isUnsupportedWindowRead(err)) throw err
-      // Deployment predates windowed reads — fall through and page.
+      // THREE-STEP DEGRADATION, and the order matters. The SDK reports both
+      // "this deployment ignored `fields`" and "this deployment ignored
+      // `fromSequence`" as `invalid_response`, and they are not distinguishable
+      // from here. Retrying the WINDOW without the selection separates them: if
+      // the projection was the problem this succeeds and keeps the one-request,
+      // O(window) read; only if the sequence floor is also unsupported do we
+      // drop to paging, which is what this deployment cost before `fields`
+      // existed. Trying the cheap-but-newer thing first must never cost the
+      // caller the older, working thing.
+      try {
+        return await read(undefined)
+      } catch (retryErr) {
+        if (!isUnsupportedWindowRead(retryErr)) throw retryErr
+      }
     }
   }
 

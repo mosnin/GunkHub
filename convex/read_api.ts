@@ -55,6 +55,12 @@ import {
 import { DEFAULT_PAGE_SIZE, MAX_EVENTS_PER_REPLAY, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 import { buildReplayProjectionMirror } from "./helpers/replay_projection.js";
 import { fixConfidence } from "./insights.js";
+// The SCHEMA ITSELF is the valid-field set for projection (see
+// §FIELD PROJECTION below). Imported for its table validators only — a
+// hand-maintained list of field names would drift the first time anyone added
+// a column, and a projection that rejects a field the table actually has is
+// indistinguishable to the caller from a field that does not exist.
+import schema from "./schema.js";
 import { enforceRateLimit, resolveApiKey } from "./sdk_ingest.js";
 
 import type { Doc, Id } from "./_generated/dataModel.js";
@@ -84,10 +90,173 @@ const RUN_STATUS = v.union(
   v.literal("timed_out"),
 );
 
+// ===========================================================================
+// FIELD PROJECTION (`fields`)
+// ===========================================================================
+//
+// WHY IT IS SERVER-SIDE. The MCP server (packages/mcp) already projects
+// documents down to a handful of fields before handing them to an agent, but
+// it does so AFTER receiving the full thirty-field document. That saves the
+// agent's context window and nothing else: the wire bytes, the Convex read
+// bandwidth, and the JSON serialization of every unwanted field were all
+// already paid. `fields` moves the projection to the only place that can
+// actually avoid those costs.
+//
+// THE FIVE RULES OF THIS CONTRACT. Three other teams build against them; they
+// are properties of the API, not implementation details.
+//
+//  1. OMITTING `fields` RETURNS THE FULL DOCUMENT, byte-for-byte as before.
+//     Projection is purely opt-in; every existing caller is unaffected.
+//
+//  2. AN UNKNOWN FIELD NAME IS A HARD ERROR, never silently ignored. This is
+//     the rule most likely to be "simplified" by a future editor, so: a
+//     dropped field name yields a document that is MISSING the data the
+//     caller asked for, which on the wire is indistinguishable from a
+//     document where that data is legitimately absent/null. This codebase has
+//     shipped that exact class of bug three times (see
+//     tests/unit/api_v1_failure_patterns_params.test.ts for the most recent).
+//     Rejecting loudly is the only behavior a caller can build on.
+//
+//  3. THE IDENTITY FIELD IS ALWAYS RETURNED, requested or not — `_id` for
+//     runs, `sequenceNumber` for events, `fingerprintHash` for failure
+//     patterns. A row you cannot address is not a useful row: the caller
+//     cannot fetch its detail, cannot de-duplicate it across pages, and
+//     cannot correlate it with anything. Callers do not have to remember to
+//     ask.
+//
+//  4. AN EMPTY ARRAY IS AN ERROR, not "return nothing". `fields: []` is
+//     overwhelmingly a bug in the caller's argument construction (a filter or
+//     `.map` that produced no entries), and answering it with a page of
+//     identity-only stubs would hide that bug behind plausible-looking data.
+//
+//  5. PROJECTION IS APPLIED AFTER ORG FILTERING, NEVER AS PART OF IT. Field
+//     selection changes what each record CONTAINS and can never change WHICH
+//     records come back. Every filter, index range, cursor and org check
+//     below runs against the complete document; `projectDoc` is the last
+//     thing that touches a row before it is returned.
+//
+// TENANCY. Field-name validation happens BEFORE any record lookup, in exactly
+// the position and for exactly the reason `apiGetRunEvents`'s `fromSequence`
+// validation does: an unknown-field error must be byte-identical whether the
+// referenced record is in the key's org, does not exist, or belongs to
+// another org. Validating after the lookup would make the error text a
+// cross-org existence oracle — this codebase closed 25 of those and is not
+// opening a 26th for a convenience parameter. Tests assert the three cases
+// produce identical messages.
+
+/** Resources whose documents this surface will project. Table names, so they cannot drift from the schema. */
+type ProjectableTable = "runs" | "events" | "failure_patterns";
+
+/**
+ * Convex system fields. Present on every document, absent from the schema's
+ * own validator, and legitimately selectable — `_creationTime` in particular
+ * is the only ordering key some rows have.
+ */
+const SYSTEM_FIELDS = ["_id", "_creationTime"] as const;
+
+/**
+ * The identity field per resource, always included in a projection.
+ * Deliberately NOT always `_id`: an event is addressed by its
+ * `sequenceNumber` within its run (Event Log Rule 4) and a failure pattern by
+ * its `fingerprintHash` (which is what every pattern-scoped endpoint here
+ * takes as its key), so those are the identifiers a caller actually needs
+ * back in order to do anything with the row.
+ */
+const IDENTITY_FIELD: Record<ProjectableTable, string> = {
+  runs: "_id",
+  events: "sequenceNumber",
+  failure_patterns: "fingerprintHash",
+};
+
+/**
+ * The valid field set for a resource, derived from the live schema rather
+ * than restated here. Sorted so the error message's "valid fields are: ..."
+ * list is stable across deployments — a caller (or a test) comparing two
+ * error strings must not see them differ because of field declaration order.
+ */
+function validFieldsFor(table: ProjectableTable): string[] {
+  return [...SYSTEM_FIELDS, ...Object.keys(schema.tables[table].validator.fields)].sort();
+}
+
+/** The `fields` validator, identical on every function that accepts it. */
+const FIELDS_ARG = v.optional(v.array(v.string()));
+
+/**
+ * Validate a `fields` selection and expand it with the resource's identity
+ * field. Returns `undefined` for an omitted selection, which `projectDoc`
+ * treats as "return the whole document".
+ *
+ * MUST be called before any `ctx.db.get`/index read — see the TENANCY note
+ * above.
+ */
+function validateFieldSelection(
+  table: ProjectableTable,
+  fields: string[] | undefined,
+): ReadonlySet<string> | undefined {
+  if (fields === undefined) return undefined;
+
+  const valid = validFieldsFor(table);
+  if (fields.length === 0) {
+    throw new Error(
+      `INVALID_ARGUMENT: fields must not be empty for ${table}; omit the argument to receive the full document (valid fields are: ${valid.join(", ")})`,
+    );
+  }
+
+  const validSet = new Set(valid);
+  for (const name of fields) {
+    if (!validSet.has(name)) {
+      throw new Error(
+        `INVALID_ARGUMENT: unknown field "${name}" for ${table}; valid fields are: ${valid.join(", ")}`,
+      );
+    }
+  }
+
+  // Rule 3: identity is not optional. Adding it here (rather than at
+  // projection time) also means a caller who DID request it is unaffected —
+  // a Set makes the two cases identical.
+  return new Set([...fields, IDENTITY_FIELD[table]]);
+}
+
+/**
+ * Project one document down to a validated selection.
+ *
+ * Iterates the DOCUMENT's keys, not the selection's, so a requested-but-unset
+ * optional field stays ABSENT rather than becoming an explicit `undefined`.
+ * That matters: `{ endedAt: undefined }` and `{}` serialize differently and a
+ * projected document must be indistinguishable from the corresponding slice
+ * of the full document.
+ *
+ * TYPING NOTE — the cast back to `T` is deliberate. Widening the declared
+ * return type to `T | Partial<T>` would break every existing consumer of
+ * these functions (apps/web services, the CLI, the SDK reader) even though
+ * none of them passes `fields`, which would violate rule 1 at the type level
+ * while honoring it at runtime. A caller that opts into `fields` has, by
+ * opting in, taken responsibility for reading only what it asked for.
+ */
+function projectDoc<T extends Record<string, unknown>>(doc: T, selection: ReadonlySet<string> | undefined): T {
+  if (selection === undefined) return doc;
+  const projected: Record<string, unknown> = {};
+  for (const key of Object.keys(doc)) {
+    if (selection.has(key)) projected[key] = doc[key];
+  }
+  return projected as T;
+}
+
+/** Vectorized `projectDoc`, for the list endpoints. */
+function projectDocs<T extends Record<string, unknown>>(docs: T[], selection: ReadonlySet<string> | undefined): T[] {
+  if (selection === undefined) return docs;
+  return docs.map((doc) => projectDoc(doc, selection));
+}
+
 /**
  * List runs for the key's org, with the same filter shape as convex/runs.ts
  * listRuns (status/agentId/environment/session), paginated. Cross-org
  * references (a foreign agentId) are validated the same way listRuns does.
+ *
+ * `fields` (optional) projects each returned run — see §FIELD PROJECTION.
+ * `_id` is always present. Filtering happens on the complete documents; the
+ * projection is applied to the finished page and cannot change which runs it
+ * contains.
  */
 export const apiListRuns = mutation({
   args: {
@@ -98,9 +267,14 @@ export const apiListRuns = mutation({
     sessionId: v.optional(v.string()),
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
+    fields: FIELDS_ARG,
   },
   handler: async (ctx, args) => {
     const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+    // BEFORE the agent lookup below, which is itself a record lookup that can
+    // throw "not found in this organization" — a bad field name must not be
+    // able to tell those two failures apart.
+    const selection = validateFieldSelection("runs", args.fields);
     const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
 
     let agentId: Id<"agents"> | undefined;
@@ -118,7 +292,9 @@ export const apiListRuns = mutation({
         .withIndex("by_org_session", (q) => q.eq("orgId", apiKey.orgId).eq("sessionId", args.sessionId))
         .order("desc")
         .take(limit);
-      return { runs, nextCursor: undefined, pageSize: runs.length };
+      // pageSize counts ROWS, and is computed from the pre-projection array
+      // for that reason — projection never changes cardinality.
+      return { runs: projectDocs(runs, selection), nextCursor: undefined, pageSize: runs.length };
     }
 
     let runsQuery;
@@ -144,11 +320,21 @@ export const apiListRuns = mutation({
     // selects `by_agent_started`, which encodes neither `status` nor
     // `environment` — both used to be silently dropped whenever combined
     // with `agentId` (e.g. `agentId=X&status=failed` returned ALL of agent
-    // X's runs, not just its failed ones, with no error). Re-applied here as
-    // in-memory secondary filters, same overfetch-then-filter pattern
-    // already used by runs.ts listRuns/listRunsByVerification — redundant
-    // but harmless in the branches where the index already encoded the
-    // condition (by_org_status / by_org_environment_started).
+    // X's runs, not just its failed ones, with no error). Re-applied here —
+    // redundant but harmless in the branches where the index already encoded
+    // the condition (by_org_status / by_org_environment_started).
+    //
+    // THESE ARE `q.filter()` PREDICATES, NOT AN IN-MEMORY PASS OVER A
+    // FINISHED PAGE, and that distinction is the whole reason this endpoint
+    // does not need the overfetch-then-filter machinery
+    // `apiListFailurePatterns` below does. Convex applies a `.filter()`
+    // during pagination, so `numItems` counts rows that ALREADY SATISFIED
+    // every predicate: a request for 25 returns 25 matches if 25 exist
+    // anywhere down the cursor, and an empty page really does mean "nothing
+    // matched". Filtering the RESULT of `.paginate()` instead — which is
+    // what this function's comments used to describe, inaccurately — is the
+    // silent-empty-page bug fixed below. Do not "simplify" these into a
+    // `page.page.filter(...)`.
     const filtered = runsQuery
       .filter((q) => q.eq(q.field("orgId"), apiKey.orgId))
       .filter((q) =>
@@ -162,7 +348,9 @@ export const apiListRuns = mutation({
     const page = await filtered.paginate({ numItems: limit, cursor: args.cursor ?? null });
 
     return {
-      runs: page.page,
+      // LAST thing to touch the rows: every filter, index range and cursor
+      // above ran against the complete documents.
+      runs: projectDocs(page.page, selection),
       nextCursor: page.isDone ? undefined : page.continueCursor,
       pageSize: page.page.length,
     };
@@ -175,11 +363,20 @@ export const apiListRuns = mutation({
  * `.collect()` — sequence numbers are contiguous from 1 (Event Log Rule 4),
  * so the max sequence number IS the event count. artifactCount is bounded by
  * MAX_ARTIFACTS_PER_RUN already, so a direct count is cheap.
+ *
+ * `fields` (optional) projects the `run` document only — see §FIELD
+ * PROJECTION. `_id` is always present. The derived `eventCount` /
+ * `artifactCount` are NOT run fields and are always returned: they are
+ * already the cheap summary this endpoint exists to provide, and making them
+ * selectable would invite a caller to ask for a "field" that has no
+ * corresponding column.
  */
 export const apiGetRun = mutation({
-  args: { apiKeyHash: v.string(), runId: v.string() },
+  args: { apiKeyHash: v.string(), runId: v.string(), fields: FIELDS_ARG },
   handler: async (ctx, args) => {
     const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+    // BEFORE the run lookup: identical error for present / absent / other-org.
+    const selection = validateFieldSelection("runs", args.fields);
     const runId = args.runId as Id<"runs">;
     const run = await ctx.db.get(runId);
     if (!run || run.orgId !== apiKey.orgId) {
@@ -197,7 +394,7 @@ export const apiGetRun = mutation({
       .collect();
 
     return {
-      run,
+      run: projectDoc(run, selection),
       eventCount: latestEvent ? latestEvent.sequenceNumber : 0,
       artifactCount: artifacts.length,
     };
@@ -232,6 +429,13 @@ export const apiGetRun = mutation({
  * `sequenceNumber` against the requested floor — the two are otherwise
  * indistinguishable, which is why this implementation must genuinely honor
  * the floor rather than accept-and-ignore it.
+ *
+ * `fields` (optional) projects each returned event — see §FIELD PROJECTION.
+ * `sequenceNumber` is always present (it is the event's identity within its
+ * run), so a caller can always tell where in the log a projected event sits,
+ * and the accept-and-ignore check described above keeps working under
+ * projection. `fields: ["type"]` is the cheap "what happened, in order" read
+ * that does not drag every `payload` across the wire.
  */
 export const apiGetRunEvents = mutation({
   args: {
@@ -240,13 +444,19 @@ export const apiGetRunEvents = mutation({
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
     fromSequence: v.optional(v.number()),
+    fields: FIELDS_ARG,
   },
   handler: async (ctx, args) => {
     const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
 
-    // Validated BEFORE the run lookup so a malformed floor cannot be used to
-    // probe run existence: an invalid `fromSequence` fails identically for a
-    // run in the key's org, an unknown run, and another org's run.
+    // Validated BEFORE the run lookup for exactly the same reason
+    // `fromSequence` is, immediately below — and deliberately in the same
+    // place, so the two argument validations cannot diverge in their
+    // oracle-safety. Note that a bad `fields` and a bad `fromSequence` are
+    // both decided with zero database reads, so neither can leak whether the
+    // run exists.
+    const selection = validateFieldSelection("events", args.fields);
+
     const fromSequence = args.fromSequence;
     if (fromSequence !== undefined && (!Number.isSafeInteger(fromSequence) || fromSequence < 1)) {
       throw new Error(
@@ -271,7 +481,9 @@ export const apiGetRunEvents = mutation({
       .paginate({ numItems: limit, cursor: args.cursor ?? null });
 
     return {
-      events: page.page,
+      // Applied after the window floor and the org check, never as part of
+      // them: `fields` cannot move the floor or change which events match it.
+      events: projectDocs(page.page, selection),
       nextCursor: page.isDone ? undefined : page.continueCursor,
     };
   },
@@ -362,16 +574,21 @@ export const apiGetExplanation = mutation({
 //
 // `agentId`, when supplied, is validated org-scoped exactly like apiListRuns'
 // `agentId` filter, then resolved to that agent's `agent_versions` ids so the
-// (already org-scoped, already paginated) page of patterns can be narrowed to
-// ones whose `affectedAgentVersionIds` intersects — an in-memory filter over
-// the fetched page, same overfetch-then-filter pattern apiListRuns uses for
-// its own secondary filters.
+// already org-scoped patterns can be narrowed to ones whose
+// `affectedAgentVersionIds` intersects.
+//
+// EVERY FILTER ON THIS ENDPOINT IS IN-MEMORY (none of the fields they read is
+// indexed), which is why this function — alone on this surface — runs the
+// bounded overfetch-then-filter scan documented immediately above
+// `apiListFailurePatterns` rather than filtering a single `.paginate()` page.
+// apiListRuns is NOT a precedent for that: its secondary filters are
+// `q.filter()` predicates that Convex applies DURING pagination.
 //
 // `spiking`, when `true` (PREVENTION cycle 2 — proactive filtering), narrows
 // the same fetched page further to patterns whose most recent spike
 // assessment flagged them as currently spiking
-// (`lastSpikeAssessment?.isSpiking === true`). Same overfetch-then-filter
-// in-memory approach as `agentId` above — there is no secondary index on
+// (`lastSpikeAssessment?.isSpiking === true`). Same bounded-scan in-memory
+// approach as `agentId` above — there is no secondary index on
 // `lastSpikeAssessment.isSpiking` (it's an optional nested field on a rollup
 // row, not worth a dedicated index for what is an observability-grade,
 // derived filter). `spiking: false` (or omitted) returns all patterns,
@@ -388,7 +605,7 @@ function isPatternMuted(pattern: Doc<"failure_patterns">): boolean {
 }
 
 // `status`/`regressed` (Resolution cycle 1 — docs/adr/006-failure-resolution.md,
-// Team A's lifecycle fields on `failure_patterns`): same overfetch-then-filter,
+// Team A's lifecycle fields on `failure_patterns`): same bounded-scan,
 // in-memory approach as `spiking`/`muted` above — no secondary index on
 // `status`/`regressedAt`, both are read-side-only narrowings over the already
 // org-scoped page. `status`, when supplied, matches exactly against the
@@ -543,6 +760,114 @@ function recurredSinceResolution(pattern: Doc<"failure_patterns">, now: number):
   );
 }
 
+// ---------------------------------------------------------------------------
+// BOUNDED OVERFETCH-THEN-FILTER (the fix for the silent-empty-page bug)
+// ---------------------------------------------------------------------------
+//
+// THE BUG THIS REPLACES. Every one of this endpoint's filters — agentId,
+// spiking, muted, status, regressed, state — reads a field with no index, so
+// all of them run in memory. They used to run in memory over ONE
+// already-paginated page: `.paginate({ numItems: limit })` first, `.filter()`
+// second. `numItems` therefore counted ROWS EXAMINED, not rows matched, so a
+// request for 25 could return 0 matches with a `nextCursor` set while matches
+// sat on page 2. The caller saw a well-formed empty page and no way to tell it
+// from "nothing matched".
+//
+// WHY THAT WAS WORSE THAN A COSMETIC PAGINATION WART. `state=regressed` exists
+// to be a CI gate — "fail the build if a confirmed-fixed pattern regressed"
+// (`afr patterns --state regressed`). Under the old ordering that command
+// could report all-clear while a regression sat one page down, and the build
+// went green. A regression detector that silently answers "nothing here" is
+// worse than no detector, because a team stops looking. This is the same
+// family as the `--spiking`/`--muted` defect that shipped for weeks: the
+// filter predicate was correct both times, and the ANSWER was still wrong.
+//
+// THE SHAPE OF THE FIX is runs.ts's `listRunsByVerification`, deliberately —
+// this codebase now has exactly two overfetch-then-filter readers and they
+// work the same way, rather than three that each work slightly differently:
+//
+//   * Read a scan window LARGER than `limit` from the base index, then count
+//     MATCHES rather than rows when deciding what the page contains.
+//   * Bound that window. A filter with no matches in a large org must not turn
+//     one request into a full-table read.
+//   * Carry `{ underlyingCursor, skip }` as the cursor instead of a raw Convex
+//     cursor, for the reason spelled out on `VerifyCursor` in runs.ts: a scan
+//     window can yield MORE matches than `limit`, and a raw continuation
+//     cursor can only resume PAST the whole window, so the surplus matches
+//     would be skipped outright. `skip` resumes mid-window.
+//
+// WHY ONE BIG `.paginate()` AND NOT A LOOP OF SMALL ONES. The obvious
+// implementation — keep paginating until `limit` matches accumulate — does not
+// run. Convex permits exactly ONE `.paginate()` per function execution
+// ("Only a single paginated query is allowed per function execution", enforced
+// at runtime by the real backend and by convex-test alike). A loop was written
+// first and every filtered test failed on that error, so: the window is taken
+// in a single call, and the ceiling is therefore the window SIZE rather than a
+// running total across batches. Do not reintroduce the loop.
+//
+// The consequence is that the scan window is sized by whether an in-memory
+// filter is actually active. With none, `limit` rows ARE `limit` matches and
+// the endpoint reads exactly what it returns, byte-for-byte as before. Only a
+// filtered request pays for the wider window, which is the request that
+// previously got a wrong answer for free.
+//
+// AND IT SAYS SO WHEN IT STOPS SHORT. Stopping on the ceiling — window full,
+// page not filled, table not exhausted — sets `scanTruncated: true` alongside
+// `nextCursor`, the same contract `exposure.runCountTruncated` already offers
+// ("this number is a floor, ask again to see more"). A silently capped scan is
+// the original bug wearing a different hat: it produces a short-or-empty page
+// that is, on the wire, indistinguishable from a complete answer. With the
+// flag, an empty page carrying `scanTruncated: false` means "nothing matched,
+// full stop" — and that is the assertion a CI gate is entitled to make.
+
+/**
+ * Hard ceiling on rows examined for one request. The endpoint returns
+ * `scanTruncated: true` plus a resumable cursor rather than reading past it.
+ * Chosen to sit in the same order of magnitude as the other bounded scans this
+ * surface already performs per request (the resolution exposure scan's 2000
+ * run rows), so a `--state` query costs no more than the evidence endpoint it
+ * complements.
+ */
+const PATTERN_SCAN_ROW_CEILING = 2_000;
+
+/**
+ * This endpoint's cursor: the underlying `failure_patterns` cursor for the
+ * START of the scan window that produced this page, plus how many of that
+ * window's matches have already been delivered. Opaque to callers — a string
+ * they hand back unmodified. Same encoding as runs.ts's `VerifyCursor`.
+ */
+interface PatternScanCursor {
+  underlyingCursor: string | null;
+  skip: number;
+}
+
+function decodePatternScanCursor(cursor: string | undefined): PatternScanCursor {
+  if (!cursor) return { underlyingCursor: null, skip: 0 };
+  try {
+    const parsed: unknown = JSON.parse(cursor);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      "skip" in parsed &&
+      typeof (parsed as { skip: unknown }).skip === "number"
+    ) {
+      const p = parsed as { underlyingCursor: string | null; skip: number };
+      return { underlyingCursor: p.underlyingCursor ?? null, skip: Math.max(0, p.skip) };
+    }
+  } catch {
+    // fall through to the fallback below
+  }
+  // BACK-COMPAT + defence: a cursor issued by the previous implementation (or
+  // by anything else) is a raw underlying cursor. Treating it as one keeps an
+  // in-flight pagination from erroring across a deploy; it simply resumes at
+  // that batch boundary with nothing skipped.
+  return { underlyingCursor: cursor, skip: 0 };
+}
+
+function encodePatternScanCursor(c: PatternScanCursor): string {
+  return JSON.stringify(c);
+}
+
 export const apiListFailurePatterns = mutation({
   args: {
     apiKeyHash: v.string(),
@@ -565,9 +890,24 @@ export const apiListFailurePatterns = mutation({
     ),
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
+    // Projects the returned `patterns` documents only — see §FIELD
+    // PROJECTION. `fingerprintHash` is always present. The `fixConfidence`
+    // envelope is NOT projected and is keyed by `fingerprintHash`, so it
+    // stays joinable to a projected page no matter how narrow the selection;
+    // that is a second, independent reason identity is non-optional here.
+    //
+    // Every filter above (agentId / spiking / muted / status / regressed /
+    // state) reads fields that a narrow projection would omit — which is
+    // precisely why projection runs last, on the finished page. Selecting
+    // `["label"]` must not quietly disable the `state` filter.
+    fields: FIELDS_ARG,
   },
   handler: async (ctx, args) => {
     const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+    // BEFORE the agent lookup below (which throws "not found in this
+    // organization" for a foreign agentId) — same oracle argument as
+    // apiListRuns.
+    const selection = validateFieldSelection("failure_patterns", args.fields);
     // AUDIT FIX (cycle 3): clamp below 1 as well as above MAX_PAGE_SIZE — an
     // unclamped non-positive `limit` (e.g. `--limit -5`, or `0`) used to be
     // passed straight to `.paginate({ numItems })` unvalidated, which is at
@@ -592,67 +932,160 @@ export const apiListFailurePatterns = mutation({
       agentVersionIds = new Set(versions.map((version) => String(version._id)));
     }
 
-    const page = await ctx.db
+    // SERVER clock, read once so every entry in one response is aged against
+    // the same instant — and, now that a request can span several batches,
+    // so a pattern near the end of the scan is not graded against a later
+    // instant than one near the start.
+    const now = Date.now();
+
+    // Every filter EXCEPT `state`. Split out because `unevaluated` below is
+    // defined over the candidates that survive these — a pattern excluded by
+    // `muted` or `agentId` is not "ungradable", it is simply not being asked
+    // about.
+    function matchesNonStateFilters(pattern: Doc<"failure_patterns">): boolean {
+      // Tenancy safety net. The index above is already org-scoped; this makes
+      // a cross-org row impossible to deliver even if that ever changes.
+      if (pattern.orgId !== apiKey.orgId) return false;
+      if (
+        agentVersionIds !== undefined &&
+        !pattern.affectedAgentVersionIds.some((versionId) => agentVersionIds.has(String(versionId)))
+      ) {
+        return false;
+      }
+      if (args.spiking === true && pattern.lastSpikeAssessment?.isSpiking !== true) return false;
+      if (args.muted !== undefined && isPatternMuted(pattern) !== args.muted) return false;
+      if (args.status !== undefined && patternStatus(pattern) !== args.status) return false;
+      if (args.regressed === true && pattern.regressedAt === undefined) return false;
+      return true;
+    }
+
+    function matchesStateFilter(pattern: Doc<"failure_patterns">): boolean {
+      if (args.state === undefined) return true;
+      const snapshot = isFixConfidenceSnapshotUsable(pattern) ? pattern.lastFixConfidence : undefined;
+      // `regressed` additionally keeps its exact, snapshot-independent path,
+      // so this filter is never weaker than it was before snapshots existed
+      // and never depends on the cron having run. The two can only ever
+      // agree — `recurred` short-circuits the engine before exposure is
+      // consulted — so OR-ing them cannot manufacture a false positive; it
+      // only refuses to lose a true one.
+      if (args.state === "regressed" && recurredSinceResolution(pattern, now)) return true;
+      return snapshot?.state === args.state;
+    }
+
+    const { underlyingCursor, skip } = decodePatternScanCursor(args.cursor);
+    // Matches this request must reach before the page is complete: the ones
+    // already delivered out of this window, plus a full page of new ones.
+    const needed = skip + limit;
+
+    // Is any filter that runs IN MEMORY actually active? `spiking: false` and
+    // `regressed: false` are documented no-ops (they mean "do not narrow"), so
+    // they do not count — treating them as active would make every default
+    // `afr patterns` call pay for the wide window it does not need.
+    const filtering =
+      agentVersionIds !== undefined ||
+      args.spiking === true ||
+      args.muted !== undefined ||
+      args.status !== undefined ||
+      args.regressed === true ||
+      args.state !== undefined;
+
+    // Unfiltered: rows ARE matches, so reading `needed` of them is exact and
+    // this endpoint costs precisely what it did before. Filtered: read the
+    // bounded window, because the whole defect being fixed is that `numItems`
+    // counted rows the filters were about to throw away.
+    const scanSize = filtering ? PATTERN_SCAN_ROW_CEILING : needed;
+
+    const matches: Doc<"failure_patterns">[] = [];
+    // Candidates that HAVE something to grade but no usable snapshot to grade
+    // it with. Collected BEFORE the state filter is consulted, so the caller
+    // learns about them even though they cannot match — "we could not
+    // evaluate these three" is a materially different answer from "these
+    // three are not confirmed", and collapsing the two is precisely the
+    // silent lie cycle 2 refused to ship. Scoped to the rows this request
+    // actually examined (deduped, in encounter order): now that the scan
+    // window is wider than the page, that is the honest bound on what this
+    // response can speak for.
+    const unevaluatedSeen = new Set<string>();
+    const unevaluatedAll: string[] = [];
+
+    // THE one permitted `.paginate()` for this execution. See the header
+    // above for why this is a single wide read and not a loop.
+    const scanWindow = await ctx.db
       .query("failure_patterns")
       .withIndex("by_org_lastSeenAt", (q) => q.eq("orgId", apiKey.orgId))
       .order("desc")
-      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+      .paginate({ numItems: scanSize, cursor: underlyingCursor });
 
-    let patterns =
-      agentVersionIds === undefined
-        ? page.page
-        : page.page.filter((pattern) =>
-            pattern.affectedAgentVersionIds.some((versionId) => agentVersionIds.has(String(versionId))),
-          );
-
-    if (args.spiking === true) {
-      patterns = patterns.filter((pattern) => pattern.lastSpikeAssessment?.isSpiking === true);
+    for (const pattern of scanWindow.page) {
+      if (!matchesNonStateFilters(pattern)) continue;
+      if (
+        pattern.resolvedAt !== undefined &&
+        !isFixConfidenceSnapshotUsable(pattern) &&
+        !unevaluatedSeen.has(pattern.fingerprintHash)
+      ) {
+        unevaluatedSeen.add(pattern.fingerprintHash);
+        unevaluatedAll.push(pattern.fingerprintHash);
+      }
+      if (matchesStateFilter(pattern)) matches.push(pattern);
     }
 
-    if (args.muted !== undefined) {
-      patterns = patterns.filter((pattern) => isPatternMuted(pattern) === args.muted);
+    const scannedRows = scanWindow.page.length;
+    const exhausted = scanWindow.isDone;
+    // Truncated means: the window ran out before the page filled AND before
+    // the table did. Exhaustion is checked FIRST — "there is nothing left" is
+    // a stronger answer than "I stopped early", and a scan that reaches the
+    // end of the table must never be reported as truncated. A window that
+    // filled the page is not truncated either: the caller has a full page and
+    // a cursor, which is an ordinary complete answer.
+    const scanTruncated = !exhausted && matches.length < needed;
+
+    const windowed = matches.slice(skip, skip + limit);
+
+    let nextCursor: string | undefined;
+    if (matches.length > needed) {
+      // Surplus matches remain INSIDE this window, so resume by re-reading the
+      // same window and skipping further into it. Advancing to
+      // `continueCursor` instead would drop them — that is the bug runs.ts's
+      // VerifyCursor comment records having actually shipped once, and it is
+      // why a raw Convex cursor cannot express this endpoint's position.
+      //
+      // The re-read is the price of Convex's one-paginate-per-execution rule.
+      // It is bounded by the ceiling on every request, and it only happens
+      // when a window is match-dense — precisely the case where the caller is
+      // getting full pages back.
+      nextCursor = encodePatternScanCursor({ underlyingCursor, skip: needed });
+    } else if (!exhausted) {
+      // Every match found has been delivered, but the table is not finished —
+      // the window either filled the page exactly or hit the ceiling. Resume
+      // at this window's continuation: nothing re-seen, nothing skipped.
+      nextCursor = encodePatternScanCursor({ underlyingCursor: scanWindow.continueCursor, skip: 0 });
     }
 
-    if (args.status !== undefined) {
-      patterns = patterns.filter((pattern) => patternStatus(pattern) === args.status);
-    }
-
-    if (args.regressed === true) {
-      patterns = patterns.filter((pattern) => pattern.regressedAt !== undefined);
-    }
-
-    // SERVER clock, read once so every entry in one response is aged against
-    // the same instant.
-    const now = Date.now();
-
-    // Candidates that HAVE something to grade but no usable snapshot to grade
-    // it with. Computed BEFORE the state filter runs, so the caller learns
-    // about them even though they cannot match — "we could not evaluate these
-    // three" is a materially different answer from "these three are not
-    // confirmed", and collapsing the two is precisely the silent lie cycle 2
-    // refused to ship.
-    const unevaluated = patterns
-      .filter((pattern) => pattern.resolvedAt !== undefined && !isFixConfidenceSnapshotUsable(pattern))
-      .map((pattern) => pattern.fingerprintHash);
-
-    if (args.state !== undefined) {
-      const wanted = args.state;
-      patterns = patterns.filter((pattern) => {
-        const snapshot = isFixConfidenceSnapshotUsable(pattern) ? pattern.lastFixConfidence : undefined;
-        // `regressed` additionally keeps its exact, snapshot-independent path,
-        // so this filter is never weaker than it was before snapshots existed
-        // and never depends on the cron having run. The two can only ever
-        // agree — `recurred` short-circuits the engine before exposure is
-        // consulted — so OR-ing them cannot manufacture a false positive; it
-        // only refuses to lose a true one.
-        if (wanted === "regressed" && recurredSinceResolution(pattern, now)) return true;
-        return snapshot?.state === wanted;
-      });
-    }
+    // Bounded to one page's worth, matching the bound this list had when the
+    // scan window WAS the page, with the overflow declared rather than
+    // trimmed in silence.
+    const unevaluated = unevaluatedAll.slice(0, limit);
 
     return {
-      patterns,
-      nextCursor: page.isDone ? undefined : page.continueCursor,
+      // Projected LAST — after every filter and after `unevaluated` / the
+      // `fixConfidence` entries below were computed from the complete
+      // documents. Those close over `windowed`, the pre-projection array,
+      // which is why the projection is inlined here rather than reassigned.
+      patterns: projectDocs(windowed, selection),
+      nextCursor,
+      /**
+       * True when the scan stopped on PATTERN_SCAN_ROW_CEILING rather than on
+       * the end of the table. The page may be short or empty purely because
+       * of that ceiling, so a caller MUST NOT read an empty page as "nothing
+       * matched" while this is true — follow `nextCursor` instead. False
+       * means the returned page is the complete answer up to `limit`: an
+       * empty page really does mean nothing matched, anywhere. Same contract
+       * as `exposure.runCountTruncated`.
+       */
+      scanTruncated,
+      /** Rows examined to produce this page, and the ceiling that bounds it. */
+      scannedRows,
+      scanRowCeiling: PATTERN_SCAN_ROW_CEILING,
       // Honesty envelope (ADR-006 cycle 3). Always present, filtered or not,
       // so a client can render a staleness marker next to a verdict without
       // having to ask for it — and so the bound itself is transported rather
@@ -660,19 +1093,30 @@ export const apiListFailurePatterns = mutation({
       fixConfidence: {
         stalenessBoundMs: FIX_CONFIDENCE_SNAPSHOT_STALE_AFTER_MS,
         /** One entry per RETURNED pattern, in the same order. */
-        entries: patterns.map((pattern) => confidenceEntryFor(pattern, now)),
+        entries: windowed.map((pattern) => confidenceEntryFor(pattern, now)),
         /** How many returned entries are served from a snapshot older than the bound. */
-        staleCount: patterns.filter((pattern) => {
+        staleCount: windowed.filter((pattern) => {
           const snapshot = isFixConfidenceSnapshotUsable(pattern) ? pattern.lastFixConfidence : undefined;
           return snapshot !== undefined && isFixConfidenceSnapshotStale(snapshot, now);
         }).length,
         /**
-         * Fingerprints on this page that have a live resolution but no usable
-         * snapshot, and so could not be graded at all. Never silently dropped
-         * — a caller filtering by `state` must be able to tell "not matching"
-         * from "not evaluated".
+         * Fingerprints EXAMINED FOR THIS PAGE that have a live resolution but
+         * no usable snapshot, and so could not be graded at all. Never
+         * silently dropped — a caller filtering by `state` must be able to
+         * tell "not matching" from "not evaluated". Scoped to the rows this
+         * request scanned (which, with the bounded overfetch above, is a
+         * superset of the returned page — by construction, since an
+         * ungradable pattern is exactly one that cannot match a `state`
+         * filter).
          */
         unevaluated,
+        /**
+         * True when more ungradable fingerprints were found than the list
+         * above carries. The list is capped at `limit` so one request cannot
+         * return an unbounded array of hashes; the flag is what keeps that cap
+         * from being another silent truncation.
+         */
+        unevaluatedTruncated: unevaluatedAll.length > unevaluated.length,
       },
     };
   },
@@ -717,10 +1161,25 @@ export interface ApiPatternResolutionEvidence {
   confidence: FixConfidenceResult | null;
 }
 
+/**
+ * `fields` (optional) projects the embedded `pattern` DOCUMENT only — see
+ * §FIELD PROJECTION. `fingerprintHash` is always present. The derived
+ * evidence (`resolution`, `exposure`, `transitions`, `confidence`) is not a
+ * document and is never projected; it is also computed from the COMPLETE
+ * pattern before projection, so a narrow selection cannot change a verdict.
+ * Same valid-field set and same identity field as `apiListFailurePatterns` —
+ * deliberately, so `failure_patterns` means one thing on this surface.
+ */
 export const apiGetFailurePatternEvidence = mutation({
-  args: { apiKeyHash: v.string(), fingerprintHash: v.string() },
+  args: { apiKeyHash: v.string(), fingerprintHash: v.string(), fields: FIELDS_ARG },
   handler: async (ctx, args): Promise<ApiPatternResolutionEvidence | null> => {
     const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+    // BEFORE the fingerprint lookup. This endpoint returns `null` (not a
+    // throw) for an unknown-or-foreign fingerprint precisely so the two are
+    // indistinguishable; validating `fields` after the lookup would undo that
+    // by making "unknown field" reachable only for fingerprints that exist in
+    // the caller's org.
+    const selection = validateFieldSelection("failure_patterns", args.fields);
 
     const pattern = await ctx.db
       .query("failure_patterns")
@@ -762,7 +1221,7 @@ export const apiGetFailurePatternEvidence = mutation({
     // hold" evidence below stays computable. A pattern with status "open" and
     // a non-null exposure is therefore valid and expected, not a bug.
     if (pattern.resolvedAt === undefined) {
-      return { pattern, resolution: null, exposure: null, transitions, confidence: null };
+      return { pattern: projectDoc(pattern, selection), resolution: null, exposure: null, transitions, confidence: null };
     }
 
     const resolvedInVersion =
@@ -792,7 +1251,7 @@ export const apiGetFailurePatternEvidence = mutation({
     // Unreachable: null is returned only for an absent `resolvedAt`, which the
     // guard above already handled.
     if (!computation) {
-      return { pattern, resolution: null, exposure: null, transitions, confidence: null };
+      return { pattern: projectDoc(pattern, selection), resolution: null, exposure: null, transitions, confidence: null };
     }
 
     const exposure: PatternResolutionExposure = {
@@ -810,6 +1269,6 @@ export const apiGetFailurePatternEvidence = mutation({
       heldSoFar: computation.recurrenceCount === 0,
     };
 
-    return { pattern, resolution, exposure, transitions, confidence: computation.confidence };
+    return { pattern: projectDoc(pattern, selection), resolution, exposure, transitions, confidence: computation.confidence };
   },
 });

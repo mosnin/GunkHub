@@ -488,18 +488,85 @@ See `examples/read_back.ts` for the full runnable version.
 | Method | Endpoint | Returns |
 |---|---|---|
 | `listRuns(filters?)` | `GET /api/v1/runs` | `{ runs, nextCursor?, pageSize?, total? }` |
-| `getRun(runId)` | `GET /api/v1/runs/:id` | `{ run, eventCount, artifactCount }` |
-| `getRunEvents(runId, { limit?, cursor? })` | `GET /api/v1/runs/:id/events` | `{ events, nextCursor? }` |
-| `getRunEventWindow(runId, { fromSequence? \| aroundSequence?, limit? })` | `GET /api/v1/runs/:id/events?fromSequence=` | `{ events, fromSequence, nextCursor? }` |
+| `getRun(runId, { fields? })` | `GET /api/v1/runs/:id` | `{ run, eventCount, artifactCount }` |
+| `getRunEvents(runId, { limit?, cursor?, fields? })` | `GET /api/v1/runs/:id/events` | `{ events, nextCursor? }` |
+| `getRunEventWindow(runId, { fromSequence? \| aroundSequence?, limit?, fields? })` | `GET /api/v1/runs/:id/events?fromSequence=` | `{ events, fromSequence, nextCursor? }` |
 | `iterateEvents(runId, { pageSize? })` | (pages `getRunEvents` transparently) | `AsyncGenerator<Event>` |
 | `getReplay(runId)` | `GET /api/v1/runs/:id/replay` | `{ projection, failureSummary }` |
 | `getExplanation(runId)` | `GET /api/v1/runs/:id/explanation` | `{ explanation, status?, runStatus?, runEndedAt? }` |
 | `getFailurePatterns(filters?)` | `GET /api/v1/patterns` | `{ patterns, nextCursor?, fixConfidence? }` |
 | `getFailurePatternEvidence(fingerprintHash)` | `GET /api/v1/patterns/:hash/evidence` | `PatternResolutionEvidence` |
 
-`filters` for `listRuns`: `status`, `agentId`, `environment`, `sessionId`, `limit`, `cursor` (all optional).
+`filters` for `listRuns`: `status`, `agentId`, `environment`, `sessionId`, `limit`, `cursor`, `fields` (all optional).
 
-`filters` for `getFailurePatterns`: `agentId`, `spiking`, `muted`, `status`, `regressed`, `state`, `limit`, `cursor` (all optional).
+`filters` for `getFailurePatterns`: `agentId`, `spiking`, `muted`, `status`, `regressed`, `state`, `limit`, `cursor`, `fields` (all optional).
+
+### `fields` — asking for less of each document
+
+Every read that returns stored documents — `listRuns`, `getRun`,
+`getRunEvents`, `getRunEventWindow`, `getFailurePatterns` — takes an optional
+`fields?: string[]`, forwarded verbatim as `?fields=a,b,c`. Ask for less and
+less comes back:
+
+```typescript
+// A run list for a status board: two fields per run instead of twenty-five.
+const { runs } = await reader.listRuns({ status: 'failed', limit: 200, fields: ['status', 'startedAt'] })
+
+// An event index with no payloads — payload is what makes an event page big.
+const { events } = await reader.getRunEvents(runId, { limit: 500, fields: ['type', 'sequenceNumber', 'timestamp'] })
+
+// Composes with the window read.
+const { events: slice } = await reader.getRunEventWindow(runId, { aroundSequence: 5000, fields: ['type'] })
+```
+
+- **Omit `fields` for the full document.** That is the default and what every
+  pre-0.15.0 caller already does — nothing about an existing call changed.
+- **The identity field always comes back**, named or not, so a projected row is
+  always re-identifiable. Don't spend a slot on it. It is **not `id` on every
+  resource** — a run is keyed by its document id, an event by `sequenceNumber`
+  (event-log rule 4), a failure pattern by `fingerprintHash`. See the exported
+  `PROJECTION_IDENTITY_FIELDS` table.
+- **The field vocabulary is the server's.** This SDK holds no second copy of
+  the projectable field list to check yours against — a client-side copy drifts
+  and starts rejecting fields a newer deployment supports. An unknown field is
+  the server's `400 INVALID_ARGUMENT` naming the offender, surfacing as
+  `V1ApiError` with `kind: 'invalid_response'` and `status: 400`.
+- **Malformed lists are rejected, never repaired.** An empty list, an empty or
+  whitespace-padded entry, an entry containing a comma, or a duplicate all
+  throw a `RangeError` before any request goes out. These are *shape* rules,
+  not vocabulary: the route rejects the same inputs, and quietly trimming
+  `' status '` or deduping would hide a caller whose field list was built wrong.
+- **Typing caveat:** results are still typed as the full `Run`/`Event`/
+  `FailurePattern` (so adding this parameter broke no signature). When you
+  project, treat them as `Partial<T>` plus the identity field — unrequested
+  fields are absent at runtime even though the type says otherwise.
+
+**Server support required — and verified, not assumed.** Exactly like
+`fromSequence` (below), a deployment that predates `?fields=` silently *drops*
+the unknown query parameter and returns the **full document** — which is
+indistinguishable, to a caller reading `run.status`, from a projection that
+happened to include everything it looked at. So the projection is checked
+rather than trusted: if any returned document carries a field outside
+`requested ∪ identity`, the server did not honor the request and the call throws
+`V1ApiError` (`kind: 'invalid_response'`) naming the missing support, instead
+of handing back a full document dressed as a projection.
+
+The check only ever fires on evidence, never on a guess. *Extra* fields are
+proof the parameter was ignored — a server that applied it cannot emit a field
+nobody asked for. *Missing* fields prove nothing and are never flagged: most
+entity fields are optional (`endedAt`, `sessionId`, `muted`, …), so a correctly
+projected document routinely lacks fields that were requested. And where there
+is no evidence at all — no `fields` requested, an empty page, an absent
+document — it stays silent.
+
+`getRunEventWindow` always adds `sequenceNumber` to whatever you name, because
+its ignored-`fromSequence` check reads it; projecting it away would silently
+disarm that check and let the head of the log come back as "the window". (It is
+also the events identity field, so the server returns it anyway — asking
+explicitly means the guarantee does not rest on that.)
+`getFailurePatterns`'s `fixConfidence.entries` are keyed by `fingerprintHash`
+and are not projected — keep `fingerprintHash` in your list if you mean to join
+them back.
 
 ### `getRunEventWindow(runId, options)` — a bounded slice of the event log
 
@@ -614,7 +681,7 @@ auth/not-found/rate-limit/server/network/malformed-response failure:
 | `'rate_limited'` | Per-key rate limit exceeded — `err.retryAfterSeconds` is set when the server sent `retry-after` |
 | `'server'` | 5xx from the backend — safe to retry with backoff |
 | `'network'` | The request itself failed (DNS, connection refused, timeout) |
-| `'invalid_response'` | The response body didn't match the expected `{ apiVersion, data }` envelope |
+| `'invalid_response'` | The response body didn't match the expected `{ apiVersion, data }` envelope; a bad request rejected by the server (HTTP 400 — e.g. `fields` naming a field it doesn't know, `err.status === 400`); or the server silently ignored a capability that was asked for (`fromSequence`, `fields` — no `err.status`, and the message names the missing support) |
 
 `err.status` (HTTP status, when there was one) and `err.code` (the v1
 envelope's `error.code`, e.g. `RUN_NOT_ACTIVE`, when the body provided one)
@@ -751,6 +818,8 @@ this pattern (including the tool-error path).
 ---
 
 ## Version
+
+v0.15.0 — **Field projection on the read API.** Every `FlightReader` read that returns stored documents — `listRuns`, `getRun`, `getRunEvents`, `getRunEventWindow`, `getFailurePatterns` — now takes an optional `fields?: string[]`, forwarded verbatim as `?fields=a,b,c`, so a caller that needs two fields out of a run (or an event index with no `payload`) stops paying for the whole document. Omitting `fields` returns the full document exactly as before — every existing call is unchanged. The identity field always comes back whether or not you name it — and it is NOT `id` on every resource (runs are keyed by their document id, events by `sequenceNumber`, patterns by `fingerprintHash`; see the exported `PROJECTION_IDENTITY_FIELDS`), and `getRunEventWindow` additionally always requests `sequenceNumber` because its ignored-`fromSequence` check reads it. Malformed lists (empty, blank/padded entry, embedded comma, duplicate) throw a `RangeError` before any request, matching the route's reject-never-coerce rule. The field vocabulary belongs to the server and is deliberately NOT re-validated client-side against a hardcoded copy that would drift; an unknown field is answered with HTTP 400 `INVALID_ARGUMENT`, surfacing as `V1ApiError` (`kind: 'invalid_response'`, `status: 400`). **Ignored-parameter detection, same as `fromSequence`:** an older deployment silently drops `?fields=` and returns the full document, which is indistinguishable from a projection that happened to include everything — so the response is checked, and if any document carries a field outside `requested ∪ identity` the call throws `V1ApiError` (`kind: 'invalid_response'`) naming the missing server support rather than passing a full document off as the requested projection. The check fires only on extra fields (proof) and never on missing ones (optional fields are routinely absent), and stays silent on an empty page or absent document. `getRun` gains an optional second parameter. New exports: `ProjectionParams`, `GetRunParams`, `ProjectableResource`, `PROJECTION_IDENTITY_FIELDS`. Additive throughout — no existing signature, return type, or export changed.
 
 v0.14.0 — **Bounded, sequence-addressed event reads.** New `FlightReader.getRunEventWindow(runId, { fromSequence? | aroundSequence?, limit? })` returns a window of a run's event log addressed by `sequenceNumber` instead of by a cursor walked from the head, so a consumer that already knows where to look (an explanation's `citedSequenceNumbers`, the tail of a long run) no longer has to pull the whole run to reach it. It never slices client-side, and if the deployment's events endpoint ignores `fromSequence` it throws `V1ApiError` (`kind: 'invalid_response'`) rather than passing the head of the log off as the requested window — see the `getRunEventWindow` section for the exactness of that check. `V1GetExplanationData` gains optional `status` (`'not_eligible' | 'pending' | 'ready'`), `runStatus` and `runEndedAt`, closing the documented coarse-null gap where the server already sends them; optional so an older deployment still typechecks. New exports: `getRunEventWindow`, `DEFAULT_EVENT_WINDOW_SIZE`, `EventWindowParams`, `V1EventWindowData`, `RunExplanationQueryStatus`. Additive throughout — no existing signature, return type, or export changed.
 

@@ -27,7 +27,7 @@ export { SDK_VERSION } from './version.js'
 export { redactPayload } from './redaction.js'
 export { buildErrorSummary, ERROR_SUMMARY_MAX_LENGTH } from './error-summary.js'
 export { decideSampling, hashString } from './sampling.js'
-export { FlightReader, DEFAULT_EVENT_WINDOW_SIZE } from './reader.js'
+export { FlightReader, DEFAULT_EVENT_WINDOW_SIZE, PROJECTION_IDENTITY_FIELDS } from './reader.js'
 export { V1ApiError, fetchV1, tryParseV1Json, messageFromV1Body } from './v1-client.js'
 
 export type {
@@ -63,7 +63,10 @@ export type {
   V1ListEventsData,
   V1ReplayData,
   ListRunsParams,
+  GetRunParams,
   ListEventsParams,
+  ProjectionParams,
+  ProjectableResource,
   EventWindowParams,
   V1EventWindowData,
   V1GetExplanationData,

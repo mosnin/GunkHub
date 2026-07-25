@@ -64,6 +64,13 @@ const PARAM_TABLE: { name: keyof ApiV1ListEventsParams; value: unknown }[] = [
   { name: 'limit', value: 25 },
   { name: 'cursor', value: 'cursor_abc' },
   { name: 'fromSequence', value: 5000 },
+  // Server-side field projection (`?fields=` on GET /api/v1/runs/[runId]/events).
+  // Added to this table in the SAME commit as the param. Dropping it returns
+  // the FULL event document — the same silent, plausible-looking wrong answer
+  // a dropped `fromSequence` produces, one field-set wide instead of one
+  // window wide. Route-level parsing lives in
+  // tests/unit/field_projection_route.test.ts.
+  { name: 'fields', value: ['sequenceNumber', 'type'] },
 ]
 
 describe('apiGetRunEvents — every declared param reaches the Convex mutation call', () => {
@@ -83,6 +90,7 @@ describe('apiGetRunEvents — every declared param reaches the Convex mutation c
       limit: 10,
       cursor: 'cursor_xyz',
       fromSequence: 4999,
+      fields: ['sequenceNumber', 'type'],
     }
     await apiGetRunEvents('hashed_key', params)
 
@@ -93,6 +101,7 @@ describe('apiGetRunEvents — every declared param reaches the Convex mutation c
       limit: 10,
       cursor: 'cursor_xyz',
       fromSequence: 4999,
+      fields: ['sequenceNumber', 'type'],
     })
   })
 
@@ -126,7 +135,7 @@ describe('apiGetRunEvents — every declared param reaches the Convex mutation c
    * reflection; `satisfies` ties the literal list back to the type.
    */
   it('PARAM_TABLE covers every field of ApiV1ListEventsParams', () => {
-    const ALL_DECLARED_PARAMS = ['runId', 'limit', 'cursor', 'fromSequence'] satisfies Array<
+    const ALL_DECLARED_PARAMS = ['runId', 'limit', 'cursor', 'fromSequence', 'fields'] satisfies Array<
       keyof ApiV1ListEventsParams
     >
     // Exhaustiveness in the other direction: this assignment fails to compile
@@ -136,6 +145,7 @@ describe('apiGetRunEvents — every declared param reaches the Convex mutation c
       limit: true,
       cursor: true,
       fromSequence: true,
+      fields: true,
     }
     void _exhaustive
     expect(PARAM_TABLE.map((p) => String(p.name)).sort()).toEqual([...ALL_DECLARED_PARAMS].sort())

@@ -1,11 +1,14 @@
 import { type NextRequest, NextResponse } from 'next/server'
 
+import { fieldsInvalidArgument, parseFieldsParam } from '../../../_lib/fieldsParam'
+
 import { mapApiErrorV1, v1UnauthorizedNoKey } from '@/lib/apiErrorMapping'
 import { withApiHandler } from '@/lib/apiHandler'
 import { apiV1Envelope } from '@/lib/apiV1Envelope'
 import { hashApiKey } from '@/lib/convexServer'
 import { apiGetFailurePatternEvidence } from '@/lib/services/api_v1'
 import { isValidFingerprint } from '@/lib/services/fingerprintValidation'
+
 
 interface RouteParams {
   params: { fingerprintHash: string }
@@ -60,9 +63,23 @@ export const GET = withApiHandler(
       )
     }
 
+    // `fields` (optional) projects the EMBEDDED `pattern` document only; the
+    // resolution claim, exposure, transitions and `confidence` verdict are
+    // derived rather than pattern fields and are always returned. Shape is
+    // validated here (reject, never coerce — see ../../../_lib/fieldsParam.ts);
+    // unknown field NAMES are convex/read_api.ts's to reject, and it does so
+    // BEFORE looking the fingerprint up, so the error stays indistinguishable
+    // between "unknown fingerprint" and "another org's fingerprint" — this
+    // route must not undo that by pre-empting it with a field list of its own.
+    const fields = parseFieldsParam(req.nextUrl.searchParams)
+    if (!fields.ok) {
+      return fieldsInvalidArgument(fields.message, ctx.requestId)
+    }
+
     try {
       const result = await apiGetFailurePatternEvidence(hashApiKey(apiKey), {
         fingerprintHash: params.fingerprintHash,
+        ...(fields.fields !== undefined && { fields: fields.fields }),
       })
       if (result === null) {
         return NextResponse.json(
