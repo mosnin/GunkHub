@@ -117,4 +117,35 @@ crons.interval(
   {},
 );
 
+// ADR-004 — run explanation coverage repair. Runs every 30 minutes.
+//
+// Explanation generation is EAGER and fire-and-forget: the four terminal-
+// failure sites (convex/events.ts, convex/sdk_ingest.ts, convex/runs.ts
+// updateRunStatus, convex/stale_runs.ts) each call
+// `ctx.scheduler.runAfter(0, "run_explanations:generateRunExplanation")` once,
+// with no retry behind it. A dropped/failed action, a transient
+// `heuristic_engine_unavailable` skip, or a run that failed before ADR-004
+// shipped therefore leaves the run permanently without an explanation — and
+// `getRunExplanation`/`apiGetExplanation` report that as `status: "pending"`,
+// which tells the caller (packages/mcp's `afr_explain_run`, apps/web's
+// ExplanationPanel) to RETRY LATER. Without this sweep that retry never
+// terminates. This job is what makes "pending" a bounded, honest claim.
+//
+// BOUNDED TWICE, never a sweep, matching verify-projection-integrity's shape:
+// the index range (`runs.by_status_started`) is narrowed to ONE terminal
+// status AND lower-bounded at now - EXPLANATION_BACKFILL_WINDOW_MS (24h), and
+// at most EXPLANATION_BACKFILL_SCAN_LIMIT (250) rows are read per status per
+// tick, with at most EXPLANATION_BACKFILL_MAX_SCHEDULES (25) generations fanned
+// out in total. Runs that ended within EXPLANATION_BACKFILL_GRACE_MS (10 min)
+// are skipped — their eager generation is legitimately still in flight.
+// Re-scheduling is harmless: generateRunExplanation is idempotent without
+// `force`. See convex/run_explanations.ts's backfillMissingExplanations for
+// the acknowledged limit (runs beyond the scan bound are not repaired).
+crons.interval(
+  "backfill-missing-explanations",
+  { minutes: 30 },
+  makeFunctionReference<"action">("run_explanations:backfillMissingExplanations"),
+  {},
+);
+
 export default crons;

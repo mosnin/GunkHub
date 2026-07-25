@@ -27,8 +27,46 @@ export { SDK_VERSION } from './version.js'
 export { redactPayload } from './redaction.js'
 export { buildErrorSummary, ERROR_SUMMARY_MAX_LENGTH } from './error-summary.js'
 export { decideSampling, hashString } from './sampling.js'
-export { FlightReader, DEFAULT_EVENT_WINDOW_SIZE, PROJECTION_IDENTITY_FIELDS } from './reader.js'
+export {
+  FlightReader,
+  DEFAULT_EVENT_WINDOW_SIZE,
+  PROJECTION_IDENTITY_FIELDS,
+  isPatternScanComplete,
+} from './reader.js'
 export { V1ApiError, fetchV1, tryParseV1Json, messageFromV1Body } from './v1-client.js'
+
+// Generic projection primitives — shared by the MCP server's projections and
+// by anything else shaping a v1 response into a budgeted one. See
+// `./projection.ts` for why these live here rather than in `packages/mcp`.
+export { columnsOf, requestFieldsOf, truncateProse } from './projection.js'
+export type { ProjectedColumn } from './projection.js'
+
+// Triage ranking — ONE implementation, imported by both the `afr_triage` MCP
+// tool and the `afr triage` CLI command. Two rankings that can disagree is
+// exactly the drift this placement exists to prevent.
+export {
+  SIGNAL_WEIGHT,
+  RECENCY_WEIGHT,
+  RECENCY_HALF_LIFE_MS,
+  VOLUME_WEIGHT,
+  VOLUME_SATURATION,
+  MAX_TIEBREAK,
+  MUTE_DEMOTION,
+  SCAN_LIMIT,
+  MAX_ITEMS,
+  LABEL_BYTE_CAP,
+  TRIAGE_UNEVALUATED_SAMPLE_CAP,
+  TRIAGE_COLUMNS,
+  TRIAGE_FIELDS,
+  TRIAGE_RANKING_SOURCES,
+  TRIAGE_REQUEST_FIELDS,
+  classifySignal,
+  scorePattern,
+  choosePointer,
+  toTriageItem,
+  toTriageResult,
+} from './triage.js'
+export type { TriageSignal, TriageItem, TriagePointer, TriageVerdict, TriageResult } from './triage.js'
 
 export type {
   RecorderConfig,

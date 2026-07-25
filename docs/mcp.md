@@ -11,6 +11,104 @@ to think. This server exists so that the *usual* question costs a few hundred to
 and the expensive answer is something you opt into, deliberately, once you know which
 run and which sequence range you care about.
 
+---
+
+## Start here
+
+```
+afr_triage()
+```
+
+That is the whole answer for most callers. No arguments, ~333 tokens, and every item
+it returns carries the exact next tool and argument object to call. If you read
+nothing else on this page, call that.
+
+**Ask the cheapest question first. Escalate only when the answer you got did not
+settle it.** The tools are a ladder, not a menu, and the rungs are priced an order
+of magnitude apart:
+
+| Start here | Tool | Answers | Cost |
+|---|---|---|---|
+| **0** | **`afr_triage`** | **"What is wrong, and what do I look at first?"** | **~333 tokens** (~436 worst case) |
+| 1 | `afr_list_failure_patterns` | "What is broken?" — *all* of it, beyond triage's top 5 | ~284 tokens (10 patterns) |
+| 2 | `afr_get_pattern_evidence` | "Did the fix hold?" | ~423 tokens (one pattern, capped history) |
+| 3 | `afr_explain_run` | "Why did *this run* fail?" | **~121 tokens** (one run) |
+| 4 | `afr_get_run_events` | "Show me the literal events." | **~3,838 tokens** (one saturated 50-event window) |
+| — | `afr_list_runs` | Orientation: which runs exist | ~475 tokens (20 runs) |
+
+Read the last row of the ladder before you read anything else on this page. **One
+tier-4 window costs about 12x a triage call, about 32x a tier-3 explanation, and
+about 13x a tier-1 pattern list** — and a window is not the whole run, it is fifty
+events of it. The tiers above it are not a warm-up you skip to get to the real data;
+they are the reason the tier-4 call is affordable at all, because they tell you
+*which fifty events* to ask for.
+
+Most investigations should end at tier 3. Many should end at tier 0. Stop as soon as
+the question is answered.
+
+Where these numbers come from, and what they do not cover, is in
+[Where the token figures come from](#where-the-token-figures-come-from). They are
+measured against the real projection code with contract-maximal fixtures; they are
+**not** measured against a running deployment, because none has ever existed.
+
+### The worked example
+
+Something is failing and you have no run id, no fingerprint, and no idea where to
+look. That is the normal starting state. The path, with the running cost:
+
+```
+0. afr_triage()                                     ~333 tok   (running: ~333)
+     → verdict "issues", complete true, scanned 50
+     → items[0]: { class: "tool_error", label: "Tool call failed",
+                   count: 128, signal: "regressed", score: 235,
+                   next: { tool: "afr_get_pattern_evidence",
+                           args: { fingerprintHash: "01f3a9…" } } }
+     → you now know WHAT to look at and WHAT TO CALL NEXT. No inference.
+
+1. …you do NOT call afr_list_failure_patterns here. Triage already read that
+   endpoint. Reach for tier 1 only when you need breadth past the top 5.
+
+2. afr_get_pattern_evidence(fingerprintHash: "01f3a9…")   ~423 tok  (running: ~756)
+     → "resolved 6 days ago, 0 exposure since — unproven"
+     → for "did last week's fix hold?", THIS IS THE END. Stop here.
+
+3. afr_explain_run(runId)                            ~121 tok   (running: ~454)
+     → root cause in prose + citedSequenceNumbers: [12, 14, 17]
+     → for "why did this run fail?", THIS IS THE END. Stop here.
+       (Reached directly from triage when an item's `next` points at a run —
+        ~333 + ~121, not ~756.)
+
+4. afr_get_run_events(runId, from: 12, limit: 10)   ≤3,838 tok  (running: ≤4,292)
+     → the literal event records, only around the numbers tier 3 cited
+```
+
+Triage plus an explanation — enough to name the worst thing in the org *and* explain
+a concrete instance of it — costs about **454 tokens**. That is roughly an eighth of
+one tier-4 window.
+
+**The naive path, for contrast.** An agent that skips the ladder and opens with
+`afr_get_run_events` pays up to **~3,838 tokens** for a fifty-event window and gets
+back… fifty event records. No root cause, no fingerprint, no verdict on whether this
+is new or the thing that has been failing all week. It has spent roughly 12x the cost
+of `afr_triage()` to buy the raw material for an answer rather than the answer, and it
+now has to reason about the failure inside whatever context budget is left. Worse, it
+had to *choose a run id* before it could make the call at all — which is the one thing
+it did not know. If it guessed wrong, it pays again.
+
+That is the mistake this server exists to make unattractive. Raw events are for
+**confirmation** — you have a hypothesis and a sequence number and you want to see
+the literal record. They are not for discovery.
+
+### If you only want a CI gate
+
+An agent-driven investigation is not the only caller. For "fail the build if a
+supposedly-fixed failure came back", see
+[Using this as a CI gate](#using-this-as-a-ci-gate), which covers the exit-code
+and truncation semantics — **including the case where a scan could not be
+completed, which must never be reported as "all clear."**
+
+---
+
 > ## :warning: Verification status of this document
 >
 > This page documents the tool contract, the transport, and the endpoints behind
@@ -24,21 +122,43 @@ run and which sequence range you care about.
 >   (`apps/web/app/api/v1/**`, `convex/read_api.ts`).
 > - The query parameters, the response envelope, the per-key rate class
 >   (300 req/min), and the error codes described below match those routes.
+> - The per-tier token figures, measured by driving the real exported projections
+>   in `packages/mcp/src/projections.ts` over the contract-maximal fixtures from
+>   `tests/unit/mcp_progressive_disclosure.test.ts`. See
+>   [Where the token figures come from](#where-the-token-figures-come-from) for the
+>   estimator, the fixtures, and what the numbers do and do not represent.
 >
 > **Unverified — treat as design intent, not measurement:**
-> - The per-tool token figures. They are the budget the tool shapes were designed
->   against, not numbers measured against a live deployment. Expect drift,
->   particularly for tier 4, whose cost is a function of your own event payloads.
+> - **Token cost against real data.** The figures above are measured against
+>   *fixtures*, not traffic. Tier 4 in particular is a function of your own event
+>   payloads. The ordering of the tiers is robust; the absolute numbers are
+>   representative, not a promise.
 > - The MCP client configuration blocks. The handshake has not been run against a
 >   real client, and the executable name/entry path comes from the package layout,
 >   not from a successful launch.
-> - Anything about live latency or real-world response sizes.
+> - Anything about live latency, wire bytes, or real-world response sizes.
+> - **`afr triage` (the CLI command) does not exist.** The MCP tool `afr_triage`
+>   has landed and is described on this page from its source. Its CLI counterpart,
+>   with CI-gate exit codes, had **not** landed at last re-verification:
+>   `packages/cli/src/commands/` contains no `triage.ts` and `packages/cli/src/index.ts`
+>   registers no `triage` subcommand. See
+>   [Using this as a CI gate](#using-this-as-a-ci-gate) for what the gate story
+>   actually is today.
+>
+> **Freshness.** Verified against the working tree at commit `2695655` **plus a large
+> body of uncommitted changes** — SDK 0.16.0, CLI 0.10.0, and the whole of
+> `packages/mcp/src/triage.ts` / `tools/triage.ts` were untracked or modified at the
+> time of writing. Multiple agents were landing code in parallel and the tree moved
+> repeatedly during this page's revision; the `scanTruncated` plumbing in particular
+> went from "backend only" to "wired through SDK, CLI, tier 1 and triage" while this
+> section was being written. **Re-check `git log` and the named call sites before
+> trusting a specific number or a specific "does not yet" claim.**
 >
 > The two `/api/v1/patterns**` endpoints behind tiers 1 and 2 are **now documented
 > in `docs/api_reference.md`** (§1), which is their canonical HTTP contract —
 > query params, response shapes, the `fixConfidence` envelope, and the
-> paginate-then-filter behavior a client has to page around. This page covers only
-> what an MCP caller needs; prefer the API reference for the wire detail.
+> bounded-overfetch-then-filter scan a client has to page around. This page covers
+> only what an MCP caller needs; prefer the API reference for the wire detail.
 >
 > **Server-side field projection (`?fields=`) landed while this page was being written**
 > and is read from the working tree, not from a design document. See
@@ -79,39 +199,8 @@ like the `afr` CLI, and inherits that door's org scoping and rate limits. See
 
 ## Progressive disclosure — the whole point
 
-The five tools are not five ways to get data. They are a **ladder**, and the rungs are
-priced very differently.
-
-| Tier | Tool | Answers | Approx. tokens |
-|------|------|---------|----------------|
-| 1 | `afr_list_failure_patterns` | "What is broken?" | ~250 |
-| 2 | `afr_get_pattern_evidence` | "Did the fix hold?" | ~300 |
-| 3 | `afr_explain_run` | "Why did *this run* fail?" | ~200 |
-| 4 | `afr_get_run_events` | "Show me." | ~2,000–5,000 |
-| — | `afr_list_runs` | Orientation: which runs exist | ~250 |
-
-Read that table as a cost curve. Tiers 1–3 together cost roughly what a *single*
-windowed slice of raw events costs at tier 4, and an unwindowed trace of a long run
-costs far more than that.
-
-**Calling tier 4 first is the wrong way to use this server.** It is the most common
-mistake and it is worth naming plainly: pulling raw events before you know which run
-matters burns the context budget you needed for the actual reasoning, and buries the
-one relevant event under two hundred irrelevant ones. Raw events are for
-*confirmation* — you already have a hypothesis and a sequence number, and you want to
-see the literal record. They are not for discovery.
-
-### The intended path
-
-```
-afr_list_failure_patterns        → "tool_error on search_docs, 47 occurrences, spiking"
-        ↓  (pick a fingerprint)
-afr_get_pattern_evidence         → "resolved 6 days ago, 0 exposure since — unproven"
-        ↓  (pick a representative runId)
-afr_explain_run                  → narrative root cause + cited sequence numbers [12, 14, 17]
-        ↓  (only now, and only around those numbers)
-afr_get_run_events?from=12&limit=10   → the literal events
-```
+The ladder, the measured costs, and the worked example are at the top of this page:
+[Start here](#start-here). This section is the *why* behind those numbers.
 
 Each rung hands you the selector for the next one. Tier 1 returns representative run
 IDs. Tier 3 returns *real* sequence numbers cited from the run's own event log — every
@@ -119,7 +208,64 @@ cited number is guaranteed to correspond to an event the same key can fetch at t
 so there is no such thing as a citation pointing at a fabricated event. That guarantee
 is what makes the windowed tier-4 call viable: you fetch ten events, not two thousand.
 
-Stop as soon as the question is answered. Most investigations should end at tier 3.
+### Where the token figures come from
+
+Every number on this page is a **client-visible token estimate**, produced by calling
+the real exported projections in `packages/mcp/src/projections.ts`
+(`toListPatternsResult`, `toPatternEvidenceResult`, `toExplainRunResult`,
+`toEventRow`, `toRunRow`) on the contract-maximal fixtures from
+`tests/unit/mcp_progressive_disclosure.test.ts`, and applying that suite's stated
+estimator:
+
+```
+estimateTokens(x) = ceil(utf8ByteLength(JSON.stringify(x)) / 4)
+```
+
+Bytes/4 is the standard rough BPE approximation. It matches what the server actually
+emits — `packages/mcp/src/tools/shared.ts` serializes with `JSON.stringify(value)` and
+no indentation — so these are the bytes a caller pays for. It is an estimate, not a
+tokenizer, and it is monotonic in payload size, which is the property that matters.
+
+| Tier | Measured | Fixture it was measured on | Asserted budget |
+|---|---|---|---|
+| 0 `afr_triage` (typical) | **333** | a full 50-pattern scan of maximal `FailurePattern`s, nothing truncated | ≤ 450 |
+| 0 `afr_triage` (worst case) | **436** | the same scan, every item muted, every caveat firing, an unevaluated sample, a top-level `next` | ≤ 450 |
+| 0 `afr_triage` (`verdict: "clear"`) | **32** | an org with nothing to report | ≤ 450 |
+| 1 `afr_list_failure_patterns` | **284** | 10 maximal `FailurePattern` rollups (~3,757 tokens unprojected) | ≤ 300 |
+| 2 `afr_get_pattern_evidence` | **423** | one pattern, 100 inbound lifecycle transitions | ≤ 450 |
+| 3 `afr_explain_run` | **121** | a realistic `RunExplanation` | ≤ 200 |
+| 3 `afr_explain_run` (worst case) | **192** | a *contract-maximal* explanation — 2 KB summary + 1 KB root cause + 1 KB fix | ≤ 200 |
+| 4 `afr_get_run_events` | **3,838** | a saturated 50-event window, every payload externalized | ≤ 10,000 |
+| 4 `afr_get_run_events` (inline) | **3,384** | a saturated 50-event window of 10,040-byte inline payloads — just under the 10 KB externalization threshold | ≤ 10,000 |
+| — `afr_list_runs` | **475** | 20 maximal `Run` documents (~27,769 tokens unprojected) | ratio ≥ 10x |
+
+The budget column is enforced by `tests/unit/mcp_progressive_disclosure.test.ts` (tiers
+1–4) and `tests/unit/mcp_triage.test.ts` (tier 0), which fail the build if a projection
+widens. That test is a ratchet on the *budget*, not on
+the measured value — the measured values above will drift within their budgets as the
+projections change, and this table is only as fresh as its last re-measurement.
+
+**What these numbers are not.** They are not measured against a deployment; none has
+ever existed for this project. They are not wire bytes (see
+[Server-side field projection](#server-side-field-projection) — that section is about a
+different quantity entirely, and the two must not be conflated). Tier 4's real cost
+depends on your own event payloads; the two tier-4 rows above are the worst cases the
+system can *legally* produce, which is why the tier-4 figure quoted at the top of the
+page is a ceiling rather than a typical value.
+
+**Tier 0's budget is derived, not chosen.** 450 is tier 2's budget, and the argument for
+the tool's existence is that it must cost less than the ~707 tokens of calling tiers 1
+and 2 yourself — otherwise it is a fifth tier pretending to be a shortcut.
+`tests/unit/mcp_triage.test.ts` asserts both: the absolute ceiling, and that a triage
+response is strictly cheaper than tier 1 + tier 2. The worst case measured **436**
+against a fully saturated, maximally caveated response, so the headroom is ~19 tokens —
+about half a triage item. Widening an item will go red almost immediately, which is the
+intended behaviour.
+
+**The ratios are the durable part.** ~3,838 vs ~121 is ~32x; vs ~284 it is ~13x; vs
+~333 it is ~12x. Those gaps are structural — they follow from what each tier returns,
+not from the fixtures — and they are the reason to work down the ladder rather than up
+it.
 
 ### Why the tiers cost what they do
 
@@ -137,6 +283,201 @@ Stop as soon as the question is answered. Most investigations should end at tier
   place (Event Log Rule 3) — those events carry an **artifact pointer** (blob URL +
   SHA-256 checksum), and this server returns the pointer, never the blob. If you need
   the bytes, fetch the artifact yourself, outside the model's context if you can.
+
+---
+
+## Using this as a CI gate
+
+The ladder above is written for an agent or a human investigating a failure. A second
+caller wants something narrower: **"fail the build if a failure we claimed to have
+fixed came back."**
+
+Two surfaces answer that. `afr_triage()` reports a `regressed` signal on any item it
+ranks — and ranks it first, above everything. `afr_list_failure_patterns(state:
+"regressed")` (or `afr patterns --state regressed` from the CLI) asks the question
+directly, with no top-5 cap.
+
+Prefer `state: "regressed"` over `regressed: true`. `regressed: true` matches any
+pattern with `regressedAt` set, including one that regressed, was genuinely re-fixed,
+and was re-resolved — `regressedAt` is retained as history. `state: "regressed"`
+matches only a recurrence strictly after the *current* `resolvedAt`, and it keeps an
+exact, snapshot-independent path in `convex/read_api.ts`, so it does not depend on the
+fix-confidence refresh cron having run.
+
+### Reading `afr_triage` as a gate
+
+`afr_triage()` is honest about incompleteness, and a gate must use that rather than
+just counting items:
+
+- **`verdict: "clear"` is the only safe green.** It means the scan completed and found
+  nothing.
+- **`verdict: "unknown"` is not green.** It means there was nothing to show *and*
+  something prevented a whole look. Exiting 0 on it reports "your agents are healthy"
+  when the truth is "I failed to look."
+- **`complete: false` qualifies any verdict, including `issues`.** It means the ranked
+  items are the worst of what was *scanned*, not the worst that exist. `caveats[]` says
+  exactly why in plain sentences, and `next` points at the tier-1 call that gets the
+  rest.
+- **Triage ranks at most 5 of at most 50.** It is a headline, not an inventory. A gate
+  that must not miss a regression anywhere in the org should use
+  `afr_list_failure_patterns(state: "regressed")` and page it, not triage.
+
+**Two independent incompleteness signals, and triage reports both.** They are not the
+same failure and neither subsumes the other:
+
+| Signal | Source | Means |
+|---|---|---|
+| `nextCursor` present | triage's own `SCAN_LIMIT` | The *ranking's* window was not whole. More patterns exist than the 50 that were ranked, so "these are the worst" is really "the worst of the 50 I looked at". The server scan was fine. |
+| `scanTruncated: true` | the server's row ceiling | The *server* could not finish scanning even that window. A short or empty page can be an artefact of the ceiling, so empty `items` is not evidence of health at all. |
+
+The second is strictly worse, so it is the one the caveat names when both fire (a
+server-side ceiling always also yields a resumable cursor, so "both" is the normal
+truncation case). `scanTruncated` is surfaced as its own top-level field on the triage
+result; the cursor is surfaced through `next`.
+
+Only the server marker is a statement about correctness. A `nextCursor` on its own means
+the ranking is a headline, which is what triage is *for* — so `complete: false` from a
+cursor alone is not evidence that anything was missed, while `scanTruncated: true` is.
+
+Prefer `state: "regressed"` over `regressed: true`. `regressed: true` matches any
+pattern with `regressedAt` set, including one that regressed, was genuinely re-fixed,
+and was re-resolved — `regressedAt` is retained as history. `state: "regressed"`
+matches only a recurrence strictly after the *current* `resolvedAt`, and it keeps an
+exact, snapshot-independent path in `convex/read_api.ts`, so it does not depend on the
+fix-confidence refresh cron having run.
+
+### An unfinished scan is not a clean scan
+
+This is the part that decides whether a gate is worth having.
+
+Every filter on `GET /api/v1/patterns` — `agentId`, `spiking`, `muted`, `status`,
+`regressed`, `state` — reads a field with **no index**, so all of them run in memory.
+The endpoint therefore reads a scan window wider than the page and filters inside it,
+bounded by `PATTERN_SCAN_ROW_CEILING` (**2,000** rows, `convex/read_api.ts`).
+
+A scan that stops on that ceiling returns a short — possibly **empty** — page. On the
+wire, an empty page because *nothing matched* and an empty page because *the scan ran
+out of budget* are the same three bytes. **A CI gate that cannot tell them apart exits
+0 on a scan it never completed, and a red build goes green.** That is worse than having
+no gate, because a team stops looking.
+
+So the backend declares it. `apiListFailurePatterns` returns, alongside `patterns` and
+`nextCursor`:
+
+| Field | Meaning |
+|---|---|
+| `scanTruncated` | `true` — the scan stopped on the row ceiling, not on the end of the table. This page **may** be short or empty purely for that reason. `false` — the page is the complete answer up to `limit`; an empty page really does mean nothing matched, anywhere. |
+| `scannedRows` | Rows examined to produce this page. |
+| `scanRowCeiling` | The ceiling that bounded it (2,000). |
+
+The rule for a gate: **`scanTruncated: true` means "not yet answered", never
+"clean".** Follow `nextCursor` until you get a page with `scanTruncated: false`, or
+fail the gate as inconclusive. Never map it to exit 0.
+
+`scanTruncated: false` is the assertion a gate is entitled to make.
+
+> **Verified, and a gap you must know about before you build on it.**
+>
+> Verified by reading the code on this branch:
+> - `convex/read_api.ts` computes `scanTruncated = !exhausted && matches.length < needed`
+>   and returns it with `scannedRows` and `scanRowCeiling`. Exhaustion is checked first,
+>   so a scan that reached the end of the table is never reported as truncated, and a
+>   page that filled is never reported as truncated either.
+> - `apps/web/app/api/v1/patterns/route.ts` forwards the backend result into the
+>   envelope wholesale, and `packages/sdk/src/v1-client.ts` returns `envelope.data`
+>   verbatim — so the field does reach a client at runtime.
+> - `convex/read_api.test.ts` asserts both directions of the flag; the structural guard
+>   is `tests/unit/pattern_pagination_contract.test.ts`.
+>
+**It is wired end to end.** Verified by reading the working tree at the moment this was
+written (SDK 0.16.0, CLI 0.10.0), while three teams were still pushing:
+
+- `packages/sdk/src/reader.ts` declares `scanTruncated?`, `scannedRows?` and
+  `scanRowCeiling?` on `V1ListFailurePatternsData`, and exports
+  **`isPatternScanComplete(data)`** as the single place that decides what an *absent*
+  marker means. All three are optional because a deployment predating the marker never
+  sends them.
+- **`afr patterns` reads it** and maps a truncated scan onto exit `11`
+  ([below](#the-clis-exit-codes)), with distinct renderings for the empty and non-empty
+  cases.
+- **MCP tier 1 forwards it.** `toListPatternsResult` takes an optional fourth `scan`
+  argument and sets `scanTruncated: true` on the tool result;
+  `packages/mcp/src/tools/list-failure-patterns.ts` passes `data`.
+- **`afr_triage` reports it too**, and keeps it *separate* from its own window limit —
+  see [Reading `afr_triage` as a gate](#reading-afr_triage-as-a-gate).
+
+### Absent is treated as complete, on purpose
+
+`isPatternScanComplete` returns `true` for both `false` and `undefined`, so a deployment
+that never declares truncation reads as complete. That looks wrong until you know why:
+treating absence as incomplete would make every request against an older deployment
+*permanently* inconclusive, which turns a gate into noise and gets it switched off —
+reaching the same end state as the bug the marker exists to fix, by a longer road.
+Treating it as complete restores exactly the behaviour those deployments already had.
+
+The honest reading of absence is "this deployment does not answer the question." If you
+need to distinguish that from a positive "the scan finished", test
+`data.scanTruncated === undefined` yourself. **Do not re-derive the collapse in a fourth
+place** — the SDK, the CLI, tier 1 and triage all call the helper rather than reimplement
+it, which is the point of it existing.
+
+### The SDK does not throw on truncation
+
+Deliberately, and the asymmetry is worth understanding. `getRunEventWindow` throws on an
+ignored `fromSequence`, and `assertProjectionHonored` throws on an ignored `fields`,
+because in both cases **the server returned a wrong answer indistinguishable from a right
+one**: the head of the log looks exactly like the requested window, and a full document
+looks exactly like a projection that included everything. Nothing in the response says
+otherwise, so refusing is the only way the caller finds out.
+
+Truncation is the inverse. The server **told the truth, in a field**, and the only defect
+was that nothing read it. Throwing would also break the correct remedy — paging on
+`nextCursor` — by turning a resumable, ordinary state into an exception, and would fail
+an unfiltered browse where truncation is harmless.
+
+So the SDK types it, names it, and hands it to the caller. **Deciding that an incomplete
+scan is fatal is the gate's job, not the client's.** `afr patterns` makes exactly that
+decision, with exit 11, for the CI path.
+
+### The CLI's exit codes
+
+`afr patterns` is the surface where the truncation contract becomes a build outcome:
+
+| Code | Meaning |
+|---|---|
+| `0` | Request succeeded and the scan was complete — **whether or not anything matched** |
+| `1` / `2` / `3` / `4` | Usage / auth / not-found / network-or-server error |
+| `11` | **"Could not evaluate."** A *filtered* request whose scan hit the server's row ceiling |
+
+Exit `11` exists because **exit 0 from a gate is a claim** — "I checked, and it is
+clean" — and a truncated scan has not checked. The result is annotated
+`[scan truncated N/M rows]`, the page the server did return is still printed in full,
+and the command exits `11` instead of `0`. Page with `nextCursor` until the scan
+completes, or treat the run as inconclusive.
+
+The rendering distinguishes the two truncated cases, because they mean different things:
+
+- **Empty and truncated** no longer prints "No recurring failure patterns found." That
+  sentence is a whole-dataset claim and it is false after a truncated scan. It instead
+  reports what was actually established — no matches *in the rows scanned* — and says
+  plainly that this is **not** "none exist", since nothing is known past the ceiling.
+- **Non-empty and truncated** prints the full table, then a `PARTIAL
+  [scan truncated N/M rows]` footnote in the existing bracket idiom: these rows are
+  real, but they are not the complete set.
+
+Withheld for unfiltered listings, deliberately: an unfiltered request does not truncate
+(`scanSize = filtering ? PATTERN_SCAN_ROW_CEILING : needed`), and "here are some
+patterns" makes no whole-dataset claim to falsify. The annotation still prints.
+
+> **Exit `11` distinguishes inconclusive from conclusive — not clean from dirty.**
+> There is still no "matches found" exit code: `afr patterns --state regressed` exits
+> `0` whether it found a regression or not. A gate must parse `--json` and fail on a
+> non-empty `patterns` array itself. What it no longer has to do is guess whether an
+> empty array meant anything.
+>
+> The `@returns` comment on `run()` in `packages/cli/src/index.ts` still lists only
+> `0/1/2/3/4` and has not been updated for `11`. The code is real
+> (`packages/cli/src/commands/patterns.ts`); the doc comment is stale.
 
 ---
 
@@ -283,6 +624,59 @@ Every tool is read-only and org-scoped to the API key's organization. Cross-org 
 are impossible by construction — scoping is enforced in `convex/read_api.ts`, not in
 this server.
 
+### `afr_triage` — tier 0, the entry point
+
+**One call, zero required arguments.** `afr_triage()` is the intended first call for
+any caller that does not already have a run id or a fingerprint.
+
+It is not a new data source. It reads the same `GET /api/v1/patterns` endpoint tier 1
+reads, once, with a field selection derived the same way — everything else is ranking,
+capping, and pointer construction over that one response
+(`packages/mcp/src/triage.ts`). There is no second fact here to disagree with the first.
+
+**Arguments.** `agentId` (optional) narrows to one agent. That is the only filter. There
+is deliberately no `environment` argument: a `FailurePattern` is an org-scoped rollup
+over fingerprints and carries no environment, so the argument could only be accepted and
+ignored — and a filter that silently does nothing is worse than an absent one, because
+the caller believes it applied. There is no `limit` either: the emitted count is fixed at
+`MAX_ITEMS` (**5**) out of a `SCAN_LIMIT` (**50**) scan, because the published cost is
+measured *at* that number and a caller-raisable cap would make the published cost a
+fiction. For breadth beyond five, use tier 1.
+
+**Response.**
+
+| Field | Meaning |
+|---|---|
+| `verdict` | `issues` \| `clear` \| `unknown`. See below — `clear` and `unknown` are **not** the same answer. |
+| `complete` | Whether the view behind the verdict was whole. Orthogonal to `verdict`: `{ verdict: "issues", complete: false }` is a real and common state, meaning "the worst of what I saw", not "the worst that exist". |
+| `scanned` | How many patterns were considered (≤ `SCAN_LIMIT`). Compare against `items.length` to see the cap at work. |
+| `items[]` | Up to 5 ranked items: `fingerprintHash`, `class`, `label`, `count`, `lastSeenAt`, `signal`, `score`, optional `muted: true`, and `next`. |
+| `caveats[]` | Every reason `complete` is false, in plain sentences. Present only when non-empty. |
+| `unevaluated` | `{ count, sample }` — patterns with a live resolution but no usable confidence snapshot, so whether the fix held could not be graded at all. Named rather than dropped. |
+| `next` | A top-level next hop when the *items* are not the answer — a truncated scan, or nothing found. Absent when the items carry their own. |
+
+**Every item carries its own next call.** `next` is `{ tool, args }` — a tool name and
+the exact argument object to pass it, verbatim. Exactly one pointer per item, chosen by
+signal: a pattern with a live resolution (or one that regressed) raises "did the fix
+hold?" and points at `afr_get_pattern_evidence`; anything else raises "why does this
+happen?" and points at `afr_explain_run` with a representative run id. An agent never has
+to infer the ladder.
+
+**The ranking, and why it is auditable.** Items are ordered by `signal` class first —
+`regressed` > `spiking` > `open` > `acknowledged` > `resolved` — with recency and volume
+ordering *within* a class and never promoting across one (the class weights are spaced
+wider than the maximum tie-break, so the tiers cannot interleave). Muted patterns sort
+last and are flagged rather than hidden. `regressed` ranks above everything because a
+regression is not merely a failure: it is a false belief living in the system, which
+everything downstream is currently reasoning from. The `score` is emitted so the ordering
+can be checked rather than trusted, and ties break on `fingerprintHash` so the order is
+total and two calls a millisecond apart cannot shuffle.
+
+**`clear` is not `unknown`.** `clear` means the scan completed and found nothing.
+`unknown` means it could not be evaluated. A tool that reports the second as the first
+has told a caller its agents are healthy when it actually failed to look. Read `verdict`
+and `complete` together, always.
+
 ### `afr_list_failure_patterns` — tier 1
 
 Recurring failure patterns for the key's org, most-recently-seen first. Compact rows.
@@ -301,6 +695,13 @@ checking its age.
 Patterns are **observability-grade derived data**, not source of truth. They are a
 rollup over explanation-derived fingerprints, regeneratable at any time. The event log
 remains the only fact about what happened on any single run.
+
+The filters run in memory over a bounded scan window, so a short or empty page is not
+always the end of the result set. The tool result carries **`scanTruncated: true`** when
+the server's scan stopped on its row ceiling — an empty page is only "nothing matched"
+when that field is absent. If you are using `state: "regressed"` as a build gate, read
+[Using this as a CI gate](#using-this-as-a-ci-gate) first; it is the difference between
+a gate and a gate-shaped object.
 
 ### `afr_get_pattern_evidence` — tier 2
 
@@ -325,7 +726,18 @@ optional suggested fix, failure class, and cited sequence numbers.
 
 Backed by `GET /api/v1/runs/{runId}/explanation`. The explanation is `null` (not an
 error) when the run is not in an explainable status (`failed` / `timed_out` /
-`cancelled`) or generation has not completed. `kind` is `"heuristic"` — always
+`cancelled`) or generation has not completed.
+
+`status: "pending"` tells you to retry later, so it is only an honest answer if the
+retry eventually terminates. Explanation generation is eager and fire-and-forget — a
+dropped action, a transient engine-unavailable skip, or a run that failed before ADR-004
+shipped would otherwise leave a run permanently `pending`. A `backfill-missing-explanations`
+cron (every 30 minutes, `convex/crons.ts`) repairs that gap, bounded to terminal runs
+that ended in the last 24 hours, at most 250 rows scanned per status per tick and 25
+generations scheduled per tick. Re-scheduling is idempotent. **The acknowledged limit:
+runs beyond that scan bound are not repaired** — a run that has been `pending` for
+longer than the window will stay that way. Verified from `convex/run_explanations.ts`
+and `convex/crons.ts` in the working tree; like everything else here, never executed. `kind` is `"heuristic"` — always
 available, deterministic, zero configuration — or `"llm"` when an LLM provider is
 configured *and* its output passed the grounding gate (it must cite at least one real
 sequence number from this run). Ungrounded LLM output is discarded in favor of the

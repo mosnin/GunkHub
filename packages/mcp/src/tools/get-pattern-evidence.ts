@@ -41,11 +41,14 @@ export function registerGetPatternEvidence(server: McpServer, reader: AfrReader)
     {
       title: 'Get failure pattern evidence',
       description:
-        'Answers "did the fix hold?" for ONE failure pattern: resolution metadata, run exposure since the fix ' +
-        '(since/runCount/runCountTruncated/recurrenceCount/heldSoFar), a 0-1 confidence score with its state and every ' +
-        'driver behind it, and the lifecycle transition history. ' +
+        'Answers "did the fix hold?" for ONE failure pattern, ~423 tokens: resolution metadata, run exposure since ' +
+        'the fix (since/runCount/runCountTruncated/recurrenceCount/heldSoFar), a 0-1 confidence score with its state ' +
+        'and every driver behind it, and the 10 most recent lifecycle transitions. ' +
         'Read confidence.state, not heldSoFar alone — heldSoFar is true for a fix nothing has exercised yet. ' +
-        'state "regressed" is the build-failing signal. score is a fraction capped at 0.95, never a percentage.',
+        'state "regressed" is the build-failing signal. score is a fraction capped at 0.95, never a percentage. ' +
+        'NOT for: finding out WHICH pattern to ask about (afr_triage), a coarse state across many patterns ' +
+        '(afr_list_failure_patterns already returns confidenceState per row for a tenth the cost), or why a ' +
+        'particular run failed (afr_explain_run).',
       inputSchema,
       annotations: { readOnlyHint: true, openWorldHint: true },
     },

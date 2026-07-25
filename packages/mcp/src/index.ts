@@ -43,6 +43,7 @@ export { readEnv, resolveConfig, MISSING_ENV_MESSAGE, MissingEnvError } from './
 export type { McpConfig, McpEnv } from './env.js'
 export { MCP_VERSION } from './version.js'
 export * from './projections.js'
+export * from './triage.js'
 
 /**
  * Boot the server on stdio. Resolves only when the transport closes.

@@ -311,6 +311,49 @@ blank screens, no silent failures (`CLAUDE.md` Design Quality Rules).
 
 ---
 
+## How To: Add or Reshape an MCP Tool
+
+`packages/mcp` is a **read surface only** (`CLAUDE.md` → System Boundaries): every tool
+is a `GET` over `/api/v1/**`, it never imports from `convex/`, and it holds no deploy
+key or Clerk session. Beyond that, the constraint that catches people out is the token
+budget — the tool set is a progressive-disclosure ladder, and a tool that returns more
+than its tier costs is not a feature, it is the defect the package exists to prevent.
+
+1. **Read `docs/mcp.md` → "Start here" first.** It has the ladder, the measured cost of
+   each tier, and where a new tool would sit on it. A tool that does not make some
+   question *cheaper* than the tier below it does not belong.
+2. **Add the projection to `packages/mcp/src/projections.ts`, not to the tool module.**
+   That file is the output shape; the tools are a thin shell around it. Emitted columns
+   are declared in a `ProjectedColumn` table (`RUN_COLUMNS`, `PATTERN_COLUMNS`,
+   `EVENT_COLUMNS`) and the `?fields=` request list is *derived* from that table by
+   `requestFieldsOf` — never maintained alongside it. See "Add a Field to a Projected
+   Resource" above for the multi-boundary version.
+3. **Register the tool in `packages/mcp/src/server.ts`** and set
+   `annotations: { readOnlyHint: true }`.
+4. **Add a budget assertion to `tests/unit/mcp_progressive_disclosure.test.ts`.** That
+   suite drives the real exported projections against deliberately *maximal* fixtures
+   and fails the build when a projection widens. Response size is the value
+   proposition, so response size is what gets asserted — a shape-only test goes green
+   while someone bolts an unbounded array onto a row.
+5. **An event-count cap is not a byte cap.** `MAX_LIMIT` bounds how many events a
+   window returns; `PAYLOAD_PREVIEW_BYTE_CAP` / `WINDOW_PAYLOAD_BYTE_BUDGET` bound what
+   it costs. Payloads under the 10 KB externalization threshold are inlined verbatim,
+   so a cap on rows alone lets a single window cost more than the raw dump the package
+   exists to replace.
+6. **Do not drop a truth-bearing flag in the projection.** `scanTruncated` on
+   `GET /api/v1/patterns` is the live example: the backend distinguishes "nothing
+   matched" from "the scan ran out of budget", and tier 1's projection currently
+   forwards neither to the caller. A caller that cannot tell those apart reads an
+   incomplete scan as an all-clear. If a response carries a "this answer is a floor"
+   marker, the projection must carry it too.
+7. **Update `docs/mcp.md`** — the tool contract section, and the cost table if the
+   measured numbers moved. That page carries a verification-status banner splitting
+   what was verified by reading the code from what was not; keep new claims on the
+   correct side of it. No Convex deployment has ever existed for this project, so
+   nothing here has been exercised end to end, and the docs must keep saying so.
+
+---
+
 ## How To: Add a New Package
 
 1. Add the package under `packages/` (or a new top-level directory if it isn't a
@@ -332,5 +375,10 @@ blank screens, no silent failures (`CLAUDE.md` Design Quality Rules).
 - `docs/adrs/` and `docs/adr/` — architecture decision records
 - `docs/ops/` — CI setup, dependency-audit rationale, observability
 - `packages/sdk/README.md` — SDK usage and API reference
-- `docs/mcp.md` — the MCP server (`packages/mcp`): tool contract, MCP client config, the
-  `read`-scoped key it requires, and the progressive-disclosure tiers its tools implement
+- `docs/mcp.md` — the MCP server (`packages/mcp`). Its "Start here" section is the
+  progressive-disclosure ladder with measured per-tier token costs, a worked example of
+  the intended investigation path, and the CI-gate/`scanTruncated` semantics; the rest
+  is the tool contract, MCP client config, and the `read`-scoped key it requires
+- `docs/api_reference.md` — the HTTP contract behind both read clients: `/api/v1/**`
+  endpoints and their envelope, `?fields=` projection, key management, the
+  alerts/webhooks management API, and the `afr` CLI's exit codes

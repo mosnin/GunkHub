@@ -79,11 +79,22 @@ export function registerExplainRun(server: McpServer, reader: AfrReader): void {
     {
       title: 'Explain a run',
       description:
-        'Why did this run fail? Returns the cached root-cause explanation: summary, rootCause, suggestedFix, ' +
-        'failureClass, and citedSequenceNumbers. Read this BEFORE afr_get_run_events — it is ~200 tokens and it ' +
-        'tells you which sequence numbers are worth fetching. ' +
-        'status "ready" means the explanation is below; "pending" means the run failed but generation has not landed ' +
-        'yet (retry later); "not_eligible" means the run did not fail and never will have one.',
+        'Answers "why did THIS run fail?" for one runId, ~121 tokens (~192 worst case). Returns the cached ' +
+        'root-cause explanation: summary, rootCause, suggestedFix, failureClass, and citedSequenceNumbers. ' +
+        'ALWAYS read this before afr_get_run_events — it costs ~1/30th as much and it tells you which sequence ' +
+        'numbers are worth fetching. ' +
+        'READ "availability", NOT "status", TO DECIDE WHETHER TO RETRY. status is the raw server discriminant and ' +
+        '"not_eligible" on it does NOT mean "never": a run that is still in flight is reported not_eligible right ' +
+        'now and may fail and get an explanation moments later. availability resolves that against runStatus — ' +
+        '"not_yet" means it can still produce one (it failed and generation has not landed, or it is still running) ' +
+        'so retry; "never" means the run finished without failing, so stop; "unknown" means runStatus was not served ' +
+        'or contradicts status, so do not conclude either. When status is "ready" the explanation is below and ' +
+        'availability is omitted. ' +
+        '"kind" tells you whether you are reading a heuristic (derived) or llm (analysed) explanation — the ' +
+        'heuristic path is unconditional, so an explanation never depends on an LLM being available. ' +
+        'NOT for: a question about a recurring failure across runs (afr_triage or afr_get_pattern_evidence), or when ' +
+        'you do not have a runId yet (afr_triage, then afr_list_runs). Long prose is capped with an explicit ' +
+        '"…[truncated, N more chars]" marker.',
       inputSchema,
       annotations: { readOnlyHint: true, openWorldHint: true },
     },

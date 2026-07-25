@@ -137,6 +137,9 @@ const _resolveRegenerateAccessRef = makeFunctionReference<"query">(
   "run_explanations:_resolveRegenerateAccess",
 );
 const _recordRegenerateAuditRef = makeFunctionReference<"mutation">("run_explanations:_recordRegenerateAudit");
+const _listRunsMissingExplanationRef = makeFunctionReference<"query">(
+  "run_explanations:_listRunsMissingExplanation",
+);
 export const _generateRunExplanationRef = makeFunctionReference<"action">(
   "run_explanations:generateRunExplanation",
 );
@@ -810,5 +813,167 @@ export const regenerateRunExplanation = action({
     });
 
     return await ctx.runAction(_generateRunExplanationRef, { runId: args.runId, force: true });
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Coverage repair sweep — makes "pending" a BOUNDED claim
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. Generation is EAGER: every path that lands a run in a
+// failed/timed_out/cancelled state schedules `generateRunExplanation` via
+// `ctx.scheduler.runAfter(0, ...)` (convex/events.ts, convex/sdk_ingest.ts,
+// convex/runs.ts updateRunStatus, convex/stale_runs.ts). That is a
+// FIRE-AND-FORGET, EXACTLY-ONCE-ATTEMPTED schedule with no retry behind it.
+// Before this sweep, any of the following left a run permanently without an
+// explanation, with nothing to ever notice or repair it:
+//
+//   - the scheduled action failed/was dropped before it wrote its row;
+//   - `getHeuristicBuilder()` missed and generation returned
+//     `{ skipped: true, reason: "heuristic_engine_unavailable" }` (a transient
+//     deploy-ordering condition that is never retried);
+//   - `_upsertRunExplanation` hit its run-existence guard mid-race;
+//   - the run reached a terminal failure state BEFORE ADR-004 shipped, so no
+//     scheduling site existed at the time.
+//
+// In every one of those cases `getRunExplanation` returns `status: "pending"`
+// forever. `"pending"` tells a caller "generation has not landed yet — retry
+// later", and both tier-3 consumers act on it that way (packages/mcp's
+// `afr_explain_run`, apps/web's ExplanationPanel). Without a repair sweep that
+// instruction never terminates: the agent retries against a state that will
+// never change. This job is what makes `"pending"` honest — it bounds the
+// claim, so "retry later" is a statement that actually comes true.
+//
+// IT IS A REPAIR SWEEP, NOT A HISTORICAL BACKFILL. It deliberately does not
+// attempt to explain every failed run that has ever existed. See the bounds
+// below and their acknowledged limit.
+
+/** Statuses the sweep repairs — exactly EXPLAINABLE_STATUSES, as a validator-typed literal union for the index range. */
+const BACKFILL_STATUSES = ["failed", "timed_out", "cancelled"] as const;
+
+/**
+ * How far back the sweep looks, by run `startedAt` (the indexed field on
+ * `by_status_started`). Runs that started before this are never examined:
+ * repairing a week-old run does not help anyone debugging, and an unbounded
+ * lookback is exactly the sweep this codebase's cron patterns forbid.
+ */
+export const EXPLANATION_BACKFILL_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A run that ended within this grace period is left alone: its eagerly
+ * scheduled generation is legitimately still in flight, and re-scheduling it
+ * would just race the original. Only runs that ended longer ago than this are
+ * treated as genuinely dropped.
+ */
+export const EXPLANATION_BACKFILL_GRACE_MS = 10 * 60 * 1000;
+
+/** Max run rows READ per status per tick — the hard bound on this job's read cost. */
+export const EXPLANATION_BACKFILL_SCAN_LIMIT = 250;
+
+/** Max generations SCHEDULED per tick across all statuses — the hard bound on the work it fans out. */
+export const EXPLANATION_BACKFILL_MAX_SCHEDULES = 25;
+
+/**
+ * Runs in one explainable status that are missing an explanation and are past
+ * the grace period. Bounded TWICE, never a table scan: the index range is
+ * `by_status_started` narrowed to one status AND lower-bounded at
+ * `windowStart`, and at most `scanLimit` rows are read from it.
+ *
+ * Newest-first (`order("desc")`). ACKNOWLEDGED LIMIT: if a single status has
+ * more than `scanLimit` runs inside the window, the oldest of them are not
+ * reached on any tick and are never repaired. That is the deliberate trade —
+ * the same one `projection_verify:verifyRecentRuns` makes (48h / 50 runs) —
+ * and it is chosen in the direction that matters for this feature: a
+ * debugging agent asks "why did this fail?" about a run that just failed, so
+ * the newest failures are the ones worth guaranteeing.
+ */
+export const _listRunsMissingExplanation = internalQuery({
+  args: {
+    status: v.union(v.literal("failed"), v.literal("timed_out"), v.literal("cancelled")),
+    windowStart: v.number(),
+    endedBefore: v.number(),
+    scanLimit: v.number(),
+    maxResults: v.number(),
+  },
+  handler: async (ctx, args): Promise<{ scanned: number; runIds: Id<"runs">[] }> => {
+    const candidates = await ctx.db
+      .query("runs")
+      .withIndex("by_status_started", (q) => q.eq("status", args.status).gte("startedAt", args.windowStart))
+      .order("desc")
+      .take(args.scanLimit);
+
+    const runIds: Id<"runs">[] = [];
+    for (const run of candidates) {
+      if (runIds.length >= args.maxResults) break;
+      // A terminal run always has endedAt (every transition site sets it);
+      // fall back to startedAt so a malformed row still ages out of the grace
+      // period rather than being skipped forever.
+      const endedAt = run.endedAt ?? run.startedAt;
+      if (endedAt > args.endedBefore) continue; // still legitimately in flight
+
+      const existing = await ctx.db
+        .query("run_explanations")
+        .withIndex("by_run", (q) => q.eq("runId", run._id))
+        .first();
+      if (existing) continue;
+
+      runIds.push(run._id);
+    }
+
+    return { scanned: candidates.length, runIds };
+  },
+});
+
+/**
+ * Cron entry point (every 30 min — see convex/crons.ts). Re-schedules
+ * `generateRunExplanation` for eligible runs whose eager scheduling never
+ * produced a row.
+ *
+ * `internalAction`, NOT `action` — this is a cross-org batch job, exactly like
+ * `projection_verify:verifyRecentRuns` and `stale_runs:expireStaleRuns`.
+ * Exposing it publicly would let anyone with the deployment URL trigger an
+ * unauthenticated cross-org sweep. It is also structurally incapable of
+ * leaking across the org boundary: it returns only aggregate COUNTS, never a
+ * run id, an org id, or any explanation content, and the work it fans out
+ * (`generateRunExplanation`) stamps each row with `run.orgId` read from the
+ * run itself.
+ *
+ * SAFE TO RE-RUN AND TO OVERLAP with eager scheduling:
+ * `generateRunExplanation` is idempotent without `force` — a run that already
+ * has a row returns `{ skipped: true, reason: "already_generated" }`.
+ *
+ * NEVER MUTATES EVENTS. Like every other path in this file it only reads the
+ * event log and writes the derived `run_explanations` row.
+ */
+export const backfillMissingExplanations = internalAction({
+  args: {},
+  handler: async (ctx): Promise<{ scanned: number; scheduled: number }> => {
+    const now = Date.now();
+    const windowStart = now - EXPLANATION_BACKFILL_WINDOW_MS;
+    const endedBefore = now - EXPLANATION_BACKFILL_GRACE_MS;
+
+    let scanned = 0;
+    let scheduled = 0;
+
+    for (const status of BACKFILL_STATUSES) {
+      if (scheduled >= EXPLANATION_BACKFILL_MAX_SCHEDULES) break;
+
+      const page = (await ctx.runQuery(_listRunsMissingExplanationRef, {
+        status,
+        windowStart,
+        endedBefore,
+        scanLimit: EXPLANATION_BACKFILL_SCAN_LIMIT,
+        maxResults: EXPLANATION_BACKFILL_MAX_SCHEDULES - scheduled,
+      })) as { scanned: number; runIds: Id<"runs">[] };
+
+      scanned += page.scanned;
+      for (const runId of page.runIds) {
+        await ctx.scheduler.runAfter(0, _generateRunExplanationRef, { runId });
+        scheduled++;
+      }
+    }
+
+    console.log(`run_explanations backfill: scanned=${scanned} scheduled=${scheduled}`);
+    return { scanned, scheduled };
   },
 });

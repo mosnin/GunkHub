@@ -912,3 +912,237 @@ describe('stale-explanation-on-status-change hazard (documented as structurally 
     expect(run?.status).toBe('failed')
   })
 })
+
+// ---------------------------------------------------------------------------
+// COVERAGE — the repair sweep that makes "pending" a bounded claim.
+//
+// Generation is EAGER and fire-and-forget: each of the four terminal-failure
+// sites schedules generateRunExplanation exactly once with no retry. When that
+// one attempt does not land a row, getRunExplanation reports "pending" — which
+// tells a tier-3 caller (packages/mcp's afr_explain_run) to RETRY LATER —
+// forever. backfillMissingExplanations is what bounds that claim. These tests
+// pin the repair itself AND both bounds that keep it from becoming a sweep.
+// ---------------------------------------------------------------------------
+describe('backfillMissingExplanations (coverage repair sweep)', () => {
+  // Seeds a terminal run with a real failure event log but NO explanation row,
+  // simulating the eager schedule having been dropped/failed. `endedAgo`
+  // controls whether it is inside or outside the 10-minute grace period.
+  async function seedUnexplainedRun(
+    t: ReturnType<typeof convexTest>,
+    orgId: any, projectId: any, agentId: any,
+    status: 'failed' | 'timed_out' | 'cancelled' = 'failed',
+    endedAgoMs = 60 * 60 * 1000,
+    startedAgoMs = 2 * 60 * 60 * 1000,
+  ) {
+    return await t.run(async (ctx) => {
+      const now = Date.now()
+      const runId = await ctx.db.insert('runs', {
+        orgId, projectId, agentId, status,
+        startedAt: now - startedAgoMs, endedAt: now - endedAgoMs, metadata: {}, tags: [],
+      })
+      await ctx.db.insert('events', { runId, orgId, type: 'run.started', sequenceNumber: 1, timestamp: now - startedAgoMs, payload: {} })
+      await ctx.db.insert('events', { runId, orgId, type: 'llm.error', sequenceNumber: 2, timestamp: now - endedAgoMs, payload: { error: { message: 'dropped-schedule boom' } } })
+      await ctx.db.insert('events', { runId, orgId, type: 'run.failed', sequenceNumber: 3, timestamp: now - endedAgoMs, payload: { message: 'dropped-schedule boom' } })
+      return runId
+    })
+  }
+
+  const explanationFor = (t: ReturnType<typeof convexTest>, runId: any) =>
+    t.run((ctx) => ctx.db.query('run_explanations').withIndex('by_run', (q) => q.eq('runId', runId)).first())
+
+  it('repairs a failed run whose eager schedule never landed a row, and getRunExplanation flips pending -> ready', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedUnexplainedRun(t, orgA, projectA, agentA, 'failed')
+    const asMember = t.withIdentity(identity('member', 'a'))
+
+    // Precondition: this is exactly the state the sweep exists to fix — an
+    // eligible run stuck reporting "pending" with nothing scheduled to change it.
+    const before = await asMember.query(api.run_explanations.getRunExplanation, { runId })
+    expect(before.status).toBe('pending')
+    expect(before.explanation).toBeNull()
+
+    vi.useFakeTimers()
+    try {
+      const result = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+      expect(result.scheduled).toBe(1)
+      await t.finishAllScheduledFunctions(vi.runAllTimers)
+    } finally {
+      vi.useRealTimers()
+    }
+
+    const after = await asMember.query(api.run_explanations.getRunExplanation, { runId })
+    expect(after.status).toBe('ready')
+    // Deterministic, no LLM configured: the repaired row is a heuristic one,
+    // and it is labelled as such so a caller never mistakes it for analysed.
+    expect(after.explanation?.kind).toBe('heuristic')
+    expect(after.explanation?.summary.length).toBeGreaterThan(0)
+  })
+
+  it('repairs timed_out and cancelled runs too, not just failed', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const timedOut = await seedUnexplainedRun(t, orgA, projectA, agentA, 'timed_out')
+    const cancelled = await seedUnexplainedRun(t, orgA, projectA, agentA, 'cancelled')
+
+    vi.useFakeTimers()
+    try {
+      const result = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+      expect(result.scheduled).toBe(2)
+      await t.finishAllScheduledFunctions(vi.runAllTimers)
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(await explanationFor(t, timedOut)).not.toBeNull()
+    expect(await explanationFor(t, cancelled)).not.toBeNull()
+  })
+
+  it('never touches a completed run — a successful run must stay not_eligible, not acquire a failure explanation', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const completed = await seedUnexplainedRun(t, orgA, projectA, agentA, 'failed')
+    await t.run((ctx) => ctx.db.patch(completed, { status: 'completed' }))
+
+    const result = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+    expect(result.scheduled).toBe(0)
+
+    const asMember = t.withIdentity(identity('member', 'a'))
+    const read = await asMember.query(api.run_explanations.getRunExplanation, { runId: completed })
+    expect(read.status).toBe('not_eligible')
+  })
+
+  it('respects the grace period: a run that ended seconds ago is left to its in-flight eager generation', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    // endedAgo = 1 minute, well inside EXPLANATION_BACKFILL_GRACE_MS (10 min).
+    await seedUnexplainedRun(t, orgA, projectA, agentA, 'failed', 60 * 1000, 5 * 60 * 1000)
+
+    const result = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+    expect(result.scheduled).toBe(0)
+  })
+
+  it('respects the 24h window: a run that started before it is never examined', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const old = 3 * 24 * 60 * 60 * 1000
+    await seedUnexplainedRun(t, orgA, projectA, agentA, 'failed', old, old + 60_000)
+
+    const result = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+    expect(result.scanned).toBe(0)
+    expect(result.scheduled).toBe(0)
+  })
+
+  it('is idempotent: a run that already has an explanation is neither rescheduled nor regenerated', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedUnexplainedRun(t, orgA, projectA, agentA, 'failed')
+
+    vi.useFakeTimers()
+    try {
+      await t.action(internal.run_explanations.backfillMissingExplanations, {})
+      await t.finishAllScheduledFunctions(vi.runAllTimers)
+    } finally {
+      vi.useRealTimers()
+    }
+    const first = await explanationFor(t, runId)
+    expect(first).not.toBeNull()
+
+    // Second sweep sees the row and schedules nothing.
+    const second = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+    expect(second.scheduled).toBe(0)
+
+    const after = await explanationFor(t, runId)
+    expect(after?._id).toBe(first?._id)
+    expect(after?.generatedAt).toBe(first?.generatedAt)
+  })
+
+  it('caps fan-out at EXPLANATION_BACKFILL_MAX_SCHEDULES (25) per tick and drains across ticks', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    for (let i = 0; i < 30; i++) {
+      await seedUnexplainedRun(t, orgA, projectA, agentA, 'failed')
+    }
+
+    vi.useFakeTimers()
+    try {
+      const first = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+      expect(first.scheduled).toBe(25) // hard bound, not 30
+      await t.finishAllScheduledFunctions(vi.runAllTimers)
+
+      // Resumable: the next tick picks up exactly the remainder.
+      const second = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+      expect(second.scheduled).toBe(5)
+      await t.finishAllScheduledFunctions(vi.runAllTimers)
+
+      const third = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+      expect(third.scheduled).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+
+    const rows = await t.run((ctx) => ctx.db.query('run_explanations').collect())
+    expect(rows.length).toBe(30)
+  })
+
+  it('repairs runs in EVERY org it sweeps, and stamps each row with that run\'s OWN orgId (no cross-org bleed)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectA, agentA } = await seedTwoOrgs(t)
+    const projectB = await t.run((ctx) => ctx.db.insert('projects', { orgId: orgB, name: 'PB', slug: 'pb', createdAt: Date.now(), updatedAt: Date.now() }))
+    const agentB = await t.run((ctx) => ctx.db.insert('agents', { orgId: orgB, projectId: projectB, name: 'Agent B', slug: 'b', createdAt: Date.now(), updatedAt: Date.now() }))
+
+    const runA = await seedUnexplainedRun(t, orgA, projectA, agentA, 'failed')
+    const runB = await seedUnexplainedRun(t, orgB, projectB, agentB, 'failed')
+
+    vi.useFakeTimers()
+    try {
+      await t.action(internal.run_explanations.backfillMissingExplanations, {})
+      await t.finishAllScheduledFunctions(vi.runAllTimers)
+    } finally {
+      vi.useRealTimers()
+    }
+
+    const rowA = await explanationFor(t, runA)
+    const rowB = await explanationFor(t, runB)
+    expect(rowA?.orgId).toBe(orgA)
+    expect(rowB?.orgId).toBe(orgB)
+
+    // Org A's member can read its own repaired run, and org B's repaired run
+    // stays indistinguishable from a missing one across the boundary.
+    const asMemberA = t.withIdentity(identity('member', 'a'))
+    expect((await asMemberA.query(api.run_explanations.getRunExplanation, { runId: runA })).status).toBe('ready')
+    await expect(asMemberA.query(api.run_explanations.getRunExplanation, { runId: runB })).rejects.toThrow(/NOT_FOUND/)
+  })
+
+  it('returns only aggregate counts — never a runId, orgId, or explanation body (it is a cross-org job)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedUnexplainedRun(t, orgA, projectA, agentA, 'failed')
+
+    const result = await t.action(internal.run_explanations.backfillMissingExplanations, {})
+    expect(Object.keys(result).sort()).toEqual(['scanned', 'scheduled'])
+    expect(typeof result.scanned).toBe('number')
+    expect(typeof result.scheduled).toBe('number')
+  })
+
+  it('appends nothing to and mutates nothing in the event log', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    const runId = await seedUnexplainedRun(t, orgA, projectA, agentA, 'failed')
+
+    const before = await t.run((ctx) => ctx.db.query('events').withIndex('by_run', (q) => q.eq('runId', runId)).collect())
+
+    vi.useFakeTimers()
+    try {
+      await t.action(internal.run_explanations.backfillMissingExplanations, {})
+      await t.finishAllScheduledFunctions(vi.runAllTimers)
+    } finally {
+      vi.useRealTimers()
+    }
+
+    const after = await t.run((ctx) => ctx.db.query('events').withIndex('by_run', (q) => q.eq('runId', runId)).collect())
+    expect(after.length).toBe(before.length)
+    expect(after.map((e) => [e._id, e.type, e.sequenceNumber, JSON.stringify(e.payload)]))
+      .toEqual(before.map((e) => [e._id, e.type, e.sequenceNumber, JSON.stringify(e.payload)]))
+  })
+})

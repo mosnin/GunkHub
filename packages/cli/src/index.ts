@@ -26,6 +26,7 @@ import { REPLAY_HELP, parseReplayArgs, printReplay, runReplay } from './commands
 import { RUNS_GET_HELP, parseRunsGetArgs, printRunsGet, runRunsGet } from './commands/runs-get.js'
 import { RUNS_LIST_HELP, parseRunsListArgs, printRunsList, runRunsList } from './commands/runs-list.js'
 import { TAIL_HELP, parseTailArgs, printTailSummary, runTail } from './commands/tail.js'
+import { TRIAGE_HELP, exitCodeForTriage, parseTriageArgs, printTriage, runTriage } from './commands/triage.js'
 import { runVersion } from './commands/version.js'
 
 export { readEnv } from './env.js'
@@ -57,6 +58,15 @@ export { parseReplayArgs, runReplay, printReplay } from './commands/replay.js'
 export type { ReplayArgs, ReplayResult } from './commands/replay.js'
 export { parseTailArgs, runTail, printTailSummary } from './commands/tail.js'
 export type { TailArgs, TailOptions, TailResult, TailStopReason } from './commands/tail.js'
+export {
+  parseTriageArgs,
+  runTriage,
+  printTriage,
+  exitCodeForTriage,
+  TRIAGE_EXIT_FINDINGS,
+  TRIAGE_EXIT_INCOMPLETE,
+} from './commands/triage.js'
+export type { TriageArgs, TriageCommandResult } from './commands/triage.js'
 export { parseExportArgs, runExport, printExport } from './commands/export.js'
 export type { ExportArgs, ExportResult, ExportBundle, WriteFileLike } from './commands/export.js'
 export type { CommandFailure } from './commands/shared.js'
@@ -68,6 +78,7 @@ Usage:
   afr <command> [subcommand] [args]
 
 Commands:
+  afr triage                    START HERE: what is wrong right now, and what to look at first
   afr init                      Zero-to-recorded-run onboarding: check config, write a starter file, print next steps
   afr record demo              Run a small demo agent end-to-end against your configured backend
   afr config check             Validate AFR_API_KEY / AFR_BASE_URL and ping /api/health
@@ -138,6 +149,20 @@ export async function main(argv: string[], log: (line: string) => void = console
       const result = await runInit(args)
       printInit(result, log)
       return result.exitCode
+    }
+
+    case 'triage': {
+      const args = parseTriageArgs(afterCommand)
+      if (args.help) {
+        log(TRIAGE_HELP)
+        return 0
+      }
+      const result = await runTriage(args)
+      printTriage(args, result, log)
+      // Transport/usage failures keep the shared 0-4 convention; a SUCCESSFUL
+      // triage maps its verdict to 0/10/11. Exit 0 is unreachable unless the
+      // verdict is 'clear', which is only produced by a complete scan.
+      return result.ok ? exitCodeForTriage(result) : result.exitCode
     }
 
     case 'explain': {

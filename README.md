@@ -19,6 +19,7 @@ exactly what happened and why. Replay and diff are derived views over the stored
 | `apps/web` | Next.js 14 (App Router) UI, ingestion API routes, Clerk auth integration |
 | `packages/contracts` | Shared TypeScript types only — zero runtime dependencies |
 | `packages/sdk` | Client recording library — instruments agent code, ships events to Convex |
+| `packages/cli` | `afr` command-line interface — a read-only client of the `/api/v1` read API |
 | `packages/mcp` | MCP server — exposes the `/api/v1` read API to MCP clients; read-only, see [`docs/mcp.md`](docs/mcp.md) |
 | `convex/` | Backend schema, query/mutation functions, crons, Convex auth config |
 | `tests/` | Unit tests (`tests/unit`), integration tests against a real Convex deployment (`tests/integration`), end-to-end tests (`tests/e2e`), shared fixtures |
@@ -85,11 +86,41 @@ buffering/retry/spool behavior, and payload-externalization details.
 
 ---
 
+## Investigating a failure
+
+Two read-only clients sit on the same `/api/v1` surface: the `afr` CLI
+(`packages/cli`) and the MCP server (`packages/mcp`). Both are deliberately tiered by
+cost, and **the order you call them in is the product**:
+
+```
+0. what is wrong, and                                   afr_triage()      ← START HERE
+   what do I look at first?                             ~333 tokens, no arguments
+1. what is broken? (breadth)  afr patterns           /  afr_list_failure_patterns
+2. did the fix hold?          afr patterns evidence … /  afr_get_pattern_evidence
+3. why did THIS run fail?     afr explain <runId>     /  afr_explain_run
+4. show me the events         afr export <runId>      /  afr_get_run_events  ← expensive
+```
+
+`afr_triage()` takes no arguments and every item it returns names the exact next tool
+and arguments to call — an agent never has to infer the ladder. Triage plus an
+explanation costs roughly an eighth of a single step-4 event window. Most
+investigations should end at step 3; many should end at step 0.
+[`docs/mcp.md`](docs/mcp.md) → "Start here" has the measured numbers, a worked example,
+and the CI-gate semantics.
+
+There is no `afr triage` CLI command yet — triage is MCP-only today. For a build gate,
+`afr patterns --state regressed` exits `11` ("could not evaluate") rather than `0` when
+its scan was truncated, so a gate cannot mistake an unfinished scan for a clean one —
+see [`docs/api_reference.md`](docs/api_reference.md) § "Exit codes".
+
+---
+
 ## Docs Index
 
 - [`docs/architecture.md`](docs/architecture.md) — system architecture, entity hierarchy, event-log invariants, tenancy model, ingest paths, durability story
 - [`docs/adrs/`](docs/adrs/) and [`docs/adr/`](docs/adr/) — architecture decision records (two directories exist today: `docs/adrs/0001`–`0026` is the original sequence, `docs/adr/001-data-retention-and-erasure.md` is a newer one; consult both when researching a decision)
-- [`docs/mcp.md`](docs/mcp.md) — the MCP server (`packages/mcp`): tool contract, client configuration, and the progressive-disclosure model the tools are built around
+- [`docs/mcp.md`](docs/mcp.md) — the MCP server (`packages/mcp`). **Start with its "Start here" section**: the progressive-disclosure ladder, the measured token cost of each tier, a worked example of the intended investigation path, and the CI-gate/`scanTruncated` semantics. Then the tool contract and client configuration
+- [`docs/api_reference.md`](docs/api_reference.md) — HTTP contract for the public v1 read API (`/api/v1/**`), key management, the alerts/webhooks management API, outbound webhook verification, and how the `afr` CLI and MCP server map onto all of it
 - [`docs/ops/`](docs/ops/) — CI setup, dependency-audit ignore rationale, observability
 - [`docs/operations_runbook.md`](docs/operations_runbook.md), [`docs/deployment_checklist.md`](docs/deployment_checklist.md) — operational procedures
 - [`design.md`](design.md) — "Neon — Server Room After Dark," the authoritative visual style for every UI change

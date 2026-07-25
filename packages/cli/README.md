@@ -26,6 +26,44 @@ export AFR_BASE_URL="https://your-afr-instance.example.com"
 
 ## Command reference
 
+### `afr triage`
+
+**Start here.** One call, zero required arguments, answering the question you actually arrive with: *what is wrong right now, and what should I look at first?* Ranks your organization's recurring failure patterns and prints the top few, each row carrying the exact next command to run.
+
+```bash
+$ afr triage
+FINGERPRINT   SIGNAL     SCORE  CLASS       LABEL                             COUNT  LAST SEEN                 MUTED  NEXT
+a1b2c3d4e5f…  REGRESSED  228    tool_error  lookup_order tool call times out  12     2026-07-25T05:00:00.000Z  -      afr patterns evidence a1b2c3d4e5f6a1b2
+f6e5d4c3b2a…  SPIKING    184    tool_error  flaky_search tool call 5xx        40     2026-07-25T04:12:00.000Z  -      afr explain run_9f2c1a
+
+Showing 2 of 50 pattern(s) scanned.
+```
+
+Options: `--agent <agentId>` (only patterns seen on this agent), `--json`, `--help`.
+
+**The ranking is shared, not reimplemented.** This is the same ranking, the same scores and the same next-hop targets the `afr_triage` MCP tool serves — one implementation, in `@agent-flight-recorder/sdk`, imported by both. A CLI that ranked failures differently from the agent-facing tool would be two answers to one question. Signal order, highest first: `regressed`, `spiking`, `open`, `acknowledged`, `resolved`. Recency and volume order items *within* a signal class and can never promote one across a class. Muted patterns are shown, flagged, and always sorted last — muting suppresses alerting, not existence.
+
+`--json` emits the ranking's result **verbatim**, with next-hop pointers in their MCP tool-name form (`afr_explain_run`, `afr_get_pattern_evidence`, …), so a machine diffing this against the MCP tool finds nothing. Only the human table above translates a pointer into a runnable `afr` command.
+
+**Exit codes — read this before scripting it:**
+
+| Code | Verdict | Meaning |
+|---|---|---|
+| `0` | `clear` | The scan completed and found nothing to look at |
+| `10` | `issues` | Ranked items were found |
+| `11` | `unknown` | Nothing was found, **but the view was incomplete** — so "nothing found" is not evidence of health |
+
+`1`/`2`/`3`/`4` keep their usual meanings (usage / auth / not-found / network).
+
+**Exit `0` is structurally unreachable on an incomplete scan.** The verdict is computed as `items.length > 0 ? 'issues' : complete ? 'clear' : 'unknown'`, so `clear` already implies a whole view; `exitCodeForTriage` re-checks `complete` anyway, deliberately, because that invariant now lives in a different package shared with the MCP server and must not be able to turn this gate green from a distance. `10` wins over `11` when both apply — findings are actionable, and the incompleteness is stated in the output and in `--json`'s `complete` and `caveats`.
+
+```bash
+afr triage            # non-zero on findings OR on a scan it could not finish
+afr triage --json     # 'verdict', 'complete', 'caveats', 'items[].next'
+```
+
+**Why this differs from `afr patterns --state regressed`, deliberately.** That command exits `0` whether or not it matched, and relies on an external `jq -e` to turn a finding into a build failure — which is exactly how a build stays green while something is wrong, because the gate only works if someone remembered to add the jq. `afr triage` fails the build itself. Please do not "harmonise" the two: the difference is the point.
+
 ### `afr init`
 
 Frictionless first-run onboarding: get from zero to a recorded run in one command + one run.
@@ -129,6 +167,15 @@ $ afr patterns --regressed         # only patterns with regressedAt set — a re
 
 $ afr patterns --state regressed   # only fixes that demonstrably did NOT hold (see below)
 $ afr patterns --state confirmed   # only fixes with enough clean exposure to trust
+
+# A filtered scan that hit the server's row ceiling — inconclusive, NOT clean:
+$ afr patterns --state regressed
+No matching patterns in the rows scanned [scan truncated 2000/2000 rows] — the scan
+stopped on the server's row ceiling, not on the end of the table. This is NOT "none
+exist": nothing is known about the rows beyond it.
+  (page with the API's nextCursor until scanTruncated is false, or treat this run as inconclusive)
+$ echo $?
+11
 ```
 
 Options: `--agent <agentId>` (only patterns seen on at least one version of this agent), `--spiking` (only patterns currently flagged as spiking), `--muted` / `--active` (mute-aware filter — mutually exclusive, passing both is a usage error, exit 1), `--status <open|acknowledged|resolved>` (exact lifecycle-status filter — an invalid value is a usage error, exit 1), `--regressed` (only patterns with `regressedAt` set), `--state <unproven|proving|confirmed|regressed>` (fix-confidence filter — see below), `--limit <n>`, `--json` (prints the raw API response, including `muted`/`mutedAt` and the full resolution-lifecycle and evidence fields).
@@ -269,6 +316,32 @@ Exit codes are consistent across all commands: `0` ok, `1` usage (e.g. missing
 bad key or missing `read` scope), `3` not found (404), `4` network/rate-limit/
 server error (429/5xx/connection failure/malformed response).
 
+Codes `0`-`4` all describe the **request**. Above that band sit codes describing
+the **answer**, so a CI script can tell "I checked and it is clean" from "I could
+not finish checking":
+
+| Code | Meaning | Emitted by |
+|---|---|---|
+| `10` | Issues found — the check completed and something needs attention | `afr triage` |
+| `11` | Could not evaluate — the check did not complete, so its result is inconclusive, not clean | `afr triage`; `afr patterns` when a filtered request's scan was truncated (see below) |
+
+Both numbers mirror the MCP triage verdicts (`issues` / `clear` / `unknown`) so
+one set of codes means the same thing across commands. Note that `afr patterns`
+still exits `0` when it finds matching patterns — only `afr triage` treats a
+finding as a build failure. That asymmetry is deliberate and is explained under
+`afr triage` below.
+
+**Why `afr patterns` can exit `11`.** A *filtered* pattern request (`--state`,
+`--status`, `--regressed`, `--agent`, `--spiking`, `--muted`, `--active`) scans a
+bounded window of rows on the server and filters it, so it can return a short or
+empty page purely because it hit the 2,000-row scan ceiling rather than the end
+of the table. The API says so via `scanTruncated`. Reporting that as `0` would
+mean the documented CI gate — `afr patterns --state regressed` — could pass a
+build on a scan it never completed. So the output is annotated
+`[scan truncated N/M rows]` and the exit code is `11`. Page with the API's
+`nextCursor` until the scan completes, or treat the run as inconclusive. An
+unfiltered `afr patterns` never truncates and always exits `0`.
+
 ### `afr runs list`
 
 ```bash
@@ -375,6 +448,14 @@ Options: `--out <file>` (default: print to stdout), `--format ndjson|json`
 (default: `ndjson`).
 
 ## Version
+
+v0.11.0 — **`afr triage` — the cheap first hop.** New command: `afr triage`, zero required arguments, answering "what is wrong right now, and what should I look at first?" in one call. Ranks your org's recurring failure patterns and prints the top few as a table, each row carrying the exact next `afr` command to run; `--agent <id>` narrows to one agent, `--json` emits the raw result. This is the **same ranking, the same scores and the same next-hop targets** the `afr_triage` MCP tool serves — the implementation moved into `@agent-flight-recorder/sdk` (>= 0.17.0) and both surfaces import it, because two rankings that can disagree is worse than either. `--json` is the ranking's result **verbatim**, pointers in their MCP tool-name form, so a machine diffing the CLI against the MCP tool finds nothing; only the human table translates a pointer into a runnable `afr` command. No new API endpoint and no new query parameter: triage composes the existing `GET /api/v1/patterns` with the ranking's own field selection and scan limit.
+
+**New exit codes — this is a CI gate.** `0` = verdict `clear` (the scan completed and found nothing); `10` = verdict `issues` (ranked items found); `11` = verdict `unknown` (nothing found, but the view was incomplete, so "nothing found" is not evidence of health). `1`/`2`/`3`/`4` keep their usual meanings for usage/auth/not-found/network. **Exit `0` is structurally unreachable on an incomplete scan**: the verdict is computed as `items.length > 0 ? 'issues' : complete ? 'clear' : 'unknown'`, so `clear` already implies a whole view — and `exitCodeForTriage` re-checks `complete` anyway, deliberately, because that invariant now lives in a different package shared with the MCP server and must not be able to turn this gate green from a distance. `10` wins over `11` when both apply: findings are actionable, and the incompleteness is stated in the output and in `--json`'s `complete`/`caveats`.
+
+**Note the deliberate difference from `afr patterns --state regressed`**, and please do not "harmonise" them: that command exits `0` whether or not it matched, leaving the build to be failed by an external `jq -e`, which is how a build stays green when someone forgets the jq. `afr triage` fails the build itself. New exports: `parseTriageArgs`, `runTriage`, `printTriage`, `exitCodeForTriage`, `TRIAGE_EXIT_FINDINGS`, `TRIAGE_EXIT_INCOMPLETE`, `TriageArgs`, `TriageCommandResult`. Additive — no existing command, flag, or exit code changed.
+
+v0.10.0 — **A truncated scan no longer exits 0.** `afr patterns` reads the `scanTruncated`/`scannedRows`/`scanRowCeiling` fields the read API returns (newly typed in `@agent-flight-recorder/sdk` >= 0.16.0). A FILTERED request scans a bounded window of rows and filters it, so it can come back short or empty purely because it hit the server's 2,000-row ceiling. Previously that printed `No recurring failure patterns found.` and exited `0` — a whole-dataset claim, and a false one, on the exact path the CI gate uses (`afr patterns --state regressed`): a regression could exist past the ceiling and the build went green. Now the result is annotated in the existing bracket idiom — `[scan truncated 2000/2000 rows]` — the empty case says what was actually established ("No matching patterns in the rows scanned ... this is NOT \"none exist\""), a non-empty page is footnoted as PARTIAL, and the command **exits `11`** instead of `0`. **New exit code `11` — "could not evaluate"**, outside the existing 0-4 band (which describes the REQUEST; this describes the ANSWER) and aligned with the `afr triage` command in flight, which proposes `10` = issues found and `11` = could not evaluate, mirroring the MCP triage verdicts `issues`/`clear`/`unknown`. An UNFILTERED listing never truncates (the server sizes its scan to the page) and is unaffected; the exit code is withheld there in any case, since "here are some patterns" makes no whole-dataset claim. `--json` output gains `ok: false`, `scanIncomplete: true`, `exitCode`, and the three scan fields. The exported `PatternsResult` type gains a third union member, `PatternsScanIncomplete` (an `ok: false` result that still carries its `data`, because that is how a non-zero exit code reaches the shell). No other command, flag, or exit code changed.
 
 v0.9.0 — **`--state` accepts all four values** (ADR-006 cycle 3). `afr patterns --state unproven|proving|confirmed|regressed` all work now: the backend serves verdicts from a periodically refreshed snapshot rather than a per-request exposure scan, so cycle 2's client-side rejection of the three exposure-dependent values is gone. An invalid value is still a usage error (exit 1). New `CONFIDENCE` column rendering three distinct outcomes — `confirmed 82%` (fresh), `confirmed 82% [stale 9h]` (a real verdict that has aged past the bound), and `-` (no verdict yet, deliberately NOT shown as `unproven`). Two new footnotes: how many verdicts are stale, and which patterns have a resolution but no usable snapshot and so could not be graded at all. `--json` carries the full `fixConfidence` envelope (`stalenessBoundMs`, `entries[]`, `staleCount`, `unevaluated[]`). Requires `@agent-flight-recorder/sdk` >= 0.13.0.
 

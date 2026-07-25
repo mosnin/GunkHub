@@ -15,11 +15,21 @@ actually needs one.
 
 | Tier | Tool | Answers | Measured cost |
 |---|---|---|---|
+| **0** | **`afr_triage`** | **What is wrong, and what do I look at first?** | **~331 tok typical, ~429 worst case** |
 | 1 | `afr_list_failure_patterns` | What is broken? | ~284 tok / 10 patterns (~28/row) |
 | 2 | `afr_get_pattern_evidence` | Did the fix hold? | ~423 tok |
 | 3 | `afr_explain_run` | Why did this run fail? | ~119 tok typical, ~190 tok worst case |
 | 4 | `afr_get_run_events` | Show me the actual events. | ~3 400-3 900 tok at the 50-event cap |
 | — | `afr_list_runs` | Where am I? | ~475 tok / 20 runs (57x smaller than raw) |
+
+**A ladder whose bottom rung is not the obvious one is a ladder people fall
+off.** Tiers 1-4 were measured and correct, and an agent arriving cold still had
+no reason to start at the bottom: the CRUD instinct is "fetch the run", which is
+tier 4, ~3 838 tokens, and answers nothing useful because the agent does not yet
+know *which* run. Tier 0 exists to be the obvious first call — no arguments, one
+upstream read, and every item carrying the exact next tool and arguments — so
+descending the ladder is the path of least resistance rather than a discipline
+the caller has to supply.
 
 Every figure above is **measured**, against contract-maximal inputs (a
 `FailurePattern` with every optional field set, an explanation using its full
@@ -61,6 +71,141 @@ is ever written to stdout except protocol frames; diagnostics go to stderr.
 
 ## Tools
 
+### `afr_triage` — Tier 0, the entry point
+
+**Input:** `{ agentId?: string }` — **zero required arguments**. `afr_triage()`
+is the intended call; that is what makes it the default.
+
+**Output:**
+
+```jsonc
+{
+  "verdict": "issues",            // "issues" | "clear" | "unknown"
+  "complete": false,              // was the view behind the verdict WHOLE?
+  "scanned": 50,
+  "items": [
+    { "fingerprintHash": "01f3a9c1d4e7b2", "class": "http_error",
+      "label": "HTTP 429 from provider", "count": 220, "lastSeenAt": 1753400000000,
+      "signal": "regressed", "score": 233,
+      "next": { "tool": "afr_get_pattern_evidence",
+                "args": { "fingerprintHash": "01f3a9c1d4e7b2" } } }
+  ],
+  "scanTruncated": true,          // only when the SERVER's scan hit its row ceiling
+  "caveats": ["Scan truncated at 50 patterns; ranking covers only what was scanned."],
+  "unevaluated": { "count": 6, "sample": ["…","…","…"] },   // only when non-empty
+  "next": { "tool": "afr_list_failure_patterns", "args": { "cursor": "…", "limit": 100 } }
+}
+```
+
+**Measured at ~331 tokens typical and ~429 worst case** (a saturated 50-pattern
+scan, every item muted, every co-occurring caveat firing, an `unevaluated`
+sample and a top-level next hop), against the same `bytes/4` estimator and the
+same contract-maximal fixtures as everything else here. The ceiling is 450 —
+tier 2's — and the reason is a test, not a preference: an agent can already buy
+"what is broken" plus "did the fix hold" by calling tier 1 (~284) and tier 2
+(~423) itself, for ~707. **A shortcut that costs more than the thing it
+shortcuts is a fifth tier pretending to be a shortcut, and it should not
+exist.**
+
+**One upstream read.** Same endpoint as tier 1, same derived `fields` selection
+discipline. There is no second data source here to disagree with the first;
+everything else is ordering, capping and pointer construction.
+
+#### `next` — the point of the tool
+
+Every item carries exactly ONE `next`: a real tool name and the exact argument
+object to pass it. An agent should never have to *infer* the ladder.
+
+- A pattern with a live resolution, or one that regressed, raises "did the fix
+  hold?" — that is tier 2, verbatim.
+- Anything else raises "why does this happen?", and the cheapest real answer is
+  the cached explanation for a run that exhibited it, so the pointer is
+  `afr_explain_run` on `representativeRunIds[0]` (~121 tokens, an order of
+  magnitude under fetching that run's events).
+
+One pointer, not two: offering a choice per item would re-create, per item, the
+choice problem this tool exists to remove.
+
+#### The ranking, and why it is this ranking
+
+Signal class first, then recency, then volume.
+
+| Signal | Weight | Why here |
+|---|---|---|
+| `regressed` | 200 | A regression is not merely a failure, it is a **false belief living in the system**. Someone asserted this was fixed, the product recorded it, and the evidence now contradicts it — so every downstream reader is reasoning from something known to be wrong. A known-wrong belief is strictly worse than the known-unknown every other row is. |
+| `spiking` | 160 | A spike is a **change**, and the only signal here carrying information about *when* something started. A steady failure rate is a known cost; one that quadrupled this morning still has its causal window open. |
+| `open` | 120 | Unfixed and **nobody has looked**. |
+| `acknowledged` | 80 | Unfixed, but a human already made a judgement about it. For "what should I look at first", unseen beats seen-and-deferred. |
+| `resolved` | 40 | Last, but **not zero** — dropping holding resolutions would make an all-resolved org indistinguishable from an empty one. |
+
+Recency decays with a 24-hour half-life (max 20) and volume is log10-scaled and
+saturates at ~100 occurrences (max 15). Volume is log-scaled deliberately:
+linear volume lets one 10 000-count pattern drown the list, and "the biggest
+number" is not the question being asked.
+
+**The weights are spaced 40 apart and the tie-breakers total at most 35, so
+recency and volume order WITHIN a class and can never promote an item across
+one.** That is what makes the ordering explainable in one sentence — read the
+signal, then read the position within it — and
+`tests/unit/mcp_triage.test.ts` asserts the spacing directly rather than
+trusting the arithmetic to stay true. Ties break on `fingerprintHash`, so the
+order is total and two calls a millisecond apart cannot shuffle.
+
+**Muted patterns are demoted below everything and flagged `muted: true`, never
+hidden.** Muting suppresses *alerting*, not existence — but an admin muting a
+fingerprint is a human saying "stop putting this in front of me", and a tool
+whose whole job is "what should I look at first" has no business overriding
+that.
+
+#### Honesty: `verdict` and `complete` are two different questions
+
+`clear` and `unknown` **are not the same answer** and are never collapsed.
+`clear` is "the scan finished and found nothing"; `unknown` is "I could not
+evaluate". Reporting the second as the first tells a caller its agents are
+healthy when the tool actually failed to look.
+
+`complete` is orthogonal on purpose. `verdict: "issues", complete: false` is a
+real and common state — *these are the worst of what I saw, not the worst that
+exist* — and folding it into the verdict would either overstate a partial
+result or discard a useful one. It goes false when the scan was truncated, when
+the deployment served no fix confidence (so regressions could only be inferred
+from `regressedAt`), or when some resolution had no gradeable snapshot;
+`caveats` names each reason in one sentence, and `unevaluated` names the
+specific fingerprints.
+
+**Two truncations, kept distinct, because they are different failures.** A
+`nextCursor` means more patterns exist than the 50 this tool ranked — the scan
+was fine, the *ranking's scope* was not, so "these are the worst" really means
+"the worst of the 50 I looked at". `scanTruncated` is the server's own marker
+and means it could not finish scanning even that window, so a short or **empty**
+`items` may be an artefact of the row ceiling rather than evidence of health.
+The second is strictly worse, so it is what the single caveat names when both
+fire; both drive `complete: false`.
+
+Neither replaced the other. The cursor answers a question the server marker
+knows nothing about (this tool's own `SCAN_LIMIT`), and the marker answers one
+no cursor can (whether the server's scan was whole). Dropping either would
+under-declare a real gap. Absence of the marker is read through the SDK's
+`isPatternScanComplete`, so what "undeclared" means is decided in one place
+rather than guessed at three layers.
+
+Emitting 5 of 50 is **not** a caveat — that is the design, and `scanned` versus
+`items.length` states it for free. A caveat that fires on every ordinary call
+makes `complete` permanently false and the list permanently unread.
+
+#### Why there is no `limit`, and no `environment`
+
+`MAX_ITEMS` is hard at 5. The measured budget is measured *at* five; a
+caller-raisable cap would mean the published cost is not the cost. Breadth is
+`afr_list_failure_patterns`, which is exactly where the top-level `next` points
+when the scan was truncated — with the cursor forwarded verbatim, so continuing
+is mechanical rather than a guess.
+
+There is no `environment` filter because a `FailurePattern` is an org-scoped
+rollup over fingerprints and carries no environment. An `environment` argument
+here could only be accepted and ignored, and **a filter that silently does
+nothing is worse than an absent one** — a caller believes it applied.
+
 ### `afr_list_failure_patterns` — Tier 1
 
 **Input:** `{ agentId?: string, state?: 'unproven'|'proving'|'confirmed'|'regressed', status?: 'open'|'acknowledged'|'resolved', spiking?: boolean, regressed?: boolean, limit?: number (1-100, default 20), cursor?: string }`
@@ -74,9 +219,27 @@ is ever written to stdout except protocol frames; diagnostics go to stderr.
     ["01f3a9…", "tool_error", "Tool call failed", 128, 1753400000000, "open", "unproven", null]
   ],
   "nextCursor": "…",                              // absent on the last page
+  "scanTruncated": true,                          // only when the scan hit its row ceiling
   "unevaluated": { "count": 2, "sample": ["…"] }  // only when non-empty
 }
 ```
+
+**`scanTruncated` is the difference between "nothing matched" and "nothing
+matched in the slice I could afford to look at."** A filtered request
+overfetches a bounded window and then filters it, so a short — or entirely
+empty — page can be produced purely by the row ceiling. While it is present, an
+empty `rows` is **not** evidence that nothing matches: follow `nextCursor` until
+a page comes back without it, or report the question as unanswered.
+
+Convex computes the marker, the v1 route forwards it and the SDK types it — and
+this projection used to drop it at the last hop, which made the whole chain
+worthless. **A marker nobody reads is the same as no marker**, and the
+consequence lands on an agent: it calls the tool it is most likely to call
+first, sees a short list, and concludes the system is healthy. Emitted only when
+true, so a complete scan pays nothing (measured +5 tokens when it fires, against
+this tier's 300-token budget — the tightest in the package). Absence means
+"complete, or a deployment that cannot say", and that collapse is decided once,
+in the SDK's `isPatternScanComplete`, not re-guessed here.
 
 **Read a row by looking its column up in `fields`, never by a hardcoded
 index.** Adding a column later must not break a caller. A column that is `null`
@@ -165,7 +328,8 @@ a build gate, branch on `state === 'regressed'`.
 ```jsonc
 {
   "runId": "…",
-  "status": "ready",              // "ready" | "pending" | "not_eligible"
+  "status": "ready",              // "ready" | "pending" | "not_eligible" — RAW server discriminant
+  "availability": "not_yet",      // omitted when status is "ready"
   "runStatus": "failed",
   "summary": "…", "rootCause": "…", "suggestedFix": "…",
   "failureClass": "tool_error", "kind": "llm",
@@ -175,12 +339,42 @@ a build gate, branch on `state === 'regressed'`.
 
 Surfaces the explanation the backend already generated and cached
 (`convex/run_explanations.ts`, served by `GET /api/v1/runs/:id/explanation`) —
-nothing is re-derived here.
+nothing is re-derived here. `kind` is `heuristic` or `llm`: the heuristic path
+is unconditional and primary, the LLM is augmentation behind a grounding gate,
+so an explanation never depends on an LLM being available — but a caller should
+know whether it is reading a derived summary or an analysed one.
 
-`status` is the honest discriminant and must not be collapsed into a bare null:
-`pending` means the run failed and generation has not landed yet (retry later);
-`not_eligible` means the run did not fail and never will have an explanation.
-Those demand different behaviour.
+**Read `availability`, not `status`, to decide whether to retry.**
+`status: "not_eligible"` is true-but-misleading for a run that is **still in
+flight**: the server means "not eligible right now", the word reads as "not
+eligible ever", and an agent that believes the second concludes *nothing to see
+here* about a run that is actively failing and will have an explanation in
+thirty seconds. Since tier 0 makes `afr_explain_run` the default second call,
+that misreading now sits on the default path.
+
+`availability` resolves `status` against `runStatus`, both of which the server
+already sends:
+
+| `availability` | Means | Do |
+|---|---|---|
+| `not_yet` | It failed and generation has not landed, **or the run is still running and may yet fail** | Retry later |
+| `never` | The run reached a terminal, non-failed state | Stop |
+| `unknown` | `runStatus` was not served, or the two signals contradict each other | Do not conclude either |
+
+`available` exists in the vocabulary but is never emitted — it is implied by
+`status: "ready"`, and tier 3's contract-maximal budget is measured on exactly
+that case, so a field with no information content must not land on it.
+
+**The wire vocabulary is deliberately not widened to fix this.** `status` is
+validated against a hard-coded `not_eligible|pending|ready` in both this package
+(`readStatus`) and `apps/web/src/lib/services/explanations.ts`, and both
+*silently downgrade* an unrecognised value to `pending` — so a new server-side
+status would reach an agent as `pending`, the exact un-actionable answer it
+would have been added to remove. Fixing that properly needs a coordinated change
+across `packages/mcp` + `apps/web` + `convex/read_api.ts`;
+`tests/unit/explanation_coverage.test.ts` pins the coupling on the source text
+until then. `availability` is the client-side derivation available today, and
+`status` is unchanged.
 
 The `citedSequenceNumbers` are the point of the tier boundary — pass one as
 `aroundSequence` to tier 4 instead of paging a whole run.
@@ -268,11 +462,21 @@ Each tool now asks for exactly the columns it will emit:
 
 | Tool | Table | `fields` sent |
 |---|---|---|
+| `afr_triage` | `failure_patterns` | `class, label, count, lastSeenAt, muted, regressedAt, resolvedAt, status, lastSpikeAssessment, representativeRunIds` |
 | `afr_list_failure_patterns` | `failure_patterns` | `class, label, count, lastSeenAt, status` |
 | `afr_list_runs` | `runs` | `agentId, status, startedAt, endedAt, environment, sessionId` |
 | `afr_get_run_events` | `events` | `type, timestamp, payload` |
 | `afr_get_pattern_evidence` | — | none: a composed envelope, not a projectable document |
 | `afr_explain_run` | — | none, same reason |
+
+`afr_triage` asks for more than it emits, and that is deliberate: `regressedAt`,
+`resolvedAt`, `lastSpikeAssessment` and `representativeRunIds` are **ranking and
+pointer inputs**, never columns. A field the server does not send is one the
+ranking silently treats as absent — without `regressedAt`/`resolvedAt`, every
+regression on a deployment without fix confidence would classify as `open` and
+the tool would confidently rank a broken fix below a new singleton. They live in
+`TRIAGE_RANKING_SOURCES` with a stated purpose each, because an unexplained name
+in a field selection is the first thing a future reader deletes as unused.
 
 **The list is DERIVED, never written twice.** Each projection declares its
 columns once as a `ProjectedColumn[]` table pairing the emitted column with the

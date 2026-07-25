@@ -47,6 +47,13 @@
  * Server-side projection is defense in depth's cheap half. This file is the
  * half that is load-bearing.
  */
+import {
+  columnsOf,
+  isPatternScanComplete,
+  requestFieldsOf,
+  truncateProse,
+} from '@agent-flight-recorder/sdk'
+
 import type {
   Event,
   ExternalizedPayload,
@@ -55,7 +62,19 @@ import type {
   Run,
   RunExplanation,
 } from '@agent-flight-recorder/contracts'
-import type { FixConfidenceEntry, V1ListFixConfidenceEnvelope } from '@agent-flight-recorder/sdk'
+import type {
+  FixConfidenceEntry,
+  ProjectedColumn,
+  V1ListFailurePatternsData,
+  V1ListFixConfidenceEnvelope,
+} from '@agent-flight-recorder/sdk'
+
+// The generic projection primitives now live in the SDK (see the notes at
+// their former definition sites below). Re-exported from here so every
+// existing importer of this module — and `index.ts`'s
+// `export * from './projections.js'` — keeps working unchanged.
+export { columnsOf, requestFieldsOf, truncateProse }
+export type { ProjectedColumn }
 
 // ---------------------------------------------------------------------------
 // Columnar encoding — LIST tools only
@@ -121,60 +140,19 @@ export function toColumnar<T extends object>(records: T[], fields: readonly (key
 // ---------------------------------------------------------------------------
 
 /**
- * One column of a projection, paired with the SOURCE DOCUMENT FIELD it reads.
+ * MOVED TO `@agent-flight-recorder/sdk` and re-exported here.
  *
- * WHY THE PAIRING EXISTS. Every tool here now asks the read API for exactly the
- * columns it will emit (`fields` — convex/read_api.ts §FIELD PROJECTION). The
- * requested list and the emitted list are the same fact stated twice, and two
- * lists that can disagree are precisely the drift this pairing exists to
- * prevent:
+ * `ProjectedColumn` / `columnsOf` / `requestFieldsOf` are generic — nothing
+ * about them is MCP-shaped — and `afr triage` in the CLI needs the same ranking
+ * this package has, which is built on them. `packages/mcp` is a leaf
+ * application (a `bin`), not a shared library, so the primitives were SPLIT out
+ * to the SDK rather than copied. See `packages/sdk/src/projection.ts` for why
+ * split rather than copy is load-bearing here.
  *
- *   - a column added to the projection but not to the request reads
- *     `undefined` on every row, and an all-`undefined` column is dropped by
- *     {@link toColumnar} — so it disappears silently rather than failing;
- *   - a name that is wrong in the other direction is worse than silent: the
- *     read API's rule 2 makes an UNKNOWN FIELD A HARD ERROR, so a stale entry
- *     fails the whole call rather than one column.
- *
- * So the list is written ONCE, per projection, and both the columnar header
- * ({@link columnsOf}) and the request ({@link requestFieldsOf}) are derived
- * from it. Neither is ever written out by hand a second time.
+ * Re-exported so every existing importer of this module keeps working
+ * unchanged, and so `index.ts`'s `export * from './projections.js'` still
+ * carries them.
  */
-export interface ProjectedColumn<C extends string> {
-  /** The column name this projection emits. */
-  readonly column: C
-  /**
-   * The document field this column's value is read from, or `null` when the
-   * value does not come from the projected document at all — an identity field
-   * the server returns whether or not it was asked for (read API rule 3), or a
-   * value joined in from a separate envelope. A `null` source is never
-   * requested: asking for the identity field would be redundant, and asking for
-   * a field the document does not have would be the hard error above.
-   */
-  readonly source: string | null
-}
-
-/** The emitted column names, in order. The columnar header. */
-export function columnsOf<C extends string>(columns: readonly ProjectedColumn<C>[]): C[] {
-  return columns.map((column) => column.column)
-}
-
-/**
- * The `fields` selection to send for a projection: every distinct non-null
- * source, deduped (several columns can read one field — the artifact pointer,
- * `originalType` and `errorSummary` all come out of `payload`).
- *
- * Order is declaration order, deduped. It is not sorted: the read API accepts
- * any order, and preserving declaration order keeps a request diff readable
- * against the column table it came from.
- */
-export function requestFieldsOf(columns: readonly ProjectedColumn<string>[]): string[] {
-  const sources = new Set<string>()
-  for (const column of columns) {
-    if (column.source !== null) sources.add(column.source)
-  }
-  return [...sources]
-}
 
 // ---------------------------------------------------------------------------
 // Tier 1 — failure pattern rows
@@ -269,6 +247,36 @@ export interface ListPatternsResult extends Columnar {
   /** Pass back as `cursor` to page. Absent on the last page. */
   nextCursor?: string
   /**
+   * Present, and only ever `true`, when the server's scan stopped on its row
+   * ceiling rather than on the end of the table.
+   *
+   * **THIS IS THE DIFFERENCE BETWEEN "NOTHING MATCHED" AND "NOTHING MATCHED IN
+   * THE SLICE I COULD AFFORD TO LOOK AT."** A filtered request overfetches a
+   * bounded window and then filters it, so a short — or entirely EMPTY — page
+   * can be produced purely by the ceiling. While this is `true`, an empty
+   * `rows` array is NOT evidence that nothing matches: follow `nextCursor`
+   * until a page comes back without this flag, or report the question as
+   * unanswered.
+   *
+   * WHY IT IS HERE AT ALL. Convex computes the marker, the v1 route forwards
+   * it, and the SDK types it — and this projection used to drop it at the last
+   * hop, which made the whole chain worthless. **A marker nobody reads is the
+   * same as no marker.** The consequence lands on an agent: it calls tier 1,
+   * sees a short or empty list, and concludes the system is healthy. That is
+   * the reassuring-empty-state failure this codebase has already removed from
+   * the dashboard, the service layer and the CLI, and it must not survive in
+   * the tool an agent is most likely to call first.
+   *
+   * Emitted only when true, so a complete scan costs zero bytes — tier 1's
+   * budget is the tightest here (measured 284 against 300).
+   *
+   * ABSENCE MEANS "COMPLETE, OR A DEPLOYMENT THAT CANNOT SAY", and that
+   * collapse is not decided here: {@link isPatternScanComplete} is the SDK's
+   * single place for it, and it is called rather than re-implemented so three
+   * layers do not each guess differently.
+   */
+  scanTruncated?: true
+  /**
    * Patterns that have a live resolution but no usable confidence snapshot, so
    * they could not be graded at all. Named rather than dropped: "we could not
    * evaluate these" is a materially different answer from "these do not
@@ -284,11 +292,16 @@ export interface ListPatternsResult extends Columnar {
  * @param envelope - the response's `fixConfidence` envelope, absent when the
  *   deployment predates it.
  * @param nextCursor - the page cursor, forwarded verbatim.
+ * @param scan - the response's scan markers. OPTIONAL, and additive on
+ *   purpose: an omitted argument reads as an undeclared marker, which
+ *   {@link isPatternScanComplete} resolves to "complete" — exactly the
+ *   behaviour every caller had before the marker existed.
  */
 export function toListPatternsResult(
   patterns: FailurePattern[],
   envelope: V1ListFixConfidenceEnvelope | undefined,
   nextCursor: string | undefined,
+  scan?: Pick<V1ListFailurePatternsData, 'scanTruncated'>,
 ): ListPatternsResult {
   const byHash = new Map<string, FixConfidenceEntry>()
   for (const entry of envelope?.entries ?? []) byHash.set(entry.fingerprintHash, entry)
@@ -296,6 +309,7 @@ export function toListPatternsResult(
   const rows = patterns.map((p) => toPatternRow(p, byHash.get(p.fingerprintHash)))
   const result: ListPatternsResult = toColumnar(rows, PATTERN_FIELDS)
   if (nextCursor !== undefined) result.nextCursor = nextCursor
+  if (!isPatternScanComplete(scan ?? {})) result.scanTruncated = true
 
   const unevaluated = envelope?.unevaluated ?? []
   if (unevaluated.length > 0) {
@@ -463,21 +477,59 @@ export const ROOT_CAUSE_BYTE_CAP = 150
 export const SUGGESTED_FIX_BYTE_CAP = 110
 
 /**
- * Truncate to a byte budget with an EXPLICIT, IN-BAND marker.
- *
- * Silent truncation is the failure mode to avoid: an agent reading a cut-off
- * root cause as a complete one draws a confident conclusion from half a
- * sentence. The marker states how much is missing, and `afr_get_run_events`
- * remains the way to get the underlying detail.
+ * MOVED TO `@agent-flight-recorder/sdk` and re-exported here — see the note on
+ * the column primitives above. `truncateProse` emits an in-band
+ * `…[truncated, N more chars]` marker that callers and tests both read, so two
+ * copies of it could drift into disagreeing about what "truncated" looks like
+ * on the wire. One declaration, imported by both.
  */
-export function truncateProse(text: string, byteCap: number): string {
-  if (Buffer.byteLength(text, 'utf8') <= byteCap) return text
-  // Slice by code points, then trim until the UTF-8 length fits, so a
-  // multi-byte character is never cut in half.
-  let cut = Array.from(text).slice(0, byteCap)
-  while (Buffer.byteLength(cut.join(''), 'utf8') > byteCap) cut = cut.slice(0, -1)
-  const kept = cut.join('')
-  return `${kept}…[truncated, ${String(Array.from(text).length - cut.length)} more chars]`
+
+/**
+ * Whether an explanation for this run is here, coming, or never coming.
+ *
+ * - `available` — it is in this response. (Never emitted; implied by `status: 'ready'`.)
+ * - `not_yet`   — the run can still produce one. It failed and generation has
+ *   not landed, or it is STILL IN FLIGHT and may yet fail. Retry later.
+ * - `never`     — the run reached a terminal, non-failed state, so there is
+ *   nothing to explain and nothing to wait for. Stop.
+ * - `unknown`   — the two signals do not agree, or `runStatus` was not served
+ *   (an older deployment). Reported as unknown rather than guessed: this is
+ *   the one place where guessing `never` tells a caller to stop looking at
+ *   something that may be broken.
+ */
+export type ExplanationAvailability = 'available' | 'not_yet' | 'never' | 'unknown'
+
+/** Run statuses that mean the run is still going, so a failure — and an explanation — is still possible. */
+const IN_FLIGHT_RUN_STATUSES: readonly string[] = ['pending', 'running']
+/** Terminal run statuses that are not failures. A `not_eligible` on one of these is genuinely final. */
+const TERMINAL_NON_FAILURE_RUN_STATUSES: readonly string[] = ['completed', 'cancelled', 'timed_out']
+
+/**
+ * Derive {@link ExplanationAvailability} from the two signals the server sends.
+ *
+ * The whole point is the `not_eligible` + in-flight case: the server means "not
+ * eligible RIGHT NOW", the word reads as "not eligible EVER", and only
+ * `runStatus` distinguishes them.
+ *
+ * @param status - the server's explanation discriminant.
+ * @param runStatus - the run's own status, when the server supplied it.
+ */
+export function deriveAvailability(
+  status: 'not_eligible' | 'pending' | 'ready',
+  runStatus: string | undefined,
+): ExplanationAvailability {
+  if (status === 'ready') return 'available'
+  // `pending` already means "it failed, generation has not landed". Bounded by
+  // the repair sweep, so it is a claim about latency, not a permanent state.
+  if (status === 'pending') return 'not_yet'
+  if (runStatus === undefined) return 'unknown'
+  if (IN_FLIGHT_RUN_STATUSES.includes(runStatus)) return 'not_yet'
+  if (TERMINAL_NON_FAILURE_RUN_STATUSES.includes(runStatus)) return 'never'
+  // `not_eligible` on a run that DID fail is a contradiction between the two
+  // signals. Neither 'never' nor 'not_yet' is defensible, so say so rather than
+  // pick one — telling a caller to stop looking at a failed run is the more
+  // costly of the two possible mistakes.
+  return 'unknown'
 }
 
 /**
@@ -493,6 +545,32 @@ export interface ExplainRunResult {
   runId: string
   status: 'not_eligible' | 'pending' | 'ready'
   runStatus?: string
+  /**
+   * THE HONEST THREE-WAY ANSWER, derived from `status` AND `runStatus`
+   * together. Emitted only when `status !== 'ready'` — for a ready
+   * explanation the availability is trivially `available` and the explanation
+   * is right there, so the field would be pure cost on the tier's most
+   * expensive case.
+   *
+   * WHY IT EXISTS. `status: 'not_eligible'` is TRUE-BUT-MISLEADING for a run
+   * that is still in flight. Read alone it says "this run did not fail and
+   * never will have an explanation", and an agent that believes that concludes
+   * "nothing to see here" about a run that is actively failing and will have
+   * an explanation in thirty seconds. The information needed to tell the two
+   * apart is already on the response — `runStatus` — but requiring every
+   * caller to cross-reference two fields to avoid a wrong conclusion is a
+   * defect, not an interface.
+   *
+   * The wire vocabulary is deliberately NOT widened to fix this. `status` is
+   * validated against a hard-coded `not_eligible|pending|ready` in two places
+   * (this package's `readStatus`, and `apps/web/src/lib/services/explanations.ts`)
+   * which SILENTLY DOWNGRADE anything unrecognised to `pending` — so a new
+   * server-side status would reach an agent as `pending`, the exact
+   * un-actionable answer it would have been added to remove. Fixing that needs
+   * a coordinated change across mcp + web + convex. This field is the
+   * client-side derivation that is available today; `status` is unchanged.
+   */
+  availability?: ExplanationAvailability
   summary?: string
   rootCause?: string
   suggestedFix?: string
@@ -522,6 +600,10 @@ export function toExplainRunResult(
 ): ExplainRunResult {
   const result: ExplainRunResult = { runId, status }
   if (runStatus !== undefined) result.runStatus = runStatus
+  // Only when it carries information — see the field's doc comment. A `ready`
+  // response is the tier's most expensive case and gains nothing from being
+  // told the explanation it contains is available.
+  if (status !== 'ready') result.availability = deriveAvailability(status, runStatus)
   if (explanation === null) return result
 
   result.summary = truncateProse(explanation.summary, SUMMARY_BYTE_CAP)

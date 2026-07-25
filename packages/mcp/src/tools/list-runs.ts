@@ -54,11 +54,14 @@ export function registerListRuns(server: McpServer, reader: AfrReader): void {
     {
       title: 'List runs',
       description:
-        'Compact run rows for orientation. COLUMNAR RESULT: {fields, rows} — each row is positional; look a column ' +
+        'Answers "which runs exist / where am I?" — compact run rows for orientation, ~475 tokens for the default ' +
+        `${String(DEFAULT_LIMIT)}. COLUMNAR RESULT: {fields, rows} — each row is positional; look a column ` +
         'up by its name in `fields`, never by a hardcoded index. Columns: runId, agentId, status, startedAt, ' +
         'endedAt, environment, sessionId (null where absent). ' +
         'Use it to find a runId, then call afr_explain_run on it. ' +
-        'If you are looking for what is broken across the org rather than one run, use afr_list_failure_patterns instead — it is cheaper and better targeted.',
+        'NOT for: "what is broken?" — that is afr_triage, which is cheaper, ranked, and tells you what to call next. ' +
+        'A list of runs tells you nothing about which one is interesting. Reach for this when you need to filter by ' +
+        'session, environment, agent or status, or to page run history.',
       inputSchema,
       annotations: { readOnlyHint: true, openWorldHint: true },
     },

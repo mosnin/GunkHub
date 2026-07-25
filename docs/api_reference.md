@@ -155,6 +155,14 @@ include it when reporting an issue.
 
 ### Endpoints
 
+> **Start cheap.** These endpoints are not equally priced. For "what is broken?" and
+> "why did this run fail?", `GET /api/v1/patterns` and
+> `GET /api/v1/runs/{runId}/explanation` answer in a few hundred tokens' worth of body.
+> `GET /api/v1/runs/{runId}/events` returns raw event records and is the expensive one
+> — reach for it when you already know which run and which sequence range you want.
+> `docs/mcp.md` → "Start here" is the ladder, with measured costs and a worked example;
+> it applies to any automated consumer of this API, not only MCP clients.
+
 #### `GET /api/v1/runs`
 
 List runs for the key's organization.
@@ -347,6 +355,9 @@ unaffected.
       }
     ],
     "nextCursor": "eyJ...",
+    "scanTruncated": false,
+    "scannedRows": 137,
+    "scanRowCeiling": 2000,
     "fixConfidence": {
       "stalenessBoundMs": 21600000,
       "entries": [
@@ -391,18 +402,85 @@ from "was never evaluated":
 
 Do not present a snapshot verdict as current without checking its age.
 
-> **Pagination happens before filtering — page to exhaustion, not to the first empty page.**
-> `convex/read_api.ts` `apiListFailurePatterns` paginates the org-scoped
-> `by_org_lastSeenAt` index first, then applies `agentId`/`spiking`/`muted`/`status`/
-> `regressed`/`state` **in memory over that page** (there is no secondary index for any
-> of them). Consequences a client must handle:
->
-> - A page can contain **fewer rows than `limit`, or zero rows**, while `nextCursor` is
->   still present and later pages still contain matches.
-> - `nextCursor` reflects the underlying unfiltered scan, not the filtered result.
->
-> Stop only when `nextCursor` is absent. Treating a short or empty page as the end of the
-> result set will silently under-report.
+##### Filtering, the scan window, and `scanTruncated`
+
+Every filter on this endpoint — `agentId`, `spiking`, `muted`, `status`, `regressed`,
+`state` — reads a field with **no secondary index**, so all of them run in memory.
+
+This used to mean `.paginate({ numItems: limit })` first and `.filter(...)` second, so
+`numItems` counted rows *examined* rather than rows *matched*: a request for 25 could
+return a well-formed **empty page with a `nextCursor`** while every match sat further
+down. That is fixed (`convex/read_api.ts`, "BOUNDED OVERFETCH-THEN-FILTER"). The
+endpoint now reads a scan window **larger than `limit`** and counts matches, bounded by
+`PATTERN_SCAN_ROW_CEILING` (**2,000** rows per request). An unfiltered request is
+unchanged and reads exactly what it returns.
+
+The window is bounded, so it can still stop short — and when it does, **it says so**:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `scanTruncated` | boolean | `true`: the scan stopped on the row ceiling, not on the end of the table. This page may be short or empty **purely for that reason** — do not read it as "nothing matched". Follow `nextCursor`. `false`: the page is the complete answer up to `limit`; an empty page really does mean nothing matched, anywhere. |
+| `scannedRows` | number | Rows examined to produce this page. |
+| `scanRowCeiling` | number | The ceiling that bounded it (2,000). |
+
+`scanTruncated` is the same contract `exposure.runCountTruncated` already offers on the
+evidence endpoint: *this answer is a floor, ask again to see the rest.*
+
+> **This matters most for CI.** `state=regressed` exists to gate a build — "fail if a
+> pattern we marked fixed came back". A gate that exits 0 on a scan it could not
+> complete turns a red build green, and a regression detector that silently answers
+> "nothing here" is worse than no detector because a team stops looking. **Treat
+> `scanTruncated: true` as "not answered yet", never as "clean."** Page on
+> `nextCursor` until you get `scanTruncated: false`, or fail the gate as inconclusive.
+
+Cursor semantics follow from the wider window: `nextCursor` is an opaque
+`{ underlyingCursor, skip }` pair, not a raw Convex cursor, because a single window can
+yield more matches than `limit` and a raw continuation cursor could only resume *past*
+the whole window — dropping the surplus. Hand it back unmodified. A cursor issued by
+the previous implementation is still accepted and resumes at that batch boundary.
+
+Stop only when `nextCursor` is absent **and** `scanTruncated` is `false`.
+
+**Reading it from the SDK.** `V1ListFailurePatternsData` (`packages/sdk/src/reader.ts`)
+declares `scanTruncated?`, `scannedRows?` and `scanRowCeiling?`. All three are optional,
+because a deployment predating the marker never sends them — so the field has **three**
+states, not two. Use the exported helper rather than testing the field directly:
+
+```ts
+import { isPatternScanComplete } from '@agent-flight-recorder/sdk'
+
+const data = await reader.getFailurePatterns({ state: 'regressed' })
+if (!isPatternScanComplete(data)) {
+  // The page is a floor, not an answer. Follow data.nextCursor, or report
+  // the gate as inconclusive. Never exit 0 here.
+}
+```
+
+`isPatternScanComplete` treats **absent** as complete (`scanTruncated !== true`), which
+restores exactly the behaviour older deployments already had rather than making every
+request against them permanently inconclusive. If you need to distinguish "the server
+says the scan finished" from "the server does not answer the question", test
+`data.scanTruncated === undefined` yourself — but do not re-derive the two-state reading
+in a third place.
+
+**The marker is wired end to end** (SDK 0.16.0, CLI 0.10.0): the backend computes it, the
+route forwards it, the SDK types it, `afr patterns` acts on it with exit `11`, and the
+MCP server's `afr_list_failure_patterns` and `afr_triage` both surface it on their tool
+results.
+
+**`FlightReader.getFailurePatterns` deliberately does not throw on truncation.** That is
+the opposite of what `getRunEventWindow` does for an ignored `fromSequence`, and what
+`assertProjectionHonored` does for an ignored `fields` — and the asymmetry is the point.
+Those two refuse because the server returned a **wrong answer indistinguishable from a
+right one**: the head of the log looks exactly like the requested window, a full document
+looks exactly like a projection that included everything, and no field in the response
+says otherwise. Truncation is the inverse situation — the server **told the truth, in a
+field**, and the only defect was that nothing read it. Throwing would also break the
+correct remedy, paging on `nextCursor`, by turning a resumable state into an exception,
+and would fail an unfiltered browse where truncation is harmless.
+
+So the SDK types it, names it, and hands it over. Deciding that an incomplete scan is
+fatal is the **gate's** job, not the client's.
 
 #### `GET /api/v1/patterns/{fingerprintHash}/evidence`
 
@@ -927,11 +1005,67 @@ documented above — it introduces no server-side behavior of its own. Every
 
 | `afr` command       | Calls |
 |----------------------|-------|
+| `afr patterns`       | `GET /api/v1/patterns` |
+| `afr patterns evidence <fingerprint>` | `GET /api/v1/patterns/{fingerprintHash}/evidence` |
+| `afr explain <id>`   | `GET /api/v1/runs/{runId}/explanation` |
 | `afr runs list`      | `GET /api/v1/runs` |
 | `afr runs get <id>`  | `GET /api/v1/runs/{runId}` |
 | `afr tail <id>`      | `GET /api/v1/runs/{runId}/events` (polled) |
 | `afr replay <id>`    | `GET /api/v1/runs/{runId}/replay` |
 | `afr export <id>`    | `GET /api/v1/runs/{runId}/events` (paginated through to completion) |
+
+**Start with `afr patterns` and `afr explain`, not `afr export`.** The first two rows
+of that table answer "what is broken?" and "why did this run fail?" for a few hundred
+tokens' worth of output; `afr export` pages a whole event log to completion. The same
+progressive-disclosure ordering the MCP server enforces applies here — see
+`docs/mcp.md` → "Start here" for the measured costs.
+
+### Exit codes
+
+`packages/cli/src/index.ts` returns a single set of process exit codes for every
+command:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success — **including a successful request that matched nothing, and one that matched everything** |
+| `1` | Usage error (bad or conflicting flags) |
+| `2` | Auth failure (missing/invalid/revoked/expired key, or a key lacking `read`) |
+| `3` | Not found |
+| `4` | Network or server error |
+| `11` | **`afr patterns` only — "could not evaluate."** A *filtered* request whose scan hit the server's row ceiling. |
+
+#### Exit `11` — the gate code that matters
+
+`afr patterns` maps `scanTruncated` onto a dedicated exit code
+(`PATTERNS_SCAN_INCOMPLETE_EXIT_CODE = 11`,
+`packages/cli/src/commands/patterns.ts`). The reasoning is worth stating plainly:
+**exit 0 from a gate is a claim — "I checked, and it is clean" — and a truncated scan
+has not checked.** So a filtered request that comes back on a truncated scan exits `11`
+instead of `0`, annotated `[scan truncated N/M rows]`, and still prints the full page it
+did get. Page with the API's `nextCursor` until the scan completes, or treat the run as
+inconclusive.
+
+**Only with an active filter.** An unfiltered listing does not truncate — the server
+sizes its scan to the page (`scanSize = filtering ? PATTERN_SCAN_ROW_CEILING : needed`)
+— and an unfiltered browse makes no whole-dataset claim to falsify. The annotation still
+prints; only the exit code is withheld.
+
+Output distinguishes the two truncated cases. **Empty and truncated** does not print
+"No recurring failure patterns found" — that is a whole-dataset claim, and it is false
+after a truncated scan; it reports no matches *in the rows scanned* and states plainly
+that this is not "none exist". **Non-empty and truncated** prints the table, then a
+`PARTIAL [scan truncated N/M rows]` footnote.
+
+> **Exit `11` separates INCONCLUSIVE from CONCLUSIVE. It does not separate clean from
+> dirty.** `afr patterns --state regressed` still exits `0` whether it found a
+> regression or not — there is no "matches found" exit code. A gate must still parse
+> `--json` and fail on a non-empty `patterns` array itself. What it no longer has to do
+> is guess whether an *empty* array meant anything.
+>
+> Verified against the working tree while agents were still landing code; the `@returns`
+> comment on `run()` in `packages/cli/src/index.ts` still lists only `0/1/2/3/4` and has
+> not been updated for `11`. There is no `afr triage` command —
+> `packages/cli/src/commands/` contains no `triage.ts`; triage is MCP-only today.
 
 All of the above require a **`read`**-scoped API key — see
 [Minting a read key for the v1 API / CLI](#minting-a-read-key-for-the-v1-api--cli).
@@ -962,7 +1096,7 @@ adds no server-side behavior, uses the same `x-api-key` header, needs the same
 **`read`** scope, and shares the same 300 req/min per-key rate class — give it
 its own key rather than sharing the CLI's.
 
-Its five tools map onto the endpoints above, including the two failure-pattern
+Its tools map onto the endpoints above, including the two failure-pattern
 endpoints (`GET /api/v1/patterns` and
 `GET /api/v1/patterns/{fingerprintHash}/evidence`), which are now documented in
 [section 1](#get-apiv1patterns) — until this cycle `docs/mcp.md` was their only
@@ -970,13 +1104,39 @@ reference:
 
 | MCP tool                      | Calls |
 |-------------------------------|-------|
+| `afr_triage` **(entry point)** | `GET /api/v1/patterns` (one call, `limit=50`) |
 | `afr_list_failure_patterns`   | `GET /api/v1/patterns` |
 | `afr_get_pattern_evidence`    | `GET /api/v1/patterns/{fingerprintHash}/evidence` |
 | `afr_explain_run`             | `GET /api/v1/runs/{runId}/explanation` |
 | `afr_get_run_events`          | `GET /api/v1/runs/{runId}/events` (windowed) |
 | `afr_list_runs`               | `GET /api/v1/runs` |
 
-The tools are deliberately tiered by token cost, and the ordering matters —
-see `docs/mcp.md`, which carries a verification-status banner for what in it has
-and has not been exercised, and explains where server-side field projection does
-and does not save an MCP caller anything.
+**The tools are a ladder, and the entry point is `afr_triage`** — one call, zero
+required arguments, at most five ranked items, each carrying the exact tool and
+arguments to call next. It makes exactly one upstream request (`GET /api/v1/patterns`
+with `limit=50`); the ranking and capping happen in `packages/mcp/src/triage.ts`, so it
+is not a new data source and cannot disagree with tier 1.
+
+Measured client-visible costs: ~333 tokens for triage (~436 worst case), ~284 for tier 1
+(ten patterns), ~423 for tier 2, ~121 for tier 3, and up to ~3,838 for a single
+saturated tier-4 event window — roughly 12x triage and 32x tier 3. An agent that opens
+with `afr_get_run_events` pays the most for the least, and has to know a run id before it
+can even make the call. `docs/mcp.md` → "Start here" has the ladder, the worked example
+with running costs, and where those numbers were measured (real projections over
+contract-maximal fixtures; **not** against a running deployment, since none has ever
+existed).
+
+A triage response separates `verdict` (`issues` / `clear` / `unknown`) from `complete`,
+because "nothing is broken" and "I could not evaluate" are different answers and neither
+should be read as the other. Any consumer using it as a build gate must treat
+`verdict: "unknown"` and `complete: false` as inconclusive rather than clean — see
+`docs/mcp.md` → "Using this as a CI gate", which also covers the `scanTruncated`
+semantics for `state: "regressed"`.
+
+`docs/mcp.md` additionally carries a verification-status banner for what in it has and
+has not been exercised, and explains where server-side field projection does and does not
+save an MCP caller anything.
+
+> Verified against the working tree at commit `2695655` **plus uncommitted changes**:
+> `packages/mcp/src/triage.ts` and `packages/mcp/src/tools/triage.ts` were untracked at
+> the time of writing. The CLI counterpart (`afr triage`) had not landed.

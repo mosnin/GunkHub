@@ -76,12 +76,17 @@ export function registerGetRunEvents(server: McpServer, reader: AfrReader): void
     {
       title: 'Get a window of run events',
       description:
-        'EXPENSIVE — use last. Returns a WINDOW of a run’s event log, never the whole run. ' +
-        `Max ${MAX_LIMIT} events per call (default ${DEFAULT_LIMIT}); a larger limit is rejected. ` +
-        'Call afr_explain_run first and pass one of its citedSequenceNumbers as aroundSequence, so you fetch the ' +
-        'events that matter instead of paging from the start. ' +
-        'Externalized (>10 KB) payloads are returned as an artifact pointer with a checksum — never inlined. ' +
-        'Page forward with the returned nextFromSequence.',
+        'THE EXPENSIVE LAST RESORT — roughly 3 800 tokens for a full window, about 30x afr_explain_run and 10x ' +
+        'afr_triage. Answers "show me the actual events" for one run, as a WINDOW of its log, never the whole run. ' +
+        'DO NOT REACH FOR THIS FIRST. If you are asking what is broken, afr_triage answers it for ~400 tokens. If ' +
+        'you are asking why a run failed, afr_explain_run answers it for ~121 and tells you which sequence numbers ' +
+        'to ask for here. Those two answer the question for a fraction of the cost in the large majority of cases; ' +
+        'come here only when you specifically need the raw payloads they cite. ' +
+        `Max ${MAX_LIMIT} events per call (default ${DEFAULT_LIMIT}); a larger limit is REJECTED, not clamped. ` +
+        'Pass one of afr_explain_run’s citedSequenceNumbers as aroundSequence to centre the window on what matters ' +
+        'instead of paging from the start. ' +
+        'Externalized (>10 KB) payloads are returned as an artifact pointer with a checksum — never inlined; large ' +
+        'inline payloads are replaced by a labelled {truncated,bytes,preview}. Page forward with nextFromSequence.',
       inputSchema,
       annotations: { readOnlyHint: true, openWorldHint: true },
     },

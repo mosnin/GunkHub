@@ -1,5 +1,7 @@
 import { parseArgs } from 'node:util'
 
+import { isPatternScanComplete } from '@agent-flight-recorder/sdk'
+
 import { listFailurePatterns } from '../apiClient.js'
 import { formatTimestamp, renderTable, truncateId } from '../format.js'
 
@@ -81,6 +83,15 @@ Options:
   --limit <n>         Max number of patterns to return
   --json              Print the raw API response as JSON
   --help              Show this message
+
+Exit codes: the usual 0/1/2/4 band, plus 11 — "could not evaluate". A
+FILTERED request scans a bounded window of rows and filters it, so it can
+come back short or empty purely because it hit the server's row ceiling. When
+that happens the result is annotated [scan truncated N/M rows] and the command
+exits 11 instead of 0, because exit 0 from a gate claims "I checked and it is
+clean" and a truncated scan has not checked. Page with the API's nextCursor
+until the scan completes, or treat the run as inconclusive. An UNFILTERED
+listing never truncates and is unaffected.
 
 Note: this command only REFLECTS mute state (a MUTED column, and the
 --muted/--active filters above). There is no 'afr patterns mute' — muting is
@@ -202,7 +213,84 @@ function resolveStateFilter(args: PatternsArgs): { state?: FixConfidenceState } 
   return { state: args.state as FixConfidenceState }
 }
 
-export type PatternsResult = (V1ListFailurePatternsData & { ok: true }) | CommandFailure
+/**
+ * Exit code for "I could not complete the check" — a scan that stopped on the
+ * server's row ceiling while a filter was active.
+ *
+ * WHY NOT 0. `afr patterns --state regressed` is the CI gate the README
+ * documents, and exit 0 from a gate is a claim: *I looked, and it is clean.*
+ * A truncated scan has not earned that claim. It looked at the first 2,000
+ * rows the server was willing to read and found nothing there — a regression
+ * can exist past the ceiling, and exiting 0 would let the build go green on a
+ * question nobody answered. "Could not evaluate" is a third outcome and it
+ * needs its own code; collapsing it into either "clean" or "broken" throws
+ * away the only distinction that matters.
+ *
+ * WHY 11. The existing band is 0-4 (ok / usage / auth / not-found /
+ * network-server) and every one of those means something specific about the
+ * REQUEST; this is about the ANSWER, so it must not collide with them. The
+ * `afr triage` work in flight proposes `10` = issues found and `11` = could
+ * not evaluate (mirroring the MCP triage verdicts `issues` / `clear` /
+ * `unknown` in `packages/mcp/src/triage.ts`). This is the `unknown` case, so
+ * it takes `11` rather than inventing a third numbering that a CI script
+ * would then have to special-case per command. `10` is deliberately left
+ * unused here: `afr patterns` still exits 0 when it finds matching patterns,
+ * because that is a pre-existing contract and changing it is a separate
+ * decision from this one.
+ *
+ * WHY ONLY WITH A FILTER. Unfiltered listing does not truncate — the server
+ * sizes its scan to the page (`convex/read_api.ts`: `scanSize = filtering ?
+ * PATTERN_SCAN_ROW_CEILING : needed`). And an unfiltered browse makes no
+ * whole-dataset claim to falsify: "here are some patterns" stays true. The
+ * annotation still prints in that case; only the exit code is withheld.
+ */
+export const PATTERNS_SCAN_INCOMPLETE_EXIT_CODE = 11
+
+/**
+ * A page that came back fine but did not answer the question asked of it.
+ *
+ * Modelled as a `CommandFailure` (`ok: false`) *carrying its data*, rather
+ * than as a success with a flag, for one reason: `packages/cli/src/index.ts`
+ * derives every command's process exit code from `result.ok ? 0 :
+ * result.exitCode`. Being a failure IS how a non-zero exit code reaches the
+ * shell. It is also the truthful shape — an incomplete check is not a
+ * successful one — and `printPatterns` still renders the full table from
+ * `data`, so nothing the server did return is thrown away.
+ */
+export interface PatternsScanIncomplete extends CommandFailure {
+  exitCode: typeof PATTERNS_SCAN_INCOMPLETE_EXIT_CODE
+  /** Marker so `printPatterns` can tell this apart from a real request failure. */
+  scanIncomplete: true
+  /** The page the server did return — rendered in full, annotated as partial. */
+  data: V1ListFailurePatternsData
+}
+
+export type PatternsResult =
+  | (V1ListFailurePatternsData & { ok: true })
+  | PatternsScanIncomplete
+  | CommandFailure
+
+/** Narrow a `PatternsResult` to the truncated-scan case. */
+function isScanIncomplete(result: PatternsResult): result is PatternsScanIncomplete {
+  return !result.ok && 'scanIncomplete' in result
+}
+
+/**
+ * Did the caller narrow the request at all? Only a narrowed request makes the
+ * whole-dataset claim ("no pattern anywhere is in state X") that a truncated
+ * scan cannot support — see {@link PATTERNS_SCAN_INCOMPLETE_EXIT_CODE}.
+ */
+function hasActiveFilter(args: PatternsArgs): boolean {
+  return (
+    args.agent !== undefined ||
+    args.spiking === true ||
+    args.muted === true ||
+    args.active === true ||
+    args.status !== undefined ||
+    args.regressed === true ||
+    args.state !== undefined
+  )
+}
 
 /** `afr patterns` — list recurring failure patterns through the v1 read API. */
 export async function runPatterns(
@@ -236,6 +324,15 @@ export async function runPatterns(
       },
       fetchImpl
     )
+    if (!isPatternScanComplete(data) && hasActiveFilter(args)) {
+      return {
+        ok: false,
+        exitCode: PATTERNS_SCAN_INCOMPLETE_EXIT_CODE,
+        scanIncomplete: true,
+        message: `scan incomplete ${formatScanAnnotation(data)} — this page is not a whole-dataset answer. Page with the API's cursor, or widen/narrow the filter, before treating it as clean.`,
+        data,
+      }
+    }
     return { ok: true, ...data }
   } catch (err) {
     return toCommandFailure(err)
@@ -248,6 +345,22 @@ function formatAge(ms: number): string {
   if (hours < 1) return `${String(Math.max(1, Math.round(ms / 60_000)))}m`
   if (hours < 48) return `${hours.toFixed(0)}h`
   return `${(hours / 24).toFixed(0)}d`
+}
+
+/**
+ * The truncation marker, in this command's existing bracket-annotation idiom
+ * (`[muted]`, `[stale 9h]`) rather than a second one.
+ *
+ * Those annotations qualify the cell they sit in; this one qualifies the whole
+ * result, so it sits at the end of the sentence it qualifies instead of in a
+ * column. Row counts are included when the deployment sent them, because
+ * "truncated at 2000 of 2000 rows" tells a reader how much WAS established,
+ * which is the only actionable part of an inconclusive answer.
+ */
+function formatScanAnnotation(data: V1ListFailurePatternsData): string {
+  const { scannedRows, scanRowCeiling } = data
+  if (scannedRows === undefined || scanRowCeiling === undefined) return '[scan truncated]'
+  return `[scan truncated ${String(scannedRows)}/${String(scanRowCeiling)} rows]`
 }
 
 /**
@@ -317,17 +430,43 @@ export function printPatterns(
   result: PatternsResult,
   log: (line: string) => void = console.log
 ): void {
-  if (!result.ok) {
+  const incomplete = isScanIncomplete(result)
+
+  if (!result.ok && !incomplete) {
     log(`Error: ${result.message}`)
     return
   }
 
+  // A truncated scan is a failure by exit code but not by content: the server
+  // answered, the answer is just partial. Everything below renders from the
+  // page either way, with the partiality stated rather than implied.
+  const data: V1ListFailurePatternsData = incomplete ? result.data : result
+
   if (args.json) {
-    log(JSON.stringify(result, null, 2))
+    log(
+      JSON.stringify(
+        incomplete
+          ? { ok: false, scanIncomplete: true, exitCode: result.exitCode, ...data }
+          : result,
+        null,
+        2
+      )
+    )
     return
   }
 
-  if (result.patterns.length === 0) {
+  if (data.patterns.length === 0) {
+    // NOT "No recurring failure patterns found." That sentence is a claim
+    // about the whole dataset, and after a truncated scan it is false — the
+    // scan stopped early and nothing is known about what lies past the
+    // ceiling. Say what was actually established instead.
+    if (data.scanTruncated === true) {
+      log(
+        `No matching patterns in the rows scanned ${formatScanAnnotation(data)} — the scan stopped on the server's row ceiling, not on the end of the table. This is NOT "none exist": nothing is known about the rows beyond it.`
+      )
+      log("  (page with the API's nextCursor until scanTruncated is false, or treat this run as inconclusive)")
+      return
+    }
     log('No recurring failure patterns found.')
     return
   }
@@ -337,10 +476,10 @@ export function printPatterns(
   // rendered against the WRONG pattern is the most damaging way this display
   // could fail, and a map costs nothing to be certain.
   const confidenceByFingerprint = new Map(
-    (result.fixConfidence?.entries ?? []).map((entry) => [entry.fingerprintHash, entry])
+    (data.fixConfidence?.entries ?? []).map((entry) => [entry.fingerprintHash, entry])
   )
 
-  const rows = result.patterns.map((pattern) => {
+  const rows = data.patterns.map((pattern) => {
     const isSpiking = pattern.lastSpikeAssessment?.isSpiking === true
     const isMuted = pattern.muted === true
     // Mute suppresses future ALERTS, not visibility (CLAUDE.md / ADR-005) —
@@ -382,8 +521,16 @@ export function printPatterns(
     )
   )
 
-  printConfidenceFootnotes(result, log)
-  if (result.nextCursor) {
+  printConfidenceFootnotes(data, log)
+  // A truncated scan that DID return matches is still incomplete: these rows
+  // are real, but they are not the complete set. Stated after the table, where
+  // a reader is deciding what the output means.
+  if (data.scanTruncated === true) {
+    log(
+      `\nThis list is PARTIAL ${formatScanAnnotation(data)} — the scan stopped on the server's row ceiling, not on the end of the table. More matches may exist past it.`
+    )
+  }
+  if (data.nextCursor) {
     log(
       '\n(more results available — narrow with --agent/--spiking/--muted/--active/--status/--regressed/--state/--limit to see fewer pages)'
     )

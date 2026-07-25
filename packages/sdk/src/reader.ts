@@ -197,6 +197,62 @@ export interface V1ListFailurePatternsData {
    * pinned to an older deployment still typechecks.
    */
   fixConfidence?: V1ListFixConfidenceEnvelope
+  /**
+   * `true` when the server's scan stopped on its row ceiling
+   * ({@link scanRowCeiling}) rather than on the end of the table.
+   *
+   * **This is the difference between "nothing matched" and "nothing matched
+   * in the slice I could afford to look at."** A filtered request overfetches
+   * a bounded window and then filters it, so a short — or entirely empty —
+   * page can be produced purely by the ceiling. While this is `true`, an
+   * empty `patterns` array is NOT evidence that nothing matches; follow
+   * {@link nextCursor} until a page comes back with `scanTruncated: false`,
+   * or report the question as unanswered.
+   *
+   * `false` is the assertion a gate is entitled to act on: the page is the
+   * complete answer up to `limit`, and an empty page really does mean nothing
+   * matched, anywhere.
+   *
+   * Same contract as `exposure.runCountTruncated` on the evidence endpoint:
+   * the bound is declared, never silent.
+   *
+   * **Absent** means the deployment predates the marker (added in the scan-
+   * window cycle after ADR-006) and therefore never declares truncation. It
+   * is optional here so a consumer pinned to an older deployment still
+   * typechecks — see {@link isPatternScanComplete} for the one place that
+   * decides what absence means, so three callers do not each guess.
+   */
+  scanTruncated?: boolean
+  /** Rows the server examined to produce this page. Absent on older deployments. */
+  scannedRows?: number
+  /** The ceiling that bounded {@link scannedRows} (2,000). Absent on older deployments. */
+  scanRowCeiling?: number
+}
+
+/**
+ * Whether a pattern page is the *complete* answer to the question that was
+ * asked, or merely the part of it the server could afford to look at.
+ *
+ * Read this instead of touching {@link V1ListFailurePatternsData.scanTruncated}
+ * directly, because the field has three states and only two of them are
+ * obvious:
+ *
+ * - `false` — a full scan. Complete. An empty page means nothing matched.
+ * - `true`  — the ceiling stopped the scan. **Not** complete.
+ * - absent  — the deployment is older than the marker and never declares
+ *   truncation. Reported as complete.
+ *
+ * That last case is a deliberate, and slightly uncomfortable, choice. Treating
+ * absence as incomplete would make every request against an older deployment
+ * permanently inconclusive, which turns a gate into noise and teaches people
+ * to disable it — the same end state as the bug this field exists to fix, by a
+ * longer road. Treating it as complete restores exactly the behaviour those
+ * deployments already had. The honest reading is "this deployment does not
+ * answer the question", and a caller that needs to distinguish it can test
+ * `data.scanTruncated === undefined` itself.
+ */
+export function isPatternScanComplete(data: Pick<V1ListFailurePatternsData, 'scanTruncated'>): boolean {
+  return data.scanTruncated !== true
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1033,31 @@ export class FlightReader {
    *   change mute or lifecycle state; those are admin/member-only,
    *   Clerk-authed, audited writes on the web app, not part of this
    *   key-authed read surface.
+   *
+   * **Truncated scans are SURFACED, not refused.** The response carries
+   * `scanTruncated` / `scannedRows` / `scanRowCeiling` (see
+   * {@link V1ListFailurePatternsData.scanTruncated} and
+   * {@link isPatternScanComplete}); a filtered request that hits the server's
+   * row ceiling can return a short or empty page for that reason alone, and a
+   * caller MUST NOT read an empty page as "nothing matched" while
+   * `scanTruncated` is `true`.
+   *
+   * This method deliberately does **not** throw on truncation, which is the
+   * opposite of what {@link getRunEventWindow} does for an ignored
+   * `fromSequence` and what `assertProjectionHonored` does for an ignored
+   * `fields`. Those two refuse because the server returned a WRONG answer
+   * indistinguishable from a right one — the head of the log looks exactly
+   * like the requested window, a full document looks exactly like a
+   * projection that included everything, and there is no field in the
+   * response that says otherwise. Truncation is the opposite situation: the
+   * server told the truth, in a field, and the only defect was that nothing
+   * read it. Throwing would also break the correct remedy — paging on
+   * `nextCursor` — by turning a resumable, ordinary state into an exception,
+   * and would fail an unfiltered browse where truncation is harmless. So the
+   * SDK types it, names it, and hands it to the caller; deciding that an
+   * incomplete scan is fatal is the *gate's* job, not the client's. `afr
+   * patterns` makes exactly that decision (exit 11) for the CI path.
+   *
    * @throws {@link V1ApiError} on any auth/rate-limit/server/network failure.
    * @throws {@link V1ApiError} with `kind: 'invalid_response'` if `fields` was requested and the
    *   server ignored it (deployment predates field projection).

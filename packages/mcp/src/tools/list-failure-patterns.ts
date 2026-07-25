@@ -60,12 +60,18 @@ export function registerListFailurePatterns(server: McpServer, reader: AfrReader
     {
       title: 'List failure patterns',
       description:
-        'START HERE. Recurring failure fingerprints for your org, most-recently-seen first. ' +
+        'Answers "what is broken, in full?" — every recurring failure fingerprint for your org, most-recently-seen ' +
+        `first, ~28 tokens per row (~284 for the default ${String(DEFAULT_LIMIT)}). ` +
         'COLUMNAR RESULT: {fields, rows} — each row is positional; look a column up by its name in `fields`, never ' +
         'by a hardcoded index. Columns: fingerprintHash, class, label, count, lastSeenAt, status, confidenceState, ' +
         'confidenceStale (null where absent). ' +
-        'Use it to decide WHICH failure to investigate before paying for anything larger. ' +
-        'Then: afr_get_pattern_evidence(fingerprintHash) for "did the fix hold?", or afr_explain_run(runId) for a single run.',
+        'IF "scanTruncated" IS PRESENT, AN EMPTY OR SHORT RESULT IS NOT EVIDENCE THAT NOTHING MATCHED — the ' +
+        'server stopped on its row ceiling. Follow nextCursor until a page comes back without it, or report the ' +
+        'question as unanswered. ' +
+        'Then: afr_get_pattern_evidence(fingerprintHash) for "did the fix hold?", or afr_explain_run(runId) for a single run. ' +
+        'NOT for: your first call, or "what should I look at first?" — afr_triage costs about the same, ranks the ' +
+        'results, and hands you the next tool and arguments per item. Reach for this when you need BREADTH past ' +
+        'triage’s top 5, or a specific filter (state/status/spiking/regressed), or paging.',
       inputSchema,
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
@@ -93,7 +99,11 @@ export function registerListFailurePatterns(server: McpServer, reader: AfrReader
         const data = await withFieldProjection(PATTERN_REQUEST_FIELDS, (fields) =>
           reader.getFailurePatterns({ ...filters, ...(fields !== undefined && { fields }) }),
         )
-        return jsonResult(toListPatternsResult(data.patterns, data.fixConfidence, data.nextCursor))
+        // `data` is passed as the scan-marker source, not destructured into a
+        // boolean here: what an ABSENT `scanTruncated` means is decided in one
+        // place (the SDK's `isPatternScanComplete`), and re-deciding it at
+        // every call site is how three layers end up disagreeing.
+        return jsonResult(toListPatternsResult(data.patterns, data.fixConfidence, data.nextCursor, data))
       } catch (err) {
         throw toMcpError(err, 'pattern')
       }
