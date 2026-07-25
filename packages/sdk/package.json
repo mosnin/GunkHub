@@ -21,7 +21,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format esm,cjs --dts --tsconfig tsconfig.build.json",
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean --tsconfig tsconfig.build.json",
     "dev": "tsup src/index.ts --format esm,cjs --dts --watch --tsconfig tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config ../../tests/vitest.config.ts",

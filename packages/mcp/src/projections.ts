@@ -477,6 +477,71 @@ export const ROOT_CAUSE_BYTE_CAP = 150
 export const SUGGESTED_FIX_BYTE_CAP = 110
 
 /**
+ * Byte budget for the serialized `citedSequenceNumbers` array — THE SAME
+ * ARGUMENT AS THE PROSE CAPS ABOVE, applied to the one field on this tier that
+ * is an array, which is where it was left unfinished.
+ *
+ * `RunExplanation` documents the array's bound as up to 20 entries, and this
+ * projection used to forward it VERBATIM: it capped the three prose fields and
+ * nothing else. Measured against the contract-maximal explanation, the tier
+ * cost 192 tokens at 5 citations, 196 at 10, 200 at 15 and 203 at 20 — so it
+ * held its 200-token budget only because the generator happens to cite few
+ * events. That is a property of the generator, not a guarantee of this layer.
+ *
+ * WHY BYTES AND NOT A COUNT. A count cap does not actually bound this field.
+ * Sequence numbers are per-run integers starting at 1 (Event Log Rule 4), so
+ * their WIDTH grows with run length: ten citations cost 30 bytes on a 50-step
+ * run and 70 on a 100k-event one. A cap of "10 citations" is therefore the same
+ * cheap-by-luck bound one level down — bounded count, unbounded width — and it
+ * would have to be re-derived every time somebody records a longer run. The
+ * three fields above are capped in BYTES for exactly this reason; so is this
+ * one, and so the tier's ceiling holds for any run length.
+ *
+ * WHY 18. It is what fits under the tier's published 200-token budget once the
+ * truncation marker below is paid for: worst case measures 198 tokens against
+ * 200, for any citation count and any sequence-number width. It admits the
+ * realistic explanation whole (the generator writes ~5 two-digit citations = 15
+ * bytes, which passes through untouched and still costs the published 192), and
+ * degrades sensibly as runs get longer — 5 citations at two digits, 4 at three,
+ * 3 at four, 2 at six.
+ *
+ * Cutting it harder was rejected: a citation is a HANDLE into tier 4, and the
+ * handles are the entire reason this tier boundary exists. Not cutting it at
+ * all is the defect. Between those, the deciding argument for a small number is
+ * that citations CLUSTER — they are contiguous around the failure more often
+ * than not, and `afr_get_run_events(runId, aroundSequence)` returns a WINDOW, so
+ * the second and third citation are usually already inside the window the first
+ * one buys. The marginal handle is worth far less than the first, while each one
+ * costs the same bytes.
+ *
+ * WHY THE HIGHEST, NOT THE FIRST. The earliest citations are not the most useful
+ * ones. `RUN_COMPLETED`/`RUN_FAILED` is always the last event (Event Log Rule
+ * 5), the root cause lands next to it, and the backend's own signal extraction
+ * already says so out loud — `convex/failure_patterns.ts`
+ * `extractFingerprintSignals` scans cited events "highest-sequence-first
+ * (closest to the failure)". Keeping the FIRST few of a `[1, 14, 22 … 39]`
+ * citation list would keep `RUN_STARTED` and throw away every event adjacent to
+ * the failure. This is the same shape as {@link TRANSITIONS_CAP} above: keep the
+ * most recent, then restore log order.
+ *
+ * Selected by sorting on VALUE rather than by slicing the array's tail, because
+ * array order is GENERATOR order — `validateCitedSeqNums` in
+ * `convex/run_explanations.ts` dedupes and slices but never sorts, so the last
+ * element is not necessarily the highest sequence number. The sort runs on the
+ * un-truncated path too, so the emitted order is log order either way rather
+ * than depending on whether a cut happened.
+ *
+ * AND THE CUT IS ANNOUNCED, which is the half that matters. `citationsDropped`
+ * carries how many were removed, for the same reason `truncateProse` emits an
+ * in-band `…[truncated, N more chars]` marker and `budgetPayload` sets
+ * `truncated`/`bytes`: a list silently shortened to five entries is a wrong
+ * answer that looks like a right one, and this package exists to remove those.
+ * It is emitted ONLY when something was actually dropped, so an explanation that
+ * fits pays nothing for it.
+ */
+export const CITED_SEQUENCE_BYTE_CAP = 18
+
+/**
  * MOVED TO `@agent-flight-recorder/sdk` and re-exported here — see the note on
  * the column primitives above. `truncateProse` emits an in-band
  * `…[truncated, N more chars]` marker that callers and tests both read, so two
@@ -580,8 +645,22 @@ export interface ExplainRunResult {
   /**
    * Event `sequenceNumber`s in this run's log that the explanation cites — the
    * handle into tier 4. Pass one as `aroundSequence` to `afr_get_run_events`.
+   *
+   * Ascending, and bounded by {@link CITED_SEQUENCE_BYTE_CAP} to the HIGHEST
+   * citations — the ones nearest the failure. When any were dropped,
+   * {@link ExplainRunResult.citationsDropped} says how many.
    */
   citedSequenceNumbers?: number[]
+  /**
+   * How many citations were cut to fit {@link CITED_SEQUENCE_BYTE_CAP}. Present
+   * ONLY when the list was truncated, and only ever a positive number.
+   *
+   * The explanation cited earlier events than the ones listed above. To reach
+   * them, page backwards from the lowest emitted `sequenceNumber` with
+   * `afr_get_run_events(runId, fromSequence)` — do not read the list as the
+   * complete set of grounding events.
+   */
+  citationsDropped?: number
 }
 
 /**
@@ -613,7 +692,24 @@ export function toExplainRunResult(
   }
   result.failureClass = explanation.failureClass
   result.kind = explanation.kind
-  result.citedSequenceNumbers = explanation.citedSequenceNumbers
+  // Highest-first into a byte budget, emitted in log order. See
+  // CITED_SEQUENCE_BYTE_CAP for why bytes rather than a count, why the highest
+  // rather than the first, and why this sorts on VALUE instead of slicing the
+  // array's tail.
+  const cited = [...explanation.citedSequenceNumbers].sort((a, b) => a - b)
+  let kept: number[] = []
+  for (let i = cited.length - 1; i >= 0; i--) {
+    const seq = cited[i]
+    if (seq === undefined) continue
+    const candidate = [seq, ...kept]
+    // The first citation is always kept, whatever it costs. A budget that can
+    // empty the list entirely does not bound a field, it deletes one — and the
+    // handles into tier 4 are what this tier is FOR.
+    if (kept.length > 0 && Buffer.byteLength(JSON.stringify(candidate), 'utf8') > CITED_SEQUENCE_BYTE_CAP) break
+    kept = candidate
+  }
+  result.citedSequenceNumbers = kept
+  if (kept.length < cited.length) result.citationsDropped = cited.length - kept.length
   return result
 }
 

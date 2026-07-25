@@ -8,10 +8,14 @@
  * only earns that position if four properties hold, and NOT ONE OF THEM is
  * protected by the type system:
  *
- * 1. IT IS CHEAPER THAN DOING IT YOURSELF. Tier 1 + tier 2 is ~707 tokens. If
- *    triage cost more than that it would be a fifth tier pretending to be a
- *    shortcut. The budget is tier 2's, 450 tokens, and it is asserted here
- *    against contract-maximal input rather than hoped for. A future
+ * 1. IT IS CHEAPER THAN DOING IT YOURSELF. Calling tier 1 and tier 2 yourself
+ *    is budgeted at 300 + 450 tokens. If triage cost more than that it would be
+ *    a fifth tier pretending to be a shortcut. Its own budget is the stricter
+ *    line — tier 2's alone — and both are asserted here against
+ *    contract-maximal input rather than hoped for. (The bar used to be the
+ *    frozen MEASUREMENTS `284 + 423`, which drifted leniently and silently
+ *    every time tier 1 or tier 2 got cheaper; see `DIY_TOKEN_BUDGET` in
+ *    `./mcp_budgets.ts`.) A future
  *    "just also return the resolution note, it's one field" is a one-line
  *    change that type-checks, passes every other test, and destroys the reason
  *    the tool exists.
@@ -31,135 +35,52 @@
  *    unreachable whenever anything prevented a whole look. This repo has
  *    shipped "nothing is broken" when it meant "I could not evaluate" before.
  *
- * TOKEN ESTIMATE — STATED ASSUMPTION
- * ----------------------------------
- * `estimateTokens(x) = ceil(utf8ByteLength(JSON.stringify(x)) / 4)` — the same
- * estimator and the same fat-input discipline as
- * `tests/unit/mcp_progressive_disclosure.test.ts`, so the numbers here are
- * comparable to the tier budgets published there. It matches what the server
- * actually emits: `tools/shared.ts` serializes with no indentation, so these
- * are the bytes a caller pays for.
+ * BUDGET AND ESTIMATOR ARE NOT DECLARED HERE
+ * ------------------------------------------
+ * Both come from `./mcp_budgets.ts`. `TRIAGE_TOKEN_BUDGET` is defined THERE as
+ * `TIER2_TOKEN_BUDGET`, because that is what it is — tier 2's budget, by
+ * derivation, not a coincidentally equal `450`. It used to be a third
+ * independent literal `450` (this file, `mcp_triage_measure.test.ts`, and tier
+ * 2's own budget), which is three chances for the derivation to quietly stop
+ * being true.
  */
+import {
+  LABEL_BYTE_CAP,
+  MAX_ITEMS,
+  MAX_TIEBREAK,
+  SCAN_LIMIT,
+  SIGNAL_WEIGHT,
+  TRIAGE_FIELDS,
+  TRIAGE_REQUEST_FIELDS,
+  choosePointer,
+  classifySignal,
+  scorePattern,
+  toTriageResult,
+} from '@agent-flight-recorder/mcp'
 import { describe, expect, it } from 'vitest'
 
+import {
+  DIY_TOKEN_BUDGET,
+  TRIAGE_TOKEN_BUDGET,
+  attributeRowBytes,
+  byteLength,
+  estimateTokens,
+} from './mcp_budgets.js'
+
 import type { FailurePattern } from '@agent-flight-recorder/contracts'
+import type { V1ListFixConfidenceEnvelope } from '@agent-flight-recorder/sdk'
 
 // ---------------------------------------------------------------------------
 // Module seam
 // ---------------------------------------------------------------------------
 
 /**
- * `packages/mcp` is not a workspace dependency of `@agent-flight-recorder/tests`
- * and has no alias in tests/vitest.config.ts, so a bare-specifier import is
- * unresolvable from here. A NON-LITERAL relative specifier is opaque to both
- * TypeScript's resolver and vite's static analysis, which lets this suite bind
- * to the real module without editing files this team does not own. Same seam,
- * and the same follow-up, as `mcp_progressive_disclosure.test.ts`.
+ * A REAL, TYPE-CHECKED IMPORT. See the seam note in
+ * `mcp_progressive_disclosure.test.ts`: the non-literal dynamic specifier and
+ * the hand-written `TriageModule` shadow that used to stand here were justified
+ * by a claim ("not a workspace dependency, no alias") that both
+ * `tests/package.json` and `tests/vitest.config.ts` have since falsified.
  */
-const TRIAGE_SPEC = '../../packages/mcp/src/triage.ts'
-
-type TriageSignal = 'regressed' | 'spiking' | 'open' | 'acknowledged' | 'resolved'
-
-interface TriagePointer {
-  tool: string
-  args: Record<string, string | number>
-}
-
-interface TriageItem {
-  fingerprintHash: string
-  class: string
-  label: string
-  count: number
-  lastSeenAt: number
-  signal: TriageSignal
-  score: number
-  muted?: true
-  next: TriagePointer
-}
-
-interface TriageResult {
-  verdict: 'issues' | 'clear' | 'unknown'
-  complete: boolean
-  scanned: number
-  items: TriageItem[]
-  caveats?: string[]
-  unevaluated?: { count: number; sample: string[] }
-  scanTruncated?: true
-  next?: TriagePointer
-}
-
-interface TriageModule {
-  toTriageResult(
-    patterns: FailurePattern[],
-    envelope: unknown,
-    nextCursor: string | undefined,
-    now: number,
-    scan?: { scanTruncated?: boolean }
-  ): TriageResult
-  classifySignal(pattern: FailurePattern, confidence?: unknown): TriageSignal
-  scorePattern(pattern: FailurePattern, signal: TriageSignal, now: number): number
-  choosePointer(pattern: FailurePattern, signal: TriageSignal): TriagePointer
-  SIGNAL_WEIGHT: Record<TriageSignal, number>
-  MAX_TIEBREAK: number
-  MAX_ITEMS: number
-  SCAN_LIMIT: number
-  LABEL_BYTE_CAP: number
-  MUTE_DEMOTION: number
-  TRIAGE_REQUEST_FIELDS: readonly string[]
-  TRIAGE_FIELDS: readonly string[]
-}
-
-const triage = (await import(/* @vite-ignore */ TRIAGE_SPEC)) as TriageModule
-
-// ---------------------------------------------------------------------------
-// Estimation
-// ---------------------------------------------------------------------------
-
-function estimateTokens(value: unknown): number {
-  return Math.ceil(Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8') / 4)
-}
-
-/**
- * Per-key byte attribution across the emitted items, biggest first.
- *
- * A budget test whose failure message is "expected 512 to be <= 450" gets
- * deleted the first time it goes red. This one says which field to cut.
- */
-function attribute(items: readonly Record<string, unknown>[]): string {
-  const totals = new Map<string, number>()
-  for (const item of items) {
-    for (const [key, value] of Object.entries(item)) {
-      const cost =
-        Buffer.byteLength(JSON.stringify(key), 'utf8') + 1 + Buffer.byteLength(JSON.stringify(value) ?? 'null', 'utf8') + 1
-      totals.set(key, (totals.get(key) ?? 0) + cost)
-    }
-  }
-  return [...totals.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, b]) => `    ${k.padEnd(18)} ${String(b).padStart(6)} B  (~${String(Math.ceil(b / 4))} tok)`)
-    .join('\n')
-}
-
-// ---------------------------------------------------------------------------
-// Budgets
-// ---------------------------------------------------------------------------
-
-/**
- * Tier 2's budget, and the ceiling triage must live under.
- *
- * DERIVED, and the derivation is the argument for the tool's existence: an
- * agent can already get "what is broken" plus "did the fix hold" by calling
- * tier 1 (~284) and tier 2 (~423) itself, for ~707. A shortcut that costs more
- * than the thing it shortcuts is not a shortcut. 450 is the stricter of the
- * two available lines — at or under the single most expensive tier it replaces
- * a call to.
- */
-const TIER1_MEASURED = 284
-const TIER2_MEASURED = 423
-const TRIAGE_TOKEN_BUDGET = 450
-
-/** What triage exists to be cheaper than. */
-const DIY_TOKENS = TIER1_MEASURED + TIER2_MEASURED
 
 const NOW = 1_753_500_000_000
 const HOUR = 60 * 60 * 1000
@@ -232,7 +153,7 @@ function fatPattern(i: number, overrides: PatternOverrides = {}): FailurePattern
 }
 
 /** The `fixConfidence` envelope a modern deployment returns for a page. */
-function envelopeFor(patterns: readonly FailurePattern[], unevaluated: string[] = []): unknown {
+function envelopeFor(patterns: readonly FailurePattern[], unevaluated: string[] = []): V1ListFixConfidenceEnvelope {
   return {
     stalenessBoundMs: 6 * HOUR,
     entries: patterns.map((p, i) => ({
@@ -258,9 +179,9 @@ describe('afr_triage token budget', () => {
     // The worst case a caller can actually receive: a full scan, every
     // optional item field present, every caveat that can fire together firing,
     // an unevaluated sample, and a top-level next hop.
-    const patterns = Array.from({ length: triage.SCAN_LIMIT }, (_, i) => fatPattern(i, { muted: true }))
+    const patterns = Array.from({ length: SCAN_LIMIT }, (_, i) => fatPattern(i, { muted: true }))
     const unevaluated = patterns.slice(0, 6).map((p) => p.fingerprintHash)
-    const result = triage.toTriageResult(patterns, envelopeFor(patterns, unevaluated), 'cursor_abc123', NOW, {
+    const result = toTriageResult(patterns, envelopeFor(patterns, unevaluated), 'cursor_abc123', NOW, {
       scanTruncated: true,
     })
 
@@ -268,43 +189,50 @@ describe('afr_triage token budget', () => {
     expect(
       tokens,
       `afr_triage worst case is ~${String(tokens)} tokens, over the ${String(TRIAGE_TOKEN_BUDGET)} budget.\n` +
-        `  items: ${String(result.items.length)}\n${attribute(result.items as unknown as Record<string, unknown>[])}\n` +
+        `  items: ${String(result.items.length)}\n${attributeRowBytes(result.items as unknown as Record<string, unknown>[])}\n` +
         `  caveats: ~${String(estimateTokens(result.caveats))} tok`,
     ).toBeLessThanOrEqual(TRIAGE_TOKEN_BUDGET)
   })
 
   it('is cheaper than calling tier 1 and tier 2 yourself — otherwise it is a fifth tier, not a shortcut', () => {
-    const patterns = Array.from({ length: triage.SCAN_LIMIT }, (_, i) => fatPattern(i))
-    const result = triage.toTriageResult(patterns, envelopeFor(patterns), undefined, NOW)
-    expect(estimateTokens(result)).toBeLessThan(DIY_TOKENS)
+    const patterns = Array.from({ length: SCAN_LIMIT }, (_, i) => fatPattern(i))
+    const result = toTriageResult(patterns, envelopeFor(patterns), undefined, NOW)
+    expect(estimateTokens(result)).toBeLessThan(DIY_TOKEN_BUDGET)
   })
 
   it('cost does not scale with how many patterns were scanned', () => {
     // The whole premise: a caller pays for the HEADLINE, not the scan. A
-    // 10-pattern org and a 500-pattern org must cost the same to triage.
-    const small = triage.toTriageResult(
+    // 10-pattern org and a 500-pattern org must cost the same to 
+    const small = toTriageResult(
       Array.from({ length: 10 }, (_, i) => fatPattern(i)),
       envelopeFor([]),
       undefined,
       NOW,
     )
-    const large = triage.toTriageResult(
+    const large = toTriageResult(
       Array.from({ length: 500 }, (_, i) => fatPattern(i)),
       envelopeFor([]),
       'more',
       NOW,
     )
-    expect(large.items).toHaveLength(triage.MAX_ITEMS)
+    expect(large.items).toHaveLength(MAX_ITEMS)
     // Large carries extra caveats/next by design; the ITEMS must not grow.
     expect(estimateTokens(large.items)).toBeLessThan(estimateTokens(small.items) * 1.5)
   })
 
   it('caps a runaway label with an explicit in-band marker rather than silently', () => {
     const long = 'x'.repeat(4000)
-    const result = triage.toTriageResult([fatPattern(0, { label: long })], envelopeFor([]), undefined, NOW)
+    const result = toTriageResult([fatPattern(0, { label: long })], envelopeFor([]), undefined, NOW)
     const label = result.items[0]!.label
     expect(label.length).toBeLessThan(long.length)
     expect(label).toContain('…[truncated,')
+    // Tied to the SHIPPED cap, not merely to "shorter than the input". Without
+    // this the test passes at any cap at all, including one an order of
+    // magnitude over budget, as long as something was cut.
+    expect(
+      byteLength(label.split('…[truncated,')[0] ?? ''),
+      `the kept part of a capped label is over LABEL_BYTE_CAP (${String(LABEL_BYTE_CAP)} B)`,
+    ).toBeLessThanOrEqual(LABEL_BYTE_CAP)
     expect(estimateTokens(result)).toBeLessThanOrEqual(TRIAGE_TOKEN_BUDGET)
   })
 })
@@ -334,7 +262,7 @@ const TOOL_ARGS: Record<string, ReadonlySet<string>> = {
 describe('afr_triage next-hop pointers', () => {
   it('gives every item exactly one executable next hop', () => {
     const patterns = Array.from({ length: 20 }, (_, i) => fatPattern(i))
-    const result = triage.toTriageResult(patterns, envelopeFor(patterns), 'c', NOW)
+    const result = toTriageResult(patterns, envelopeFor(patterns), 'c', NOW)
     expect(result.items.length).toBeGreaterThan(0)
     for (const item of result.items) {
       expect(REAL_TOOLS.has(item.next.tool), `unknown tool in pointer: ${item.next.tool}`).toBe(true)
@@ -348,7 +276,7 @@ describe('afr_triage next-hop pointers', () => {
 
   it('points a resolved or regressed pattern at the evidence tier — "did the fix hold?"', () => {
     const p = fatPattern(0, { status: 'resolved', resolvedAt: NOW - DAY, regressedAt: NOW - HOUR })
-    expect(triage.choosePointer(p, 'regressed')).toEqual({
+    expect(choosePointer(p, 'regressed')).toEqual({
       tool: 'afr_get_pattern_evidence',
       args: { fingerprintHash: p.fingerprintHash },
     })
@@ -356,17 +284,17 @@ describe('afr_triage next-hop pointers', () => {
 
   it('points an unresolved pattern at a concrete run, not at more pattern metadata', () => {
     const p = fatPattern(1, { status: 'open', resolvedAt: undefined, regressedAt: undefined })
-    expect(triage.choosePointer(p, 'open')).toEqual({ tool: 'afr_explain_run', args: { runId: 'run_1a' } })
+    expect(choosePointer(p, 'open')).toEqual({ tool: 'afr_explain_run', args: { runId: 'run_1a' } })
   })
 
   it('falls back to the evidence tier rather than emitting no pointer at all', () => {
     const p = fatPattern(1, { status: 'open', resolvedAt: undefined, regressedAt: undefined, representativeRunIds: [] })
-    expect(triage.choosePointer(p, 'open').tool).toBe('afr_get_pattern_evidence')
+    expect(choosePointer(p, 'open').tool).toBe('afr_get_pattern_evidence')
   })
 
   it('forwards the scan cursor verbatim so continuing is mechanical, not a guess', () => {
     const patterns = Array.from({ length: 10 }, (_, i) => fatPattern(i))
-    const result = triage.toTriageResult(patterns, envelopeFor(patterns), 'cursor_xyz', NOW)
+    const result = toTriageResult(patterns, envelopeFor(patterns), 'cursor_xyz', NOW)
     expect(result.next).toEqual({ tool: 'afr_list_failure_patterns', args: { cursor: 'cursor_xyz', limit: 100 } })
   })
 })
@@ -381,9 +309,9 @@ describe('afr_triage ranking', () => {
     // one. That holds only while the tie-breakers stay under the gap between
     // adjacent signal weights. Asserted rather than left to arithmetic,
     // because widening a tie-breaker is the change that would silently kill it.
-    const weights = Object.values(triage.SIGNAL_WEIGHT).sort((a, b) => a - b)
+    const weights = Object.values(SIGNAL_WEIGHT).sort((a, b) => a - b)
     for (let i = 1; i < weights.length; i++) {
-      expect(weights[i]! - weights[i - 1]!).toBeGreaterThan(triage.MAX_TIEBREAK)
+      expect(weights[i]! - weights[i - 1]!).toBeGreaterThan(MAX_TIEBREAK)
     }
   })
 
@@ -408,14 +336,14 @@ describe('afr_triage ranking', () => {
       lastSpikeAssessment: undefined,
       muted: false,
     })
-    const result = triage.toTriageResult([loudOpen, regressed], undefined, undefined, NOW)
+    const result = toTriageResult([loudOpen, regressed], undefined, undefined, NOW)
     expect(result.items.map((i) => i.fingerprintHash)).toEqual(['aa_regressed', 'bb_open'])
     expect(result.items[0]!.signal).toBe('regressed')
   })
 
   it('detects a regression from regressedAt when the deployment serves no fix confidence', () => {
     const p = fatPattern(0, { status: 'resolved', resolvedAt: NOW - 2 * DAY, regressedAt: NOW - DAY })
-    expect(triage.classifySignal(p)).toBe('regressed')
+    expect(classifySignal(p)).toBe('regressed')
   })
 
   it('does NOT call a pattern regressed when the regression predates the current resolution', () => {
@@ -429,28 +357,40 @@ describe('afr_triage ranking', () => {
       resolvedAt: NOW - DAY,
       lastSpikeAssessment: undefined,
     })
-    expect(triage.classifySignal(p)).toBe('resolved')
+    expect(classifySignal(p)).toBe('resolved')
   })
 
   it('prefers the fix-confidence verdict over the rollup fallback when one is served', () => {
     const p = fatPattern(0, { status: 'open', resolvedAt: undefined, regressedAt: undefined })
-    expect(triage.classifySignal(p, { fingerprintHash: p.fingerprintHash, state: 'regressed', stale: false })).toBe(
-      'regressed',
-    )
+    // A COMPLETE `FixConfidenceEntry`. The seam's old `confidence?: unknown`
+    // shadow accepted a three-field stub, so this case was silently asserting
+    // that `classifySignal` reads `state` and tolerates a malformed entry —
+    // a weaker claim than the one it is written to make.
+    expect(
+      classifySignal(p, {
+        fingerprintHash: p.fingerprintHash,
+        state: 'regressed',
+        score: 0.12,
+        computedAt: NOW - 2 * HOUR,
+        ageMs: 2 * HOUR,
+        stale: false,
+        basis: 'snapshot',
+      }),
+    ).toBe('regressed')
   })
 
   it('orders by recency within a class, and decays rather than cliff-edges', () => {
-    const fresh = triage.scorePattern(fatPattern(0, { count: 10, lastSeenAt: NOW }), 'open', NOW)
-    const day = triage.scorePattern(fatPattern(0, { count: 10, lastSeenAt: NOW - DAY }), 'open', NOW)
-    const week = triage.scorePattern(fatPattern(0, { count: 10, lastSeenAt: NOW - 7 * DAY }), 'open', NOW)
+    const fresh = scorePattern(fatPattern(0, { count: 10, lastSeenAt: NOW }), 'open', NOW)
+    const day = scorePattern(fatPattern(0, { count: 10, lastSeenAt: NOW - DAY }), 'open', NOW)
+    const week = scorePattern(fatPattern(0, { count: 10, lastSeenAt: NOW - 7 * DAY }), 'open', NOW)
     expect(fresh).toBeGreaterThan(day)
     expect(day).toBeGreaterThan(week)
   })
 
   it('log-scales volume so one huge pattern cannot drown the list', () => {
-    const ten = triage.scorePattern(fatPattern(0, { count: 10, lastSeenAt: NOW }), 'open', NOW)
-    const hundred = triage.scorePattern(fatPattern(0, { count: 100, lastSeenAt: NOW }), 'open', NOW)
-    const million = triage.scorePattern(fatPattern(0, { count: 1_000_000, lastSeenAt: NOW }), 'open', NOW)
+    const ten = scorePattern(fatPattern(0, { count: 10, lastSeenAt: NOW }), 'open', NOW)
+    const hundred = scorePattern(fatPattern(0, { count: 100, lastSeenAt: NOW }), 'open', NOW)
+    const million = scorePattern(fatPattern(0, { count: 1_000_000, lastSeenAt: NOW }), 'open', NOW)
     expect(hundred).toBeGreaterThan(ten)
     // Saturated: four more orders of magnitude buy nothing.
     expect(million).toBe(hundred)
@@ -476,7 +416,7 @@ describe('afr_triage ranking', () => {
       lastSeenAt: NOW - 30 * DAY,
       count: 1,
     })
-    const result = triage.toTriageResult([muted, quiet], undefined, undefined, NOW)
+    const result = toTriageResult([muted, quiet], undefined, undefined, NOW)
     expect(result.items.map((i) => i.fingerprintHash)).toEqual(['bb_quiet', 'aa_muted'])
     expect(result.items[1]!.muted).toBe(true)
   })
@@ -484,13 +424,13 @@ describe('afr_triage ranking', () => {
   it('is a total order — equal scores break deterministically, so two calls do not shuffle', () => {
     const a = fatPattern(0, { fingerprintHash: 'aaa', count: 10, lastSeenAt: NOW, status: 'open', resolvedAt: undefined, regressedAt: undefined, lastSpikeAssessment: undefined })
     const b = fatPattern(0, { fingerprintHash: 'bbb', count: 10, lastSeenAt: NOW, status: 'open', resolvedAt: undefined, regressedAt: undefined, lastSpikeAssessment: undefined })
-    expect(triage.toTriageResult([a, b], undefined, undefined, NOW).items.map((i) => i.fingerprintHash)).toEqual(['aaa', 'bbb'])
-    expect(triage.toTriageResult([b, a], undefined, undefined, NOW).items.map((i) => i.fingerprintHash)).toEqual(['aaa', 'bbb'])
+    expect(toTriageResult([a, b], undefined, undefined, NOW).items.map((i) => i.fingerprintHash)).toEqual(['aaa', 'bbb'])
+    expect(toTriageResult([b, a], undefined, undefined, NOW).items.map((i) => i.fingerprintHash)).toEqual(['aaa', 'bbb'])
   })
 
   it('emits the score, so the ordering is auditable and not merely asserted', () => {
     const patterns = Array.from({ length: 5 }, (_, i) => fatPattern(i))
-    const result = triage.toTriageResult(patterns, envelopeFor(patterns), undefined, NOW)
+    const result = toTriageResult(patterns, envelopeFor(patterns), undefined, NOW)
     const scores = result.items.map((i) => i.score)
     expect(scores).toEqual([...scores].sort((x, y) => y - x))
   })
@@ -502,7 +442,7 @@ describe('afr_triage ranking', () => {
 
 describe('afr_triage honesty', () => {
   it('says "clear" only when the scan actually finished and found nothing', () => {
-    const result = triage.toTriageResult([], envelopeFor([]), undefined, NOW)
+    const result = toTriageResult([], envelopeFor([]), undefined, NOW)
     expect(result.verdict).toBe('clear')
     expect(result.complete).toBe(true)
     expect(result.caveats).toBeUndefined()
@@ -515,25 +455,25 @@ describe('afr_triage honesty', () => {
     // No fix-confidence served: regressions could only be inferred from the
     // rollup. Reporting that as "nothing is broken" is the specific mistake
     // this assertion exists to prevent.
-    const result = triage.toTriageResult([], undefined, undefined, NOW)
+    const result = toTriageResult([], undefined, undefined, NOW)
     expect(result.verdict).toBe('unknown')
     expect(result.complete).toBe(false)
     expect(result.caveats?.length).toBeGreaterThan(0)
   })
 
   it('marks a truncated scan incomplete and says so in words, while still returning items', () => {
-    const patterns = Array.from({ length: triage.SCAN_LIMIT }, (_, i) => fatPattern(i))
-    const result = triage.toTriageResult(patterns, envelopeFor(patterns), 'cursor_more', NOW)
+    const patterns = Array.from({ length: SCAN_LIMIT }, (_, i) => fatPattern(i))
+    const result = toTriageResult(patterns, envelopeFor(patterns), 'cursor_more', NOW)
     expect(result.verdict).toBe('issues')
     expect(result.complete).toBe(false)
     expect(result.caveats?.some((c) => c.toLowerCase().includes('truncated'))).toBe(true)
-    expect(result.scanned).toBe(triage.SCAN_LIMIT)
+    expect(result.scanned).toBe(SCAN_LIMIT)
   })
 
   it('names patterns whose fix state could not be evaluated instead of dropping them', () => {
     const patterns = Array.from({ length: 4 }, (_, i) => fatPattern(i))
     const hashes = patterns.map((p) => p.fingerprintHash)
-    const result = triage.toTriageResult(patterns, envelopeFor(patterns, hashes), undefined, NOW)
+    const result = toTriageResult(patterns, envelopeFor(patterns, hashes), undefined, NOW)
     expect(result.unevaluated?.count).toBe(4)
     expect(result.unevaluated?.sample.length).toBeLessThanOrEqual(3)
     expect(result.complete).toBe(false)
@@ -545,7 +485,7 @@ describe('afr_triage honesty', () => {
     // and a projection that drops it at the last hop makes the whole chain
     // worthless. A marker nobody reads is the same as no marker.
     const patterns = Array.from({ length: 3 }, (_, i) => fatPattern(i))
-    const result = triage.toTriageResult(patterns, envelopeFor(patterns), undefined, NOW, { scanTruncated: true })
+    const result = toTriageResult(patterns, envelopeFor(patterns), undefined, NOW, { scanTruncated: true })
     expect(result.scanTruncated).toBe(true)
     expect(result.complete).toBe(false)
     expect(result.caveats?.some((c) => c.includes('row ceiling'))).toBe(true)
@@ -555,7 +495,7 @@ describe('afr_triage honesty', () => {
     // THE REASSURING EMPTY STATE. An empty page under a truncated scan means
     // "nothing matched in the slice I could afford to look at", not "nothing
     // is broken", and an agent that reads it the second way stops looking.
-    const result = triage.toTriageResult([], envelopeFor([]), undefined, NOW, { scanTruncated: true })
+    const result = toTriageResult([], envelopeFor([]), undefined, NOW, { scanTruncated: true })
     expect(result.items).toHaveLength(0)
     expect(result.verdict).toBe('unknown')
     expect(result.scanTruncated).toBe(true)
@@ -565,26 +505,26 @@ describe('afr_triage honesty', () => {
     // An older deployment never declares truncation. Treating absence as
     // incomplete would make every such request permanently inconclusive.
     const patterns = Array.from({ length: 3 }, (_, i) => fatPattern(i))
-    expect(triage.toTriageResult(patterns, envelopeFor(patterns), undefined, NOW, {}).scanTruncated).toBeUndefined()
-    expect(triage.toTriageResult(patterns, envelopeFor(patterns), undefined, NOW).complete).toBe(true)
+    expect(toTriageResult(patterns, envelopeFor(patterns), undefined, NOW, {}).scanTruncated).toBeUndefined()
+    expect(toTriageResult(patterns, envelopeFor(patterns), undefined, NOW).complete).toBe(true)
   })
 
   it('keeps the two truncation kinds distinct — a window limit is not a server ceiling', () => {
-    const patterns = Array.from({ length: triage.SCAN_LIMIT }, (_, i) => fatPattern(i))
+    const patterns = Array.from({ length: SCAN_LIMIT }, (_, i) => fatPattern(i))
     // Cursor only: the ranking's window was partial, the scan itself was fine.
-    const windowOnly = triage.toTriageResult(patterns, envelopeFor(patterns), 'c', NOW, { scanTruncated: false })
+    const windowOnly = toTriageResult(patterns, envelopeFor(patterns), 'c', NOW, { scanTruncated: false })
     expect(windowOnly.scanTruncated).toBeUndefined()
     expect(windowOnly.complete).toBe(false)
     expect(windowOnly.caveats?.some((c) => c.includes('ranking covers only'))).toBe(true)
     // Both: the worse one is what the single caveat names.
-    const both = triage.toTriageResult(patterns, envelopeFor(patterns), 'c', NOW, { scanTruncated: true })
+    const both = toTriageResult(patterns, envelopeFor(patterns), 'c', NOW, { scanTruncated: true })
     expect(both.caveats?.some((c) => c.includes('row ceiling'))).toBe(true)
     expect(both.caveats?.some((c) => c.includes('ranking covers only'))).toBe(false)
   })
 
   it('reports complete:true only when nothing at all was degraded', () => {
     const patterns = Array.from({ length: 3 }, (_, i) => fatPattern(i))
-    const result = triage.toTriageResult(patterns, envelopeFor(patterns), undefined, NOW)
+    const result = toTriageResult(patterns, envelopeFor(patterns), undefined, NOW)
     expect(result.complete).toBe(true)
     expect(result.verdict).toBe('issues')
     expect(result.caveats).toBeUndefined()
@@ -618,15 +558,15 @@ describe('afr_triage shape', () => {
   ]
 
   it('never leaks a lower-tier field into a triage item', () => {
-    const patterns = Array.from({ length: triage.SCAN_LIMIT }, (_, i) => fatPattern(i))
-    const serialized = JSON.stringify(triage.toTriageResult(patterns, envelopeFor(patterns), 'c', NOW))
+    const patterns = Array.from({ length: SCAN_LIMIT }, (_, i) => fatPattern(i))
+    const serialized = JSON.stringify(toTriageResult(patterns, envelopeFor(patterns), 'c', NOW))
     for (const key of FORBIDDEN) {
       expect(serialized.includes(`"${key}"`), `triage leaked "${key}"`).toBe(false)
     }
   })
 
   it('never emits orgId — the tenancy boundary is the key’s, not a value to hand an agent', () => {
-    const result = triage.toTriageResult([fatPattern(0)], envelopeFor([]), undefined, NOW)
+    const result = toTriageResult([fatPattern(0)], envelopeFor([]), undefined, NOW)
     expect(JSON.stringify(result)).not.toContain('org_caller')
   })
 
@@ -640,13 +580,13 @@ describe('afr_triage shape', () => {
     const table = /failure_patterns: defineTable\(\{([\s\S]*?)\n {2}\}\)/.exec(schema)?.[1] ?? ''
     expect(table.length).toBeGreaterThan(0)
     const declared = new Set([...table.matchAll(/^ {4}([a-zA-Z_][a-zA-Z0-9_]*):/gm)].map((m) => m[1]!))
-    for (const field of triage.TRIAGE_REQUEST_FIELDS) {
+    for (const field of TRIAGE_REQUEST_FIELDS) {
       expect(declared.has(field), `"${field}" is not a failure_patterns field`).toBe(true)
     }
   })
 
   it('never requests the identity field — the read API returns it regardless', () => {
-    expect(triage.TRIAGE_REQUEST_FIELDS).not.toContain('fingerprintHash')
-    expect(triage.TRIAGE_FIELDS).toContain('fingerprintHash')
+    expect(TRIAGE_REQUEST_FIELDS).not.toContain('fingerprintHash')
+    expect(TRIAGE_FIELDS).toContain('fingerprintHash')
   })
 })

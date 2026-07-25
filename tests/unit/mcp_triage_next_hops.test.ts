@@ -29,39 +29,16 @@
  * Everything below is a client-side derivation over the two fields the server
  * already sends.
  */
+import { deriveAvailability, toExplainRunResult, toListPatternsResult } from '@agent-flight-recorder/mcp'
 import { describe, expect, it } from 'vitest'
 
-import type { RunExplanation } from '@agent-flight-recorder/contracts'
+import { MARKER_TOKEN_ALLOWANCE, estimateTokens } from './mcp_budgets.js'
 
-// See the module-seam note in `mcp_triage.test.ts`.
-const PROJECTIONS_SPEC = '../../packages/mcp/src/projections.ts'
+import type { FailurePattern, RunExplanation } from '@agent-flight-recorder/contracts'
 
-type Availability = 'available' | 'not_yet' | 'never' | 'unknown'
-
-interface ListPatternsResult {
-  fields: string[]
-  rows: unknown[][]
-  nextCursor?: string
-  scanTruncated?: true
-}
-
-interface ProjectionsModule {
-  toListPatternsResult(
-    patterns: unknown[],
-    envelope: unknown,
-    nextCursor: string | undefined,
-    scan?: { scanTruncated?: boolean }
-  ): ListPatternsResult
-  deriveAvailability(status: 'not_eligible' | 'pending' | 'ready', runStatus: string | undefined): Availability
-  toExplainRunResult(
-    runId: string,
-    status: 'not_eligible' | 'pending' | 'ready',
-    explanation: RunExplanation | null,
-    runStatus: string | undefined
-  ): Record<string, unknown>
-}
-
-const projections = (await import(/* @vite-ignore */ PROJECTIONS_SPEC)) as ProjectionsModule
+// A REAL, TYPE-CHECKED IMPORT — see the module-seam note in
+// `mcp_progressive_disclosure.test.ts` for why the dynamic specifier and the
+// hand-written `ProjectionsModule` shadow that used to stand here are gone.
 
 const READY_EXPLANATION: RunExplanation = {
   runId: 'run_1',
@@ -77,58 +54,58 @@ describe('explanation availability — “never” vs “not yet”', () => {
   it('does NOT say never for a run that is still in flight', () => {
     // The whole defect. A running run reports not_eligible today and may fail
     // and get an explanation moments later.
-    expect(projections.deriveAvailability('not_eligible', 'running')).toBe('not_yet')
-    expect(projections.deriveAvailability('not_eligible', 'pending')).toBe('not_yet')
+    expect(deriveAvailability('not_eligible', 'running')).toBe('not_yet')
+    expect(deriveAvailability('not_eligible', 'pending')).toBe('not_yet')
   })
 
   it('says never only for a run that finished WITHOUT failing', () => {
-    expect(projections.deriveAvailability('not_eligible', 'completed')).toBe('never')
-    expect(projections.deriveAvailability('not_eligible', 'cancelled')).toBe('never')
-    expect(projections.deriveAvailability('not_eligible', 'timed_out')).toBe('never')
+    expect(deriveAvailability('not_eligible', 'completed')).toBe('never')
+    expect(deriveAvailability('not_eligible', 'cancelled')).toBe('never')
+    expect(deriveAvailability('not_eligible', 'timed_out')).toBe('never')
   })
 
   it('says unknown rather than guessing when runStatus was not served', () => {
     // An older deployment. Guessing 'never' here would tell a caller to stop
     // looking at something that may be broken — the more costly of the two
     // possible mistakes, so it is not made.
-    expect(projections.deriveAvailability('not_eligible', undefined)).toBe('unknown')
+    expect(deriveAvailability('not_eligible', undefined)).toBe('unknown')
   })
 
   it('says unknown when the two signals contradict each other', () => {
     // not_eligible on a run that DID fail. Neither answer is defensible.
-    expect(projections.deriveAvailability('not_eligible', 'failed')).toBe('unknown')
+    expect(deriveAvailability('not_eligible', 'failed')).toBe('unknown')
   })
 
   it('treats pending as a bounded latency claim, not a permanent state', () => {
-    expect(projections.deriveAvailability('pending', 'failed')).toBe('not_yet')
+    expect(deriveAvailability('pending', 'failed')).toBe('not_yet')
   })
 
   it('is emitted on every non-ready response, so no caller has to cross-reference two fields', () => {
     for (const runStatus of ['running', 'completed', 'failed', undefined]) {
-      const result = projections.toExplainRunResult('run_1', 'not_eligible', null, runStatus)
+      const result = toExplainRunResult('run_1', 'not_eligible', null, runStatus)
       expect(result['availability'], `missing availability for runStatus=${String(runStatus)}`).toBeDefined()
     }
-    expect(projections.toExplainRunResult('run_1', 'pending', null, 'failed')['availability']).toBe('not_yet')
+    expect(toExplainRunResult('run_1', 'pending', null, 'failed')['availability']).toBe('not_yet')
   })
 
   it('is omitted on a ready response — the tier’s most expensive case pays nothing for it', () => {
     // A ready explanation is trivially available and the prose is right there.
     // Tier 3's contract-maximal budget is measured on exactly this case, so a
     // field with no information content must not land on it.
-    const result = projections.toExplainRunResult('run_1', 'ready', READY_EXPLANATION, 'failed')
+    const result = toExplainRunResult('run_1', 'ready', READY_EXPLANATION, 'failed')
     expect(result['availability']).toBeUndefined()
     expect(result['status']).toBe('ready')
   })
 
   it('leaves the wire status untouched — the fix is a derivation, not a vocabulary change', () => {
-    const result = projections.toExplainRunResult('run_1', 'not_eligible', null, 'running')
+    const result = toExplainRunResult('run_1', 'not_eligible', null, 'running')
     expect(result['status']).toBe('not_eligible')
     expect(result['runStatus']).toBe('running')
     expect(result['availability']).toBe('not_yet')
   })
 
   it('surfaces kind, so a caller knows whether it is reading a derived or an analysed summary', () => {
-    const result = projections.toExplainRunResult('run_1', 'ready', READY_EXPLANATION, 'failed')
+    const result = toExplainRunResult('run_1', 'ready', READY_EXPLANATION, 'failed')
     expect(result['kind']).toBe('heuristic')
   })
 })
@@ -149,7 +126,7 @@ describe('explanation availability — “never” vs “not yet”', () => {
  * reassuring-empty-state failure already removed from the dashboard, the
  * service layer and the CLI.
  */
-const PATTERN = {
+const PATTERN: FailurePattern = {
   id: 'fp_1',
   orgId: 'org_caller',
   fingerprintHash: '01f3a9c1d4e7b2',
@@ -166,13 +143,13 @@ const PATTERN = {
 
 describe('afr_list_failure_patterns truncation marker', () => {
   it('surfaces scanTruncated so an empty page is not read as "nothing is broken"', () => {
-    const result = projections.toListPatternsResult([], undefined, undefined, { scanTruncated: true })
+    const result = toListPatternsResult([], undefined, undefined, { scanTruncated: true })
     expect(result.rows).toHaveLength(0)
     expect(result.scanTruncated).toBe(true)
   })
 
   it('omits it on a complete scan, so the common case costs zero bytes', () => {
-    const result = projections.toListPatternsResult([PATTERN], undefined, undefined, { scanTruncated: false })
+    const result = toListPatternsResult([PATTERN], undefined, undefined, { scanTruncated: false })
     expect(result.scanTruncated).toBeUndefined()
   })
 
@@ -180,20 +157,42 @@ describe('afr_list_failure_patterns truncation marker', () => {
     // An older deployment never declares truncation. `isPatternScanComplete`
     // is the single place that decides what absence means; this projection
     // calls it rather than guessing a third time.
-    expect(projections.toListPatternsResult([PATTERN], undefined, undefined, {}).scanTruncated).toBeUndefined()
-    expect(projections.toListPatternsResult([PATTERN], undefined, undefined).scanTruncated).toBeUndefined()
+    expect(toListPatternsResult([PATTERN], undefined, undefined, {}).scanTruncated).toBeUndefined()
+    expect(toListPatternsResult([PATTERN], undefined, undefined).scanTruncated).toBeUndefined()
   })
 
-  it('costs a handful of tokens against tier 1’s tight 300-token budget', () => {
-    // Tier 1 is the tightest budget in the package (measured 284 / 300), so
-    // this is measured rather than assumed.
+  it('costs a handful of tokens — the marker’s DELTA, measured', () => {
+    /**
+     * WHAT THIS ASSERTS, AND WHAT IT DELIBERATELY NO LONGER ASSERTS.
+     *
+     * It asserts the marker's MARGINAL cost. That is this file's subject, and
+     * nowhere else measures it.
+     *
+     * It used to ALSO assert `expect(truncated).toBeLessThanOrEqual(300)` —
+     * tier 1's absolute budget, a second time, against a DIFFERENT fixture and
+     * a bare literal `300` unconnected to the one tier 1's own suite uses.
+     * `PATTERN` above is a thin hand-written rollup, so that assertion measured
+     * ~217 where `mcp_progressive_disclosure.test.ts` measures 284 on the
+     * contract-maximal fixture: ~67 tokens of headroom that does not exist,
+     * which would have stayed green through a widening the real budget test
+     * catches. Two places asserting one budget with two fixtures, already
+     * disagreeing — exactly the failure this consolidation is about.
+     *
+     * The absolute now lives in one place, on the fat fixture, and it covers
+     * this marker case explicitly: see "stays within ~300 tokens WITH the
+     * scanTruncated marker set" in `mcp_progressive_disclosure.test.ts`. Same
+     * tool, same budget constant, strictly fatter input — a STRICTER assertion
+     * than the one removed here, so coverage went up, not down.
+     */
     const page = Array.from({ length: 10 }, (_, i) => ({ ...PATTERN, fingerprintHash: `0${String(i)}f3a9c1d4e7b2` }))
-    const tok = (v: unknown): number => Math.ceil(Buffer.byteLength(JSON.stringify(v) ?? '', 'utf8') / 4)
-    const complete = tok(projections.toListPatternsResult(page, undefined, undefined, { scanTruncated: false }))
-    const truncated = tok(projections.toListPatternsResult(page, undefined, undefined, { scanTruncated: true }))
+    const complete = estimateTokens(toListPatternsResult(page, undefined, undefined, { scanTruncated: false }))
+    const truncated = estimateTokens(toListPatternsResult(page, undefined, undefined, { scanTruncated: true }))
     // eslint-disable-next-line no-console
     console.log(`\n  tier 1 with marker: ${String(complete)} tok complete -> ${String(truncated)} tok truncated (+${String(truncated - complete)})`)
-    expect(truncated - complete).toBeLessThanOrEqual(8)
-    expect(truncated).toBeLessThanOrEqual(300)
+    expect(
+      truncated - complete,
+      `the scanTruncated marker costs ${String(truncated - complete)} extra tokens. It is a ` +
+        `boolean flag; anything approaching a row's worth means it stopped being one.`,
+    ).toBeLessThanOrEqual(MARKER_TOKEN_ALLOWANCE)
   })
 })

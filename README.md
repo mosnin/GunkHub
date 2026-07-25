@@ -67,14 +67,15 @@ Starts `apps/web` (Next.js dev server, `http://localhost:3000`) and `convex dev`
 | Command | What it does |
 |---------|---------------|
 | `pnpm typecheck` | `tsc --noEmit` across every package (7 Turbo tasks) |
-| `pnpm lint` | ESLint across every package (5 Turbo tasks) |
+| `pnpm lint` | ESLint across every package (7 Turbo tasks) |
 | `pnpm build` | Production build of all packages |
-| `pnpm test` | Run all unit test suites |
+| `pnpm test` | Run all unit test suites — including the MCP token-budget assertions, which are a release gate, not a nicety ([`CONTRIBUTING.md`](CONTRIBUTING.md)) |
 | `pnpm clean` | Delete all build artifacts and caches |
-| `./scripts/validate.sh` | Runs typecheck + build + lint + schema-drift with a pass/fail summary — run this before pushing |
+| `./scripts/validate.sh` | Runs typecheck + build + lint + schema-drift + convex-refs + design-tokens with a pass/fail summary — run this before pushing |
 
-CI (`.github/workflows/ci.yml`) runs typecheck, lint, schema-drift, dependency-audit,
-build, unit tests, and a real-Convex integration test job on every PR into `main`.
+CI (`.github/workflows/ci.yml`) runs ten jobs — typecheck, lint, dependency-audit,
+schema-drift, convex-refs, convex-codegen-sync, design-tokens, build, test, and a
+real-Convex integration test job — on every PR into `main`.
 
 ---
 
@@ -94,7 +95,7 @@ cost, and **the order you call them in is the product**:
 
 ```
 0. what is wrong, and                                   afr_triage()      ← START HERE
-   what do I look at first?                             ~333 tokens, no arguments
+   what do I look at first?                             ~332 tokens, no arguments
 1. what is broken? (breadth)  afr patterns           /  afr_list_failure_patterns
 2. did the fix hold?          afr patterns evidence … /  afr_get_pattern_evidence
 3. why did THIS run fail?     afr explain <runId>     /  afr_explain_run
@@ -108,10 +109,14 @@ investigations should end at step 3; many should end at step 0.
 [`docs/mcp.md`](docs/mcp.md) → "Start here" has the measured numbers, a worked example,
 and the CI-gate semantics.
 
-There is no `afr triage` CLI command yet — triage is MCP-only today. For a build gate,
-`afr patterns --state regressed` exits `11` ("could not evaluate") rather than `0` when
-its scan was truncated, so a gate cannot mistake an unfinished scan for a clean one —
-see [`docs/api_reference.md`](docs/api_reference.md) § "Exit codes".
+`afr triage` is the CLI counterpart, and it is the same ranking — both surfaces import
+`toTriageResult` from `@agent-flight-recorder/sdk`, so they cannot disagree. For a build
+gate it maps the verdict onto exit codes: `0` clear, `10` findings, `11` inconclusive
+("nothing found, but the view was incomplete"). Exit `0` is unreachable on an incomplete
+scan. `afr patterns --state regressed` similarly exits `11` rather than `0` when its
+scan was truncated, so a gate cannot mistake an unfinished scan for a clean one — see
+[`docs/api_reference.md`](docs/api_reference.md) § "Exit codes" and
+[`docs/mcp.md`](docs/mcp.md) § "Using this as a CI gate".
 
 ---
 
@@ -119,12 +124,12 @@ see [`docs/api_reference.md`](docs/api_reference.md) § "Exit codes".
 
 - [`docs/architecture.md`](docs/architecture.md) — system architecture, entity hierarchy, event-log invariants, tenancy model, ingest paths, durability story
 - [`docs/adrs/`](docs/adrs/) and [`docs/adr/`](docs/adr/) — architecture decision records (two directories exist today: `docs/adrs/0001`–`0026` is the original sequence, `docs/adr/001-data-retention-and-erasure.md` is a newer one; consult both when researching a decision)
-- [`docs/mcp.md`](docs/mcp.md) — the MCP server (`packages/mcp`). **Start with its "Start here" section**: the progressive-disclosure ladder, the measured token cost of each tier, a worked example of the intended investigation path, and the CI-gate/`scanTruncated` semantics. Then the tool contract and client configuration
+- [`docs/mcp.md`](docs/mcp.md) — the MCP server (`packages/mcp`). **Start with its "Start here" section**: the progressive-disclosure ladder, the measured token cost of each tier, a worked example of the intended investigation path, and the CI-gate/`scanTruncated` semantics. "Where the token figures come from" → "What keeps these numbers true" names the suites that stop those costs drifting, and the gaps that remain. Then the tool contract and client configuration
 - [`docs/api_reference.md`](docs/api_reference.md) — HTTP contract for the public v1 read API (`/api/v1/**`), key management, the alerts/webhooks management API, outbound webhook verification, and how the `afr` CLI and MCP server map onto all of it
 - [`docs/ops/`](docs/ops/) — CI setup, dependency-audit ignore rationale, observability
 - [`docs/operations_runbook.md`](docs/operations_runbook.md), [`docs/deployment_checklist.md`](docs/deployment_checklist.md) — operational procedures
 - [`design.md`](design.md) — "Neon — Server Room After Dark," the authoritative visual style for every UI change
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — dev workflow, verification gates, how to add event types / Convex functions / UI surfaces / packages
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — dev workflow, verification gates (including the MCP token budgets and the obligation that comes with them), how to add event types / Convex functions / MCP tools / UI surfaces / packages
 - [`CLAUDE.md`](CLAUDE.md) — project constitution: system boundaries, entity model, event log and tenancy rules
 
 ---

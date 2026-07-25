@@ -547,6 +547,34 @@ jobs:
       - name: Build all packages
         run: pnpm build
 
+      # Both checks below need real build artifacts, so they live here rather
+      # than in jobs of their own — a separate job would repeat the ~60s build
+      # to inspect its output.
+      #
+      # Neither may run while another build is in flight: both read dist/, and
+      # tsup's `clean: true` empties it for tens of milliseconds to a few
+      # seconds at the start of every build. Inside one turbo invocation the
+      # ^build edges serialise that away; across concurrent invocations they
+      # would flake. Sequential steps in this job are the safe placement.
+      - name: Check build integrity
+        # A FAILED tsup DTS step leaves the PREVIOUS .d.ts on disk, so tsc
+        # typechecks clean against yesterday's types. `rm -rf dist` does NOT
+        # cure it — the artifact comes from a build that ran and partly failed,
+        # not one that never ran. Asserts declarations never predate the JS
+        # beside them (a direction test: the real inversion observed was 10.8s,
+        # which any staleness threshold loose enough for a loaded runner would
+        # have missed).
+        run: pnpm tsx scripts/check-build-integrity.ts
+
+      - name: Check MCP token budgets
+        # The budgets ARE the product claim: an agent spends ~332 tokens
+        # learning what is broken instead of ~3,844 fetching a run. Nothing
+        # else enforces that. Tools are enumerated from the server's own
+        # registry, so a newly registered tool with no declared budget fails
+        # rather than shipping unmeasured, and an empty/renamed registry exits
+        # 2 rather than passing everything trivially.
+        run: pnpm tsx scripts/check-token-budgets.ts
+
   e2e:
     name: E2E Smoke (Playwright)
     runs-on: ubuntu-latest

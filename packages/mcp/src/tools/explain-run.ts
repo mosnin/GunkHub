@@ -13,7 +13,11 @@
  *
  * The `citedSequenceNumbers` are the whole point of the tier boundary — they
  * are what let a caller jump straight to the three events that matter with
- * `afr_get_run_events(runId, aroundSequence)` instead of reading the log.
+ * `afr_get_run_events(runId, aroundSequence)` instead of reading the log. They
+ * are byte-budgeted like everything else on this tier (see
+ * `CITED_SEQUENCE_BYTE_CAP` in ../projections.ts) and a cut is announced with
+ * `citationsDropped` — the handles are valuable, but an unbounded list of them
+ * is what put this tier over its budget.
  */
 import { z } from 'zod'
 
@@ -79,7 +83,7 @@ export function registerExplainRun(server: McpServer, reader: AfrReader): void {
     {
       title: 'Explain a run',
       description:
-        'Answers "why did THIS run fail?" for one runId, ~121 tokens (~192 worst case). Returns the cached ' +
+        'Answers "why did THIS run fail?" for one runId, ~121 tokens (~198 worst case). Returns the cached ' +
         'root-cause explanation: summary, rootCause, suggestedFix, failureClass, and citedSequenceNumbers. ' +
         'ALWAYS read this before afr_get_run_events — it costs ~1/30th as much and it tells you which sequence ' +
         'numbers are worth fetching. ' +
@@ -94,7 +98,11 @@ export function registerExplainRun(server: McpServer, reader: AfrReader): void {
         'heuristic path is unconditional, so an explanation never depends on an LLM being available. ' +
         'NOT for: a question about a recurring failure across runs (afr_triage or afr_get_pattern_evidence), or when ' +
         'you do not have a runId yet (afr_triage, then afr_list_runs). Long prose is capped with an explicit ' +
-        '"…[truncated, N more chars]" marker.',
+        '"…[truncated, N more chars]" marker. citedSequenceNumbers is capped too: it carries the HIGHEST cited ' +
+        'sequence numbers (the ones nearest the failure) in ascending order, and when it was cut, ' +
+        '"citationsDropped" says how many earlier citations are not shown — page backwards from the lowest one ' +
+        'with afr_get_run_events(runId, fromSequence) to reach them, and do not read the list as the complete ' +
+        'set of grounding events.',
       inputSchema,
       annotations: { readOnlyHint: true, openWorldHint: true },
     },

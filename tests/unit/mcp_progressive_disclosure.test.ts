@@ -21,19 +21,46 @@
  * against deliberately FAT inputs. Fat inputs are the point: a projection is
  * only proven lean if the thing it projected from was not.
  *
- * TOKEN ESTIMATE — STATED ASSUMPTION
- * ----------------------------------
- * `estimateTokens(x) = ceil(utf8ByteLength(JSON.stringify(x)) / 4)`.
- *
- * Bytes/4 is the standard rough BPE approximation, used CONSISTENTLY
- * throughout this file. It matches what the server actually emits: tools/
- * shared.ts serializes with `JSON.stringify(value)` and no indentation, so the
- * bytes measured here are the bytes an agent pays for. It is an estimate, not a
- * tokenizer — the budgets carry enough headroom that ±20% estimator error does
- * not flip a verdict, and the property that matters is that it is MONOTONIC in
- * payload size, which is what a ratchet needs.
+ * BUDGETS AND ESTIMATOR ARE NOT DECLARED HERE
+ * -------------------------------------------
+ * Both come from `./mcp_budgets.ts`, which is the ONE place every mcp suite
+ * reads them from. They used to be declared here AND in `mcp_triage.test.ts`
+ * AND in `mcp_triage_measure.test.ts` AND in `mcp_triage_next_hops.test.ts` —
+ * four estimators and the literal `450` in three files — which is exactly the
+ * arrangement in which two suites assert "the same" budget and slowly stop
+ * agreeing. See that file's header for the estimator's stated assumption and
+ * for each budget's derivation.
  */
+import {
+  TRANSITIONS_CAP,
+  budgetEventRows,
+  toEventRow,
+  toExplainRunResult,
+  toListPatternsResult,
+  toPatternEvidenceResult,
+  toRunRow,
+} from '@agent-flight-recorder/mcp'
 import { describe, expect, it } from 'vitest'
+
+import {
+  RAW_DUMP_TOKENS,
+  TIER1_PATTERN_COUNT,
+  TIER1_TOKEN_BUDGET,
+  TIER2_TOKEN_BUDGET,
+  TIER3_TOKEN_BUDGET,
+  ROOT_CAUSE_BYTE_CAP,
+  SUGGESTED_FIX_BYTE_CAP,
+  SUMMARY_BYTE_CAP,
+  TIER4_WINDOW_TOKEN_BUDGET,
+  TRUNCATION_NOTE,
+  WINDOW_PAYLOAD_BYTE_BUDGET,
+  attributeColumnBytes,
+  attributeRowBytes,
+  attributeTopLevelBytes,
+  byteLength,
+  estimateTokens,
+  findForbiddenPaths,
+} from './mcp_budgets.js'
 
 import type {
   Event,
@@ -43,209 +70,49 @@ import type {
   Run,
   RunExplanation,
 } from '@agent-flight-recorder/contracts'
+import type { V1ListFixConfidenceEnvelope } from '@agent-flight-recorder/sdk'
 
 // ---------------------------------------------------------------------------
 // Module seam
 // ---------------------------------------------------------------------------
 
 /**
- * `packages/mcp` is not (yet) a workspace dependency of
- * `@agent-flight-recorder/tests` and has no alias in tests/vitest.config.ts, so
- * a bare-specifier import is unresolvable from here. A NON-LITERAL relative
- * specifier is opaque to both TypeScript's resolver and vite's static analysis,
- * which lets this suite bind to the real module without editing files this team
- * does not own.
+ * A REAL, TYPE-CHECKED IMPORT of the module under test.
  *
- * FOLLOW-UP for whoever owns tests/ config: add
- * `"@agent-flight-recorder/mcp": "workspace:*"` to tests/package.json and the
- * matching `resolve.alias` entry to tests/vitest.config.ts, then collapse this
- * into a normal `import`. The local `Projections` interface below exists only
- * because that plumbing is missing.
+ * This file used to reach `packages/mcp` through a NON-LITERAL relative
+ * specifier (`await import(/* @vite-ignore *\/ '../../packages/mcp/src/…')`)
+ * plus a hand-written `interface Projections` shadowing the module's exports,
+ * on the stated grounds that "`packages/mcp` is not a workspace dependency of
+ * `@agent-flight-recorder/tests` and has no alias in tests/vitest.config.ts".
+ *
+ * BOTH HALVES OF THAT ARE NOW FALSE — `"@agent-flight-recorder/mcp":
+ * "workspace:*"` is in tests/package.json and the `resolve.alias` entry is in
+ * tests/vitest.config.ts. The follow-up the comment asked for was done and
+ * nobody came back to collapse the seam.
+ *
+ * Collapsing it is not tidying, it is coverage. The shadow interfaces were a
+ * silent drift surface of exactly the kind this suite exists to catch: this
+ * file declared `toListPatternsResult(patterns, envelope, nextCursor)` with
+ * THREE parameters while `mcp_triage_next_hops.test.ts` declared the same
+ * function with FOUR — and the real one takes four. The `scanTruncated`
+ * argument was simply unreachable from here. A shadow type also weakened
+ * `envelope` to `unknown`, which is why the fixture below silently omitted
+ * half of `V1ListFixConfidenceEnvelope`.
  */
-const PROJECTIONS_SPEC = '../../packages/mcp/src/projections.ts'
-
-interface PatternRow {
-  fingerprintHash: string
-  class: string
-  label: string
-  count: number
-  lastSeenAt: number
-  status: string
-  confidenceState?: string
-  confidenceStale?: true
-}
 
 /**
- * Columnar, per orchestrator ruling 3: the field names are declared ONCE in
- * `fields` and each row is positional. That is what took tier 1 from 467 to
- * 284 tokens for 10 patterns — repeated JSON keys were ~50% of the bytes, and
- * that cost scales with row count in a way the field VALUES do not.
+ * Tier 4's hard cap. `packages/mcp/src/tools/**` is not re-exported from the
+ * package root, and CLAUDE.md § Imports forbids a relative specifier that
+ * escapes a package root, so this one stays a non-literal dynamic import.
  *
- * PatternRow below is retained deliberately: it is the per-pattern field set
- * this projection is allowed to expose, and TIER1_ALLOWED_KEYS is checked
- * against `fields`. Losing it would lose the shape guard.
- */
-interface ListPatternsResult {
-  /**
-   * Typed as `keyof PatternRow` rather than `string[]` on purpose: a column
-   * added to the projection that is not a declared tier-1 field now fails at
-   * COMPILE time, not merely in the runtime shape guard below. The guard stays
-   * because it also catches a field renamed on both sides at once.
-   */
-  fields: (keyof PatternRow)[]
-  rows: unknown[][]
-  nextCursor?: string
-  unevaluated?: { count: number; sample: string[] }
-}
-
-interface EventRow {
-  sequenceNumber: number
-  type: string
-  timestamp: number
-  payload?: unknown
-  artifact?: Record<string, unknown>
-  originalType?: string
-  errorSummary?: string
-}
-
-interface Projections {
-  toListPatternsResult(
-    patterns: FailurePattern[],
-    envelope: unknown,
-    nextCursor: string | undefined
-  ): ListPatternsResult
-  toPatternEvidenceResult(evidence: PatternResolutionEvidence): Record<string, unknown>
-  toExplainRunResult(
-    runId: string,
-    status: 'not_eligible' | 'pending' | 'ready',
-    explanation: RunExplanation | null,
-    runStatus: string | undefined
-  ): Record<string, unknown>
-  toEventRow(event: Event): EventRow
-  toRunRow(run: Run): Record<string, unknown>
-  TRANSITIONS_CAP: number
-}
-
-const projections = (await import(/* @vite-ignore */ PROJECTIONS_SPEC)) as Projections
-
-/**
- * Tier 4's hard cap, read from the tool module rather than duplicated. If Team A
- * raises `MAX_LIMIT`, the window budget below re-measures at the NEW cap and
- * fails — which is exactly the regression that should not pass silently.
+ * READ FROM THE TOOL MODULE, NEVER DUPLICATED: if `MAX_LIMIT` is raised there,
+ * the window budgets below re-measure at the NEW cap and fail — which is
+ * exactly the regression that should not pass silently.
  */
 const GET_RUN_EVENTS_SPEC = '../../packages/mcp/src/tools/get-run-events.ts'
 const { MAX_LIMIT: TIER4_MAX_LIMIT } = (await import(/* @vite-ignore */ GET_RUN_EVENTS_SPEC)) as {
   MAX_LIMIT: number
 }
-
-// ---------------------------------------------------------------------------
-// Token estimation + attribution
-// ---------------------------------------------------------------------------
-
-function byteLength(s: string): number {
-  return Buffer.byteLength(s, 'utf8')
-}
-
-/** See "TOKEN ESTIMATE" in the file header. bytes/4, consistently. */
-function estimateTokens(value: unknown): number {
-  return Math.ceil(byteLength(JSON.stringify(value) ?? '') / 4)
-}
-
-/**
- * Per-field byte attribution across uniform rows, biggest first.
- *
- * This exists so a blown budget produces "label: 385 B (97 tok)" and not just
- * "expected 465 to be <= 250". A budget test whose failure nobody can act on
- * gets deleted the first time it goes red, which makes it worse than no test.
- */
-function attributeRowBytes(rows: Array<Record<string, unknown>>): string {
-  const totals = new Map<string, number>()
-  for (const row of rows) {
-    for (const [key, value] of Object.entries(row)) {
-      const cost = byteLength(JSON.stringify(key)) + 1 + byteLength(JSON.stringify(value) ?? 'null') + 1
-      totals.set(key, (totals.get(key) ?? 0) + cost)
-    }
-  }
-  return [...totals.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, b]) => `    ${k.padEnd(20)} ${String(b).padStart(7)} B  (~${Math.ceil(b / 4)} tok)`)
-    .join('\n')
-}
-
-/**
- * Per-column byte attribution for a columnar ({fields, rows}) result.
- *
- * Same purpose as attributeRowBytes, different encoding: the field NAME is
- * paid once in the header, while each row pays only its value. Reporting them
- * separately is the point — it is what shows that going columnar moved the
- * cost from names to values, and which column to cut if the budget is blown.
- */
-function attributeColumnBytes(fields: readonly string[], rows: readonly unknown[][]): string {
-  const header = fields.map((f) => byteLength(JSON.stringify(f)) + 1)
-  const totals = fields.map((_, i) =>
-    rows.reduce((sum, row) => sum + byteLength(JSON.stringify(row[i]) ?? 'null') + 1, 0),
-  )
-  return fields
-    .map((f, i) => ({ f, name: header[i] ?? 0, values: totals[i] ?? 0 }))
-    .sort((a, b) => b.values - a.values)
-    .map(
-      ({ f, name, values }) =>
-        `    ${f.padEnd(20)} ${String(values).padStart(7)} B values  (~${Math.ceil(values / 4)} tok)` +
-        `  + ${name} B name (paid once)`,
-    )
-    .join('\n')
-}
-
-/** Paths at which a forbidden key appears, for an actionable failure message. */
-function findForbiddenPaths(value: unknown, forbidden: readonly string[], path = '$'): string[] {
-  const hits: string[] = []
-  if (Array.isArray(value)) {
-    value.forEach((item, i) => hits.push(...findForbiddenPaths(item, forbidden, `${path}[${i}]`)))
-  } else if (value !== null && typeof value === 'object') {
-    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      const childPath = `${path}.${key}`
-      if (forbidden.includes(key)) hits.push(childPath)
-      hits.push(...findForbiddenPaths(child, forbidden, childPath))
-    }
-  }
-  return hits
-}
-
-// ---------------------------------------------------------------------------
-// Budgets
-// ---------------------------------------------------------------------------
-
-const TIER1_PATTERN_COUNT = 10
-// MEASURED, not aspirational. Both were set before anything existed to
-// measure, and both were wrong in different directions.
-//
-// Tier 1: 250 was unreachable as an array of per-pattern OBJECTS — repeated
-// JSON key names were ~50% of the bytes, and that cost scales with row count.
-// The projection was already correct; the ENCODING was the problem, so tier 1
-// and afr_list_runs went columnar ({fields, rows}). Measured 284 for 10
-// patterns (~28/row), against ~215 for the values alone. 300 is the real
-// ceiling with headroom; going lower means dropping a mandated column.
-//
-// Tier 2: 300 required cutting real lifecycle history to hit a number nobody
-// had measured. The cut genuinely available — the unbounded per-transition
-// `metadata` bag, ~10k tokens — is taken. TRANSITIONS_CAP stays at 10 because
-// resolution history is the answer this tier exists to give. Measured 423.
-const TIER1_TOKEN_BUDGET = 300
-const TIER2_TOKEN_BUDGET = 450
-const TIER3_TOKEN_BUDGET = 200
-/**
- * Tier 4 is a WINDOW, so its budget is per-window and must not scale with run
- * length. The contract states only "bounded and hard-capped", so this is
- * DERIVED, and the derivation is written down because an undocumented ceiling
- * gets raised the first time it goes red:
- *
- * The premise this package exists for is that a 50-step run dumped raw is
- * 100k+ tokens. A fully-saturated tier-4 window must stay at least an ORDER OF
- * MAGNITUDE under that, or the tier has no reason to exist — an agent may as
- * well ask for everything. 10k tokens at the 50-event cap is that line.
- */
-const RAW_DUMP_TOKENS = 100_000
-const TIER4_WINDOW_TOKEN_BUDGET = RAW_DUMP_TOKENS / 10
 
 // ---------------------------------------------------------------------------
 // FAT inputs — every field the contract permits, so the projection is proven
@@ -337,12 +204,28 @@ function fatPattern(i: number): FailurePattern {
 
 const FAT_PATTERNS = Array.from({ length: TIER1_PATTERN_COUNT }, (_, i) => fatPattern(i))
 
-const CONFIDENCE_ENVELOPE = {
+/**
+ * A CONTRACT-COMPLETE `V1ListFixConfidenceEnvelope`.
+ *
+ * It was not complete before: `stalenessBoundMs`, `staleCount` and each entry's
+ * `score`/`computedAt`/`ageMs`/`basis` were all missing, and the seam's
+ * `envelope: unknown` shadow type meant nothing said so. A fat-input suite
+ * whose input is not actually fat is measuring the easy case — the tier-1
+ * budget is only evidence about a projection if the projection had something to
+ * throw away.
+ */
+const CONFIDENCE_ENVELOPE: V1ListFixConfidenceEnvelope = {
+  stalenessBoundMs: 6 * 60 * 60 * 1000,
   entries: FAT_PATTERNS.map((p, i) => ({
     fingerprintHash: p.fingerprintHash,
     state: (['unproven', 'proving', 'confirmed', 'regressed'] as const)[i % 4]!,
+    score: 0.71,
+    computedAt: 1_753_395_000_000,
+    ageMs: 2 * 60 * 60 * 1000,
     stale: false,
+    basis: 'snapshot',
   })),
+  staleCount: 0,
   unevaluated: [],
 }
 
@@ -351,7 +234,7 @@ const CONFIDENCE_ENVELOPE = {
 // ---------------------------------------------------------------------------
 
 describe('tier 1 (afr_list_failure_patterns) — token budget', () => {
-  const result = projections.toListPatternsResult(FAT_PATTERNS, CONFIDENCE_ENVELOPE, 'cursor_9f2a')
+  const result = toListPatternsResult(FAT_PATTERNS, CONFIDENCE_ENVELOPE, 'cursor_9f2a')
 
   it(`returns ${TIER1_PATTERN_COUNT} patterns within ~${TIER1_TOKEN_BUDGET} tokens`, () => {
     const tokens = estimateTokens(result)
@@ -366,6 +249,37 @@ describe('tier 1 (afr_list_failure_patterns) — token budget', () => {
         `Cost per column, biggest first (names paid once, values per row):\n\n${attributeColumnBytes(result.fields, result.rows)}\n\n` +
         `"~250 tokens to learn what is broken" is this product's core claim. A ` +
         `field added here is paid for on every row of every call.`
+    ).toBeLessThanOrEqual(TIER1_TOKEN_BUDGET)
+  })
+
+  it(`stays within ~${TIER1_TOKEN_BUDGET} tokens WITH the scanTruncated marker set`, () => {
+    /**
+     * THE SAME BUDGET, ON THE MORE EXPENSIVE OF THE TWO SHAPES.
+     *
+     * `mcp_triage_next_hops.test.ts` used to assert `<= 300` here too, but on a
+     * THIN hand-written pattern rather than the contract-maximal fixture: it
+     * measured 217 where this fixture measures 284, so it carried ~67 tokens of
+     * headroom that does not exist and would have stayed green through a
+     * widening this assertion catches. Two places asserting one budget with two
+     * fixtures, disagreeing exactly as predicted.
+     *
+     * The absolute now lives here, once, on the fat fixture. That file keeps
+     * the part it is actually about: the marker's DELTA.
+     *
+     * This case was unreachable from this file before — the hand-written seam
+     * shadow declared `toListPatternsResult` with three parameters and the
+     * `scan` argument is the fourth.
+     */
+    const truncated = toListPatternsResult(FAT_PATTERNS, CONFIDENCE_ENVELOPE, 'cursor_9f2a', {
+      scanTruncated: true,
+    })
+    expect(truncated.scanTruncated, 'the marker under measurement was not even emitted').toBe(true)
+    const tokens = estimateTokens(truncated)
+    expect(
+      tokens,
+      `TIER 1 OVER BUDGET with the truncation marker: ~${tokens} tokens ` +
+        `(budget ${TIER1_TOKEN_BUDGET}).\n` +
+        `Cost per column, biggest first:\n\n${attributeColumnBytes(truncated.fields, truncated.rows)}`,
     ).toBeLessThanOrEqual(TIER1_TOKEN_BUDGET)
   })
 
@@ -385,7 +299,7 @@ describe('tier 1 (afr_list_failure_patterns) — token budget', () => {
 })
 
 describe('tier 1 (afr_list_failure_patterns) — shape guard', () => {
-  const result = projections.toListPatternsResult(FAT_PATTERNS, CONFIDENCE_ENVELOPE, 'cursor_9f2a')
+  const result = toListPatternsResult(FAT_PATTERNS, CONFIDENCE_ENVELOPE, 'cursor_9f2a')
 
   /**
    * ABSENCE IS THE INVARIANT. A presence test ("it has a fingerprintHash")
@@ -530,15 +444,11 @@ const FAT_EVIDENCE: PatternResolutionEvidence = {
 }
 
 describe('tier 2 (afr_get_pattern_evidence) — token budget', () => {
-  const result = projections.toPatternEvidenceResult(FAT_EVIDENCE)
+  const result = toPatternEvidenceResult(FAT_EVIDENCE)
 
   it(`fits within ~${TIER2_TOKEN_BUDGET} tokens with 100 inbound transitions`, () => {
     const tokens = estimateTokens(result)
-    const breakdown = Object.entries(result)
-      .map(([k, v]) => [k, byteLength(JSON.stringify(v) ?? 'null')] as const)
-      .sort((a, b) => b[1] - a[1])
-      .map(([k, b]) => `    ${k.padEnd(20)} ${String(b).padStart(6)} B  (~${Math.ceil(b / 4)} tok)`)
-      .join('\n')
+    const breakdown = attributeTopLevelBytes(result as unknown as Record<string, unknown>)
 
     expect(
       tokens,
@@ -551,7 +461,7 @@ describe('tier 2 (afr_get_pattern_evidence) — token budget', () => {
 
   it('caps transitions and says so, rather than silently truncating', () => {
     const transitions = result.transitions as unknown[]
-    expect(transitions.length).toBeLessThanOrEqual(projections.TRANSITIONS_CAP)
+    expect(transitions.length).toBeLessThanOrEqual(TRANSITIONS_CAP)
     expect(
       result.transitionsTruncated,
       'history was truncated without telling the caller — a partial history read as ' +
@@ -613,7 +523,24 @@ describe('tier 2 (afr_get_pattern_evidence) — token budget', () => {
 // Tier 3 — afr_explain_run
 // ---------------------------------------------------------------------------
 
-/** The largest explanation the contract permits: 2 KB + 1 KB + 1 KB of prose. */
+/**
+ * The largest explanation the contract permits: 2 KB + 1 KB + 1 KB of prose,
+ * AND the maximum 20 cited sequence numbers.
+ *
+ * IT USED TO CITE FIVE, and that was not a detail. `RunExplanation` bounds
+ * `citedSequenceNumbers` at 20 (packages/contracts/src/run_explanations.ts) and
+ * `toExplainRunResult` forwards the array VERBATIM — it caps the three prose
+ * fields and nothing else. At 5 citations this fixture measures 192 and the
+ * old absolute assertion below passed; at the contract's real maximum of 20 it
+ * measures 203, over the 200 ceiling.
+ *
+ * So a test whose whole stated purpose was "assert the layer enforces its own
+ * bound rather than trusting an upstream one it does not control" was itself
+ * trusting an upstream bound it did not control, and had been green over a real
+ * breach. `scripts/check-token-budgets.ts` found it, which is the argument for
+ * that script existing: its `checkMaximality` proves a fixture saturates its
+ * contract instead of asserting in a comment that it does.
+ */
 const CONTRACT_MAX_EXPLANATION: RunExplanation = {
   id: 'expl_1',
   orgId: 'org_caller',
@@ -622,7 +549,7 @@ const CONTRACT_MAX_EXPLANATION: RunExplanation = {
   summary: 'S'.repeat(2048),
   rootCause: 'R'.repeat(1024),
   suggestedFix: 'F'.repeat(1024),
-  citedSequenceNumbers: [1, 14, 22, 23, 24],
+  citedSequenceNumbers: Array.from({ length: 20 }, (_, i) => i * 3 + 1),
   failureClass: 'tool_error',
   generatedAt: 1_753_400_000_000,
   model: 'claude-opus-5',
@@ -640,7 +567,7 @@ const REALISTIC_EXPLANATION: RunExplanation = {
 
 describe('tier 3 (afr_explain_run) — token budget', () => {
   it(`fits within ~${TIER3_TOKEN_BUDGET} tokens for a realistic explanation`, () => {
-    const result = projections.toExplainRunResult('run_8f2c1a', 'ready', REALISTIC_EXPLANATION, 'failed')
+    const result = toExplainRunResult('run_8f2c1a', 'ready', REALISTIC_EXPLANATION, 'failed')
     const tokens = estimateTokens(result)
     expect(
       tokens,
@@ -654,32 +581,87 @@ describe('tier 3 (afr_explain_run) — token budget', () => {
   it('BOUNDS the prose a contract-maximal explanation can carry', () => {
     /**
      * `RunExplanation` caps summary at 2 KB and rootCause/suggestedFix at 1 KB
-     * each (packages/contracts/src/run_explanations.ts). 4 KB of prose is ~1000
-     * tokens — five times this tier's budget. `toExplainRunResult` currently
-     * passes all three through verbatim, so the tier-3 budget holds only
-     * because real explanations happen to be short. That is a property of the
-     * generator, not a guarantee of this layer.
+     * each. 4 KB of prose is ~1000 tokens — five times this tier's budget. This
+     * asserts the layer enforces its own bound on the PROSE rather than
+     * trusting an upstream one it does not control.
      *
-     * This asserts the layer enforces its own bound rather than trusting an
-     * upstream one it does not control.
+     * WHY THIS IS NOW A PROSE ASSERTION AND NOT AN ABSOLUTE.
+     *
+     * It used to assert `estimateTokens(result) <= 200` on this fixture, and it
+     * passed at 192 — but only because the fixture cited 5 sequence numbers
+     * where the contract permits 20. Truly maximal, the same projection costs
+     * 203. The absolute was green over a live breach.
+     *
+     * The absolute now lives in `scripts/check-token-budgets.ts`, which measures
+     * this exact scenario ("contract-maximal explanation") on a fixture it
+     * PROVES maximal, reports the 203/200 breach, freezes it so it may only
+     * fall, and blocks on one token more. Restating a weaker copy of that
+     * ceiling here would put the repo straight back into two-places-one-budget —
+     * with the test being the one that lies, which is how it got here.
+     *
+     * What stays here is what a CI script cannot express: that the projection's
+     * own prose caps do the cutting.
      */
-    const result = projections.toExplainRunResult('run_8f2c1a', 'ready', CONTRACT_MAX_EXPLANATION, 'failed')
-    const tokens = estimateTokens(result)
-    expect(
-      tokens,
-      `A contract-maximal RunExplanation projects to ~${tokens} tokens, over the ` +
-        `${TIER3_TOKEN_BUDGET}-token tier-3 budget. toExplainRunResult forwards summary/` +
-        `rootCause/suggestedFix verbatim, so tier 3 is only cheap by luck: an LLM-kind ` +
-        `explanation that uses its full 2 KB summary allowance blows the tier. Truncate ` +
-        `in the projection (with an explicit marker), do not rely on the contract's caps.`
-    ).toBeLessThanOrEqual(TIER3_TOKEN_BUDGET)
+    const result = toExplainRunResult('run_8f2c1a', 'ready', CONTRACT_MAX_EXPLANATION, 'failed')
+    for (const [field, cap] of [
+      ['summary', SUMMARY_BYTE_CAP],
+      ['rootCause', ROOT_CAUSE_BYTE_CAP],
+      ['suggestedFix', SUGGESTED_FIX_BYTE_CAP],
+    ] as const) {
+      const kept = String(result[field]).split('…[truncated,')[0] ?? ''
+      expect(
+        byteLength(kept),
+        `tier 3 forwarded ${field} beyond its ${String(cap)} B cap. toExplainRunResult must not ` +
+          `rely on real explanations happening to be short — that is a property of the ` +
+          `generator, not a guarantee of this layer.`,
+      ).toBeLessThanOrEqual(cap)
+    }
+    // And the whole projection stays the same order of magnitude as its budget,
+    // rather than the ~1000 tokens the raw contract maximum would cost.
+    expect(estimateTokens(result)).toBeLessThan(TIER3_TOKEN_BUDGET * 2)
+  })
+
+  it('SAYS it truncated the prose, rather than silently returning a cut-off summary', () => {
+    /**
+     * THE COUNTERWEIGHT TO THE BUDGET TEST ABOVE.
+     *
+     * The contract-maximal test only asserts a NUMBER. The cheapest way to make
+     * that number go green is to chop the prose at `SUMMARY_BYTE_CAP` and say
+     * nothing — which reads to an agent as a complete root-cause analysis that
+     * happens to stop mid-sentence, and is a worse failure than being over
+     * budget. `truncateProse` emits an in-band `…[truncated, N more chars]`
+     * marker; nothing in this file asserted that it survives the projection.
+     *
+     * `mcp_triage.test.ts` asserts the same marker on triage's label cap. This
+     * is the tier-3 half of the same invariant, and the marker text is read
+     * from ONE implementation (`truncateProse`, in the SDK) by both.
+     */
+    const result = toExplainRunResult('run_8f2c1a', 'ready', CONTRACT_MAX_EXPLANATION, 'failed')
+    for (const field of ['summary', 'rootCause', 'suggestedFix'] as const) {
+      const value = result[field]
+      expect(typeof value, `${field} was dropped entirely`).toBe('string')
+      expect(
+        String(value),
+        `tier 3 cut ${field} to fit its budget without telling the caller. A summary ` +
+          `that stops mid-sentence with no marker is read as a complete answer.`,
+      ).toContain('…[truncated,')
+    }
+  })
+
+  it('leaves a realistic explanation completely untouched', () => {
+    // The other half: a cap set below realistic output would silently degrade
+    // every ordinary answer to buy headroom on a case that never happens.
+    const result = toExplainRunResult('run_8f2c1a', 'ready', REALISTIC_EXPLANATION, 'failed')
+    expect(result.summary).toBe(REALISTIC_EXPLANATION.summary)
+    expect(result.rootCause).toBe(REALISTIC_EXPLANATION.rootCause)
+    expect(result.suggestedFix).toBe(REALISTIC_EXPLANATION.suggestedFix)
   })
 
   it('returns representative SEQUENCE NUMBERS, never the events themselves', () => {
     // The entire economic argument for tier 3 is that it hands back POINTERS
     // into the event log so the agent can decide whether tier 4 is worth it.
     // Inlining the cited events would collapse tiers 3 and 4 into one call.
-    const result = projections.toExplainRunResult('run_8f2c1a', 'ready', REALISTIC_EXPLANATION, 'failed')
+    const result = toExplainRunResult('run_8f2c1a', 'ready', REALISTIC_EXPLANATION, 'failed')
     const cited = result.citedSequenceNumbers as unknown[]
     expect(Array.isArray(cited)).toBe(true)
     for (const seq of cited) {
@@ -693,8 +675,8 @@ describe('tier 3 (afr_explain_run) — token budget', () => {
     // that can tell "will never have an explanation" from "not generated yet"
     // stops instead of retrying, and a retry loop is the most expensive thing
     // an agent can do on this surface.
-    const notEligible = projections.toExplainRunResult('run_x', 'not_eligible', null, 'completed')
-    const pending = projections.toExplainRunResult('run_y', 'pending', null, 'failed')
+    const notEligible = toExplainRunResult('run_x', 'not_eligible', null, 'completed')
+    const pending = toExplainRunResult('run_y', 'pending', null, 'failed')
     expect(notEligible.status).toBe('not_eligible')
     expect(pending.status).toBe('pending')
     expect(notEligible.status).not.toBe(pending.status)
@@ -755,7 +737,7 @@ describe('tier 4 (afr_get_run_events) — externalized payloads', () => {
      * blob into a context window to answer a question the pointer already
      * answers.
      */
-    const row = projections.toEventRow(externalizedEvent(24))
+    const row = toEventRow(externalizedEvent(24))
     expect(row.payload, 'an externalized payload was inlined').toBeUndefined()
     expect(row.artifact).toBeDefined()
     expect(Object.keys(row.artifact ?? {}).sort()).toEqual(
@@ -781,7 +763,7 @@ describe('tier 4 (afr_get_run_events) — window is bounded and hard-capped', ()
   })
 
   it(`a saturated window of externalized events stays under ${TIER4_WINDOW_TOKEN_BUDGET} tokens`, () => {
-    const rows = Array.from({ length: TIER4_MAX_LIMIT }, (_, i) => projections.toEventRow(externalizedEvent(18 + i)))
+    const rows = Array.from({ length: TIER4_MAX_LIMIT }, (_, i) => toEventRow(externalizedEvent(18 + i)))
     const window = { runId: 'run_8f2c1a', fromSequence: 18, events: rows, nextFromSequence: 18 + TIER4_MAX_LIMIT }
     const tokens = estimateTokens(window)
     expect(
@@ -798,22 +780,19 @@ describe('tier 4 (afr_get_run_events) — window is bounded and hard-capped', ()
      *
      * `toEventRow` enforces "never inline an artifact payload" only for
      * payloads that were EXTERNALIZED — i.e. those over 10 KB. A payload of
-     * 10 239 bytes is under the threshold, is never externalized, and is
-     * assigned straight through as `row.payload = payload`.
+     * 10 239 bytes is under the threshold, is never externalized, and would be
+     * assigned straight through.
      *
      * At the 50-event cap that is 50 x ~10 KB = ~500 KB in a single tool
      * result: roughly 125 000 tokens, MORE than the 100k raw dump this entire
-     * package exists to prevent. The tool's own docstring says "a 50-step run
-     * is 100k+ tokens raw; the entire point of tiers 1-3 is that a caller
-     * arrives here already knowing which three sequence numbers matter" — and
-     * then the window can cost more than the dump.
+     * package exists to prevent. The cap on the number of EVENTS is not a cap
+     * on the number of BYTES, and only the second one is what an agent pays for.
      *
-     * The cap on the number of EVENTS is not a cap on the number of BYTES, and
-     * only the second one is what an agent pays for. Tier 4 needs a payload
-     * size budget (truncate-with-marker, or externalize-on-read), not just an
-     * event count limit.
+     * IT IS `budgetEventRows` THAT CLOSES THIS, NOT `toEventRow`, AND THAT IS
+     * WHY THIS TEST CALLS IT. See the test below for what this file used to be
+     * measuring instead.
      */
-    const rows = Array.from({ length: TIER4_MAX_LIMIT }, (_, i) => projections.toEventRow(nearThresholdEvent(18 + i)))
+    const { rows } = budgetEventRows(Array.from({ length: TIER4_MAX_LIMIT }, (_, i) => nearThresholdEvent(18 + i)))
     const window = { runId: 'run_8f2c1a', fromSequence: 18, events: rows }
     const tokens = estimateTokens(window)
 
@@ -822,14 +801,120 @@ describe('tier 4 (afr_get_run_events) — window is bounded and hard-capped', ()
       `TIER 4 IS UNBOUNDED IN BYTES: ~${tokens} tokens for ${TIER4_MAX_LIMIT} events ` +
         `(budget ${TIER4_WINDOW_TOKEN_BUDGET}), ~${Math.ceil(tokens / TIER4_MAX_LIMIT)} tok/event.\n\n` +
         `Every payload here is ${PAYLOAD_EXTERNALIZATION_THRESHOLD - 200} B — just UNDER the 10 KB\n` +
-        `externalization threshold, so none of them is an artifact and toEventRow\n` +
-        `inlines all of them verbatim (\`row.payload = payload\`).\n\n` +
+        `externalization threshold, so none of them is an artifact.\n\n` +
         `MAX_LIMIT caps EVENTS, not BYTES, and bytes are what the agent pays for.\n` +
         `A single saturated window can cost more than the ~${RAW_DUMP_TOKENS}-token raw dump\n` +
         `this package exists to prevent.\n\n` +
-        `Fix: budget payload bytes in toEventRow — truncate with an explicit marker,\n` +
-        `or return a pointer for anything over a few hundred bytes.`
+        `Fix: budget payload bytes — truncate with an explicit marker, or return a\n` +
+        `pointer for anything over a few hundred bytes.`
     ).toBeLessThanOrEqual(TIER4_WINDOW_TOKEN_BUDGET)
+  })
+
+  /**
+   * THE ASSERTION THIS FILE WAS MISSING, AND THE ONE IT THOUGHT IT HAD.
+   *
+   * Every tier-4 budget test above used to call `toEventRow` directly and build
+   * the window itself. `afr_get_run_events` does not: it calls
+   * `budgetEventRows(window.events)` and emits `truncationNote` when that
+   * reports a cut (packages/mcp/src/tools/get-run-events.ts). NOTHING IN
+   * `tests/` REFERENCED `budgetEventRows`, `WINDOW_PAYLOAD_BYTE_BUDGET` OR
+   * `TRUNCATION_NOTE` AT ALL.
+   *
+   * So the whole-window byte budget — the only thing that stops 50 x 400 B of
+   * previews compounding to 20 KB — was asserted nowhere, and the suite looked
+   * like it covered tier 4 because it measured the per-event-capped path and
+   * passed comfortably under a 10 000-token ceiling. Deleting `budgetEventRows`
+   * from the tool would have left every test in this file green.
+   *
+   * That is the exact bug class this project keeps paying for: a budget that
+   * stops being asserted anywhere because each side assumed the other had it.
+   */
+  it('spends the WHOLE-WINDOW byte budget, not just the per-event cap', () => {
+    const events = Array.from({ length: TIER4_MAX_LIMIT }, (_, i) => nearThresholdEvent(18 + i))
+    const { rows } = budgetEventRows(events)
+
+    /**
+     * The budget is spent on the payloads that are KEPT. Once it is exhausted
+     * the remaining rows carry a bare `{truncated, bytes, preview: ''}` marker,
+     * and those markers are emitted OUTSIDE the accounting — measured, they add
+     * ~1.2 KB across a saturated 50-event window on top of the 8 KB budget.
+     *
+     * That is bounded by MAX_LIMIT and small, so it is not a defect; it is
+     * written down here because the obvious assertion ("total payload bytes <=
+     * WINDOW_PAYLOAD_BYTE_BUDGET") is FALSE and the next person to write it will
+     * otherwise conclude the budget is broken. The invariant that does hold is
+     * on the kept bytes.
+     */
+    const isDropMarker = (p: unknown): boolean =>
+      typeof p === 'object' && p !== null && 'preview' in p && (p as { preview: unknown }).preview === ''
+    const keptBytes = rows.reduce(
+      (sum, row) =>
+        sum + (row.payload === undefined || isDropMarker(row.payload) ? 0 : byteLength(JSON.stringify(row.payload) ?? '')),
+      0,
+    )
+    expect(
+      keptBytes,
+      `kept inline payload bytes across one window: ${keptBytes} B, over the ` +
+        `${WINDOW_PAYLOAD_BYTE_BUDGET} B whole-window budget. The per-event cap alone ` +
+        `still multiplies — ${TIER4_MAX_LIMIT} events x the per-event cap is what this ` +
+        `second budget exists to stop.`,
+    ).toBeLessThanOrEqual(WINDOW_PAYLOAD_BYTE_BUDGET)
+
+    // Unbudgeted, the same window is far larger. Asserting the gap is what
+    // proves the budget is doing work rather than being trivially satisfied.
+    const unbudgeted = estimateTokens({ events: events.map((e) => toEventRow(e)) })
+    const budgeted = estimateTokens({ events: rows })
+    expect(
+      budgeted,
+      `budgeting saved nothing: ${unbudgeted} tok unbudgeted vs ${budgeted} tok budgeted.`,
+    ).toBeLessThan(unbudgeted / 2)
+  })
+
+  it('SAYS it truncated, rather than handing back a short window as a whole one', () => {
+    // A caller that is not told its result was trimmed reads a partial payload
+    // as a complete one — the same reassuring-empty-state failure `scanTruncated`
+    // exists to prevent on tier 1, one tier down.
+    const { truncated } = budgetEventRows(Array.from({ length: TIER4_MAX_LIMIT }, (_, i) => nearThresholdEvent(18 + i)))
+    expect(truncated, 'the window was cut and did not say so').toBe(true)
+    expect(TRUNCATION_NOTE).toMatch(/truncated or dropped/)
+  })
+
+  it('does not claim truncation on a window that fitted', () => {
+    // The counterweight: a marker that is always on carries no information, and
+    // a caller that learns to ignore it has lost the case above too.
+    const small = Array.from({ length: 3 }, (_, i) => ({
+      id: 'ev_' + String(i),
+      runId: 'run_8f2c1a',
+      sequenceNumber: i,
+      type: 'llm.response',
+      timestamp: 1_753_400_000_000,
+      payload: { type: 'llm.response', ok: true },
+    })) as unknown as Event[]
+    expect(budgetEventRows(small).truncated).toBe(false)
+  })
+
+  it('spends the budget on the events nearest the window start — the ones the caller aimed at', () => {
+    /**
+     * BUDGET ORDER IS PART OF THE CONTRACT. A caller who centred the window on
+     * one of `afr_explain_run`'s cited sequence numbers must get THAT payload,
+     * not whichever ones happened to fit. Spending the budget back-to-front
+     * would still satisfy every byte assertion above and would hand the caller
+     * the events it did not ask about.
+     *
+     * At 10 KB each, EVERY payload in this fixture is over
+     * PAYLOAD_PREVIEW_BYTE_CAP, so none survives whole. The distinction the
+     * order produces is between a real preview and an empty drop marker.
+     */
+    const { rows } = budgetEventRows(Array.from({ length: TIER4_MAX_LIMIT }, (_, i) => nearThresholdEvent(18 + i)))
+    const previewOf = (p: unknown): string => String((p as { preview?: unknown } | undefined)?.preview ?? '')
+    expect(
+      previewOf(rows[0]?.payload).length,
+      'the first event in the window was dropped to a bare marker while later ones were previewed',
+    ).toBeGreaterThan(0)
+    expect(
+      previewOf(rows[rows.length - 1]?.payload),
+      'the budget was not actually exhausted by the end of the window, so this fixture no longer saturates it',
+    ).toBe('')
   })
 })
 
@@ -865,7 +950,7 @@ function fatRun(i: number): Run {
 }
 
 describe('tier 5 (afr_list_runs) — compact rows', () => {
-  const rows = Array.from({ length: 20 }, (_, i) => projections.toRunRow(fatRun(i)))
+  const rows = Array.from({ length: 20 }, (_, i) => toRunRow(fatRun(i)))
 
   it('projects 20 fat runs into a response an order of magnitude smaller', () => {
     /**
@@ -883,7 +968,7 @@ describe('tier 5 (afr_list_runs) — compact rows', () => {
       ratio,
       `TIER 5 IS NOT COMPACT: ~${tokens} tokens for 20 runs against ~${inputTokens} ` +
         `unprojected — only ${ratio.toFixed(1)}x.\n` +
-        `Cost per field, biggest first:\n\n${attributeRowBytes(rows as Array<Record<string, unknown>>)}`
+        `Cost per field, biggest first:\n\n${attributeRowBytes(rows as unknown as Record<string, unknown>[])}`
     ).toBeGreaterThanOrEqual(10)
   })
 

@@ -19,7 +19,7 @@ run and which sequence range you care about.
 afr_triage()
 ```
 
-That is the whole answer for most callers. No arguments, ~333 tokens, and every item
+That is the whole answer for most callers. No arguments, ~332 tokens, and every item
 it returns carries the exact next tool and argument object to call. If you read
 nothing else on this page, call that.
 
@@ -29,11 +29,11 @@ of magnitude apart:
 
 | Start here | Tool | Answers | Cost |
 |---|---|---|---|
-| **0** | **`afr_triage`** | **"What is wrong, and what do I look at first?"** | **~333 tokens** (~436 worst case) |
-| 1 | `afr_list_failure_patterns` | "What is broken?" — *all* of it, beyond triage's top 5 | ~284 tokens (10 patterns) |
+| **0** | **`afr_triage`** | **"What is wrong, and what do I look at first?"** | **~332 tokens** (~435 worst case) |
+| 1 | `afr_list_failure_patterns` | "What is broken?" — *all* of it, beyond triage's top 5 | ~294 tokens (10 patterns) |
 | 2 | `afr_get_pattern_evidence` | "Did the fix hold?" | ~423 tokens (one pattern, capped history) |
 | 3 | `afr_explain_run` | "Why did *this run* fail?" | **~121 tokens** (one run) |
-| 4 | `afr_get_run_events` | "Show me the literal events." | **~3,838 tokens** (one saturated 50-event window) |
+| 4 | `afr_get_run_events` | "Show me the literal events." | **~3,844 tokens** (one saturated 50-event window) |
 | — | `afr_list_runs` | Orientation: which runs exist | ~475 tokens (20 runs) |
 
 Read the last row of the ladder before you read anything else on this page. **One
@@ -46,10 +46,11 @@ they are the reason the tier-4 call is affordable at all, because they tell you
 Most investigations should end at tier 3. Many should end at tier 0. Stop as soon as
 the question is answered.
 
-Where these numbers come from, and what they do not cover, is in
-[Where the token figures come from](#where-the-token-figures-come-from). They are
-measured against the real projection code with contract-maximal fixtures; they are
-**not** measured against a running deployment, because none has ever existed.
+Where these numbers come from, what keeps them from drifting, and what they do not
+cover, is in [Where the token figures come from](#where-the-token-figures-come-from).
+They are measured by invoking the real registered tool handlers over contract-maximal
+fixtures, and held there by a standing gate; they are **not** measured against a running
+deployment, because none has ever existed.
 
 ### The worked example
 
@@ -57,7 +58,7 @@ Something is failing and you have no run id, no fingerprint, and no idea where t
 look. That is the normal starting state. The path, with the running cost:
 
 ```
-0. afr_triage()                                     ~333 tok   (running: ~333)
+0. afr_triage()                                     ~332 tok   (running: ~332)
      → verdict "issues", complete true, scanned 50
      → items[0]: { class: "tool_error", label: "Tool call failed",
                    count: 128, signal: "regressed", score: 235,
@@ -68,26 +69,26 @@ look. That is the normal starting state. The path, with the running cost:
 1. …you do NOT call afr_list_failure_patterns here. Triage already read that
    endpoint. Reach for tier 1 only when you need breadth past the top 5.
 
-2. afr_get_pattern_evidence(fingerprintHash: "01f3a9…")   ~423 tok  (running: ~756)
+2. afr_get_pattern_evidence(fingerprintHash: "01f3a9…")   ~423 tok  (running: ~755)
      → "resolved 6 days ago, 0 exposure since — unproven"
      → for "did last week's fix hold?", THIS IS THE END. Stop here.
 
-3. afr_explain_run(runId)                            ~121 tok   (running: ~454)
+3. afr_explain_run(runId)                            ~121 tok   (running: ~453)
      → root cause in prose + citedSequenceNumbers: [12, 14, 17]
      → for "why did this run fail?", THIS IS THE END. Stop here.
        (Reached directly from triage when an item's `next` points at a run —
-        ~333 + ~121, not ~756.)
+        ~332 + ~121, not ~755.)
 
-4. afr_get_run_events(runId, from: 12, limit: 10)   ≤3,838 tok  (running: ≤4,292)
+4. afr_get_run_events(runId, from: 12, limit: 10)   ≤3,844 tok  (running: ≤4,297)
      → the literal event records, only around the numbers tier 3 cited
 ```
 
 Triage plus an explanation — enough to name the worst thing in the org *and* explain
-a concrete instance of it — costs about **454 tokens**. That is roughly an eighth of
+a concrete instance of it — costs about **453 tokens**. That is roughly an eighth of
 one tier-4 window.
 
 **The naive path, for contrast.** An agent that skips the ladder and opens with
-`afr_get_run_events` pays up to **~3,838 tokens** for a fifty-event window and gets
+`afr_get_run_events` pays up to **~3,844 tokens** for a fifty-event window and gets
 back… fifty event records. No root cause, no fingerprint, no verdict on whether this
 is new or the thing that has been failing all week. It has spent roughly 12x the cost
 of `afr_triage()` to buy the raw material for an answer rather than the answer, and it
@@ -102,9 +103,10 @@ the literal record. They are not for discovery.
 ### If you only want a CI gate
 
 An agent-driven investigation is not the only caller. For "fail the build if a
-supposedly-fixed failure came back", see
-[Using this as a CI gate](#using-this-as-a-ci-gate), which covers the exit-code
-and truncation semantics — **including the case where a scan could not be
+supposedly-fixed failure came back", the shell answer is **`afr triage`** — the same
+ranking as tier 0, mapped onto exit codes `0` (clear) / `10` (findings) / `11`
+(inconclusive). See [Using this as a CI gate](#using-this-as-a-ci-gate), which covers
+the exit-code and truncation semantics — **including the case where a scan could not be
 completed, which must never be reported as "all clear."**
 
 ---
@@ -122,11 +124,17 @@ completed, which must never be reported as "all clear."**
 >   (`apps/web/app/api/v1/**`, `convex/read_api.ts`).
 > - The query parameters, the response envelope, the per-key rate class
 >   (300 req/min), and the error codes described below match those routes.
-> - The per-tier token figures, measured by driving the real exported projections
->   in `packages/mcp/src/projections.ts` over the contract-maximal fixtures from
->   `tests/unit/mcp_progressive_disclosure.test.ts`. See
->   [Where the token figures come from](#where-the-token-figures-come-from) for the
->   estimator, the fixtures, and what the numbers do and do not represent.
+> - **Every token figure on this page**, re-measured by actually running
+>   `pnpm build && pnpm tsx scripts/check-token-budgets.ts` on this tree and
+>   transcribing its report. Three figures the previous revision published were stale
+>   and are corrected here: tier 0 typical (333 → **332**), tier 1 (284 → **294**), and
+>   tier 4 externalized (3,838 → **3,844**). Two others (`afr_list_runs` **475**, tier 4
+>   inline **3,390**) are confirmed unchanged.
+> - The enforcement described in
+>   [What keeps these numbers true](#what-keeps-these-numbers-true): the script and
+>   `scripts/token-budget-baseline.json` exist and run; the seven `mcp_*` suites pass
+>   (144 tests) under `pnpm test`; `createServer` registers exactly six tools and the
+>   script enumerates them from that registry.
 >
 > **Unverified — treat as design intent, not measurement:**
 > - **Token cost against real data.** The figures above are measured against
@@ -137,22 +145,37 @@ completed, which must never be reported as "all clear."**
 >   real client, and the executable name/entry path comes from the package layout,
 >   not from a successful launch.
 > - Anything about live latency, wire bytes, or real-world response sizes.
-> - **`afr triage` (the CLI command) does not exist.** The MCP tool `afr_triage`
->   has landed and is described on this page from its source. Its CLI counterpart,
->   with CI-gate exit codes, had **not** landed at last re-verification:
->   `packages/cli/src/commands/` contains no `triage.ts` and `packages/cli/src/index.ts`
->   registers no `triage` subcommand. See
->   [Using this as a CI gate](#using-this-as-a-ci-gate) for what the gate story
->   actually is today.
 >
-> **Freshness.** Verified against the working tree at commit `2695655` **plus a large
-> body of uncommitted changes** — SDK 0.16.0, CLI 0.10.0, and the whole of
-> `packages/mcp/src/triage.ts` / `tools/triage.ts` were untracked or modified at the
-> time of writing. Multiple agents were landing code in parallel and the tree moved
-> repeatedly during this page's revision; the `scanTruncated` plumbing in particular
-> went from "backend only" to "wired through SDK, CLI, tier 1 and triage" while this
-> section was being written. **Re-check `git log` and the named call sites before
-> trusting a specific number or a specific "does not yet" claim.**
+> **Changed since the previous revision of this page — re-verified at `600b4f8`:**
+> - **`afr triage` (the CLI command) now exists**, and the claim that it did not is
+>   removed. `packages/cli/src/commands/triage.ts` implements it and
+>   `packages/cli/src/index.ts` registers the subcommand, with CI-gate exit codes
+>   `0`/`10`/`11`. See [Using this as a CI gate](#using-this-as-a-ci-gate).
+> - **The ranking moved out of `packages/mcp`.** `toTriageResult` and every weight
+>   now live in `packages/sdk/src/triage.ts`; `packages/mcp/src/triage.ts` is a pure
+>   re-export, and `packages/cli` imports the same function. There is one
+>   implementation, so the CLI and the MCP tool cannot rank differently.
+>
+> **Landed but not yet finished — do not read these as fully wired:**
+> - `scripts/check-token-budgets.ts` runs, enforces, and its baseline is seeded with all
+>   14 scenarios — but it is in neither `scripts/validate.sh` nor
+>   `.github/workflows/ci.yml`, so nothing runs it automatically.
+> - `scripts/check-build-integrity.ts` is in `validate.sh` (as `build-integrity`, after
+>   `build`) but not in CI.
+> - `afr_explain_run`'s contract-maximal scenario is **over budget (203 / 200)**, frozen
+>   as a `knownBreach`. That is a real, owned defect in `packages/mcp`, not a
+>   documentation caveat.
+>
+> **Freshness.** Verified against the working tree at commit `600b4f8` **plus
+> uncommitted changes**: `scripts/check-token-budgets.ts`,
+> `scripts/check-build-integrity.ts`, `scripts/token-budget-baseline.json` and
+> `tests/unit/mcp_budgets.ts` were untracked, and
+> `tests/unit/mcp_progressive_disclosure.test.ts` was modified, at the time of writing —
+> all three landed *while this page was being revised*. SDK 0.17.0, CLI 0.11.0,
+> `packages/mcp` 0.1.0. The previous revision was written at `2695655` against a similar
+> moving tree, which is how three token figures went stale. Multiple agents land code in
+> parallel on this branch. **Re-run the script and re-check `git log` before trusting a
+> specific number or a specific "does not yet" claim.**
 >
 > The two `/api/v1/patterns**` endpoints behind tiers 1 and 2 are **now documented
 > in `docs/api_reference.md`** (§1), which is their canonical HTTP contract —
@@ -210,12 +233,14 @@ is what makes the windowed tier-4 call viable: you fetch ten events, not two tho
 
 ### Where the token figures come from
 
-Every number on this page is a **client-visible token estimate**, produced by calling
-the real exported projections in `packages/mcp/src/projections.ts`
-(`toListPatternsResult`, `toPatternEvidenceResult`, `toExplainRunResult`,
-`toEventRow`, `toRunRow`) on the contract-maximal fixtures from
-`tests/unit/mcp_progressive_disclosure.test.ts`, and applying that suite's stated
-estimator:
+Every number on this page is a **client-visible token estimate** — the size of the exact
+`text` an MCP client receives. It is produced by `scripts/check-token-budgets.ts`, which
+calls `createServer()`, enumerates the tools from **the server's own registry**, and
+invokes each registered handler against a stub reader and a contract-maximal fixture. Not
+the projection in isolation: a tool that wraps a lean projection in a fat envelope is
+over budget, and only the handler's own output shows that.
+
+The estimator:
 
 ```
 estimateTokens(x) = ceil(utf8ByteLength(JSON.stringify(x)) / 4)
@@ -224,26 +249,109 @@ estimateTokens(x) = ceil(utf8ByteLength(JSON.stringify(x)) / 4)
 Bytes/4 is the standard rough BPE approximation. It matches what the server actually
 emits — `packages/mcp/src/tools/shared.ts` serializes with `JSON.stringify(value)` and
 no indentation — so these are the bytes a caller pays for. It is an estimate, not a
-tokenizer, and it is monotonic in payload size, which is the property that matters.
+tokenizer, and it is monotonic in payload size, which is the property a ratchet needs.
 
-| Tier | Measured | Fixture it was measured on | Asserted budget |
+**Run it yourself:** `pnpm build && pnpm tsx scripts/check-token-budgets.ts`. The build
+is required — the script imports `packages/mcp/src/**` as source, and that source
+resolves `@agent-flight-recorder/sdk` and `/contracts` to their `dist/`.
+
+| Tool / scenario | Measured | Budget | Fixture |
 |---|---|---|---|
-| 0 `afr_triage` (typical) | **333** | a full 50-pattern scan of maximal `FailurePattern`s, nothing truncated | ≤ 450 |
-| 0 `afr_triage` (worst case) | **436** | the same scan, every item muted, every caveat firing, an unevaluated sample, a top-level `next` | ≤ 450 |
-| 0 `afr_triage` (`verdict: "clear"`) | **32** | an org with nothing to report | ≤ 450 |
-| 1 `afr_list_failure_patterns` | **284** | 10 maximal `FailurePattern` rollups (~3,757 tokens unprojected) | ≤ 300 |
-| 2 `afr_get_pattern_evidence` | **423** | one pattern, 100 inbound lifecycle transitions | ≤ 450 |
-| 3 `afr_explain_run` | **121** | a realistic `RunExplanation` | ≤ 200 |
-| 3 `afr_explain_run` (worst case) | **192** | a *contract-maximal* explanation — 2 KB summary + 1 KB root cause + 1 KB fix | ≤ 200 |
-| 4 `afr_get_run_events` | **3,838** | a saturated 50-event window, every payload externalized | ≤ 10,000 |
-| 4 `afr_get_run_events` (inline) | **3,384** | a saturated 50-event window of 10,040-byte inline payloads — just under the 10 KB externalization threshold | ≤ 10,000 |
-| — `afr_list_runs` | **475** | 20 maximal `Run` documents (~27,769 tokens unprojected) | ratio ≥ 10x |
+| `afr_triage` typical | **332** | 450 | a full 50-pattern scan of maximal `FailurePattern`s, nothing degraded |
+| `afr_triage` worst case | **435** | 450 | truncated scan + unevaluated + every item muted |
+| `afr_triage` `verdict: "clear"` | **32** | 450 | an org with nothing to report |
+| `afr_list_failure_patterns`, 10 | **294** | 300 | 10 maximal rollups — the published tier-1 figure (12.8x unprojected) |
+| `afr_list_failure_patterns`, 20 | **561** | 600 | a default page (13.5x) |
+| `afr_list_failure_patterns`, 100 | **2,681** | 2,800 | a saturated page at `MAX_LIMIT` (14.2x) |
+| `afr_get_pattern_evidence` | **423** | 450 | one pattern, 100 inbound lifecycle transitions, capped to 10 (34.7x) |
+| `afr_explain_run` realistic | **121** | 200 | a realistic `RunExplanation` |
+| `afr_explain_run` contract-maximal | **203** ⚠ | 200 | 2 KB summary + 1 KB root cause + 1 KB fix — **over budget by 3, see below** |
+| `afr_explain_run` pending | **24** | 200 | no explanation generated yet |
+| `afr_get_run_events` externalized | **3,844** | 10,000 | a saturated 50-event window, every payload externalized |
+| `afr_get_run_events` inline | **3,390** | 10,000 | a saturated 50-event window of 10,040-byte inline payloads, just under the externalization threshold |
+| `afr_list_runs`, 20 | **475** | 600 | a default page of maximal `Run` documents (58.8x) |
+| `afr_list_runs`, 100 | **2,250** | 2,800 | a saturated page at `MAX_LIMIT` (62.0x) |
 
-The budget column is enforced by `tests/unit/mcp_progressive_disclosure.test.ts` (tiers
-1–4) and `tests/unit/mcp_triage.test.ts` (tier 0), which fail the build if a projection
-widens. That test is a ratchet on the *budget*, not on
-the measured value — the measured values above will drift within their budgets as the
-projections change, and this table is only as fresh as its last re-measurement.
+The ratios in the fixture column are **commentary**. Nothing passes on one — every
+budget is an absolute integer, because a ratio against a fat fixture gets easier as the
+fixture gets fatter, which is not the property under test.
+
+> ⚠ **`afr_explain_run`'s contract-maximal scenario is over budget: 203 against 200.**
+> The guard found it on its first run and it is recorded as a `knownBreach` — frozen, not
+> waived: the script exits `0`, but the number may only fall, one token more blocks, and
+> the guard fails if the entry outlives the breach.
+>
+> The cause is that `toExplainRunResult` caps the three prose fields and forwards
+> `citedSequenceNumbers` **verbatim**. The long-published "192 worst case" was measured
+> against an explanation citing five sequence numbers; `RunExplanation` documents the
+> bound as ≤ 20. Measured: 5 citations → 192, 10 → 196, 15 → 200, 20 → **204**. So this
+> tier was under budget only because real explanations happen to cite few events — a
+> property of the generator, not a guarantee of this layer. The fix (capping the citation
+> array the way the prose is capped) belongs to the `packages/mcp` owner. Do not raise
+> the 200.
+
+### What keeps these numbers true
+
+Three layers, and they are not redundant:
+
+| Layer | What it does |
+|---|---|
+| `scripts/check-token-budgets.ts` | the standing gate. Enumerates tools from `createServer()`'s registry, measures 14 scenarios through the registered handlers, asserts absolutes, and ratchets `scripts/token-budget-baseline.json` |
+| `tests/unit/mcp_budgets.ts` | the single declaration of every budget and of the estimator, imported by every mcp suite. `450` used to appear in three files and `300` in two, only one of each carrying the derivation |
+| `tests/unit/mcp_progressive_disclosure.test.ts`, `mcp_triage.test.ts`, `mcp_triage_measure.test.ts`, `mcp_triage_next_hops.test.ts` | projection-level budgets plus the shape guards — a projection that starts emitting a field it is not allowed to fails here even when the byte count would still fit |
+
+Everything drives the real exported code — not a copy, not a snapshot — over fixtures
+that are **proved** maximal, not claimed to be: the script parses the contracts source
+with the TypeScript AST and fails (`FIXTURE_NOT_MAXIMAL`) if any declared property of
+`FailurePattern`, `Run`, `Event`, `RunExplanation` or the evidence envelope is left
+unpopulated. A budget measured against a fixture missing half the optional fields is a
+budget measured against a payload the system cannot produce.
+
+**The three things the script does that the suites could not:**
+
+1. **A new tool cannot ship unbudgeted.** The tool list comes from the server's registry,
+   so a registered tool with no declared budget fails as `NO_BUDGET`, and a budget for a
+   tool no longer registered fails as `STALE_BUDGET`.
+2. **Tier 4's ceiling is an absolute.** It used to be `RAW_DUMP_TOKENS / 10` — a ceiling
+   that rose whenever someone raised the assumed raw-dump size. It is written as
+   `10_000` now.
+3. **The whole picture is in one place.** The figures on this page used to be re-derived
+   by hand from several suites' stdout, so nobody could see the picture drift.
+
+**The ratchet, and the obligation it puts on you.** `scripts/token-budget-baseline.json`
+records where every scenario actually is:
+
+- `measured > budget` → **fail**: the published ceiling was breached. Cut the response.
+- `measured > baseline` → **fail**, separately: still under the ceiling, but above where
+  we were. Silent drift inside the headroom is how a ceiling gets reached. A deliberate
+  increase is recorded with `--write-baseline` and lands as a reviewable diff **in the
+  same commit**.
+- `measured < baseline` → **pass**, and it prints the delta telling you to lower the
+  baseline in the same commit. Failing CI on the commit that improves things is how
+  ratchets get deleted; a stale-high baseline cannot hide, because the delta prints on
+  every run.
+
+`--write-baseline` refuses to record any value above its own budget: a baseline may
+record where we are, never bless a breached ceiling.
+
+A **pre-existing** breach — one the guard found rather than one someone introduced — is
+recorded as a `knownBreach` with its owner and its fix written out, reports as
+`FROZEN_BREACH`, and does not block. It is debt with a receipt, not an exemption: the
+frozen number may only fall, and the guard fails if the entry outlives the breach.
+
+**Where this is not yet closed.** The script is in neither `scripts/validate.sh` nor
+`.github/workflows/ci.yml`, so nothing runs it automatically — it is a command someone
+has to remember. (`scripts/check-build-integrity.ts` *is* in `validate.sh`, as
+`build-integrity` after `build`; it is not in CI either.) Separately, the script declares
+its budgets inline rather than importing `tests/unit/mcp_budgets.ts`; the two agree today
+(450/300/200/10,000) but they are still two copies, which `mcp_budgets.ts`'s own header
+flags as the remaining consolidation step.
+
+**A one-token difference you will notice.** `mcp_triage_measure.test.ts` prints 331 for
+the typical triage response; the script measures 332. Both are correct and neither is
+drift — the suite measures `toTriageResult`'s output, the script measures the tool
+result an MCP client receives. Where they differ, **this page quotes the script**,
+because that is what the agent actually pays.
 
 **What these numbers are not.** They are not measured against a deployment; none has
 ever existed for this project. They are not wire bytes (see
@@ -257,13 +365,13 @@ page is a ceiling rather than a typical value.
 the tool's existence is that it must cost less than the ~707 tokens of calling tiers 1
 and 2 yourself — otherwise it is a fifth tier pretending to be a shortcut.
 `tests/unit/mcp_triage.test.ts` asserts both: the absolute ceiling, and that a triage
-response is strictly cheaper than tier 1 + tier 2. The worst case measured **436**
-against a fully saturated, maximally caveated response, so the headroom is ~19 tokens —
-about half a triage item. Widening an item will go red almost immediately, which is the
-intended behaviour.
+response is strictly cheaper than tier 1 + tier 2. The worst case measures **435**
+against a fully saturated, maximally caveated response — 97% of the ceiling, about 15
+tokens of headroom, well under half a triage item. Widening an item will go red almost
+immediately, which is the intended behaviour.
 
-**The ratios are the durable part.** ~3,838 vs ~121 is ~32x; vs ~284 it is ~13x; vs
-~333 it is ~12x. Those gaps are structural — they follow from what each tier returns,
+**The ratios are the durable part.** ~3,844 vs ~121 is ~32x; vs ~294 it is ~13x; vs
+~332 it is ~12x. Those gaps are structural — they follow from what each tier returns,
 not from the fixtures — and they are the reason to work down the ladder rather than up
 it.
 
@@ -296,6 +404,25 @@ Two surfaces answer that. `afr_triage()` reports a `regressed` signal on any ite
 ranks — and ranks it first, above everything. `afr_list_failure_patterns(state:
 "regressed")` (or `afr patterns --state regressed` from the CLI) asks the question
 directly, with no top-5 cap.
+
+**From a shell, prefer `afr triage`.** It is the same ranking (same SDK function, same
+scores, same next-hop pointers) and it maps the verdict straight onto an exit code, so
+a build fails without anyone having to remember a `jq -e`:
+
+| Code | Verdict | Meaning |
+|---|---|---|
+| `0` | `clear` | the scan completed and found nothing |
+| `10` | `issues` | ranked items were found |
+| `11` | `unknown` | nothing was found **and** the view was incomplete — not evidence of health |
+| `1` / `2` / `3` / `4` | — | usage / auth / not-found / network-or-server |
+
+`10` wins over `11` when both apply: findings are actionable, and the incompleteness is
+stated in the output and in `--json`'s `complete` field. **Exit `0` is unreachable on an
+incomplete scan** — not by convention in the command, but because `verdict: "clear"` is
+only ever constructed when every honesty check passed, which is why the gate cannot be
+weakened later without changing the verdict itself. Read
+`packages/cli/src/commands/triage.ts` (`TRIAGE_HELP`, `exitCodeForTriage`) for the
+binding version.
 
 Prefer `state: "regressed"` over `regressed: true`. `regressed: true` matches any
 pattern with `regressedAt` set, including one that regressed, was genuinely re-fixed,
@@ -469,15 +596,20 @@ Withheld for unfiltered listings, deliberately: an unfiltered request does not t
 (`scanSize = filtering ? PATTERN_SCAN_ROW_CEILING : needed`), and "here are some
 patterns" makes no whole-dataset claim to falsify. The annotation still prints.
 
-> **Exit `11` distinguishes inconclusive from conclusive — not clean from dirty.**
-> There is still no "matches found" exit code: `afr patterns --state regressed` exits
-> `0` whether it found a regression or not. A gate must parse `--json` and fail on a
-> non-empty `patterns` array itself. What it no longer has to do is guess whether an
-> empty array meant anything.
+> **On `afr patterns`, exit `11` distinguishes inconclusive from conclusive — not clean
+> from dirty.** This command has no "matches found" exit code: `afr patterns --state
+> regressed` exits `0` whether it found a regression or not, so a gate built on it must
+> parse `--json` and fail on a non-empty `patterns` array itself. What it no longer has
+> to do is guess whether an empty array meant anything.
 >
-> The `@returns` comment on `run()` in `packages/cli/src/index.ts` still lists only
-> `0/1/2/3/4` and has not been updated for `11`. The code is real
-> (`packages/cli/src/commands/patterns.ts`); the doc comment is stale.
+> **`afr triage` is the command that closed that gap**, with exit `10` for findings —
+> which is why it is the better default for a shell gate. Reach for `afr patterns
+> --state regressed` when you need breadth past triage's top 5 and are willing to page.
+>
+> The `@returns` comment on `main()` in `packages/cli/src/index.ts:109` still lists only
+> `0/1/2/3/4` and has been updated for neither `11` nor `10`. Both codes are real
+> (`packages/cli/src/commands/patterns.ts`, `packages/cli/src/commands/triage.ts`); the
+> doc comment is stale. Verified at `600b4f8`.
 
 ---
 
@@ -631,8 +763,14 @@ any caller that does not already have a run id or a fingerprint.
 
 It is not a new data source. It reads the same `GET /api/v1/patterns` endpoint tier 1
 reads, once, with a field selection derived the same way — everything else is ranking,
-capping, and pointer construction over that one response
-(`packages/mcp/src/triage.ts`). There is no second fact here to disagree with the first.
+capping, and pointer construction over that one response. There is no second fact here
+to disagree with the first.
+
+That ranking lives in **`packages/sdk/src/triage.ts`**, not in this package.
+`packages/mcp/src/triage.ts` is a pure re-export, and `afr triage` imports the same
+`toTriageResult`. Two surfaces answering one question with two rankings is the drift
+this arrangement exists to prevent, so there is exactly one implementation and the CLI's
+`--json` output is byte-identical to the tool result.
 
 **Arguments.** `agentId` (optional) narrows to one agent. That is the only filter. There
 is deliberately no `environment` argument: a `FailurePattern` is an org-scoped rollup
@@ -895,8 +1033,10 @@ seeded org — the server has no fixture or offline mode.
 
 - `docs/api_reference.md` — the v1 read API contract (runs, events, replay, explanation,
   and both pattern endpoints), plus the `?fields=` projection contract
-- `CONTRIBUTING.md` — "Add a Field to a Projected Resource," the multi-boundary checklist
-  for making a new field reachable through this server
+- `CONTRIBUTING.md` — "The MCP Token Budgets Are a Release Gate" (the obligation that
+  comes with adding or reshaping a tool), "Add or Reshape an MCP Tool", and "Add a Field
+  to a Projected Resource," the multi-boundary checklist for making a new field
+  reachable through this server
 - `docs/adr/005-failure-patterns.md` — why failure patterns exist and their
   observability-grade constraints
 - `docs/adr/006-failure-resolution.md` — the resolution lifecycle and the fix-confidence

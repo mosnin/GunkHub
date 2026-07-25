@@ -1,26 +1,34 @@
 /**
  * PUBLISHED COST OF `afr_triage`, measured and printed.
  *
- * The README quotes a number for every tier. A quoted number nobody re-derives
- * drifts, so this prints the measurement the README cites, on the same
- * estimator (`bytes/4`) and the same contract-maximal inputs as
+ * `docs/mcp.md` quotes a number for every tier. A quoted number nobody
+ * re-derives drifts, so this prints the measurements that page cites, on the
+ * same estimator and the same contract-maximal inputs as
  * `mcp_progressive_disclosure.test.ts`. Read the stdout, not just the pass.
+ *
+ * THE BUDGET IS NOT DECLARED HERE. It was a bare literal `450` — the third copy
+ * of tier 2's budget, with no comment saying where it came from and nothing
+ * connecting it to the two other copies. It now comes from `./mcp_budgets.ts`
+ * with the rest.
+ *
+ * WHAT THIS FILE IS AND IS NOT. It is a MEASUREMENT PRINTER that happens to
+ * assert the budget as a floor of sanity; `mcp_triage.test.ts` is where the
+ * budget is genuinely argued, on the worst case, with per-field attribution on
+ * failure. If a standing `scripts/check-token-budgets.ts` takes over the
+ * measure-and-ratchet job, THIS is the file that becomes redundant — not the
+ * assertions in `mcp_triage.test.ts`, and not the shape or truncation guards.
  */
+import { SCAN_LIMIT, toTriageResult } from '@agent-flight-recorder/mcp'
 import { describe, expect, it } from 'vitest'
 
-import type { FailurePattern } from '@agent-flight-recorder/contracts'
+import { TRIAGE_TOKEN_BUDGET, byteLength, estimateTokens } from './mcp_budgets.js'
 
-const TRIAGE_SPEC = '../../packages/mcp/src/triage.ts'
-const triage = (await import(/* @vite-ignore */ TRIAGE_SPEC)) as {
-  toTriageResult(p: FailurePattern[], e: unknown, c: string | undefined, now: number, s?: { scanTruncated?: boolean }): unknown
-  SCAN_LIMIT: number
-  MAX_ITEMS: number
-}
+import type { FailurePattern } from '@agent-flight-recorder/contracts'
+import type { V1ListFixConfidenceEnvelope } from '@agent-flight-recorder/sdk'
 
 const NOW = 1_753_500_000_000
 const HOUR = 3_600_000
 const DAY = 24 * HOUR
-const tok = (v: unknown): number => Math.ceil(Buffer.byteLength(JSON.stringify(v) ?? '', 'utf8') / 4)
 
 type PatternOverrides = { [K in keyof FailurePattern]?: FailurePattern[K] | undefined }
 
@@ -57,7 +65,7 @@ function pattern(i: number, o: PatternOverrides = {}): FailurePattern {
   } as FailurePattern
 }
 
-function envelope(ps: readonly FailurePattern[], unevaluated: string[] = []): unknown {
+function envelope(ps: readonly FailurePattern[], unevaluated: string[] = []): V1ListFixConfidenceEnvelope {
   return {
     stalenessBoundMs: 6 * HOUR,
     entries: ps.map((p, i) => ({
@@ -72,14 +80,14 @@ function envelope(ps: readonly FailurePattern[], unevaluated: string[] = []): un
 
 describe('afr_triage measured cost', () => {
   it('prints the published numbers', () => {
-    const full = Array.from({ length: triage.SCAN_LIMIT }, (_, i) => pattern(i))
+    const full = Array.from({ length: SCAN_LIMIT }, (_, i) => pattern(i))
     const cases: [string, unknown][] = [
-      ['typical (50 scanned, complete, nothing degraded)', triage.toTriageResult(full, envelope(full), undefined, NOW)],
-      ['truncated scan (+caveat, +top-level next)', triage.toTriageResult(full, envelope(full), 'cursor_abc123', NOW)],
-      ['no fix confidence served (+caveat)', triage.toTriageResult(full, undefined, undefined, NOW)],
+      ['typical (50 scanned, complete, nothing degraded)', toTriageResult(full, envelope(full), undefined, NOW)],
+      ['truncated scan (+caveat, +top-level next)', toTriageResult(full, envelope(full), 'cursor_abc123', NOW)],
+      ['no fix confidence served (+caveat)', toTriageResult(full, undefined, undefined, NOW)],
       [
         'WORST CASE (truncated + unevaluated + all muted)',
-        triage.toTriageResult(
+        toTriageResult(
           full.map((p) => ({ ...p, muted: true })),
           envelope(full, full.slice(0, 6).map((p) => p.fingerprintHash)),
           'cursor_abc123',
@@ -87,15 +95,15 @@ describe('afr_triage measured cost', () => {
           { scanTruncated: true },
         ),
       ],
-      ['nothing broken (verdict: clear)', triage.toTriageResult([], envelope([]), undefined, NOW)],
+      ['nothing broken (verdict: clear)', toTriageResult([], envelope([]), undefined, NOW)],
     ]
     // eslint-disable-next-line no-console
-    console.log('\n  afr_triage measured token cost (bytes/4):')
+    console.log(`\n  afr_triage measured token cost (bytes/4), budget ${String(TRIAGE_TOKEN_BUDGET)}:`)
     for (const [name, value] of cases) {
-      const bytes = Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8')
+      const bytes = byteLength(JSON.stringify(value) ?? '')
       // eslint-disable-next-line no-console
-      console.log(`    ${String(tok(value)).padStart(4)} tok  (${String(bytes).padStart(5)} B)  ${name}`)
-      expect(tok(value)).toBeLessThanOrEqual(450)
+      console.log(`    ${String(estimateTokens(value)).padStart(4)} tok  (${String(bytes).padStart(5)} B)  ${name}`)
+      expect(estimateTokens(value), `"${name}" is over the triage budget`).toBeLessThanOrEqual(TRIAGE_TOKEN_BUDGET)
     }
   })
 })

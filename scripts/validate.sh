@@ -5,6 +5,7 @@
 #   ./scripts/validate.sh           # run all checks
 #   ./scripts/validate.sh typecheck # run only typecheck
 #   ./scripts/validate.sh build     # run only build
+#   ./scripts/validate.sh build-integrity # run only the stale/partial artifact check
 #   ./scripts/validate.sh lint      # run only lint
 #   ./scripts/validate.sh convex-refs # run only the convex ref/call-site check
 #   ./scripts/validate.sh design-tokens # run only the design.md conformance check
@@ -65,7 +66,7 @@ print_summary() {
   log_header "Validation Summary"
   echo ""
 
-  for check in typecheck build lint schema-drift convex-refs design-tokens; do
+  for check in typecheck build build-integrity lint schema-drift convex-refs design-tokens; do
     if [[ -v RESULTS[$check] ]]; then
       local result="${RESULTS[$check]}"
       if [[ "$result" == "PASS" ]]; then
@@ -107,7 +108,7 @@ fi
 
 # ─── Determine which checks to run ───────────────────────────────────────────
 
-CHECKS_TO_RUN=("typecheck" "build" "lint" "schema-drift" "convex-refs" "design-tokens")
+CHECKS_TO_RUN=("typecheck" "build" "build-integrity" "lint" "schema-drift" "convex-refs" "design-tokens")
 
 if [[ $# -gt 0 ]]; then
   CHECKS_TO_RUN=("$@")
@@ -122,6 +123,16 @@ for check in "${CHECKS_TO_RUN[@]}"; do
       ;;
     build)
       run_check "build" "pnpm build"
+      ;;
+    build-integrity)
+      # MUST run after `build`. Detects dist/ artifacts left behind by a build
+      # that RAN AND PARTIALLY FAILED — the case a cold `rm -rf packages/*/dist`
+      # cannot reach, because the stale file was written by a real build, not
+      # left by a missing one. Specifically: a `tsup` run whose DTS step fails
+      # leaves the PREVIOUS index.d.ts on disk (contracts and sdk build without
+      # --clean), and every `tsc` in the repo then typechecks against types that
+      # no longer describe the source, at exit 0. See the script header.
+      run_check "build-integrity" "pnpm tsx scripts/check-build-integrity.ts"
       ;;
     lint)
       run_check "lint" "pnpm lint"
@@ -145,7 +156,7 @@ for check in "${CHECKS_TO_RUN[@]}"; do
       run_check "design-tokens" "pnpm tsx scripts/check-design-tokens.ts"
       ;;
     *)
-      echo -e "${RED}Unknown check: ${check}. Valid options: typecheck, build, lint, schema-drift, convex-refs, design-tokens${RESET}"
+      echo -e "${RED}Unknown check: ${check}. Valid options: typecheck, build, build-integrity, lint, schema-drift, convex-refs, design-tokens${RESET}"
       exit 1
       ;;
   esac

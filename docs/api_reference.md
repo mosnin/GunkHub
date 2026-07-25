@@ -1032,7 +1032,8 @@ command:
 | `2` | Auth failure (missing/invalid/revoked/expired key, or a key lacking `read`) |
 | `3` | Not found |
 | `4` | Network or server error |
-| `11` | **`afr patterns` only — "could not evaluate."** A *filtered* request whose scan hit the server's row ceiling. |
+| `10` | **`afr triage` only — "findings."** Verdict `issues`: ranked items were found. |
+| `11` | **"Could not evaluate."** On `afr patterns`, a *filtered* request whose scan hit the server's row ceiling. On `afr triage`, verdict `unknown` — or `clear` with an incomplete view. |
 
 #### Exit `11` — the gate code that matters
 
@@ -1056,16 +1057,33 @@ after a truncated scan; it reports no matches *in the rows scanned* and states p
 that this is not "none exist". **Non-empty and truncated** prints the table, then a
 `PARTIAL [scan truncated N/M rows]` footnote.
 
-> **Exit `11` separates INCONCLUSIVE from CONCLUSIVE. It does not separate clean from
-> dirty.** `afr patterns --state regressed` still exits `0` whether it found a
-> regression or not — there is no "matches found" exit code. A gate must still parse
-> `--json` and fail on a non-empty `patterns` array itself. What it no longer has to do
-> is guess whether an *empty* array meant anything.
->
-> Verified against the working tree while agents were still landing code; the `@returns`
-> comment on `run()` in `packages/cli/src/index.ts` still lists only `0/1/2/3/4` and has
-> not been updated for `11`. There is no `afr triage` command —
-> `packages/cli/src/commands/` contains no `triage.ts`; triage is MCP-only today.
+> **On `afr patterns`, exit `11` separates INCONCLUSIVE from CONCLUSIVE. It does not
+> separate clean from dirty.** `afr patterns --state regressed` still exits `0` whether
+> it found a regression or not — that command has no "matches found" exit code. A gate
+> built on it must still parse `--json` and fail on a non-empty `patterns` array itself.
+> What it no longer has to do is guess whether an *empty* array meant anything.
+
+#### `afr triage` — exits `0` / `10` / `11`
+
+`afr triage` has landed (`packages/cli/src/commands/triage.ts`, registered in
+`packages/cli/src/index.ts`) and is the command that closes the "clean vs dirty" gap
+above: `0` clear, `10` findings, `11` inconclusive. `10` wins over `11` when both apply
+— findings are actionable, and the incompleteness is reported in the output and in
+`--json`'s `complete` field.
+
+**Exit `0` is unreachable on an incomplete scan**, and not by a convention this command
+applies on top of the result: `verdict: "clear"` is only ever constructed when every
+honesty check passed, so the property belongs to the verdict itself and cannot be
+weakened in the CLI later. `exitCodeForTriage` is the whole mapping.
+
+`--json` prints the raw `TriageResult`, byte-identical to what the `afr_triage` MCP tool
+returns (both call `toTriageResult` from `@agent-flight-recorder/sdk`), including
+next-hop pointers in their MCP tool-name form.
+
+> Verified at commit `600b4f8` (clean tree). One stale artifact remains: the `@returns`
+> comment on `main()` in `packages/cli/src/index.ts:109` still lists only `0/1/2/3/4`
+> and has been updated for neither `10` nor `11`. Both codes are real in the command
+> modules; the doc comment is wrong.
 
 All of the above require a **`read`**-scoped API key — see
 [Minting a read key for the v1 API / CLI](#minting-a-read-key-for-the-v1-api--cli).
@@ -1114,17 +1132,22 @@ reference:
 **The tools are a ladder, and the entry point is `afr_triage`** — one call, zero
 required arguments, at most five ranked items, each carrying the exact tool and
 arguments to call next. It makes exactly one upstream request (`GET /api/v1/patterns`
-with `limit=50`); the ranking and capping happen in `packages/mcp/src/triage.ts`, so it
-is not a new data source and cannot disagree with tier 1.
+with `limit=50`); the ranking and capping happen in `packages/sdk/src/triage.ts`
+(`packages/mcp/src/triage.ts` is a pure re-export of it), so it is not a new data source
+and cannot disagree with tier 1. The `afr triage` CLI command imports the same
+`toTriageResult`, so the two surfaces cannot rank differently either.
 
-Measured client-visible costs: ~333 tokens for triage (~436 worst case), ~284 for tier 1
-(ten patterns), ~423 for tier 2, ~121 for tier 3, and up to ~3,838 for a single
+Measured client-visible costs: ~332 tokens for triage (~435 worst case), ~294 for tier 1
+(ten patterns), ~423 for tier 2, ~121 for tier 3, and up to ~3,844 for a single
 saturated tier-4 event window — roughly 12x triage and 32x tier 3. An agent that opens
 with `afr_get_run_events` pays the most for the least, and has to know a run id before it
 can even make the call. `docs/mcp.md` → "Start here" has the ladder, the worked example
 with running costs, and where those numbers were measured (real projections over
 contract-maximal fixtures; **not** against a running deployment, since none has ever
-existed).
+existed). Those figures are held in place by `scripts/check-token-budgets.ts`, which enumerates
+the tools from the MCP server's own registry and measures each registered handler
+against a contract-maximal fixture — `docs/mcp.md` → "What keeps these numbers true"
+has the ratchet rules and what is still unwired.
 
 A triage response separates `verdict` (`issues` / `clear` / `unknown`) from `complete`,
 because "nothing is broken" and "I could not evaluate" are different answers and neither
@@ -1137,6 +1160,8 @@ semantics for `state: "regressed"`.
 has not been exercised, and explains where server-side field projection does and does not
 save an MCP caller anything.
 
-> Verified against the working tree at commit `2695655` **plus uncommitted changes**:
-> `packages/mcp/src/triage.ts` and `packages/mcp/src/tools/triage.ts` were untracked at
-> the time of writing. The CLI counterpart (`afr triage`) had not landed.
+> Token figures re-measured at commit `600b4f8` (clean tree) by driving the committed
+> contract-maximal fixtures through the real projections; the previous set was written
+> at `2695655` against uncommitted changes and four of the numbers had gone stale. The
+> CLI counterpart `afr triage` **has since landed** — see
+> [`afr triage` — exits `0` / `10` / `11`](#afr-triage--exits-0--10--11) above.
