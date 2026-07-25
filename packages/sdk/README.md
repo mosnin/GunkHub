@@ -490,14 +490,65 @@ See `examples/read_back.ts` for the full runnable version.
 | `listRuns(filters?)` | `GET /api/v1/runs` | `{ runs, nextCursor?, pageSize?, total? }` |
 | `getRun(runId)` | `GET /api/v1/runs/:id` | `{ run, eventCount, artifactCount }` |
 | `getRunEvents(runId, { limit?, cursor? })` | `GET /api/v1/runs/:id/events` | `{ events, nextCursor? }` |
+| `getRunEventWindow(runId, { fromSequence? \| aroundSequence?, limit? })` | `GET /api/v1/runs/:id/events?fromSequence=` | `{ events, fromSequence, nextCursor? }` |
 | `iterateEvents(runId, { pageSize? })` | (pages `getRunEvents` transparently) | `AsyncGenerator<Event>` |
 | `getReplay(runId)` | `GET /api/v1/runs/:id/replay` | `{ projection, failureSummary }` |
-| `getExplanation(runId)` | `GET /api/v1/runs/:id/explanation` | `{ explanation: RunExplanation \| null }` |
-| `getFailurePatterns(filters?)` | `GET /api/v1/patterns` | `{ patterns, nextCursor? }` |
+| `getExplanation(runId)` | `GET /api/v1/runs/:id/explanation` | `{ explanation, status?, runStatus?, runEndedAt? }` |
+| `getFailurePatterns(filters?)` | `GET /api/v1/patterns` | `{ patterns, nextCursor?, fixConfidence? }` |
+| `getFailurePatternEvidence(fingerprintHash)` | `GET /api/v1/patterns/:hash/evidence` | `PatternResolutionEvidence` |
 
 `filters` for `listRuns`: `status`, `agentId`, `environment`, `sessionId`, `limit`, `cursor` (all optional).
 
-`filters` for `getFailurePatterns`: `agentId`, `spiking`, `muted`, `limit`, `cursor` (all optional).
+`filters` for `getFailurePatterns`: `agentId`, `spiking`, `muted`, `status`, `regressed`, `state`, `limit`, `cursor` (all optional).
+
+### `getRunEventWindow(runId, options)` — a bounded slice of the event log
+
+`getRunEvents`/`iterateEvents` page forward from the head of the log: to reach
+sequence 5 000 with a cursor you must first fetch the 4 999 events before it.
+For a consumer that already knows *where* to look — a `RunExplanation`'s
+`citedSequenceNumbers`, a failing tool call, the tail of a 20 000-event run —
+that means paying for the whole run to get a hundred events of signal.
+`getRunEventWindow` addresses the log by `sequenceNumber` instead:
+
+```typescript
+// Read the failing region an explanation points at, and nothing else.
+const { explanation } = await reader.getExplanation(runId)
+const cited = explanation?.citedSequenceNumbers[0]
+if (cited !== undefined) {
+  const { events } = await reader.getRunEventWindow(runId, { aroundSequence: cited, limit: 40 })
+  // events covers roughly cited-20 .. cited+20 — the preceding context plus the failure
+}
+
+// Or walk forward from a known floor. Continue with the last sequence + 1 —
+// stateless, restartable, no cursor to keep alive.
+let from = 1
+for (;;) {
+  const page = await reader.getRunEventWindow(runId, { fromSequence: from, limit: 200 })
+  if (page.events.length === 0) break
+  from = page.events[page.events.length - 1]!.sequenceNumber + 1
+}
+```
+
+Pass **either** `fromSequence` **or** `aroundSequence`, never both (that throws
+a `RangeError` before any request is made, as do non-positive or non-integer
+bounds). `aroundSequence` is resolved client-side to
+`fromSequence = max(1, aroundSequence - floor(limit / 2))`, defaulting `limit`
+to `DEFAULT_EVENT_WINDOW_SIZE` (100) — so the backend only ever needs one new
+primitive, a sequence floor, not two.
+
+**This method never slices client-side.** It does not fetch the run and cut a
+window out of it — that would spend exactly the cost the window exists to
+avoid.
+
+**Server support required.** The v1 events endpoint has long accepted
+`limit`/`cursor`; `fromSequence` is newer. An older deployment *ignores* an
+unknown query parameter and returns the first page of the log — events 1..N,
+looking exactly like a window that just happened to start at the beginning.
+Rather than hand back that wrong answer, this method detects it and throws
+`V1ApiError` with `kind: 'invalid_response'` naming the missing support. The
+check is exact, not a heuristic: sequence numbers are positive and contiguous,
+so a server that honored the floor can never return an event below it, and one
+that ignored it always does whenever the run has any events.
 
 ### `getFailurePatterns(filters?)` — recurring failure patterns (PREVENTION cycle 1, ADR-005; `spiking` filter added cycle 2; `muted` field/filter added cycle 3)
 
@@ -527,24 +578,29 @@ Like every other query surface in this system (CLAUDE.md), this is **observabili
 
 Fetches the cached root-cause explanation for a run. Resolves `{ explanation }`, mirroring the existing Clerk-authed `GET /api/runs/:id/explanation` exactly — `explanation` is a `RunExplanation` (`kind: 'heuristic' | 'llm'`, `summary`, `rootCause`, `suggestedFix?`, `citedSequenceNumbers`, `failureClass`, `generatedAt`, `model?` when `kind === 'llm'`) when one is cached, or `null` when there's nothing to show yet. `null` resolving is a *successful* call, not an error — never wrap this in try/catch to detect it.
 
-**Known gap (`docs/design/explanations.md` "Known gap: coarse null state"):** `null` covers BOTH "this run hasn't failed — nothing to explain" AND "this run failed but generation hasn't completed/been triggered yet." The endpoint cannot distinguish those two on its own. If you need to tell them apart, pair a `null` result with the run's own `status` (`getRun(runId)` — ADR-004 generates explanations for `'failed'` and `'timed_out'` runs):
+**The coarse-null gap is closed where `status` is present.** `explanation: null` on its own covers BOTH "this run will never have an explanation" (not failed/timed_out/cancelled) AND "eligible, but generation hasn't landed yet." The response now carries an explicit `status` discriminant (`'not_eligible' | 'pending' | 'ready'`) plus `runStatus`/`runEndedAt`, so a caller can tell those apart — and apply a grace period — without a second round-trip:
 
 ```typescript
-const [{ run }, { explanation }] = await Promise.all([reader.getRun(runId), reader.getExplanation(runId)])
-if (explanation) {
-  // ready
-} else if (run.status === 'failed' || run.status === 'timed_out') {
-  // pending — failed but not explained yet
+const { explanation, status, runStatus } = await reader.getExplanation(runId)
+if (status === 'ready') {
+  console.log(explanation!.rootCause)
+} else if (status === 'pending') {
+  // eligible, still analyzing — try again shortly
+} else if (status === 'not_eligible') {
+  // this run didn't fail; there is nothing to explain
 } else {
-  // not_failed — nothing to explain
+  // status absent: deployment predates the discriminant. Fall back to pairing
+  // `null` with the run's own status, which is what `afr explain` does.
+  const { run } = await reader.getRun(runId)
+  void run, runStatus
 }
 ```
 
-This is exactly what `@agent-flight-recorder/cli`'s `afr explain` does — see `packages/cli/src/commands/explain.ts`.
+`status`, `runStatus` and `runEndedAt` are typed as optional precisely so a consumer pinned to an older deployment still typechecks. See `packages/cli/src/commands/explain.ts` for the same branching in the CLI.
 
 `V1ApiError` is still thrown for genuine failures (the run doesn't exist: `kind: 'not_found'`; auth; rate limiting; network; malformed response) — exactly like every other `FlightReader` method.
 
-**Server-side status (as of this cycle):** `GET /api/v1/runs/:id/explanation` (the key-authed v1 counterpart of the already-shipped Clerk-authed `GET /api/runs/:id/explanation`) does not exist yet — this method is written against the exact same response shape that route already returns (backed by `convex/run_explanations.ts`), so wiring the v1 route should be a thin proxy with no SDK-side change required. Calling it today surfaces a `V1ApiError` with `kind: 'not_found'` until the route is registered.
+**Server-side status:** `GET /api/v1/runs/:id/explanation` is live (`apps/web/app/api/v1/runs/[runId]/explanation/route.ts`, backed by `convex/read_api.ts`'s `apiGetExplanation`). Earlier releases of this README described it as unbuilt; that is no longer true.
 
 ### Errors
 
@@ -695,6 +751,8 @@ this pattern (including the tool-error path).
 ---
 
 ## Version
+
+v0.14.0 — **Bounded, sequence-addressed event reads.** New `FlightReader.getRunEventWindow(runId, { fromSequence? | aroundSequence?, limit? })` returns a window of a run's event log addressed by `sequenceNumber` instead of by a cursor walked from the head, so a consumer that already knows where to look (an explanation's `citedSequenceNumbers`, the tail of a long run) no longer has to pull the whole run to reach it. It never slices client-side, and if the deployment's events endpoint ignores `fromSequence` it throws `V1ApiError` (`kind: 'invalid_response'`) rather than passing the head of the log off as the requested window — see the `getRunEventWindow` section for the exactness of that check. `V1GetExplanationData` gains optional `status` (`'not_eligible' | 'pending' | 'ready'`), `runStatus` and `runEndedAt`, closing the documented coarse-null gap where the server already sends them; optional so an older deployment still typechecks. New exports: `getRunEventWindow`, `DEFAULT_EVENT_WINDOW_SIZE`, `EventWindowParams`, `V1EventWindowData`, `RunExplanationQueryStatus`. Additive throughout — no existing signature, return type, or export changed.
 
 v0.13.0 — **All four `state` values are answerable** (ADR-006 cycle 3). `FlightReader.getFailurePatterns({ state })` now accepts `'unproven'`/`'proving'`/`'confirmed'` as well as `'regressed'`: verdicts are served from a periodically refreshed per-pattern snapshot instead of a per-request exposure scan, so the filter no longer needs a scan it cannot afford. The param's name, type and meaning are unchanged — only the set of values the server will answer. `V1ListFailurePatternsData` gains an optional `fixConfidence` envelope (`V1ListFixConfidenceEnvelope`): `stalenessBoundMs` (transported, so no client hardcodes it), `entries[]` (one `FixConfidenceEntry` per returned pattern, carrying `state`/`score`/`computedAt`/`ageMs`/`stale`/`basis`), `staleCount`, and `unevaluated[]`. New exports: `V1ListFixConfidenceEnvelope`, `FixConfidenceEntry`. Requires `@agent-flight-recorder/contracts` >= 0.10.0. Additive — the envelope is optional, so a consumer pinned to an older deployment still typechecks.
 

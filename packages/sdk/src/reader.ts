@@ -33,6 +33,7 @@ import type {
   ReplayProjection,
   Run,
   RunExplanation,
+  RunExplanationQueryStatus,
   RunStatus,
 } from '@agent-flight-recorder/contracts'
 
@@ -71,21 +72,33 @@ export interface V1ReplayData {
 // ---------------------------------------------------------------------------
 
 /**
- * Response shape for the run-explanation read, mirroring the existing
- * Clerk-authed `GET /api/runs/:id/explanation`
- * (`apps/web/app/api/runs/[id]/explanation/route.ts`) exactly: `explanation`
- * is `null` when there is nothing to show yet.
+ * Response shape for the run-explanation read, mirroring the Clerk-authed
+ * `GET /api/runs/:id/explanation` exactly: `explanation` is `null` when there
+ * is nothing to show yet.
  *
- * **Known gap (`docs/design/explanations.md` "Known gap: coarse null
- * state"):** `null` covers BOTH "this run hasn't failed — nothing to
- * explain" AND "this run failed but generation hasn't completed/been
- * triggered yet." This shape cannot distinguish them on its own — pair a
- * `null` result with the run's own `status` (e.g. via {@link
- * FlightReader.getRun}) if you need to tell those two apart, the same way
- * `@agent-flight-recorder/cli`'s `afr explain` does.
+ * **The coarse-null gap is closed, but only where `status` is present.**
+ * `explanation: null` on its own covers BOTH "this run will never have an
+ * explanation" (not failed/timed_out/cancelled) AND "eligible, but generation
+ * hasn't landed yet." `status` is the explicit discriminant that separates
+ * them (`'not_eligible' | 'pending' | 'ready'`, matching contracts'
+ * `RunExplanationQueryResult`), and `runStatus`/`runEndedAt` let a caller
+ * apply a grace period without a second round-trip.
+ *
+ * `status`, `runStatus` and `runEndedAt` are OPTIONAL on this type rather
+ * than required, because a consumer pinned to an older deployment (whose
+ * `apiGetExplanation` predates the discriminant) still has to typecheck.
+ * Branch on `status` when it is present; fall back to pairing `null` with
+ * the run's own status from {@link FlightReader.getRun} when it is not —
+ * which is what `@agent-flight-recorder/cli`'s `afr explain` does.
  */
 export interface V1GetExplanationData {
   explanation: RunExplanation | null
+  /** Explicit discriminant. Absent on deployments older than the coarse-null fix. */
+  status?: RunExplanationQueryStatus
+  /** The run's own status, carried so a caller need not re-fetch the run. */
+  runStatus?: string
+  /** The run's `endedAt`, for grace-period logic. Absent for a run still in flight. */
+  runEndedAt?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +314,60 @@ export interface ListEventsParams {
   cursor?: string
 }
 
+/**
+ * Window size used by {@link FlightReader.getRunEventWindow} when the caller
+ * gives an `aroundSequence` without an explicit `limit`. Centering needs a
+ * known width, and the server's own page default is not knowable client-side,
+ * so the window read picks one rather than guessing at the server's.
+ */
+export const DEFAULT_EVENT_WINDOW_SIZE = 100
+
+/**
+ * Parameters for {@link FlightReader.getRunEventWindow} — a BOUNDED slice of
+ * a run's event log addressed by `sequenceNumber` instead of by an opaque
+ * cursor walked from the start of the log.
+ *
+ * Exactly one of `fromSequence` / `aroundSequence` may be given (both is a
+ * caller error and throws). Omitting both reads from the head of the log,
+ * i.e. `fromSequence: 1`.
+ */
+export interface EventWindowParams {
+  /**
+   * Lower bound (inclusive) on `sequenceNumber`. Positive integer.
+   * Continue forward by re-calling with `fromSequence = last.sequenceNumber + 1` —
+   * a stateless, restartable continuation that needs no cursor.
+   */
+  fromSequence?: number
+  /**
+   * Center the window on this `sequenceNumber` — e.g. an event cited by a
+   * `RunExplanation`'s `citedSequenceNumbers`, read with its preceding
+   * context. Resolved client-side to
+   * `fromSequence = max(1, aroundSequence - floor(limit / 2))`, so it needs
+   * no second server primitive beyond the sequence floor.
+   */
+  aroundSequence?: number
+  /** Window width. Defaults to {@link DEFAULT_EVENT_WINDOW_SIZE} when `aroundSequence` is used; otherwise to the server's page default. Server-capped. */
+  limit?: number
+}
+
+/** Result of {@link FlightReader.getRunEventWindow}. */
+export interface V1EventWindowData {
+  /** The events in the window, in `sequenceNumber` order. */
+  events: Event[]
+  /**
+   * The sequence floor actually requested — echoed back because with
+   * `aroundSequence` it is computed here, and a caller reasoning about
+   * coverage needs the number that was really asked for.
+   */
+  fromSequence: number
+  /**
+   * The server's own forward cursor, when it sent one. Prefer continuing with
+   * `fromSequence = last.sequenceNumber + 1`: it survives a process restart
+   * and cannot silently point at a different position.
+   */
+  nextCursor?: string
+}
+
 /** Constructor options for {@link FlightReader}. */
 export interface FlightReaderConfig {
   /** Base URL of the Agent Flight Recorder deployment (e.g. `https://afr.example.com`). */
@@ -315,6 +382,19 @@ export interface FlightReaderConfig {
    * Default: false.
    */
   allowInsecureEndpoint?: boolean
+}
+
+/**
+ * Reject a non-positive / non-integer window bound before a request is made.
+ * Sequence numbers are positive contiguous integers (CLAUDE.md event-log rule
+ * 4), so `fromSequence: 0` or `limit: 2.5` is a caller bug, not something to
+ * forward to the server and let it interpret.
+ */
+function assertPositiveInteger(value: number | undefined, name: string): void {
+  if (value === undefined) return
+  if (!Number.isInteger(value) || value < 1) {
+    throw new RangeError(`getRunEventWindow: ${name} must be a positive integer, got ${value}.`)
+  }
 }
 
 /**
@@ -394,6 +474,104 @@ export class FlightReader {
       { ...(options.limit !== undefined && { limit: options.limit }), ...(options.cursor !== undefined && { cursor: options.cursor }) },
       this.fetchImpl
     )
+  }
+
+  /**
+   * Read a BOUNDED WINDOW of a run's event log, addressed by
+   * `sequenceNumber` rather than by an opaque cursor walked from the start.
+   *
+   * This exists because {@link getRunEvents}/{@link iterateEvents} can only
+   * page forward from the head: to reach sequence 5 000 with a cursor you
+   * must fetch the 4 999 events before it. For a consumer that already knows
+   * WHERE to look — a `RunExplanation`'s `citedSequenceNumbers`, a failing
+   * tool call, the tail of a 20 000-event run — that is the whole log for a
+   * hundred events of signal.
+   *
+   * **Never slices client-side.** This method does not fetch the run and cut
+   * a window out of it; that would spend exactly the cost the window exists
+   * to avoid. It asks the server for the window and, if the server did not
+   * honor the request, says so (see below) instead of returning a wrong
+   * answer that looks right.
+   *
+   * **SERVER SUPPORT REQUIRED — check your deployment.** The v1 events
+   * endpoint accepts `limit`/`cursor` today; `fromSequence` is a newer
+   * parameter. An older deployment IGNORES an unknown query parameter and
+   * cheerfully returns the FIRST page of the log — events 1..N, presented as
+   * though they were the window around 5 000. That silent wrong answer is the
+   * failure mode this method refuses to have: when the returned page starts
+   * below the requested floor, it throws a {@link V1ApiError} with
+   * `kind: 'invalid_response'` naming the missing server support. The check is
+   * exact, not heuristic — sequence numbers start at 1 and are contiguous, so
+   * a server that honored the floor can never return an event below it, and a
+   * server that ignored it always does whenever the run has events at all.
+   *
+   * Artifact payloads are never inlined by this (or any) reader method: an
+   * event whose payload was externalized past the 10 KB limit carries its
+   * artifact pointer and SHA-256 checksum in the payload, and the bytes are
+   * fetched separately and deliberately.
+   *
+   * @param runId - the run's id.
+   * @param options - `fromSequence` OR `aroundSequence` (not both), plus `limit`.
+   * @returns `{ events, fromSequence, nextCursor? }`. An empty `events` means
+   *   the run has nothing at or after the floor — not an error.
+   * @throws {@link V1ApiError} with `kind: 'not_found'` if the run does not
+   *   exist or does not belong to the key's org — the two are deliberately
+   *   indistinguishable, exactly as on every other method here.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if the server
+   *   ignored `fromSequence` (deployment predates windowed reads).
+   * @throws {RangeError} if the arguments are self-contradictory or not
+   *   positive integers — a caller bug, surfaced before any request is made.
+   */
+  async getRunEventWindow(runId: string, options: EventWindowParams = {}): Promise<V1EventWindowData> {
+    const { fromSequence, aroundSequence, limit } = options
+
+    if (fromSequence !== undefined && aroundSequence !== undefined) {
+      throw new RangeError(
+        'getRunEventWindow: pass either fromSequence or aroundSequence, not both — they specify the same window edge two different ways.'
+      )
+    }
+    assertPositiveInteger(fromSequence, 'fromSequence')
+    assertPositiveInteger(aroundSequence, 'aroundSequence')
+    assertPositiveInteger(limit, 'limit')
+
+    // `aroundSequence` is resolved to a floor here rather than sent as its own
+    // server parameter: centering is pure arithmetic over a width the caller
+    // already chose, so the backend only ever needs ONE new primitive (a
+    // sequence floor on an index it already has), not two.
+    const effectiveLimit = aroundSequence !== undefined ? (limit ?? DEFAULT_EVENT_WINDOW_SIZE) : limit
+    const effectiveFrom =
+      aroundSequence !== undefined
+        ? Math.max(1, aroundSequence - Math.floor((effectiveLimit ?? DEFAULT_EVENT_WINDOW_SIZE) / 2))
+        : (fromSequence ?? 1)
+
+    const data = await fetchV1<V1ListEventsData>(
+      this.config,
+      `/api/v1/runs/${encodeURIComponent(runId)}/events`,
+      {
+        fromSequence: effectiveFrom,
+        ...(effectiveLimit !== undefined && { limit: effectiveLimit }),
+      },
+      this.fetchImpl
+    )
+
+    const events = data.events ?? []
+    // Capability check. A floor of 1 is a no-op — honoring and ignoring it are
+    // the same answer — so it is not evidence either way and is not checked.
+    const first = events[0]
+    if (effectiveFrom > 1 && first !== undefined && first.sequenceNumber < effectiveFrom) {
+      throw new V1ApiError(
+        'invalid_response',
+        `getRunEventWindow(${runId}): the server ignored fromSequence=${effectiveFrom} and returned the log from sequence ` +
+          `${first.sequenceNumber} instead. This deployment's GET /api/v1/runs/:id/events does not support windowed ` +
+          `reads yet. Refusing to return the head of the log as though it were the requested window.`
+      )
+    }
+
+    return {
+      events,
+      fromSequence: effectiveFrom,
+      ...(data.nextCursor !== undefined && { nextCursor: data.nextCursor }),
+    }
   }
 
   /**

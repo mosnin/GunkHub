@@ -598,3 +598,31 @@ ingest events, or manage keys/alerts/webhooks) — those remain SDK
 (`packages/sdk`) and web-UI-only surfaces. A `read`-scoped key is sufficient
 for every `afr` command; an `ingest:write`-only key is rejected by all of
 them with `403 FORBIDDEN`.
+
+---
+
+## 5. The MCP server and this API
+
+`packages/mcp` is a second read-only client of the same surface, for MCP
+clients (Claude, Cursor, or an agent debugging its own runs). Like the CLI it
+adds no server-side behavior, uses the same `x-api-key` header, needs the same
+**`read`** scope, and shares the same 300 req/min per-key rate class — give it
+its own key rather than sharing the CLI's.
+
+Its five tools map onto the endpoints above, plus the two failure-pattern
+endpoints (`GET /api/v1/patterns` and
+`GET /api/v1/patterns/{fingerprintHash}/evidence`) that this document does not
+yet cover:
+
+| MCP tool                      | Calls |
+|-------------------------------|-------|
+| `afr_list_failure_patterns`   | `GET /api/v1/patterns` |
+| `afr_get_pattern_evidence`    | `GET /api/v1/patterns/{fingerprintHash}/evidence` |
+| `afr_explain_run`             | `GET /api/v1/runs/{runId}/explanation` |
+| `afr_get_run_events`          | `GET /api/v1/runs/{runId}/events` (windowed) |
+| `afr_list_runs`               | `GET /api/v1/runs` |
+
+The tools are deliberately tiered by token cost, and the ordering matters —
+see `docs/mcp.md`, which is currently also the only reference for the two
+pattern endpoints and carries a verification-status banner for what in it has
+and has not been exercised.

@@ -11,9 +11,10 @@
     "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
   },
   "dependencies": {
+    "@agent-flight-recorder/cli": "workspace:*",
     "@agent-flight-recorder/contracts": "workspace:*",
-    "@agent-flight-recorder/sdk": "workspace:*",
-    "@agent-flight-recorder/cli": "workspace:*"
+    "@agent-flight-recorder/mcp": "workspace:*",
+    "@agent-flight-recorder/sdk": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.4.0",

@@ -92,6 +92,21 @@ export interface ApiV1ListEventsParams {
   runId: string
   limit?: number
   cursor?: string
+  /**
+   * WINDOW floor: return only events with `sequenceNumber >= fromSequence`,
+   * served as a range read on the existing `by_run` index in
+   * `convex/read_api.ts` (no head-of-log paging to reach a deep sequence).
+   *
+   * DECLARED AND FORWARDED IN THE SAME COMMIT, with the param-table test in
+   * tests/unit/event_window_api_v1_params.test.ts added alongside — for the
+   * reason spelled out on `ApiV1ListFailurePatternsParams` below: these args
+   * cross a hand-maintained `makeFunctionReference` string ref
+   * (apps/web/src/lib/convexFunctions.ts), so TypeScript cannot catch a
+   * param that is declared here but omitted from the spread. A dropped
+   * `fromSequence` would return the HEAD of the log — a wrong window that
+   * looks exactly like a correct one.
+   */
+  fromSequence?: number
 }
 
 export async function apiGetRunEvents(
@@ -106,6 +121,7 @@ export async function apiGetRunEvents(
       runId: params.runId,
       ...(params.limit !== undefined && { limit: params.limit }),
       ...(params.cursor !== undefined && { cursor: params.cursor }),
+      ...(params.fromSequence !== undefined && { fromSequence: params.fromSequence }),
     }),
   )
   return result as ApiGetRunEventsResponse

@@ -1,0 +1,32 @@
+{
+  "name": "@agent-flight-recorder/mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server exposing the Agent Flight Recorder read API to MCP clients",
+  "type": "module",
+  "bin": {
+    "afr-mcp": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
+  },
+  "dependencies": {
+    "@agent-flight-recorder/contracts": "workspace:*",
+    "@agent-flight-recorder/sdk": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -38,6 +38,16 @@
       "dependsOn": ["^build"],
       "outputs": []
     },
+    "@agent-flight-recorder/sdk#test": {
+      // Third task with the same self-referential-import hole. dist_smoke and
+      // examples_smoke import '@agent-flight-recorder/sdk' by its own name and
+      // resolve to dist/, which `^build` never produces for this package. Cold,
+      // that is 6 failing tests; warm, it passes — so it was invisible until the
+      // tree was actually cleaned. `typecheck` and `lint` got this override when
+      // the hole was first found; `test` was missed.
+      "dependsOn": ["^build", "build"],
+      "outputs": ["coverage/**"]
+    },
     "@agent-flight-recorder/sdk#lint": {
       // Same self-referential-import reason as this package's typecheck: the
       // examples import '@agent-flight-recorder/sdk' by name, which `^build`

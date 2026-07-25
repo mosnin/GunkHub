@@ -128,6 +128,197 @@ describe('read_api.apiGetExplanation', () => {
   })
 })
 
+// Tests for apiGetRunEvents' `fromSequence` WINDOW floor — the range read on
+// the EXISTING `by_run: ["runId", "sequenceNumber"]` index (convex/schema.ts)
+// that lets a caller land on a deep sequence number without paging through
+// everything before it. Covers: the floor is genuinely honored (an
+// accept-and-ignore implementation is indistinguishable from a window that
+// legitimately starts at 1, and the SDK's getRunEventWindow throws on that
+// ambiguity rather than return a wrong answer); a floor past the end is an
+// empty page, not an error; malformed floors are rejected, not coerced; and
+// the param opens no existence oracle across orgs.
+describe('read_api.apiGetRunEvents — fromSequence window', () => {
+  async function seedReadKeyNamed(t: ReturnType<typeof convexTest>, orgId: any, keyHash: string) {
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId, keyHash, name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['read'] })
+    })
+  }
+
+  /** Seeds `count` contiguous events (sequence 1..count) for a run, per Event Log Rule 4. */
+  async function seedEvents(t: ReturnType<typeof convexTest>, orgId: any, runId: any, count: number) {
+    await t.run(async (ctx) => {
+      const base = Date.now() - count * 10
+      for (let i = 1; i <= count; i++) {
+        await ctx.db.insert('events', {
+          runId, orgId, type: i === 1 ? 'RUN_STARTED' : 'LLM_CALL', sequenceNumber: i,
+          timestamp: base + i * 10, payload: { i },
+        })
+      }
+    })
+  }
+
+  it('omitting fromSequence still returns the head of the log (unchanged behavior)', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedReadKeyNamed(t, orgA, 'read_key')
+    const runId = await seedRun(t, orgA, projectA, agentA, 'completed')
+    await seedEvents(t, orgA, runId, 40)
+
+    const result = await t.mutation(api.read_api.apiGetRunEvents, { apiKeyHash: 'read_key', runId: String(runId), limit: 5 })
+    expect(result.events.map((e: any) => e.sequenceNumber)).toEqual([1, 2, 3, 4, 5])
+  })
+
+  it('fromSequence starts the page AT the floor, not at the head of the log', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedReadKeyNamed(t, orgA, 'read_key')
+    const runId = await seedRun(t, orgA, projectA, agentA, 'completed')
+    await seedEvents(t, orgA, runId, 40)
+
+    const result = await t.mutation(api.read_api.apiGetRunEvents, {
+      apiKeyHash: 'read_key', runId: String(runId), fromSequence: 30, limit: 5,
+    })
+    // The exact assertion an accept-and-ignore server fails: the FIRST event
+    // is the floor, and nothing below the floor appears anywhere in the page.
+    expect(result.events.map((e: any) => e.sequenceNumber)).toEqual([30, 31, 32, 33, 34])
+    expect(result.events.every((e: any) => e.sequenceNumber >= 30)).toBe(true)
+  })
+
+  it('fromSequence: 1 is exactly equivalent to omitting it', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedReadKeyNamed(t, orgA, 'read_key')
+    const runId = await seedRun(t, orgA, projectA, agentA, 'completed')
+    await seedEvents(t, orgA, runId, 10)
+
+    const withFloor = await t.mutation(api.read_api.apiGetRunEvents, { apiKeyHash: 'read_key', runId: String(runId), fromSequence: 1 })
+    const without = await t.mutation(api.read_api.apiGetRunEvents, { apiKeyHash: 'read_key', runId: String(runId) })
+    expect(withFloor.events.map((e: any) => e._id)).toEqual(without.events.map((e: any) => e._id))
+  })
+
+  it('a fromSequence past the end of the run is an EMPTY page, not an error', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedReadKeyNamed(t, orgA, 'read_key')
+    const runId = await seedRun(t, orgA, projectA, agentA, 'completed')
+    await seedEvents(t, orgA, runId, 10)
+
+    const result = await t.mutation(api.read_api.apiGetRunEvents, {
+      apiKeyHash: 'read_key', runId: String(runId), fromSequence: 5000,
+    })
+    expect(result.events).toEqual([])
+    expect(result.nextCursor).toBeUndefined()
+  })
+
+  it('a run with no events at all yields an empty page for any floor', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedReadKeyNamed(t, orgA, 'read_key')
+    const runId = await seedRun(t, orgA, projectA, agentA, 'completed')
+
+    const result = await t.mutation(api.read_api.apiGetRunEvents, { apiKeyHash: 'read_key', runId: String(runId), fromSequence: 3 })
+    expect(result.events).toEqual([])
+  })
+
+  it('cursor pagination WITHIN a window never falls back below the floor', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedReadKeyNamed(t, orgA, 'read_key')
+    const runId = await seedRun(t, orgA, projectA, agentA, 'completed')
+    await seedEvents(t, orgA, runId, 40)
+
+    const first = await t.mutation(api.read_api.apiGetRunEvents, {
+      apiKeyHash: 'read_key', runId: String(runId), fromSequence: 20, limit: 5,
+    })
+    expect(first.events.map((e: any) => e.sequenceNumber)).toEqual([20, 21, 22, 23, 24])
+    expect(first.nextCursor).toBeDefined()
+
+    const second = await t.mutation(api.read_api.apiGetRunEvents, {
+      apiKeyHash: 'read_key', runId: String(runId), fromSequence: 20, limit: 5, cursor: first.nextCursor,
+    })
+    expect(second.events.map((e: any) => e.sequenceNumber)).toEqual([25, 26, 27, 28, 29])
+  })
+
+  it('rejects a malformed floor rather than coercing it to a different window', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await seedReadKeyNamed(t, orgA, 'read_key')
+    const runId = await seedRun(t, orgA, projectA, agentA, 'completed')
+    await seedEvents(t, orgA, runId, 10)
+
+    for (const bad of [0, -1, 2.5, Number.MAX_SAFE_INTEGER + 2]) {
+      await expect(
+        t.mutation(api.read_api.apiGetRunEvents, { apiKeyHash: 'read_key', runId: String(runId), fromSequence: bad }),
+      ).rejects.toThrow(/INVALID_ARGUMENT/)
+    }
+  })
+
+  it('an ingest-only key (no "read" scope) is rejected even with a window floor', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, projectA, agentA } = await seedTwoOrgs(t)
+    await t.run(async (ctx) => {
+      await ctx.db.insert('api_keys', { orgId: orgA, keyHash: 'ingest_only', name: 'k', createdBy: 'u', createdAt: Date.now(), scopes: ['ingest:write'] })
+    })
+    const runId = await seedRun(t, orgA, projectA, agentA, 'completed')
+    await seedEvents(t, orgA, runId, 5)
+
+    await expect(
+      t.mutation(api.read_api.apiGetRunEvents, { apiKeyHash: 'ingest_only', runId: String(runId), fromSequence: 2 }),
+    ).rejects.toThrow(/Forbidden/)
+  })
+
+  it('never returns another org\'s events through the window', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectB, agentB } = await seedTwoOrgs(t)
+    await seedReadKeyNamed(t, orgA, 'read_key_a')
+    const runInOrgB = await seedRun(t, orgB, projectB, agentB, 'completed')
+    await seedEvents(t, orgB, runInOrgB, 40)
+
+    await expect(
+      t.mutation(api.read_api.apiGetRunEvents, { apiKeyHash: 'read_key_a', runId: String(runInOrgB), fromSequence: 30 }),
+    ).rejects.toThrow(/not found/i)
+  })
+
+  /**
+   * EXISTENCE-ORACLE GUARD. A new query param is a new opportunity to open
+   * one: if an unknown runId and a cross-org runId diverged in ANY observable
+   * way, the endpoint would confirm the existence of another org's run. They
+   * must be deep-equal, both with and without a floor.
+   */
+  it('an unknown runId and a cross-org runId are indistinguishable, with and without fromSequence', async () => {
+    const t = convexTest(schema, modules)
+    const { orgA, orgB, projectA, projectB, agentA, agentB } = await seedTwoOrgs(t)
+    await seedReadKeyNamed(t, orgA, 'read_key_a')
+
+    // A syntactically valid id that resolves to nothing: seeded in the key's
+    // own org, then deleted (direct db access, not a product mutation —
+    // events remain append-only).
+    const danglingRunId = await seedRun(t, orgA, projectA, agentA, 'completed')
+    await t.run(async (ctx) => { await ctx.db.delete(danglingRunId) })
+
+    const runInOrgB = await seedRun(t, orgB, projectB, agentB, 'completed')
+    await seedEvents(t, orgB, runInOrgB, 40)
+
+    async function outcome(runId: string, fromSequence?: number) {
+      try {
+        return { ok: true, value: await t.mutation(api.read_api.apiGetRunEvents, {
+          apiKeyHash: 'read_key_a', runId, ...(fromSequence !== undefined && { fromSequence }),
+        }) }
+      } catch (err: any) {
+        // Normalize away anything id- or frame-specific so the comparison is
+        // about the OBSERVABLE difference, not incidental formatting.
+        return { ok: false, message: String(err?.message ?? err).split('\n')[0] }
+      }
+    }
+
+    expect(await outcome(String(danglingRunId))).toEqual(await outcome(String(runInOrgB)))
+    expect(await outcome(String(danglingRunId), 30)).toEqual(await outcome(String(runInOrgB), 30))
+    // And a floor past the end of the (real, other-org) run must not become a
+    // quiet empty page for one and an error for the other.
+    expect(await outcome(String(danglingRunId), 5000)).toEqual(await outcome(String(runInOrgB), 5000))
+  })
+})
+
 // Tests for apiListFailurePatterns — the key-authed (read scope) counterpart
 // to the Failure Patterns rollup (PREVENTION cycle 1). Covers: read-scope
 // enforcement (implicitly, via resolveReadApiKey being shared code already

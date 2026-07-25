@@ -34,6 +34,7 @@ export default defineConfig({
       '@agent-flight-recorder/contracts': path.resolve(__dirname, '../packages/contracts/src/index.ts'),
       '@agent-flight-recorder/sdk': path.resolve(__dirname, '../packages/sdk/src/index.ts'),
       '@agent-flight-recorder/cli': path.resolve(__dirname, '../packages/cli/src/index.ts'),
+      '@agent-flight-recorder/mcp': path.resolve(__dirname, '../packages/mcp/src/index.ts'),
       // Mirrors apps/web/tsconfig.json's `"@/*": ["./src/*"]` path alias, so
       // tests can import apps/web service modules that themselves use `@/lib/...`
       // imports (e.g. services/api_v1.ts importing '@/lib/convexServer') without

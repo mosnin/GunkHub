@@ -19,6 +19,7 @@ exactly what happened and why. Replay and diff are derived views over the stored
 | `apps/web` | Next.js 14 (App Router) UI, ingestion API routes, Clerk auth integration |
 | `packages/contracts` | Shared TypeScript types only — zero runtime dependencies |
 | `packages/sdk` | Client recording library — instruments agent code, ships events to Convex |
+| `packages/mcp` | MCP server — exposes the `/api/v1` read API to MCP clients; read-only, see [`docs/mcp.md`](docs/mcp.md) |
 | `convex/` | Backend schema, query/mutation functions, crons, Convex auth config |
 | `tests/` | Unit tests (`tests/unit`), integration tests against a real Convex deployment (`tests/integration`), end-to-end tests (`tests/e2e`), shared fixtures |
 | `scripts/` | Developer tooling: `validate.sh`, `check-schema-drift.ts`, `seed.ts`, `rebuild-projection.ts`, `verify-e2e.ts` |
@@ -88,6 +89,7 @@ buffering/retry/spool behavior, and payload-externalization details.
 
 - [`docs/architecture.md`](docs/architecture.md) — system architecture, entity hierarchy, event-log invariants, tenancy model, ingest paths, durability story
 - [`docs/adrs/`](docs/adrs/) and [`docs/adr/`](docs/adr/) — architecture decision records (two directories exist today: `docs/adrs/0001`–`0026` is the original sequence, `docs/adr/001-data-retention-and-erasure.md` is a newer one; consult both when researching a decision)
+- [`docs/mcp.md`](docs/mcp.md) — the MCP server (`packages/mcp`): tool contract, client configuration, and the progressive-disclosure model the tools are built around
 - [`docs/ops/`](docs/ops/) — CI setup, dependency-audit ignore rationale, observability
 - [`docs/operations_runbook.md`](docs/operations_runbook.md), [`docs/deployment_checklist.md`](docs/deployment_checklist.md) — operational procedures
 - [`design.md`](design.md) — "Neon — Server Room After Dark," the authoritative visual style for every UI change

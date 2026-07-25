@@ -170,6 +170,8 @@ been assigned without explicit instruction.
 apps/web/**             → web boundary (UI, API routes, Clerk integration, Next.js config)
 packages/contracts/**   → contracts boundary (shared types only, zero runtime deps)
 packages/sdk/**         → sdk boundary (client recording library)
+packages/cli/**         → cli boundary (`afr` command-line interface; sdk team owns)
+packages/mcp/**         → mcp boundary (read-only MCP server over /api/v1; see docs/mcp.md)
 convex/**               → convex boundary (schema, queries, mutations, auth config, crons)
 scripts/**              → shared tooling (any team may edit)
 docs/**                 → shared documentation (any team may edit)
@@ -276,3 +278,5 @@ blank screens, no silent failures (`CLAUDE.md` Design Quality Rules).
 - `docs/adrs/` and `docs/adr/` — architecture decision records
 - `docs/ops/` — CI setup, dependency-audit rationale, observability
 - `packages/sdk/README.md` — SDK usage and API reference
+- `docs/mcp.md` — the MCP server (`packages/mcp`): tool contract, MCP client config, the
+  `read`-scoped key it requires, and the progressive-disclosure tiers its tools implement

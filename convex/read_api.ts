@@ -204,16 +204,56 @@ export const apiGetRun = mutation({
   },
 });
 
-/** Paginated event log for a run, same shape as convex/events.ts listEvents. */
+/**
+ * Paginated event log for a run, same shape as convex/events.ts listEvents.
+ *
+ * `fromSequence` (optional) makes this a WINDOW read: only events with
+ * `sequenceNumber >= fromSequence` are considered, and the page starts at
+ * that floor instead of at the head of the log. This is a RANGE READ on the
+ * EXISTING `by_run: ["runId", "sequenceNumber"]` index (convex/schema.ts) —
+ * no new index, no migration, no scan of the events before the floor. It
+ * exists so a caller that wants a window around sequence N (the MCP server's
+ * tier-4 tool, packages/mcp) does not have to page through the N-1 events
+ * before it just to reach it; fetching the whole log and slicing client-side
+ * is exactly the token cost this parameter removes.
+ *
+ * A `fromSequence` past the end of the run is NOT an error — sequence
+ * numbers are contiguous from 1 (Event Log Rule 4), so "past the end" is
+ * simply an empty page. It is validated as a positive integer here as
+ * defense in depth; the v1 route (apps/web/app/api/v1/runs/[runId]/events)
+ * already rejects a malformed value with 400/INVALID_ARGUMENT before this
+ * function is reached. Both surfaces REJECT rather than coerce: a silently
+ * clamped or truncated floor returns the wrong window while looking like a
+ * correct answer.
+ *
+ * Callers that need to distinguish "the server honored my floor" from "the
+ * server is an older deployment that dropped the unknown arg and handed back
+ * the head of the log" can compare the first returned event's
+ * `sequenceNumber` against the requested floor — the two are otherwise
+ * indistinguishable, which is why this implementation must genuinely honor
+ * the floor rather than accept-and-ignore it.
+ */
 export const apiGetRunEvents = mutation({
   args: {
     apiKeyHash: v.string(),
     runId: v.string(),
     limit: v.optional(v.number()),
     cursor: v.optional(v.string()),
+    fromSequence: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+
+    // Validated BEFORE the run lookup so a malformed floor cannot be used to
+    // probe run existence: an invalid `fromSequence` fails identically for a
+    // run in the key's org, an unknown run, and another org's run.
+    const fromSequence = args.fromSequence;
+    if (fromSequence !== undefined && (!Number.isSafeInteger(fromSequence) || fromSequence < 1)) {
+      throw new Error(
+        "INVALID_ARGUMENT: fromSequence must be a positive integer (sequence numbers start at 1)",
+      );
+    }
+
     const runId = args.runId as Id<"runs">;
     const run = await ctx.db.get(runId);
     if (!run || run.orgId !== apiKey.orgId) {
@@ -223,7 +263,11 @@ export const apiGetRunEvents = mutation({
     const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
     const page = await ctx.db
       .query("events")
-      .withIndex("by_run", (q) => q.eq("runId", runId))
+      .withIndex("by_run", (q) =>
+        fromSequence === undefined
+          ? q.eq("runId", runId)
+          : q.eq("runId", runId).gte("sequenceNumber", fromSequence),
+      )
       .paginate({ numItems: limit, cursor: args.cursor ?? null });
 
     return {

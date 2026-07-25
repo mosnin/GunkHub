@@ -27,7 +27,7 @@ export { SDK_VERSION } from './version.js'
 export { redactPayload } from './redaction.js'
 export { buildErrorSummary, ERROR_SUMMARY_MAX_LENGTH } from './error-summary.js'
 export { decideSampling, hashString } from './sampling.js'
-export { FlightReader } from './reader.js'
+export { FlightReader, DEFAULT_EVENT_WINDOW_SIZE } from './reader.js'
 export { V1ApiError, fetchV1, tryParseV1Json, messageFromV1Body } from './v1-client.js'
 
 export type {
@@ -64,6 +64,8 @@ export type {
   V1ReplayData,
   ListRunsParams,
   ListEventsParams,
+  EventWindowParams,
+  V1EventWindowData,
   V1GetExplanationData,
   V1ListFailurePatternsData,
   ListFailurePatternsParams,
@@ -81,6 +83,7 @@ export type {
   Event,
   RunExplanation,
   RunExplanationKind,
+  RunExplanationQueryStatus,
   FailurePattern,
   FailurePatternClass,
   FailurePatternStatus,

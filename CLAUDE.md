@@ -30,7 +30,26 @@ Each boundary owns its domain exclusively. Do not blur these lines.
 | `packages/contracts` | Shared TypeScript types only — zero runtime dependencies |
 | `packages/sdk` | Client recording library — instruments agent code, ships events to Convex |
 | `packages/cli` | `afr` command-line interface — sdk team owns |
+| `packages/mcp` | MCP server exposing the read API to MCP clients — **READ SURFACE ONLY** |
 | `convex/` | Backend schema, query functions, mutation functions, Convex auth config |
+
+`packages/mcp` is constrained beyond the ordinary boundary rules, because it hands a
+tool surface to an autonomous caller:
+
+- **It must never write.** No event ingestion, no run creation, no status/triage/
+  lifecycle mutation, no alert or webhook configuration. Every tool it exposes is a
+  `GET`. If a tool would change stored state, it does not belong in this package.
+- **It must not import from `convex/` directly**, and must not hold a Convex deploy key
+  or a Clerk session. It reaches the product only over the public `/api/v1/**` read API
+  with an `x-api-key` carrying the `read` scope — the same door the `afr` CLI uses, with
+  the same org scoping, the same 403 on a key that lacks `read`, and the same per-key
+  rate class.
+- **Entity types come from `@agent-flight-recorder/contracts`**, never redeclared
+  locally (Repo Conventions → Types applies unchanged).
+- **Tool responses are token-budgeted by design.** The tool set is a progressive-
+  disclosure ladder (cheap orientation first, raw events last) — see `docs/mcp.md`.
+  Adding a tool that returns unbounded event payloads defeats the package's purpose;
+  large payloads stay artifact pointers, per Event Log Rule 3.
 
 ### File Ownership Map
 
@@ -42,6 +61,7 @@ apps/web/**              → web boundary
 packages/contracts/**   → contracts boundary
 packages/sdk/**         → sdk boundary
 packages/cli/**         → cli boundary — sdk team owns
+packages/mcp/**         → mcp boundary — read-only MCP server; no writes, no convex/ imports
 convex/**               → convex boundary
 scripts/**              → shared tooling (any team may edit)
 docs/**                 → shared documentation (any team may edit)
@@ -202,6 +222,9 @@ Every UI decision must reflect this.
 - `CONTRIBUTING.md` is the practical dev workflow doc (setup, verification gates, boundary
   map, and how-tos for adding an event type / Convex function / UI surface / package).
   It defers to this file as authoritative on rules; update both if a rule changes.
+- `docs/mcp.md` documents the `packages/mcp` server: tool contract, MCP client config,
+  env vars, required key scope, and the progressive-disclosure model the tool set is
+  built around. Read it before adding or reshaping an MCP tool.
 - Non-negotiable decisions (event log rules, tenancy rules, retention/erasure) are
   formalized as ADRs. Two ADR directories currently exist — `docs/adrs/` (the original
   numbered sequence, `0001`–`0026`) and `docs/adr/` (a newer sequence, starting with
