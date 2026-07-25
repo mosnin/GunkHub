@@ -21,7 +21,7 @@ import { z } from 'zod'
 
 import { toMcpError } from '../errors.js'
 import { fetchEventWindow } from '../events-window.js'
-import { budgetEventRows, PROVENANCE_NOTE, TRUNCATION_NOTE } from '../projections.js'
+import { budgetEventRows, ORDERING_UNVERIFIED_BASIS, PROVENANCE_NOTE, TRUNCATION_NOTE } from '../projections.js'
 
 import { jsonResult } from './shared.js'
 
@@ -136,7 +136,13 @@ export function registerGetRunEvents(server: McpServer, reader: AfrReader): void
         'inline payloads are replaced by a labelled {truncated,bytes,preview}. Page forward with nextFromSequence. ' +
         'An event DERIVED from an OpenTelemetry span rather than recorded first-party carries derived:"otel", plus ' +
         'derivedLossy:true when the mapping dropped information — treat those payloads as an interpretation, and ' +
-        'note that on a derived run sequenceNumber is ingest order, not necessarily temporal order.',
+        'note that on a derived run sequenceNumber is ingest order, not necessarily temporal order. ' +
+        `orderingBasis:"${ORDERING_UNVERIFIED_BASIS}" on the response means that is PROVEN for this run: at least ` +
+        'one derived event has no ordering key, so the sequence you are holding is an arrival log and cannot be ' +
+        'made into a timeline — do not reason about what happened before what. Its ABSENCE means UNDETERMINED, ' +
+        'not verified: this tool returns a window, and the three-way verdict needs the whole event log, which it ' +
+        'deliberately never reads. When the distinction matters, get the ordering from the run view rather than ' +
+        'inferring it here.',
       inputSchema,
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
@@ -160,7 +166,7 @@ export function registerGetRunEvents(server: McpServer, reader: AfrReader): void
       const start = resolveStart(limit, args.aroundSequence, args.fromSequence)
       try {
         const window = await fetchEventWindow(reader, args.runId, start, limit)
-        const { rows, truncated, derived } = budgetEventRows(window.events, { includeProvenance })
+        const { rows, truncated, derived, orderUnverified } = budgetEventRows(window.events, { includeProvenance })
         return jsonResult({
           runId: args.runId,
           fromSequence: start,
@@ -170,6 +176,12 @@ export function registerGetRunEvents(server: McpServer, reader: AfrReader): void
           // Once per window, and only when the window contains a derived event
           // — the same rule truncationNote follows. A native window pays zero.
           ...(derived && { provenanceNote: PROVENANCE_NOTE }),
+          // ONLY WHEN PROVEN, never as a status field. See
+          // ORDERING_UNVERIFIED_BASIS: a window can prove `ingest-unverified`
+          // outright but can never prove `temporal` or `sequence-native`, so
+          // this is a one-sided alarm and the absent case is stated as
+          // "undetermined" in the description rather than implied to be fine.
+          ...(orderUnverified && { orderingBasis: ORDERING_UNVERIFIED_BASIS }),
         })
       } catch (err) {
         throw toMcpError(err, 'run')

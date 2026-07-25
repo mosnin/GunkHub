@@ -518,6 +518,12 @@ export const apiGetReplay = mutation({
         timestamp: e.timestamp,
         payload: e.payload,
         parentEventId: e.parentEventId !== undefined ? String(e.parentEventId) : undefined,
+        // ADR-007. Both are REQUIRED for the projection to know whether its
+        // frame order is a timeline or an arrival log. Dropping them here
+        // would make every derived run report `sequence-native` — a silent
+        // claim of full confidence over collector flush order.
+        provenance: e.provenance,
+        temporalOrder: e.temporalOrder,
       })),
     );
   },

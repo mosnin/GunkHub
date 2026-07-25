@@ -195,3 +195,115 @@ export function extractErrorMessage(payload: unknown): string | undefined {
   }
   return undefined;
 }
+
+// ---------------------------------------------------------------------------
+// ADR-007 — the O(1) ordering verdict for a derived run.
+//
+// WHAT THIS EXISTS TO REPLACE. `analyzeRunOrdering` (contracts) returns
+// `sequence-native` | `temporal` | `ingest-unverified`, and the verdict is a
+// property of the WHOLE log: `ingest-unverified` iff ANY derived event lacks a
+// temporal key. That asymmetry is the problem. Seeing one unkeyed event PROVES
+// the run is unverifiable, but no window can ever prove the other two verdicts
+// — absence of evidence within a page says nothing about the rest of the run.
+// So a paged consumer can only ship a one-sided alarm, and the full verdict
+// costs an O(run) scan that the MCP tier-4 budget exists to refuse and that
+// `apps/web` currently pays on every render.
+//
+// These two counters record the fact at the ONE moment it is free: on write,
+// when we already hold the events. ADR-002's terms apply and are met —
+// additive, org-scoped, observability-grade, and never a substitute for the
+// event log, which remains the source of truth for the ordering itself.
+//
+// THE THREE PROPERTIES THAT MAKE THEM SAFE, each of which the counter would be
+// worthless without:
+//
+//   ADD-ONLY. Both are sums over appended events. Nothing recomputes them and
+//     nothing decrements, so they cannot drift the way a cached aggregate can.
+//   PARTITION-INDEPENDENT. Each is a function of the event SET, not of arrival
+//     order, so a trace delivered in any number of batches in any order
+//     produces the same totals. A counter that depended on arrival order would
+//     be R1 again in a new costume.
+//   REDELIVERY-NEUTRAL. A redelivered batch appends ZERO events, so it adds
+//     zero. Idempotency is inherited from the append path rather than needing
+//     its own guard.
+//
+// ONE SHARED COUNTER FOR EVERY WRITER, deliberately. The counted property is
+// "was this row written without a temporal key", so the count has to be taken
+// wherever rows are written — and there are two such places (the ingest batch
+// and the settle terminal). A second hand-rolled tally in the second writer is
+// exactly the mirroring failure this codebase keeps paying for, so both call
+// this.
+// ---------------------------------------------------------------------------
+
+export interface DerivedOrderingTally {
+  /** Events whose provenance says `otel` — i.e. our interpretation, not a first-party recording. */
+  derived: number;
+  /**
+   * Derived events stored WITHOUT a usable temporal key. Non-zero means the run
+   * can only be rendered in arrival order, and must be LABELLED as such rather
+   * than presented as a timeline.
+   */
+  unkeyed: number;
+}
+
+/**
+ * Tally the ordering-relevant facts about a batch of events about to be (or
+ * just) appended.
+ *
+ * The key check is STRUCTURAL, not merely a presence test: a malformed stored
+ * key must count as absent, for the same reason `isTemporalOrderKey` validates
+ * before trusting — a half-parsed ordering key produces a confidently wrong
+ * timeline, which is worse than an admittedly unverified one.
+ *
+ * ---------------------------------------------------------------------------
+ * ONE BUCKET, NOT TWO — "no key" and "unusable key" are counted together, and
+ * this is a decision rather than an oversight. Do not "fix" it by splitting.
+ *
+ * `/^\d+$/` means a NEGATIVE epoch instant — reachable from an emitter with a
+ * badly set clock — counts as unkeyed, so `otelUnkeyedDerivedCount` can be
+ * non-zero for a run that is otherwise perfectly well formed. Splitting the
+ * buckets to report that case more precisely looks like an improvement and is
+ * in fact the one change that would break the counter:
+ *
+ *   THE COUNTER'S ENTIRE PURPOSE IS TO BE AN O(1) EQUIVALENT OF
+ *   `analyzeRunOrdering`. That function reads keys through
+ *   `isTemporalOrderKey`, which applies exactly this `/^\d+$/` test and treats
+ *   a failing key as ABSENT. If this tally classified an unusable key
+ *   differently, the O(1) verdict and the O(run) verdict would disagree — and
+ *   a fast path that disagrees with the authority it stands in for is worse
+ *   than no fast path, because a consumer cannot tell which one lied.
+ *
+ * It is also not a false alarm. `readTemporalOrder` rejects such a key, so
+ * `orderEventsForProjection` really does fall back to the sequence sort: the
+ * run really can only be shown in arrival order. Reporting `ingest-unverified`
+ * for it is the truth, not an over-reaction — and the alternative (clamping a
+ * negative instant to zero so it parses) would falsify a recorded timestamp,
+ * which is the one thing this whole path exists not to do.
+ *
+ * If the product ever wants to distinguish "badly clocked" from "unkeyed" in
+ * the UI, the place to do it is a separate signal derived from
+ * `provenance.lossReasons`, NOT by desynchronising these two functions.
+ * ---------------------------------------------------------------------------
+ */
+export function tallyDerivedOrdering(
+  events: ReadonlyArray<{
+    provenance?: { source?: string } | undefined;
+    temporalOrder?: unknown;
+  }>,
+): DerivedOrderingTally {
+  let derived = 0;
+  let unkeyed = 0;
+  for (const event of events) {
+    if (event.provenance?.source !== "otel") continue;
+    derived += 1;
+    const key = event.temporalOrder;
+    const ok =
+      typeof key === "object" &&
+      key !== null &&
+      typeof (key as Record<string, unknown>)["instantUnixNano"] === "string" &&
+      /^\d+$/.test((key as Record<string, unknown>)["instantUnixNano"] as string) &&
+      typeof (key as Record<string, unknown>)["spanId"] === "string";
+    if (!ok) unkeyed += 1;
+  }
+  return { derived, unkeyed };
+}

@@ -30,7 +30,19 @@ export type AfrErrorCode =
   | "RATE_LIMITED"
   | "COMMENT_LIMIT_EXCEEDED"
   | "INVALID_ARGUMENT"
-  | "PURGE_FAILED";
+  | "PURGE_FAILED"
+  // --- ADR-007 (OTel span ingestion). All four are REJECTIONS, never partial
+  // acceptances: an OTLP exporter that receives success drops the batch, so a
+  // half-recorded batch is a permanently incomplete run that nothing knows is
+  // incomplete. Mirrored in packages/contracts/src/api_errors.ts.
+  /** OTLP batch exceeded MAX_OTEL_SPANS_PER_BATCH. Rejected whole, not truncated. */
+  | "BATCH_TOO_LARGE"
+  /** A derived payload exceeded the 10 KB inline limit (Event Log Rule 3). */
+  | "PAYLOAD_TOO_LARGE"
+  /** The span->event mapper returned a fatal diagnostic; nothing was written. */
+  | "OTEL_MAPPING_FAILED"
+  /** Trace's earliest span predates the stale-run ceiling; see convex/otel_ingest.ts. */
+  | "OTEL_TRACE_TOO_OLD";
 
 /**
  * Build an Error whose message is prefixed with a stable machine-readable code:

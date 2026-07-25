@@ -33,7 +33,7 @@ of magnitude apart:
 | 1 | `afr_list_failure_patterns` | "What is broken?" — *all* of it, beyond triage's top 5 | ~294 tokens (10 patterns) |
 | 2 | `afr_get_pattern_evidence` | "Did the fix hold?" | ~423 tokens (one pattern, capped history) |
 | 3 | `afr_explain_run` | "Why did *this run* fail?" | **~121 tokens** (one run) |
-| 4 | `afr_get_run_events` | "Show me the literal events." | **~4,445 tokens** (one saturated 50-event window; ~8,717 with `includeProvenance`) |
+| 4 | `afr_get_run_events` | "Show me the literal events." | **~4,445 tokens** (one saturated 50-event window; ~8,707 with `includeProvenance`) |
 | — | `afr_list_runs` | Orientation: which runs exist | ~475 tokens (20 runs) |
 
 Read the last row of the ladder before you read anything else on this page. **One
@@ -90,7 +90,7 @@ one tier-4 window.
 **The naive path, for contrast.** An agent that skips the ladder and opens with
 `afr_get_run_events` pays up to **~4,445 tokens** for a fifty-event window and gets
 back… fifty event records. No root cause, no fingerprint, no verdict on whether this
-is new or the thing that has been failing all week. It has spent roughly 12x the cost
+is new or the thing that has been failing all week. It has spent roughly 13x the cost
 of `afr_triage()` to buy the raw material for an answer rather than the answer, and it
 now has to reason about the failure inside whatever context budget is left. Worse, it
 had to *choose a run id* before it could make the call at all — which is the one thing
@@ -136,10 +136,39 @@ completed, which must never be reported as "all clear."**
 >   **3,390 → 3,991**) and added a fourth tier-4 row for the opt-in full-record path
 >   (`includeProvenance: true`, **8,717** at its lower `MAX_LIMIT_WITH_PROVENANCE`
 >   of 40). Native-only windows pay none of this. No other figure moved.
+> - **Re-measured a third time after the fixtures were made contract-maximal again**
+>   (contracts 0.11.0 → 0.14.0). ADR-007 added four fields to `Run`
+>   (`otelTraceId`, `otelRoot`, `otelRootStartNano`, `otelLastAppendAt`) and one to
+>   `Event` (`temporalOrder`); the shared fixtures did not populate them, so
+>   `FIXTURE_NOT_MAXIMAL` fired and every budget on this page had been measured
+>   against a payload smaller than the contract permits. They are populated now.
+>   **No measured figure moved** — `toRunRow` and `toEventRow` build their rows by
+>   explicit assignment, never by spread, so the five new fields are dropped at the
+>   projection rather than paid for. The two `afr_list_runs` *ratios* moved, because
+>   the un-projected input got fatter while the row did not: **58.8x → 62.6x** and
+>   **62.0x → 66.1x**. `scripts/token-budget-baseline.json` is byte-identical.
+>   ADR-007 landed on `Run` in four separate waves during this cycle — the
+>   `otel*` block, then `otelMaxInstantNano`, then `derivedEventCount` /
+>   `otelUnkeyedDerivedCount` — and `FIXTURE_NOT_MAXIMAL` caught every one within
+>   minutes. **Not one of them moved a token count**, because `toRunRow` builds
+>   its row by explicit assignment; all seven fields are dropped at the
+>   projection. The ratios above are the only visible trace, which is exactly why
+>   they are checked (`DOC_FIGURE_STALE`) rather than transcribed by hand.
+> - **Two deliberate movements, both landing in the same diff as the numbers above.**
+>   (a) Tier 4 gained an `orderingBasis` field — see
+>   [Ordering on a derived run](#ordering-on-a-derived-run). Measured at exactly
+>   **+9 tokens**, and only when it fires: **4,445 → 4,454** on an otherwise
+>   identical window. Every other scenario is unchanged, because the field is
+>   absent unless proven. (b) The fixture family's `spanId` was 17 characters
+>   where a W3C span id is 16 — safe in direction (a maximal fixture that
+>   over-states cannot under-state a budget) but wrong, and this family's claim is
+>   that it is contract-maximal and *provably* so. Corrected, which moved the one
+>   scenario that emits a span id: `includeProvenance` **8,717 → 8,707** (1 byte ×
+>   40 events).
 > - The enforcement described in
 >   [What keeps these numbers true](#what-keeps-these-numbers-true): the script and
->   `scripts/token-budget-baseline.json` exist and run; the seven `mcp_*` suites pass
->   (144 tests) under `pnpm test`; `createServer` registers exactly six tools and the
+>   `scripts/token-budget-baseline.json` exist and run; the eight `mcp_*` suites pass
+>   (171 tests) under `pnpm test`; `createServer` registers exactly six tools and the
 >   script enumerates them from that registry.
 >
 > **Unverified — treat as design intent, not measurement:**
@@ -272,12 +301,14 @@ resolves `@agent-flight-recorder/sdk` and `/contracts` to their `dist/`.
 | `afr_get_pattern_evidence` | **423** | 450 | one pattern, 100 inbound lifecycle transitions, capped to 10 (34.7x) |
 | `afr_explain_run` realistic | **121** | 200 | a realistic `RunExplanation` |
 | `afr_explain_run` contract-maximal | **198** | 200 | 2 KB summary + 1 KB root cause + 1 KB fix |
+| `afr_explain_run` 20 six-digit citations | **198** | 200 | the same explanation on a 100k-event run — what makes `CITED_SEQUENCE_BYTE_CAP`'s "any count, any width" claim falsifiable |
 | `afr_explain_run` pending | **24** | 200 | no explanation generated yet |
-| `afr_get_run_events` externalized | **4,445** | 10,000 | a saturated 50-event window, every payload externalized, every event OTel-derived |
-| `afr_get_run_events` inline | **3,991** | 10,000 | a saturated 50-event window of 10,040-byte inline payloads, just under the externalization threshold |
-| `afr_get_run_events` + `includeProvenance` | **8,717** | 10,000 | 40 fully-derived events at `MAX_LIMIT_WITH_PROVENANCE` — the full `OtelEventProvenance` record per event, not the compact marker |
-| `afr_list_runs`, 20 | **475** | 600 | a default page of maximal `Run` documents (58.8x) |
-| `afr_list_runs`, 100 | **2,250** | 2,800 | a saturated page at `MAX_LIMIT` (62.0x) |
+| `afr_get_run_events` externalized | **4,445** | 10,000 | a saturated 50-event window, every payload externalized, every event OTel-derived and carrying a `temporalOrder` key (3.1x) |
+| `afr_get_run_events` inline | **3,991** | 10,000 | a saturated 50-event window of 10,040-byte inline payloads, just under the externalization threshold (34.3x) |
+| `afr_get_run_events` + `includeProvenance` | **8,707** | 10,000 | 40 fully-derived events at `MAX_LIMIT_WITH_PROVENANCE` — the full `OtelEventProvenance` record per event, not the compact marker (1.3x) |
+| `afr_get_run_events` ordering unverifiable | **4,454** | 10,000 | the same externalized window with no `temporalOrder` on any event — the `orderingBasis` alarm firing, and the pair that measures its cost (2.6x) |
+| `afr_list_runs`, 20 | **475** | 600 | a default page of maximal `Run` documents, ADR-007 `otel*` block included (62.6x) |
+| `afr_list_runs`, 100 | **2,250** | 2,800 | a saturated page at `MAX_LIMIT` (66.1x) |
 
 The ratios in the fixture column are **commentary**. Nothing passes on one — every
 budget is an absolute integer, because a ratio against a fat fixture gets easier as the
@@ -308,8 +339,8 @@ Three layers, and they are not redundant:
 
 | Layer | What it does |
 |---|---|
-| `scripts/check-token-budgets.ts` | the standing gate. Enumerates tools from `createServer()`'s registry, measures 14 scenarios through the registered handlers, asserts absolutes, and ratchets `scripts/token-budget-baseline.json` |
-| `tests/unit/mcp_budgets.ts` | the single declaration of every budget and of the estimator, imported by every mcp suite. `450` used to appear in three files and `300` in two, only one of each carrying the derivation |
+| `scripts/check-token-budgets.ts` | the standing gate. Enumerates tools from `createServer()`'s registry, measures 17 scenarios through the registered handlers, asserts absolutes, and ratchets `scripts/token-budget-baseline.json` |
+| `tests/unit/mcp_budgets.ts` | the single declaration of every budget, of the estimator, **and of the contract-maximal fixture family** — all imported by every mcp suite. `450` used to appear in three files and `300` in two, only one of each carrying the derivation; `fatPattern` appeared in four, and the copies measured 284 where the script measured 294 for the same tool on the same scenario. The suites now import all three from here, so `FIXTURE_DUPLICATION` reports clean |
 | `tests/unit/mcp_progressive_disclosure.test.ts`, `mcp_triage.test.ts`, `mcp_triage_measure.test.ts`, `mcp_triage_next_hops.test.ts` | projection-level budgets plus the shape guards — a projection that starts emitting a field it is not allowed to fails here even when the byte count would still fit |
 
 Everything drives the real exported code — not a copy, not a snapshot — over fixtures
@@ -903,6 +934,50 @@ are artifact pointers, never inline bytes — this tool returns the pointer.
 Use it last, with a window centered on a sequence number you got from tier 3. If you
 find yourself paging the whole log, the earlier tiers did not do their job or you
 skipped them.
+
+#### Ordering on a derived run
+
+For an event derived from an OpenTelemetry span, `sequenceNumber` is **the order we
+learned about the event, not the order it happened** (ADR-007; see
+`packages/contracts/src/temporal.ts`). Within one OTLP batch the two coincide. Across
+batches they cannot: a span that arrives late but occurred early can only be
+*appended*, because inserting it would require renumbering, and renumbering an
+append-only log is permanent corruption (Event Log Rule 1).
+
+The tool used to state that caveat and stop there. **A warning with no resolution
+mechanism is worse than silence** — it makes the uncertainty unresolvable rather than
+merely unflagged, and MCP is the one surface where a caller cannot go and look at the
+run view instead. So the response now carries:
+
+```
+orderingBasis: "ingest-unverified"
+```
+
+**Present means proven.** At least one derived event in this run has no ordering key,
+so what you are holding is an arrival log and cannot be made into a timeline. Do not
+reason about what happened before what.
+
+**Absent means undetermined — it is not a clean bill of health.** The reasoning is
+one-directional on purpose. `analyzeRunOrdering` returns `ingest-unverified` for a run
+*iff* any derived event lacks a key, so seeing one in a window proves the verdict for
+the whole run regardless of what lies outside the window. Nothing observable in a
+window can prove the other two verdicts (`temporal`, `sequence-native`), because a
+single unkeyed event one sequence number outside it would overturn them. A tier-4
+response is a slice **by construction**, so this is the normal case, not an edge case,
+and the tier does not guess.
+
+Costs **9 tokens**, and only when it fires. The semantics live in the tool
+description, which an agent pays for once per session, rather than in the response,
+which it pays for on every call — an earlier draft put the explanation in
+`provenanceNote` and measured +33 tokens on *every* derived window for information the
+description already carried.
+
+> **Known gap.** The three-way verdict needs an O(run) read that this tier
+> deliberately never performs, so `temporal` and `sequence-native` are not reportable
+> here at all. The fix is not in this package: a denormalized run-level counter
+> (an `unkeyedDerivedCount`, monotonic and add-only in the manner of `tokensIn` /
+> `modelsSeen`) written at ingest would make the full verdict an O(1) read for MCP,
+> the CLI and the web UI alike. That is a `convex/` + `packages/contracts` change.
 
 ### `afr_list_runs` — orientation
 

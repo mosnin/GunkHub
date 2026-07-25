@@ -64,7 +64,15 @@ export default defineSchema({
     // createAgentVersion (helpers/agent_version_fields.ts), not here. Bounded
     // to <= 20 rules at write time.
     evalRules: v.optional(v.array(v.any())),
-  }).index("by_agent", ["agentId"]),
+  })
+    .index("by_agent", ["agentId"])
+    // ADR-007: exact get-or-create key for convex/otel_ingest.ts, which must
+    // resolve `(agentId, version)` to at most one immutable AgentVersion when
+    // it materializes a run for a new trace. Same OCC argument as
+    // runs.by_org_trace: two concurrent first batches naming the same version
+    // read the same empty range, so the second is retried and reuses the
+    // version the first created instead of inserting a duplicate.
+    .index("by_agent_version", ["agentId", "version"]),
 
   runs: defineTable({
     orgId: v.id("organizations"),
@@ -137,6 +145,71 @@ export default defineSchema({
     // authoritative — the event log remains the source of truth for the
     // underlying payloads themselves.
     modelsSeen: v.optional(v.array(v.string())),
+    // ADR-007 (OTel span ingestion). The W3C trace id this run was derived
+    // from, set ONLY by convex/otel_ingest.ts and never by the SDK path.
+    //
+    // THE TRACE->RUN RULING LIVES HERE, because this field IS the ruling: one
+    // trace is exactly one run, keyed `(orgId, otelTraceId)` via the
+    // by_org_trace index below. See convex/otel_ingest.ts for the full
+    // argument and for why that index (not a lock, not a counter) is what
+    // makes concurrent batches of the same trace safe.
+    //
+    // Additive + optional: every existing run predates OTel ingestion and
+    // correctly has none. Absent means "not derived from a trace".
+    otelTraceId: v.optional(v.string()),
+    // ADR-007: the trace's TRUE ROOT span, recorded the first time one is seen
+    // CLOSED. Its presence is what makes the run eligible to be settled (i.e.
+    // closed with a terminal event); its absence means the outcome is genuinely
+    // unknown and the run correctly stays in-progress per Event Log Rule 5.
+    //
+    // NOT a denormalization of event data: none of this is derived from stored
+    // events, and nothing recomputes it. It is ingest-path state about a trace
+    // that has no home in the event log, recorded once and never revised.
+    otelRoot: v.optional(
+      v.object({
+        spanId: v.string(),
+        spanName: v.string(),
+        /** Root span status. Decides run.completed vs run.failed. */
+        status: v.union(v.literal("unset"), v.literal("ok"), v.literal("error")),
+        /** Root's end instant, epoch NANOSECONDS as a decimal string. */
+        endUnixNano: v.string(),
+      }),
+    ),
+    // The chosen root's START instant, epoch nanoseconds as a decimal string.
+    // Stored alongside otelRoot because root selection is `min(start, spanId)`
+    // over the whole TRACE, and comparing a later batch's candidate against the
+    // recorded one requires the recorded one's start. Without it the choice
+    // would depend on arrival order, and a trace with two true roots would
+    // settle to completed or failed based on which batch flushed first.
+    otelRootStartNano: v.optional(v.string()),
+    // The LATEST temporal instant of any event appended to this run, epoch
+    // nanoseconds as a decimal string. Monotonic max, add-only, never
+    // recomputed — the same justification as tokensIn/tokensOut under ADR-002,
+    // and it is ingest-path state rather than a cached aggregate of the log.
+    //
+    // It exists because the settle terminal must sort AFTER every event it
+    // terminates, and the only alternative is scanning the run's events, which
+    // is not affordable at the MAX_EVENTS_PER_RUN ceiling. Deriving it from the
+    // LAST-APPENDED event instead is what broke: the event set is
+    // partition-independent, but which event was appended last is not.
+    otelMaxInstantNano: v.optional(v.string()),
+    // ADR-007 / ADR-002: the O(1) ordering verdict for this run.
+    //   derivedEventCount === 0        -> "sequence-native"
+    //   otelUnkeyedDerivedCount === 0  -> "temporal"
+    //   otherwise                      -> "ingest-unverified"
+    // Add-only sums over appended events, taken by tallyDerivedOrdering at
+    // every write site. Observability-grade: the event log remains the source
+    // of truth for the ordering itself. They exist because the verdict is
+    // otherwise an O(run) scan — which the MCP tier-4 budget refuses outright,
+    // and which the web UI pays on every render — while being free at write
+    // time, when the events are already in hand.
+    derivedEventCount: v.optional(v.number()),
+    otelUnkeyedDerivedCount: v.optional(v.number()),
+    // Wall clock of the most recent derived append. The settle sweep waits for
+    // this to go quiet for OTEL_TRACE_SETTLE_MS before closing the run, which
+    // is what makes "the trace has finished arriving" a decision with evidence
+    // behind it rather than a per-batch guess.
+    otelLastAppendAt: v.optional(v.number()),
   })
     .index("by_org", ["orgId"])
     .index("by_org_status", ["orgId", "status"])
@@ -157,6 +230,21 @@ export default defineSchema({
     // compareVersions ships and is being updated to use this index this
     // same cycle.
     .index("by_agent_version_started", ["agentVersionId", "startedAt"])
+    // ADR-007: the trace->run resolution key for convex/otel_ingest.ts, and
+    // the ONLY way that mutation looks a run up. Two properties, both
+    // load-bearing and both lost if this were a filter() scan instead:
+    //   TENANCY — `orgId` is the FIRST component, so a lookup physically
+    //     cannot range over another org's runs. A trace id belonging to org A
+    //     is not "denied" for org B, it is simply absent from B's range, which
+    //     is what makes it indistinguishable from a trace that never existed.
+    //   CONCURRENCY — Convex OCC records the INDEX RANGE a query read. Two
+    //     concurrent first batches of the same trace both read the empty range
+    //     `(orgId, traceId)`; whichever commits second has had that exact
+    //     range written into, so its read set is invalidated and it is retried
+    //     against the run the first one created. A `.filter()` over by_org
+    //     would also conflict, but by ranging over EVERY run in the org — it
+    //     would serialize all ingest for the tenant.
+    .index("by_org_trace", ["orgId", "otelTraceId"])
     // ADR-002: full-text search over runs, scoped to the caller's org via
     // filterFields. searchField must be a stored field (searchText).
     .searchIndex("search_runs", {
@@ -212,7 +300,58 @@ export default defineSchema({
         }),
       ),
     ),
-  }).index("by_run", ["runId", "sequenceNumber"]),
+    // ADR-007: the TEMPORAL truth for a derived event, carried separately from
+    // `sequenceNumber`. Mirrors `TemporalOrderKey` in
+    // packages/contracts/src/temporal.ts.
+    //
+    // WHY THIS COLUMN HAS TO EXIST. On the OTel path `sequenceNumber` is the
+    // order we LEARNED about an event, not the order it happened: a span
+    // arriving in batch 2 that occurred before spans already appended in batch
+    // 1 can only be APPENDED, because inserting it would require renumbering,
+    // and renumbering an append-only log is permanent corruption. The mapper
+    // computes this key precisely so the temporal order survives that append.
+    // If the ingest path does not PERSIST it, the ruling is decorative and
+    // every OTel-ingested run is permanently unorderable — with no backfill
+    // available that is not a rewrite of history.
+    //
+    // OPTIONAL, and absent by construction on every SDK-recorded event: a
+    // native event has no span and no clamp, and its `sequenceNumber` IS its
+    // temporal order. Absent on a DERIVED event means the ordering is
+    // unverifiable, which consumers must LABEL (`ingest-unverified`) rather
+    // than silently render as a timeline.
+    //
+    // NANOSECONDS AS DECIMAL STRINGS, not numbers. `v.number()` is a float64;
+    // ULP at a 2026 epoch-nanosecond value (~1.75e18) is 256 ns, so storing
+    // these as numbers would collapse instants under ~128 ns apart into the
+    // same value and manufacture ties out of genuinely ordered input. `v.int64`
+    // is not used because BigInt is not JSON-serializable across the read API.
+    temporalOrder: v.optional(
+      v.object({
+        instantUnixNano: v.string(),
+        rawInstantUnixNano: v.string(),
+        phase: v.union(v.literal("open"), v.literal("close")),
+        depth: v.number(),
+        spanId: v.string(),
+      }),
+    ),
+  })
+    .index("by_run", ["runId", "sequenceNumber"])
+    // ADR-007 C1/C2: SPAN-LEVEL idempotency for convex/otel_ingest.ts.
+    //
+    // ADR-0007's key is `(runId, sequenceNumber)`, which cannot dedupe a span:
+    // a redelivered span is assigned a DIFFERENT derived ordinal if other
+    // spans landed in between, so it does not collide and is inserted twice.
+    // Under an append-only log that is permanent doubling, not a glitch.
+    //
+    // A SCAN of the run's events is not an acceptable substitute at the
+    // MAX_EVENTS_PER_RUN ceiling (50k) — convex/artifact_gc.ts already pages
+    // rather than .collect()ing a run's events for exactly that reason. This
+    // index makes "have I already recorded this span?" O(1) per span, bounded
+    // by MAX_OTEL_SPANS_PER_BATCH probes.
+    //
+    // Nested field path: `provenance.spanId` is undefined for every SDK-path
+    // row, which is correct — those rows have no span and must never match.
+    .index("by_run_span", ["runId", "provenance.spanId"]),
 
   artifacts: defineTable({
     runId: v.id("runs"),

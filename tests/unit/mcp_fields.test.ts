@@ -69,6 +69,7 @@ interface Projections {
   PATTERN_REQUEST_FIELDS: readonly string[]
   RUN_REQUEST_FIELDS: readonly string[]
   EVENT_REQUEST_FIELDS: readonly string[]
+  EVENT_READ_ONLY_SOURCE_FIELDS: readonly string[]
   columnsOf(columns: readonly ProjectedColumn[]): string[]
   requestFieldsOf(columns: readonly ProjectedColumn[]): string[]
   toRunRow(run: Run): Record<string, unknown>
@@ -156,6 +157,7 @@ const TIERS = [
     columns: projections.PATTERN_COLUMNS,
     emitted: projections.PATTERN_FIELDS,
     requested: projections.PATTERN_REQUEST_FIELDS,
+    readOnlySources: [] as readonly string[],
   },
   {
     tool: 'afr_list_runs',
@@ -163,6 +165,7 @@ const TIERS = [
     columns: projections.RUN_COLUMNS,
     emitted: projections.RUN_FIELDS,
     requested: projections.RUN_REQUEST_FIELDS,
+    readOnlySources: [] as readonly string[],
   },
   {
     tool: 'afr_get_run_events',
@@ -170,6 +173,7 @@ const TIERS = [
     columns: projections.EVENT_COLUMNS,
     emitted: projections.EVENT_FIELDS,
     requested: projections.EVENT_REQUEST_FIELDS,
+    readOnlySources: projections.EVENT_READ_ONLY_SOURCE_FIELDS,
   },
 ]
 
@@ -187,8 +191,37 @@ describe('field selections are derived from the projections’ own column tables
       ).toEqual(projections.columnsOf(tier.columns))
     })
 
-    it(`${tier.tool}: request is exactly requestFieldsOf(table)`, () => {
-      expect([...tier.requested]).toEqual(projections.requestFieldsOf(tier.columns))
+    it(`${tier.tool}: request is exactly requestFieldsOf(table) plus its declared read-only sources`, () => {
+      /**
+       * THE REQUEST IS "WHAT THE PROJECTION READS", WHICH IS A SUPERSET OF WHAT
+       * IT EMITS — and the superset must still be DERIVED, never hand-written.
+       *
+       * `ProjectedColumn` pairs an emitted column with its source, which cannot
+       * express a field that is read and deliberately not returned. Tier 4 has
+       * one: `temporalOrder` decides the window-level `orderingBasis` alarm and
+       * is ~130 B per event, so emitting it would cost more than the answer it
+       * supports. It is declared in ONE place
+       * (`EVENT_READ_ONLY_SOURCE_FIELDS`) and concatenated, so the request is
+       * still a derivation rather than a second list.
+       *
+       * Getting this wrong is silent in the worst direction: `fields` is a
+       * projection, so an unrequested field comes back ABSENT rather than null,
+       * and a missing `temporalOrder` would make every derived event read as
+       * unkeyed and label every healthy derived run `ingest-unverified`.
+       */
+      expect([...tier.requested]).toEqual([
+        ...projections.requestFieldsOf(tier.columns),
+        ...tier.readOnlySources,
+      ])
+    })
+
+    it(`${tier.tool}: no read-only source is also an emitted column's source`, () => {
+      // The two lists concatenate, so an entry in both would be requested
+      // twice. The read API accepts duplicates, but a duplicate means the
+      // column table and the read-only list disagree about which one owns the
+      // field — and that is the drift this whole seam exists to prevent.
+      const fromColumns = new Set(projections.requestFieldsOf(tier.columns))
+      expect(tier.readOnlySources.filter((f) => fromColumns.has(f))).toEqual([])
     })
 
     it(`${tier.tool}: every requested name is a real ${tier.table} field`, () => {

@@ -36,11 +36,11 @@
   ],
   "frozen": {
     "ALIAS_SPELLING": {
-      "total": 818,
+      "total": 817,
       "classes": {
         "border-neutral-800": 136,
         "text-neutral-400": 132,
-        "text-neutral-500": 121,
+        "text-neutral-500": 120,
         "text-destructive-400": 62,
         "text-neutral-200": 56,
         "border-neutral-700": 52,
@@ -81,9 +81,9 @@
       }
     },
     "DERIVED_RAMP": {
-      "total": 323,
+      "total": 322,
       "classes": {
-        "text-neutral-300": 125,
+        "text-neutral-300": 124,
         "text-neutral-100": 34,
         "text-primary-300": 22,
         "border-primary-700": 17,

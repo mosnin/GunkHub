@@ -1123,7 +1123,7 @@ const CASES: AdversarialCase[] = [
       'GUARANTEES exactly that inversion. Both invariants cannot hold on skewed ' +
       'input. The only escape is clamping a span timestamp to its parent, which ' +
       'falsifies recorded data and must therefore set ' +
-      "`provenance.lossy` with the `inferred_timestamp` reason " +
+      "`provenance.lossy` with the `timing-approximated` reason " +
       '(`packages/contracts/src/provenance.ts`). Whichever way this is resolved, ' +
       'it must be resolved deliberately.',
     catches: ['causal'],

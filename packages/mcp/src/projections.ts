@@ -47,7 +47,7 @@
  * Server-side projection is defense in depth's cheap half. This file is the
  * half that is load-bearing.
  */
-import { isDerivedProvenance } from '@agent-flight-recorder/contracts'
+import { isDerivedProvenance, readTemporalOrder } from '@agent-flight-recorder/contracts'
 import {
   columnsOf,
   isPatternScanComplete,
@@ -856,6 +856,37 @@ export const PROVENANCE_NOTE =
   'sequenceNumber on a derived run is ingest order — NOT necessarily the order the operations occurred in, which ' +
   'is what replay and diff assume. derivedLossy:true means the mapping dropped information. Call again with ' +
   'includeProvenance:true for trace/span ids, semconv and mapper versions, and the specific loss reasons.'
+// DELIBERATELY SAYS NOTHING ABOUT `orderingBasis`. A clause here explaining the
+// absent case measured +33 tokens on EVERY derived window; the identical
+// explanation lives in the tool description, which an agent pays for once per
+// session. Per-call bytes for once-per-session semantics is the trade this
+// whole package exists to refuse — see ORDERING_UNVERIFIED_BASIS.
+
+/**
+ * The ONE ordering verdict this tier is entitled to state, and the reason it is
+ * one and not three.
+ *
+ * `OrderingBasis` (packages/contracts/src/temporal.ts) is a RUN-level verdict:
+ * `analyzeRunOrdering` reaches it by walking the whole event log. A tier-4
+ * response is a WINDOW by construction — that is the entire point of the tier —
+ * so computing the three-way verdict from what is in hand would be computing it
+ * from a slice, and a slice can report `temporal` while a single unkeyed event
+ * ten sequence numbers outside it has already forced the real answer to
+ * `ingest-unverified`. Rendering a confident timeline that is wrong in an
+ * unmarked place is worse than either honest option.
+ *
+ * ONE DIRECTION OF THE INFERENCE IS SOUND, and only one. `analyzeRunOrdering`
+ * returns `ingest-unverified` iff `keyedCount !== derivedCount` over the FULL
+ * set, so a single derived event with no usable key ANYWHERE forces it. A window
+ * containing such an event therefore proves the run's verdict outright, no
+ * matter what lies outside the window. Nothing about a window can prove
+ * `temporal` or `sequence-native`, so this tier never says either.
+ *
+ * Emitted as a bare scalar rather than a sentence because the semantics belong
+ * in the tool DESCRIPTION, which an agent pays for once per session, not in the
+ * RESPONSE, which it pays for on every call.
+ */
+export const ORDERING_UNVERIFIED_BASIS = 'ingest-unverified'
 
 /** One event in a window. */
 export interface EventRow {
@@ -991,8 +1022,38 @@ export const EVENT_COLUMNS = [
 /** The columns tier 4 emits. DERIVED from {@link EVENT_COLUMNS}. */
 export const EVENT_FIELDS: readonly (keyof EventRow)[] = columnsOf(EVENT_COLUMNS)
 
-/** The `fields` selection `afr_get_run_events` sends. DERIVED from {@link EVENT_COLUMNS}. */
-export const EVENT_REQUEST_FIELDS: readonly string[] = requestFieldsOf(EVENT_COLUMNS)
+/**
+ * Source fields the window projection READS but never EMITS.
+ *
+ * `ProjectedColumn` pairs an emitted column with its source, which is the right
+ * shape for every column above — but `temporalOrder` is neither. It is read to
+ * decide ONE window-level fact ({@link budgetEventRows}'s `orderUnverified`) and
+ * is never returned to the caller, because a `TemporalOrderKey` is ~130 B per
+ * event and this is the tier where per-event bytes are the whole problem.
+ *
+ * IT MUST BE REQUESTED ANYWAY, and getting this wrong is silent in the worst
+ * direction. `fields` is a projection: a field not asked for comes back ABSENT,
+ * not `null`. So if `temporalOrder` were left out of the request, every derived
+ * event would read as unkeyed, and every derived run would be labelled
+ * `ingest-unverified` — a confident alarm on healthy runs, which is how an
+ * honesty marker becomes noise and then gets ignored.
+ *
+ * `temporalOrder` is a valid selection name without any change to the read API:
+ * `validateFieldSelection` derives its vocabulary from the live Convex schema
+ * (`convex/read_api.ts` → `validFieldsFor`), and `convex/schema.ts` declares the
+ * column. `tests/unit/mcp_fields.test.ts` pins that agreement.
+ */
+export const EVENT_READ_ONLY_SOURCE_FIELDS: readonly string[] = ['temporalOrder']
+
+/**
+ * The `fields` selection `afr_get_run_events` sends. DERIVED from
+ * {@link EVENT_COLUMNS}, plus {@link EVENT_READ_ONLY_SOURCE_FIELDS} — the
+ * request is "what the projection READS", which is a superset of what it emits.
+ */
+export const EVENT_REQUEST_FIELDS: readonly string[] = [
+  ...requestFieldsOf(EVENT_COLUMNS),
+  ...EVENT_READ_ONLY_SOURCE_FIELDS,
+]
 
 function isExternalized(payload: unknown): payload is ExternalizedPayload {
   return (
@@ -1054,13 +1115,20 @@ export const TRUNCATION_NOTE =
 export function budgetEventRows(
   events: Event[],
   options: EventRowOptions = {},
-): { rows: EventRow[]; truncated: boolean; derived: boolean } {
+): { rows: EventRow[]; truncated: boolean; derived: boolean; orderUnverified: boolean } {
   let spent = 0
   let truncated = false
   let derived = false
+  let orderUnverified = false
   const rows = events.map((event) => {
     const row = toEventRow(event, options)
     if (row.derived !== undefined) derived = true
+    // THE ONE-DIRECTIONAL ORDERING PROOF — see ORDERING_UNVERIFIED_BASIS.
+    // `analyzeRunOrdering` returns `ingest-unverified` for the whole run iff ANY
+    // derived event lacks a usable key, so observing one HERE proves it for the
+    // run, even though this is only a window. The converse does not hold and is
+    // not claimed.
+    if (isDerivedProvenance(event.provenance) && readTemporalOrder(event) === undefined) orderUnverified = true
     if (row.payload === undefined) return row
     const bytes = Buffer.byteLength(JSON.stringify(row.payload) ?? '', 'utf8')
     if (spent + bytes > WINDOW_PAYLOAD_BYTE_BUDGET) {
@@ -1072,7 +1140,7 @@ export function budgetEventRows(
     if (typeof row.payload === 'object' && row.payload !== null && 'truncated' in row.payload) truncated = true
     return row
   })
-  return { rows, truncated, derived }
+  return { rows, truncated, derived, orderUnverified }
 }
 
 /** Per-window options for {@link toEventRow} / {@link budgetEventRows}. */

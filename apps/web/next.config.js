@@ -89,5 +89,56 @@ const nextConfig = {
       },
     ]
   },
+
+  // OTLP endpoint compatibility.
+  //
+  // The OTLP trace endpoint lives at `/api/v1/traces` deliberately, so it
+  // inherits the `/api/v1/**` auth, rate class and request-id logging rather
+  // than growing a parallel set of its own.
+  //
+  // The cost is a silent adoption failure. `OTEL_EXPORTER_OTLP_ENDPOINT` is the
+  // BASE-URL form of the exporter config — the SDK appends the signal path
+  // (`/v1/traces`) itself — and it is the more common configuration in the
+  // wild, because one variable covers traces, metrics and logs. An exporter
+  // configured that way POSTs to `/v1/traces`, gets a 404, and an OTLP exporter
+  // treats a 404 as a retryable transport failure: it retries, backs off, and
+  // drops spans. The user sees no data and no error they can act on. (The
+  // per-signal form, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, takes the FULL path
+  // and works against `/api/v1/traces` today without this rewrite.)
+  //
+  // `afterFiles` is load-bearing, not incidental. It is consulted only after
+  // filesystem routes and static pages have failed to match, so it cannot
+  // shadow or reorder any existing route. `beforeFiles` runs ahead of the
+  // filesystem and could. There is no `app/v1` segment and the only catch-all
+  // routes in the tree are `/sign-in/[[...sign-in]]` and
+  // `/sign-up/[[...sign-up]]`, neither of which can match `/v1/traces`, so this
+  // rewrite fires exactly on the path that would otherwise 404.
+  //
+  // Rewrite, NOT redirect: a 307/308 would require the exporter to follow
+  // redirects on a POST with a binary protobuf body, which not every OTLP
+  // exporter does reliably.
+  //
+  // Only `traces` is rewritten. `/v1/metrics` and `/v1/logs` continue to 404
+  // because we do not ingest those signals, and mapping them onto a route that
+  // would also reject them buys nothing.
+  //
+  // The rewrite is transparent to the handler: `app/api/v1/traces/route.ts`
+  // does not read the request pathname, so it behaves identically on either
+  // entry point. `middleware.ts` needs no change — its `isProtectedPage`
+  // matcher does not cover `/v1(.*)`, so `/v1/traces` is public in exactly the
+  // way `/api/v1/traces` already is, and OTLP auth stays with the route's own
+  // `x-api-key` check.
+  async rewrites() {
+    return {
+      beforeFiles: [],
+      afterFiles: [
+        {
+          source: '/v1/traces',
+          destination: '/api/v1/traces',
+        },
+      ],
+      fallback: [],
+    }
+  },
 }
 module.exports = nextConfig

@@ -84,6 +84,11 @@ export interface CreateEventResponse {
 /**
  * One event derived from one OpenTelemetry span.
  *
+ * THE SHAPE THE INGEST MUTATION PRODUCES INTERNALLY, retained because the
+ * invariant it encodes is still live and still enforced: a derived event cannot
+ * be written without provenance. It is NOT a request body — see
+ * {@link IngestOtelSpansRequest} for why sending pre-mapped events is unsafe.
+ *
  * `provenance` is REQUIRED and non-optional. Note also that it is typed as
  * {@link OtelEventProvenance}, not {@link EventProvenance}: this path cannot
  * even claim `source: "sdk"`. The ingest mapper is structurally incapable of
@@ -108,8 +113,28 @@ export interface OtelDerivedEventWrite {
 /**
  * A batch of events derived from one OTel export request.
  *
- * Batched because OTLP arrives batched, and because the unmapped-span count
- * below is only meaningful per batch.
+ * @deprecated NOT IMPLEMENTED, AND NOT IMPLEMENTABLE SAFELY. Use
+ * {@link IngestOtelSpanBatchRequest}, which sends SPANS and maps them inside
+ * the mutation.
+ *
+ * THE ARCHITECTURE THIS TYPE DESCRIBES WAS TRIED AND REJECTED, and the reason
+ * is a correctness one rather than a preference. This shape presumes the
+ * span->event mapping and the SEQUENCE SYNTHESIS happened UPSTREAM of the
+ * write. But the mapper requires `PriorRunState` — the run's current maximum
+ * sequence number and its already-recorded span ids — so mapping upstream means
+ * reading that state in one transaction and writing in another. Two concurrent
+ * batches for one trace then both read the same maximum and compute the SAME
+ * sequence numbers. Under an append-only log that is not a recoverable lost
+ * update; it is permanent corruption of the artifact the product exists to make
+ * trustworthy.
+ *
+ * Doing the mapping inside the mutation is what closes it: the max-sequence
+ * read and the append are in one transaction, so Convex's OCC invalidates the
+ * loser's read set and re-executes it against the winner's writes.
+ *
+ * Kept only because it is referenced by existing type-level tests. It describes
+ * an architecture we deliberately rejected, and a published type doing that is
+ * worse than no type — nothing should be implemented against it.
  */
 export interface IngestOtelSpansRequest {
   /**
@@ -120,6 +145,12 @@ export interface IngestOtelSpansRequest {
   events: OtelDerivedEventWrite[];
 }
 
+/**
+ * @deprecated Response half of {@link IngestOtelSpansRequest}. Use
+ * {@link IngestOtelSpanBatchResponse}, which additionally reports the resolved
+ * `runId`, the ordering-relevant diagnostics, and a CLOSED rejection-reason
+ * union rather than a bare string.
+ */
 export interface IngestOtelSpansResponse {
   /** Ids of the events actually appended, in submission order. */
   eventIds: string[];
@@ -132,6 +163,157 @@ export interface IngestOtelSpansResponse {
    * able to tell those apart rather than inferring silence.
    */
   rejected: Array<{ spanId: string; reason: string }>;
+}
+
+// ---------------------------------------------------------------------------
+// OTel span ingestion — the SPAN-IN request (ADR-007)
+//
+// {@link IngestOtelSpansRequest} above takes already-derived EVENTS, which
+// presumes the span->event mapping and the sequence synthesis happened
+// upstream of the write. That shape cannot be made correct: sequence
+// allocation, span-level dedupe and trace->run resolution all have to read the
+// run's current state, and they have to do it INSIDE the same transaction that
+// performs the append, or a concurrent batch invalidates every one of them
+// between the read and the write.
+//
+// So the shipped ingest (`otelIngestSpans`, convex/otel_ingest.ts) takes SPANS
+// and does the mapping server-side. These are its types.
+// {@link IngestOtelSpansRequest} is retained for the event-shaped contract it
+// describes but is NOT the shape the backend accepts.
+// ---------------------------------------------------------------------------
+
+/**
+ * @deprecated Alias of the canonical {@link OtelSpanInput} in
+ * `packages/contracts/src/otel.ts`, kept for one release so existing imports
+ * keep resolving. Import `OtelSpanInput` directly.
+ */
+export type OtelSpanIngestInput = import("./otel.js").OtelSpanInput;
+
+/**
+ * One decoded OTLP batch, for exactly ONE trace.
+ *
+ * `traceId` is explicit rather than inferred from the spans, because it is the
+ * RUN KEY. Inferring it would make the key depend on which spans happened to
+ * be in the batch, so one malformed batch could attach a trace's spans to a
+ * brand-new run. Spans naming a different trace are rejected and reported in
+ * {@link IngestOtelSpanBatchResponse.rejected}.
+ *
+ * There is no `runId`. The backend resolves `(orgId, traceId)` to a run and
+ * materializes one on the trace's first batch. A caller-supplied run id would
+ * be both unknowable to an OTLP exporter and a cross-org write surface.
+ */
+export interface IngestOtelSpanBatchRequest {
+  /** W3C trace id — 32 lowercase hex chars. The run key, together with the caller's org. */
+  traceId: string;
+  /**
+   * The Agent these spans belong to, in the API key's org. REQUIRED and never
+   * derived from span attributes: deriving one from `gen_ai.agent.name` would
+   * spray a new Agent per distinct agent string into the org's namespace,
+   * keyed on an experimental attribute most instrumentation omits.
+   */
+  agentId: string;
+  /**
+   * Optional AgentVersion label, typically the exporter's resource-level
+   * `service.version`. Get-or-created on the trace's first batch. When absent
+   * the run simply has no version — nothing is synthesized, because an
+   * invented "unknown" version would pollute version comparison with a bucket
+   * that mixes every un-versioned trace together.
+   */
+  agentVersion?: string;
+  /** Bounded by the backend's per-call span ceiling; an over-sized batch is rejected whole (`BATCH_TOO_LARGE`), never truncated. */
+  spans: import("./otel.js").OtelSpanInput[];
+}
+
+/** Why a span in the batch was NOT recorded. */
+export type OtelSpanRejectionReason =
+  /** Span named a different `traceId` than the batch's. */
+  | "foreign-trace"
+  /** Span was already recorded in this run — a redelivery. Recording it again would permanently double the run. */
+  | "already-known"
+  /**
+   * Arrived after the run was closed. Event Log Rule 5 forbids appending after
+   * a terminal event and there is no update mutation, so the span is
+   * PERMANENTLY unrecordable.
+   *
+   * DISTINCT from `already-known`, which is a harmless retry. This is data
+   * loss, and it is the reason a caller should surface most loudly: the trace
+   * is incomplete and nothing later can complete it.
+   */
+  | "after-terminal"
+  /**
+   * A redundant copy of the SAME operation (same name, start and parent). One
+   * copy was kept by a deterministic, arrival-order-independent key. NOTHING
+   * WAS LOST.
+   */
+  | "duplicate"
+  /**
+   * Shared a span id with a DIFFERENT operation. SOMETHING WAS LOST — kept
+   * strictly separate from `duplicate` precisely so a lost operation cannot be
+   * read as a harmless retry.
+   */
+  | "span-id-collision"
+  /** Span or parent id was not W3C hex. Refused per span, so innocent spans in the batch still land. */
+  | "malformed-id"
+  /**
+   * The span's derived payload exceeded the 10 KB inline limit (Event Log Rule
+   * 3) even after the mapper's own attribute bounding, so the span was excluded
+   * rather than allowed to refuse the whole batch. Externalize the span's
+   * Opt-In content attributes to blob storage and resend.
+   */
+  | "payload-too-large";
+
+/**
+ * A mapper diagnostic, surfaced verbatim so a caller can tell WHY a batch
+ * produced the events it did (clock-skew clamps, orphan spans, a missing root)
+ * without reading the events back.
+ */
+export interface OtelIngestDiagnostic {
+  code: string;
+  /** True if this diagnostic means the batch was refused. */
+  fatal: boolean;
+  spanIds: string[];
+  message: string;
+}
+
+export interface IngestOtelSpanBatchResponse {
+  /** The run this trace resolved to. Stable across every batch of the trace. */
+  runId: string;
+  /** True when THIS call materialized the run (the trace's first batch). */
+  runCreated: boolean;
+  /** Ids of the events actually appended, in sequence order. EMPTY for a pure redelivery. */
+  eventIds: string[];
+  /** How many of `eventIds` are `otel.span.unmapped` events — RECORDED, never dropped. */
+  unmappedCount: number;
+  /**
+   * Spans NOT recorded. Strictly distinct from unmapped: an unmapped span WAS
+   * recorded (as an `otel.span.unmapped` event), a rejected one was not.
+   * Conflating them is how a dropped span passes for a recorded one.
+   */
+  /**
+   * CLOSED union, deliberately not widened with `| string`. A caller building
+   * an OTLP `ExportTracePartialSuccess` switches on this, and a widened type
+   * would let a new backend reason reach the wire as an unhandled default —
+   * which is exactly how a lost span passes for a recorded one. Adding a reason
+   * is a reviewed contracts change that breaks every incomplete switch, which
+   * is the point.
+   */
+  rejected: Array<{ spanId: string; reason: OtelSpanRejectionReason }>;
+  diagnostics: OtelIngestDiagnostic[];
+  /** True when no terminal event was emitted — the run is in-progress per Event Log Rule 5. */
+  runOpen: boolean;
+  terminalType: "run.completed" | "run.failed" | null;
+  /** Sequence range appended by this call. Both null for a pure redelivery. */
+  firstSequenceNumber: number | null;
+  lastSequenceNumber: number | null;
+  stats: {
+    spansIn: number;
+    spansAccepted: number;
+    spansMapped: number;
+    spansUnmapped: number;
+    spansRejected: number;
+    eventsOut: number;
+    clockSkewClamps: number;
+  };
 }
 
 export interface ListEventsRequest {

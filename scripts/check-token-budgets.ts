@@ -338,6 +338,7 @@ export interface McpFixtures {
   fatRun(i: number): Record<string, unknown>
   externalizedEvent(seq: number): Record<string, unknown>
   nearThresholdEvent(seq: number): Record<string, unknown>
+  unkeyedDerivedEvent(seq: number): Record<string, unknown>
   fatEvidence(): Record<string, unknown>
   contractMaxExplanation(): Record<string, unknown>
   realisticExplanation(): Record<string, unknown>
@@ -348,7 +349,8 @@ const FIXTURES_MODULE = path.join(REPO_ROOT, 'tests/unit/mcp_budgets.ts')
 
 const REQUIRED_FIXTURE_EXPORTS: readonly (keyof McpFixtures)[] = [
   'FROZEN_NOW', 'fatPattern', 'fatEnvelope', 'fatRun', 'externalizedEvent',
-  'nearThresholdEvent', 'fatEvidence', 'contractMaxExplanation', 'realisticExplanation', 'WIDE_CITATIONS',
+  'nearThresholdEvent', 'unkeyedDerivedEvent', 'fatEvidence', 'contractMaxExplanation', 'realisticExplanation',
+  'WIDE_CITATIONS',
 ]
 
 export async function loadFixtures(file: string = FIXTURES_MODULE): Promise<McpFixtures> {
@@ -716,6 +718,20 @@ export function buildScenarios(f: McpFixtures): readonly Scenario[] {
   },
   {
     tool: 'afr_get_run_events',
+    name: 'ordering unverifiable — 50 derived events, none carrying a temporalOrder key',
+    budget: 10_000,
+    why:
+      'THE PAIR SCENARIO FOR THE `orderingBasis` ALARM, and the reason it is a pair. It is identical to the ' +
+      'externalized window above in every respect except that its events carry no `temporalOrder`, so the ' +
+      'difference between the two measurements IS the cost of the one field the tier gained — measured, not ' +
+      'estimated (+9 tokens; ORDERING_BASIS_TOKEN_COST in tests/unit/mcp_budgets.ts pins it exactly). A field ' +
+      'added "because it is only a scalar" and never measured is how a scalar grows into a paragraph.',
+    args: { runId: 'run_8f2c1a', fromSequence: 18, limit: 50 },
+    reader: eventWindow(f.unkeyedDerivedEvent),
+    rawInput: () => Array.from({ length: 50 }, (_, i) => f.unkeyedDerivedEvent(18 + i)),
+  },
+  {
+    tool: 'afr_get_run_events',
     name: 'includeProvenance — 40 fully-derived events at MAX_LIMIT_WITH_PROVENANCE',
     budget: 10_000,
     why:
@@ -784,6 +800,16 @@ export type ViolationCode =
   | 'STALE_BREACH'
   /** Measured BELOW the baseline. Progress; lower the baseline in the same commit. */
   | 'BELOW_BASELINE'
+  /** A figure published in docs/mcp.md or a tool description that no measurement supports. */
+  | 'DOC_FIGURE_STALE'
+  /** A measured scenario that the published table never shows. */
+  | 'DOC_FIGURE_MISSING'
+  /** A published ratio whose declared operands no longer divide to it. */
+  | 'DOC_RATIO_STALE'
+  /** A ratio published in prose with no declaration saying what it divided. */
+  | 'DOC_RATIO_UNDECLARED'
+  /** A token figure in prose that no measurement, budget or sum of two supports. Heuristic — report only. */
+  | 'DOC_FIGURE_UNVERIFIED'
 
 export interface Violation {
   readonly code: ViolationCode
@@ -826,6 +852,14 @@ export const TIERS: Partial<Record<ViolationCode, 'block' | 'report'>> = {
   // on day two; one that names the debt and pins it survives to catch the next
   // regression.
   FROZEN_BREACH: 'report',
+  // The only HEURISTIC check in this file, and the only one that may not block.
+  // Every other published-figure check is exact — a table cell either equals a
+  // measurement or it does not. This one sweeps free prose for `~N tokens`, and
+  // prose legitimately rounds ("~400 tokens" for a 332-typical/435-worst pair)
+  // and legitimately derives (a per-row figure, a running total). Blocking on a
+  // heuristic is how a check gets switched off, and switching this one off
+  // would take the four exact checks with it.
+  DOC_FIGURE_UNVERIFIED: 'report',
 }
 
 export const tierOf = (code: ViolationCode): 'block' | 'report' => TIERS[code] ?? 'block'
@@ -1067,6 +1101,325 @@ export function checkMaximality(claims: readonly MaximalityClaim[]): Violation[]
   return out
 }
 
+// ─── Published figures: the numbers a HUMAN retyped out of this script ───────
+//
+// THE HOLE THIS CLOSES. Everything above protects the numbers this script
+// PRINTS. Nothing protected the numbers a person then transcribed into
+// docs/mcp.md and into the tool descriptions — and those are the ones a reader
+// actually consumes. Three instances were found by hand in a single sitting:
+//
+//   - a tool description claiming "10x afr_triage" in the same sentence that
+//     put triage at "~400 tokens" (4,445/400 is 11.1, not 10);
+//   - docs/mcp.md's worked example claiming the naive path costs "roughly 12x"
+//     a triage call, a figure left over from before tier 4 grew — 4,445/332 is
+//     13.4, and the same page said "13x" twice elsewhere;
+//   - docs/mcp.md stating the script "measures 14 scenarios" when it measured
+//     16.
+//
+// None of them was catchable by anything: they are prose. All three are the
+// same defect — a measurement copied by hand, and then one side moved.
+//
+// THE TOOL DESCRIPTIONS MATTER MOST, and they are the reason this is blocking
+// rather than a lint. `docs/mcp.md` is read by an engineer who can run the
+// script; a tool description is read by an AGENT that cannot. It is the one
+// consumer with no way to check, which makes a stale figure there not
+// misleading but load-bearing — it is the input to the agent's decision about
+// which tier to call.
+//
+// WHAT IS AND IS NOT MECHANICAL. Absolute figures are: a published number is
+// either a value this script measured or it is not. Ratios are not — "13x" does
+// not say what it divided — so ratios must be DECLARED here against the two
+// measurements they relate, in the same spirit as declaring a budget for a
+// tool. An undeclared ratio in published prose is reported, never silently
+// accepted.
+
+/** Strip thousands separators so `4,445`, `4 400` and `4445` compare equal. */
+function parseFigure(raw: string): number {
+  return Number(raw.replace(/[,\s ]/g, ''))
+}
+
+/**
+ * A ratio published in prose, declared against the two measurements it divides.
+ *
+ * WHY DECLARED AND NOT INFERRED. "about 37x afr_explain_run" is a claim about a
+ * quotient, and the text does not say which two numbers. Inferring it — "does
+ * SOME pair of measurements divide to 37?" — is a check that passes almost
+ * always and therefore proves almost nothing. Naming the operands makes the
+ * claim falsifiable: move either measurement and the ratio fails here, in the
+ * same run that reported the move.
+ */
+export interface DeclaredRatio {
+  /** Exactly as it appears in the prose, so the failure message can be searched for. */
+  readonly text: string
+  /** Where it is published. */
+  readonly where: string
+  /** Baseline keys, or `budget:<tool>` for a ceiling. */
+  readonly numerator: string
+  readonly denominator: string
+}
+
+const TIER4_EXTERNALIZED = 'afr_get_run_events :: saturated 50-event window — every payload externalized'
+const TIER3_REALISTIC = 'afr_explain_run :: realistic explanation'
+const TIER1_TEN = 'afr_list_failure_patterns :: 10 maximal patterns (the published tier-1 figure)'
+const TIER0_TYPICAL = 'afr_triage :: typical — full 50-pattern scan, nothing degraded'
+const TIER0_WORST = 'afr_triage :: worst case — truncated scan + unevaluated + every item muted'
+
+export const DECLARED_RATIOS: readonly DeclaredRatio[] = [
+  { text: '37x', where: 'docs/mcp.md + afr_get_run_events description', numerator: TIER4_EXTERNALIZED, denominator: TIER3_REALISTIC },
+  { text: '15x', where: 'docs/mcp.md § Progressive disclosure', numerator: TIER4_EXTERNALIZED, denominator: TIER1_TEN },
+  { text: '13x', where: 'docs/mcp.md § Progressive disclosure + worked example', numerator: TIER4_EXTERNALIZED, denominator: TIER0_TYPICAL },
+  // The tool description quotes triage at "~400 tokens", which is the round
+  // figure covering the 332 typical / 435 worst-case pair. Its ratio is
+  // declared against the WORST case deliberately: a description that under-
+  // states how much cheaper the alternative is fails safe, one that over-states
+  // it does not.
+  { text: '10x', where: 'afr_get_run_events description', numerator: TIER4_EXTERNALIZED, denominator: TIER0_WORST },
+]
+
+/**
+ * A PER-UNIT figure published in prose, declared against the measurement and
+ * the divisor it came from.
+ *
+ * Same argument as {@link DeclaredRatio}, one step down: "~28 tokens per row"
+ * is a real and useful claim, and it is a quotient, so nothing can check it
+ * unless the operands are named. This one was already stale when the sweep
+ * first ran — the description beside it still quoted "~284 for the default 20",
+ * a figure from back when tier 1 measured 284 for TEN patterns.
+ */
+export interface DerivedFigure {
+  readonly value: number
+  readonly where: string
+  readonly measurement: string
+  readonly divisor: number
+  readonly what: string
+}
+
+export const DERIVED_FIGURES: readonly DerivedFigure[] = [
+  {
+    value: 28,
+    where: 'afr_list_failure_patterns description',
+    measurement: 'afr_list_failure_patterns :: default page — 20 maximal patterns',
+    divisor: 20,
+    what: 'tokens per columnar row at DEFAULT_LIMIT',
+  },
+]
+
+/** Resolve a declared operand to a number. */
+function resolveOperand(key: string, measurements: readonly Measurement[]): number | undefined {
+  if (key.startsWith('budget:')) {
+    return measurements.find((m) => m.tool === key.slice('budget:'.length))?.budget
+  }
+  return measurements.find((m) => keyOf(m.tool, m.scenario) === key)?.tokens
+}
+
+/**
+ * Check every figure published in docs/mcp.md's measurement table and in the
+ * live tool descriptions against what was actually measured.
+ *
+ * The table is checked structurally rather than by matching row labels to
+ * scenario names: labels are prose and will never match reliably, but per TOOL
+ * the set of published token counts, the set of published budgets, the set of
+ * published saving ratios and the ROW COUNT are all exactly checkable.
+ */
+export function checkPublishedFigures(
+  measurements: readonly Measurement[],
+  scenarioCount: number,
+  descriptions: ReadonlyMap<string, string>,
+  docFile: string = path.join(REPO_ROOT, 'docs/mcp.md'),
+): Violation[] {
+  const out: Violation[] = []
+  if (!fs.existsSync(docFile)) return out
+  const doc = fs.readFileSync(docFile, 'utf8')
+
+  // — the measurement table —————————————————————————————————————————————
+  const rows = [...doc.matchAll(/^\|\s*`(afr_[a-z_]+)`([^|]*)\|\s*\*\*([\d,\s]+)\*\*\s*\|\s*([\d,\s]+)\|([^|]*)\|/gm)]
+  const publishedPerTool = new Map<string, number>()
+  for (const row of rows) {
+    const tool = row[1] ?? ''
+    const label = (row[2] ?? '').trim()
+    const tokens = parseFigure(row[3] ?? '')
+    const budget = parseFigure(row[4] ?? '')
+    const fixture = row[5] ?? ''
+    publishedPerTool.set(tool, (publishedPerTool.get(tool) ?? 0) + 1)
+    const forTool = measurements.filter((m) => m.tool === tool)
+
+    if (!forTool.some((m) => m.tokens === tokens)) {
+      out.push({
+        code: 'DOC_FIGURE_STALE',
+        subject: `${rel(docFile)} — \`${tool}\` ${label}`,
+        detail:
+          `publishes ${String(tokens)} tokens, which this script did not measure for that tool. Measured: ` +
+          `${forTool.map((m) => String(m.tokens)).join(', ')}.`,
+        fix: `re-transcribe the row from this script's own output. It is the source; the page is a copy.`,
+      })
+    }
+    if (!forTool.some((m) => m.budget === budget)) {
+      out.push({
+        code: 'DOC_FIGURE_STALE',
+        subject: `${rel(docFile)} — \`${tool}\` ${label} (budget column)`,
+        detail: `publishes a budget of ${String(budget)}; declared budgets for that tool are ${forTool.map((m) => String(m.budget)).join(', ')}.`,
+        fix: 'correct the page, or correct the scenario — but they are the same fact and must not differ.',
+      })
+    }
+    const ratio = /\(([\d.]+)x/.exec(fixture)
+    if (ratio !== null) {
+      const published = Number(ratio[1])
+      const measured = forTool.map((m) => m.savingRatio).filter((r): r is number => r !== null)
+      if (!measured.some((r) => Math.abs(r - published) < 0.05)) {
+        out.push({
+          code: 'DOC_FIGURE_STALE',
+          subject: `${rel(docFile)} — \`${tool}\` ${label} (saving ratio)`,
+          detail:
+            `publishes ${String(published)}x against the un-projected input; measured ` +
+            `${measured.map((r) => r.toFixed(1)).join('x, ')}x. A ratio moves whenever the FIXTURE grows, ` +
+            'even when the projection did not — which is exactly the change nobody thinks to re-transcribe.',
+          fix: `re-transcribe from this script's output.`,
+        })
+      }
+    }
+  }
+  for (const tool of new Set(measurements.map((m) => m.tool))) {
+    const measured = measurements.filter((m) => m.tool === tool).length
+    const published = publishedPerTool.get(tool) ?? 0
+    if (published === measured) continue
+    out.push({
+      code: 'DOC_FIGURE_MISSING',
+      subject: `${rel(docFile)} — ${tool}`,
+      detail: `publishes ${String(published)} row(s) for this tool; ${String(measured)} scenarios are measured.`,
+      fix:
+        'add the missing row (or delete the extra one). A scenario measured but never published is a ceiling ' +
+        'the page implicitly claims does not exist.',
+    })
+  }
+
+  // — the scenario count ————————————————————————————————————————————————
+  const counted = /measures (\d+) scenarios/.exec(doc)
+  if (counted !== null && Number(counted[1]) !== scenarioCount) {
+    out.push({
+      code: 'DOC_FIGURE_STALE',
+      subject: `${rel(docFile)} — scenario count`,
+      detail: `says "measures ${String(counted[1])} scenarios"; this script measures ${String(scenarioCount)}.`,
+      fix: 'update the sentence. A count nobody rechecks is how "14" outlived four added scenarios.',
+    })
+  }
+
+  // — declared ratios, wherever they are published ——————————————————————
+  const prose = new Map<string, string>([[rel(docFile), doc], ...[...descriptions].map(([t, d]) => [`${t} description`, d] as [string, string])])
+  const declaredTexts = new Set(DECLARED_RATIOS.map((r) => r.text))
+  for (const declared of DECLARED_RATIOS) {
+    const numerator = resolveOperand(declared.numerator, measurements)
+    const denominator = resolveOperand(declared.denominator, measurements)
+    if (numerator === undefined || denominator === undefined) {
+      out.push({
+        code: 'DOC_RATIO_UNDECLARED',
+        subject: `ratio "${declared.text}" (${declared.where})`,
+        detail: 'names an operand that no longer resolves to a measurement — a scenario was renamed or removed.',
+        fix: `point it at the new key in ${rel(__filename_)}, or drop the ratio from the prose.`,
+      })
+      continue
+    }
+    const actual = numerator / denominator
+    const stated = Number(declared.text.replace('x', ''))
+    if (Math.round(actual) === stated) continue
+    out.push({
+      code: 'DOC_RATIO_STALE',
+      subject: `ratio "${declared.text}" (${declared.where})`,
+      detail:
+        `${String(numerator)} / ${String(denominator)} is ${actual.toFixed(1)}x, which does not round to ` +
+        `${String(stated)}x. The prose says ${declared.text}.`,
+      fix:
+        'correct the prose AND this declaration together. A tool description is read by an agent, which is the ' +
+        'one consumer that cannot run this script to check.',
+    })
+  }
+  for (const [where, text] of prose) {
+    for (const found of text.matchAll(/(?<![\d.])(\d{1,3})x\b/g)) {
+      if (declaredTexts.has(`${found[1] ?? ''}x`)) continue
+      out.push({
+        code: 'DOC_RATIO_UNDECLARED',
+        subject: `${where} — "${found[1] ?? ''}x"`,
+        detail:
+          'publishes a ratio that is not declared against the two measurements it relates, so nothing can tell ' +
+          'whether it is still true.',
+        fix: `add it to DECLARED_RATIOS in ${rel(__filename_)} with its numerator and denominator, or remove it.`,
+      })
+    }
+  }
+
+  // — absolute token figures in prose ————————————————————————————————————
+  //
+  // REPORT-ONLY, and the reason is rounding. Prose legitimately says "~400
+  // tokens" for a figure that is 332 typical / 435 worst case, and blocking on
+  // that would make the check something people turn off. Round figures are
+  // allowed a 10% band; a precise-looking one must match a measurement, a
+  // budget, or the sum of two — `453` (332 + 121) and `707` (300 + 450) are
+  // both real published figures and both legitimate.
+  const values = new Set<number>()
+  for (const m of measurements) {
+    values.add(m.tokens)
+    values.add(m.budget)
+  }
+  for (const a of [...values]) for (const b of [...values]) values.add(a + b)
+  for (const derived of DERIVED_FIGURES) {
+    const measured = resolveOperand(derived.measurement, measurements)
+    if (measured === undefined) {
+      out.push({
+        code: 'DOC_RATIO_UNDECLARED',
+        subject: `derived figure ${String(derived.value)} (${derived.where})`,
+        detail: 'names a measurement that no longer exists — a scenario was renamed or removed.',
+        fix: `point it at the new key in ${rel(__filename_)}, or drop the figure from the prose.`,
+      })
+      continue
+    }
+    const actual = measured / derived.divisor
+    if (Math.round(actual) !== derived.value) {
+      out.push({
+        code: 'DOC_FIGURE_STALE',
+        subject: `${derived.where} — "~${String(derived.value)}" (${derived.what})`,
+        detail:
+          `${String(measured)} / ${String(derived.divisor)} is ${actual.toFixed(1)}, which does not round to ` +
+          `${String(derived.value)}.`,
+        fix: 'correct the prose AND this declaration together.',
+      })
+    }
+    values.add(derived.value)
+  }
+  for (const [where, text] of prose) {
+    // `~N tokens` is the easy case. `(~284 for the default 20)` is the one that
+    // actually went stale, and it names no unit at all.
+    //
+    // THE PROXIMITY RULE, and why it is not just "any ~N". Sweeping every bare
+    // `~N` found nine figures of which two were real: it also flagged `~30
+    // declared fields`, a `<= 20` array bound and a `~1/30th`. A report-only
+    // check that prints seven false positives every run is one people stop
+    // reading, which costs more than the two it catches. So a bare `~N` counts
+    // as a cost only when the word "tok" appears in the preceding 60 characters
+    // — i.e. it is riding along with an explicit token figure, which is exactly
+    // the shape `~28 tokens per row (~284 for the default 20)` has.
+    for (const found of text.matchAll(
+      /[~\u2264]\s*(\d[\d,\s\u00a0]*\d|\d)\s*(?!(?:[KMG]?B\b|ms\b|%|x\b|\.\d|fields?\b|columns?\b|patterns?\b|events?\b|runs?\b|rows?\b|req\b|entries\b|chars?\b))/g,
+    )) {
+      const at = found.index ?? 0
+      const labelled = /tok/.test(text.slice(Math.max(0, at - 60), at + (found[0]?.length ?? 0) + 8))
+      if (!labelled) continue
+      const value = parseFigure(found[1] ?? '')
+      const round = value % 100 === 0
+      const ok = [...values].some((v) => (round ? Math.abs(v - value) <= value * 0.1 : v === value))
+      if (ok) continue
+      out.push({
+        code: 'DOC_FIGURE_UNVERIFIED',
+        subject: `${where} — "${found[0]?.trim() ?? ''}"`,
+        detail:
+          `${String(value)} tokens matches no measurement, no budget, and no sum of two. Either it moved, or it ` +
+          'is a derived figure whose derivation is not written down anywhere.',
+        fix: 're-transcribe it, or state next to it which measurements it is derived from.',
+      })
+    }
+  }
+
+  return out
+}
+
 // ─── Loading the MCP server and enumerating its tools ─────────────────────────
 
 interface RegisteredTool {
@@ -1305,6 +1658,13 @@ export async function analyze(baseline: Baseline): Promise<AnalysisResult> {
   }
 
   violations.push(...evaluate(measurements, baseline))
+  violations.push(
+    ...checkPublishedFigures(
+      measurements,
+      scenarios.length,
+      new Map([...tools].map(([name, t]) => [name, String((t as unknown as { description?: string }).description ?? '')])),
+    ),
+  )
   return { registered, claimCount: maximalityClaims(fixtures).length, measurements, violations, warnings }
 }
 
@@ -1323,6 +1683,11 @@ const HEADLINE: Record<ViolationCode, string> = {
   FROZEN_BREACH: 'Over budget, frozen at a recorded number — documented pre-existing debt',
   STALE_BREACH: 'Recorded breach that no longer describes anything',
   BELOW_BASELINE: 'Response shrank below its baseline — lower the baseline',
+  DOC_FIGURE_STALE: 'Published figure contradicts what was measured',
+  DOC_FIGURE_MISSING: 'Measured scenario missing from the published table',
+  DOC_RATIO_STALE: 'Published ratio no longer matches its declared operands',
+  DOC_RATIO_UNDECLARED: 'Published ratio with no declared operands to check it against',
+  DOC_FIGURE_UNVERIFIED: 'Token figure in prose that no measurement explains',
 }
 
 const ORDER: readonly ViolationCode[] = [
@@ -1334,6 +1699,11 @@ const ORDER: readonly ViolationCode[] = [
   'STALE_BUDGET',
   'STALE_BASELINE',
   'STALE_BREACH',
+  'DOC_FIGURE_STALE',
+  'DOC_FIGURE_MISSING',
+  'DOC_RATIO_STALE',
+  'DOC_RATIO_UNDECLARED',
+  'DOC_FIGURE_UNVERIFIED',
   'FIXTURE_DUPLICATION',
   'FROZEN_BREACH',
   'UNWIRED_TOOL',

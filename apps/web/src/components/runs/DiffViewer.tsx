@@ -1,10 +1,13 @@
 'use client'
 
+import { analyzeRunOrdering, readEventTiming } from '@agent-flight-recorder/contracts'
 import { useRouter } from 'next/navigation'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 
-import type { DiffKind, EventDiff, FieldChange, RunDiff } from '@agent-flight-recorder/contracts'
 
+import type { DiffKind, Event, EventDiff, FieldChange, RunDiff } from '@agent-flight-recorder/contracts'
+
+import { OrderingBasisNote } from '@/components/runs/TemporalOrderNote'
 import { EmptyState } from '@/components/ui/EmptyState'
 
 interface DiffViewerProps {
@@ -87,6 +90,13 @@ function EventDiffRow({ entry, isFirstDivergence, expanded, onToggleExpanded }: 
   const changes = entry.changes ?? []
   const hasChanges = entry.kind === 'changed' && changes.length > 0
 
+  // True when EITHER side's instant was inferred rather than measured. A
+  // position aligning an inferred timing against a measured one is a weaker
+  // comparison than one aligning two measured timings, and the row says so.
+  const inferred =
+    (entry.leftEvent !== undefined && !readEventTiming(entry.leftEvent).measured) ||
+    (entry.rightEvent !== undefined && !readEventTiming(entry.rightEvent).measured)
+
   return (
     <div>
       {isFirstDivergence && (
@@ -126,6 +136,15 @@ function EventDiffRow({ entry, isFirstDivergence, expanded, onToggleExpanded }: 
           >
             {type ?? '(no event)'}
           </span>
+          {inferred && (
+            <span
+              className="shrink-0 font-mono text-xs text-pewter"
+              title="Inferred timing on at least one side — clamped or rounded at ingest, not measured."
+              aria-label="Inferred timing"
+            >
+              ~
+            </span>
+          )}
           {hasChanges && (
             <button
               onClick={onToggleExpanded}
@@ -213,6 +232,10 @@ function RunSelector() {
   )
 }
 
+function isEvent(e: Event | undefined): e is Event {
+  return e !== undefined
+}
+
 interface DiffResultProps {
   diff: RunDiff
   incomparable?: boolean
@@ -222,6 +245,20 @@ interface DiffResultProps {
 function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps) {
   const { summary, leftRunId, rightRunId, eventDiffs } = diff
   const firstDivergenceIndex = eventDiffs.findIndex((e) => e.kind !== 'same')
+
+  // Each side's ordering basis, reconstructed from the events the diff carries.
+  // Reported SEPARATELY rather than merged: a comparison where one run is
+  // temporally ordered and the other is only in arrival order is aligning
+  // positions that mean different things on each side, and collapsing that into
+  // a single badge would hide exactly the asymmetry an engineer needs to see.
+  const leftOrdering = useMemo(
+    () => analyzeRunOrdering(eventDiffs.map((e) => e.leftEvent).filter(isEvent)),
+    [eventDiffs]
+  )
+  const rightOrdering = useMemo(
+    () => analyzeRunOrdering(eventDiffs.map((e) => e.rightEvent).filter(isEvent)),
+    [eventDiffs]
+  )
 
   // Windowed rendering — center the initial window on the first divergence (the
   // row engineers care about) when one exists, else start at the top.
@@ -287,6 +324,28 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
           )}
         </div>
       </div>
+
+      {/* Ordering basis, per side. Silent when both runs are natively recorded. */}
+      {(leftOrdering.basis !== 'sequence-native' || rightOrdering.basis !== 'sequence-native') && (
+        <div className="flex flex-col gap-2">
+          {leftOrdering.basis !== 'sequence-native' && (
+            <div>
+              <div className="text-xs font-medium text-ash uppercase tracking-wider mb-1">
+                Run A ordering
+              </div>
+              <OrderingBasisNote ordering={leftOrdering} subject="comparison" />
+            </div>
+          )}
+          {rightOrdering.basis !== 'sequence-native' && (
+            <div>
+              <div className="text-xs font-medium text-ash uppercase tracking-wider mb-1">
+                Run B ordering
+              </div>
+              <OrderingBasisNote ordering={rightOrdering} subject="comparison" />
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Truncation warning */}
       {diff.truncated && (

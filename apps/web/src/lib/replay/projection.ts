@@ -1,4 +1,7 @@
+import { analyzeRunOrdering, orderEventsForProjection } from "@agent-flight-recorder/contracts";
+
 import type { Event, FrameStatus, ReplayActor, ReplayFrame, ReplayProjection, Run } from "@agent-flight-recorder/contracts";
+
 
 /**
  * Maximum parent-chain depth traversal to prevent runaway cycles.
@@ -9,7 +12,9 @@ export const MAX_REPLAY_DEPTH = 20;
 /**
  * Maximum number of events to process in a single replay projection.
  * Runs exceeding this limit will set truncated=true and only include
- * the first MAX_EVENTS_PER_REPLAY events sorted by sequenceNumber.
+ * the first MAX_EVENTS_PER_REPLAY events in projection order (see
+ * `orderEventsForProjection` — sequence order for a native run, temporal order
+ * for a run derived from OTel spans).
  */
 export const MAX_EVENTS_PER_REPLAY = 10_000;
 
@@ -216,7 +221,12 @@ function computeDepth(
  *
  * @param run - The run record providing `id` and metadata.
  * @param events - The full event log for the run. May arrive out of order.
- * @returns A ReplayProjection with one ReplayFrame per event, sorted by sequenceNumber.
+ * @returns A ReplayProjection with one ReplayFrame per event, in projection
+ *          order: `sequenceNumber` for a natively-recorded run, `temporalOrder`
+ *          for a run derived from OTel spans. Callers rendering the result
+ *          should also call `analyzeRunOrdering` and surface the basis — a run
+ *          whose derived events carry no ordering key is shown in ARRIVAL order
+ *          and the user has to be told so.
  *
  * Edge cases:
  * - Empty event array: returns a projection with 0 frames, 0 duration, isComplete=false.
@@ -229,6 +239,10 @@ export function buildReplayProjection(run: Run, events: Event[]): ReplayProjecti
     return {
       runId: run.id,
       frames: [],
+      // An empty run has nothing whose order could be wrong. Stated rather than
+      // omitted so this branch matches `buildReplayProjectionMirror`'s empty
+      // case, which also returns "sequence-native".
+      orderingBasis: "sequence-native",
       totalEvents: 0,
       duration_ms: 0,
       isComplete: false,
@@ -236,8 +250,22 @@ export function buildReplayProjection(run: Run, events: Event[]): ReplayProjecti
     };
   }
 
-  // 1. Sort by sequenceNumber ascending.
-  const allSorted = [...events].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+  // 1. Order the events.
+  //
+  // NOT "sort by sequenceNumber" any more. `sequenceNumber` is the order we
+  // LEARNED of an event, which coincides with the order it HAPPENED only on the
+  // first-party SDK path. For a run derived from OpenTelemetry spans arriving
+  // across multiple OTLP batches the two diverge, and rendering the divergent
+  // one as a timeline shows the order the collector flushed — which for exactly
+  // the crash / backpressure / timeout cases this product exists to explain is
+  // NOT the order things happened.
+  //
+  // `orderEventsForProjection` takes the literal pre-existing sequence sort for
+  // a fully-native run (see its contract), so the first-party path is unchanged.
+  // See `packages/contracts/src/temporal.ts` for the ruling and its provenance.
+  // That module is CANONICAL — it was hoisted out of this package precisely so
+  // that the browser, `afr` and MCP cannot order the same run differently.
+  const allSorted = orderEventsForProjection(events);
 
   // Truncate to MAX_EVENTS_PER_REPLAY if necessary.
   const truncated = allSorted.length > MAX_EVENTS_PER_REPLAY;
@@ -290,6 +318,24 @@ export function buildReplayProjection(run: Run, events: Event[]): ReplayProjecti
   return {
     runId: run.id,
     frames,
+    // What the order above is entitled to CLAIM.
+    //
+    // Computed from `events` — the FULL log — not from `sorted`, and the
+    // distinction is load-bearing rather than stylistic. `orderEventsForProjection`
+    // decides its branch from the full set: if ANY derived event in the run
+    // lacks an ordering key, the whole array is ordered by arrival. Deriving the
+    // label from the post-truncation slice would then report `temporal` for a
+    // >10,000-event run whose only unkeyed event fell outside the window — a
+    // timeline ordered by arrival, labelled as ordered by time. That is a
+    // strictly worse failure than no label at all.
+    //
+    // This also keeps the label identical to `convex/helpers/replay_projection.ts`,
+    // which computes `analyzeOrderingBasis(events)` the same way. `apiGetReplay`
+    // (the `afr` CLI and MCP read path) and this projection therefore cannot
+    // label the same run differently — two independently-computed bases that
+    // disagree would be worse than the unlabelled divergence this field exists
+    // to fix, because both sides would then claim to be labelled.
+    orderingBasis: analyzeRunOrdering(events).basis,
     totalEvents: sorted.length,
     duration_ms,
     isComplete,

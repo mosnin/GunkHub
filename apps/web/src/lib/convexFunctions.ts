@@ -67,6 +67,11 @@ export const convex = {
     createComment: makeFunctionReference<M>('comments:createComment'),
     resolveComment: makeFunctionReference<M>('comments:resolveComment'),
   },
+  // ADR-007 OTLP/HTTP trace ingest. Consumed by
+  // apps/web/src/lib/services/otel_ingest.ts, behind POST /api/v1/traces.
+  otel_ingest: {
+    otelIngestSpans: makeFunctionReference<M>('otel_ingest:otelIngestSpans'),
+  },
   sdk_ingest: {
     checkIngestAuth: makeFunctionReference<Q>('sdk_ingest:checkIngestAuth'),
     sdkCreateRun: makeFunctionReference<M>('sdk_ingest:sdkCreateRun'),

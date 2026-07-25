@@ -60,11 +60,15 @@ import {
 import { describe, expect, it } from 'vitest'
 
 import {
+  DAY,
   DIY_TOKEN_BUDGET,
+  FROZEN_NOW as NOW,
+  HOUR,
   TRIAGE_TOKEN_BUDGET,
   attributeRowBytes,
   byteLength,
   estimateTokens,
+  fatPattern,
 } from './mcp_budgets.js'
 
 import type { FailurePattern } from '@agent-flight-recorder/contracts'
@@ -82,75 +86,19 @@ import type { V1ListFixConfidenceEnvelope } from '@agent-flight-recorder/sdk'
  * `tests/package.json` and `tests/vitest.config.ts` have since falsified.
  */
 
-const NOW = 1_753_500_000_000
-const HOUR = 60 * 60 * 1000
-const DAY = 24 * HOUR
-
 // ---------------------------------------------------------------------------
-// FAT inputs — every field the contract permits, so the projection is proven
+// FAT inputs — SHARED, not re-declared here
 // ---------------------------------------------------------------------------
-
-const LABELS = [
-  'Tool call failed',
-  'LLM request timed out',
-  'HTTP 429 from provider',
-  'Retrieval returned no documents',
-  'Tool "search" returned malformed JSON',
-  'Model refused: content policy',
-  'Context length exceeded',
-  'Rate limited by upstream API',
-  'Unhandled exception in agent loop',
-  'Timed out waiting for tool result',
-]
-const CLASSES = ['tool_error', 'timeout', 'http_error', 'retrieval_error', 'llm_error']
-
-/**
- * A MAXIMAL `FailurePattern` — every optional field populated, including the
- * bounded-but-large arrays and the nested spike assessment and confidence
- * snapshot. Serialized whole, one of these is ~1.5 KB; a triage item must be a
- * few dozen tokens. That gap is what is under test.
- */
-/**
- * Overrides must permit an EXPLICIT `undefined` per key: under
- * `exactOptionalPropertyTypes` a `Partial<T>` rejects `{ lastSpikeAssessment:
- * undefined }`, and "this optional field is absent" is exactly what several
- * cases below need to say about a maximal fixture.
- */
-type PatternOverrides = { [K in keyof FailurePattern]?: FailurePattern[K] | undefined }
-
-function fatPattern(i: number, overrides: PatternOverrides = {}): FailurePattern {
-  return {
-    id: `fp_${String(i)}`,
-    orgId: 'org_caller',
-    fingerprintHash: String(i + 1).padStart(2, '0') + 'f3a9c1d4e7b2',
-    class: CLASSES[i % CLASSES.length]!,
-    label: LABELS[i % LABELS.length]!,
-    salientKey: 'search',
-    count: [128, 41, 7, 220, 3, 19, 66, 12, 5, 88][i % 10]!,
-    firstSeenAt: NOW - 30 * DAY,
-    lastSeenAt: NOW - (i % 7) * HOUR,
-    representativeRunIds: [`run_${String(i)}a`, `run_${String(i)}b`, `run_${String(i)}c`, `run_${String(i)}d`, `run_${String(i)}e`],
-    affectedAgentVersionIds: Array.from({ length: 20 }, (_, v) => `ver_${String(i)}_${String(v)}`),
-    affectedAgentIds: ['agent_a1', 'agent_b2'],
-    lastSpikeAssessment: { assessedAt: NOW - HOUR, isSpiking: i % 2 === 0, recentCount: 44, baselineMean: 6.25, z: 4.81 },
-    lastPatternSpikeAlertFiredAt: NOW - 2 * HOUR,
-    muted: false,
-    mutedAt: NOW - 10 * DAY,
-    status: (['open', 'acknowledged', 'resolved'] as const)[i % 3]!,
-    acknowledgedAt: NOW - 5 * DAY,
-    acknowledgedByUserId: 'user_2f9',
-    resolvedAt: NOW - 4 * DAY,
-    resolvedByUserId: 'user_2f9',
-    resolutionNote:
-      'Added retry with jitter on 429 from the provider, plus a circuit breaker after five consecutive failures.',
-    resolutionRef: 'https://github.com/acme/agent/pull/812',
-    regressedAt: NOW - 3 * DAY,
-    resolvedInVersionId: 'ver_7c1',
-    resolvedAtRunCount: 1204,
-    resolvedAtOccurrenceCount: 41,
-    ...overrides,
-  } as FailurePattern
-}
+//
+// `fatPattern` and its clock (`FROZEN_NOW`, `HOUR`, `DAY`) come from
+// `./mcp_budgets.js`, the single declaration of the contract-maximal fixture
+// family and the only copy `checkMaximality` proves saturated. The local copy
+// this replaces was already two fields short of the contract
+// (`lastFixConfidence`, `fixConfidenceRefreshAt`) and the OTel iteration would
+// have widened that gap silently, because nothing ever checked it.
+//
+// `NOW` is `FROZEN_NOW` under its old name: every recency assertion below is
+// written as an offset from it, and the shared fixtures use the same instant.
 
 /** The `fixConfidence` envelope a modern deployment returns for a page. */
 function envelopeFor(patterns: readonly FailurePattern[], unevaluated: string[] = []): V1ListFixConfidenceEnvelope {
@@ -284,7 +232,9 @@ describe('afr_triage next-hop pointers', () => {
 
   it('points an unresolved pattern at a concrete run, not at more pattern metadata', () => {
     const p = fatPattern(1, { status: 'open', resolvedAt: undefined, regressedAt: undefined })
-    expect(choosePointer(p, 'open')).toEqual({ tool: 'afr_explain_run', args: { runId: 'run_1a' } })
+    // `run_10` is `fatPattern(1).representativeRunIds[0]` in the shared family
+    // (`run_${i}${r}`); the local copy this suite used to carry named it `run_1a`.
+    expect(choosePointer(p, 'open')).toEqual({ tool: 'afr_explain_run', args: { runId: 'run_10' } })
   })
 
   it('falls back to the evidence tier rather than emitting no pointer at all', () => {

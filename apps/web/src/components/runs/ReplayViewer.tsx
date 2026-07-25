@@ -1,9 +1,16 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { analyzeRunOrdering, readEventTiming } from '@agent-flight-recorder/contracts'
+import { useEffect, useMemo, useRef, useState } from 'react'
+
 
 import type { FailureSummary, ReplayFrame, ReplayProjection } from '@agent-flight-recorder/contracts'
 
+import {
+  EventTimingRows,
+  InferredTimingMark,
+  OrderingBasisNote,
+} from '@/components/runs/TemporalOrderNote'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { isEditableTarget, isNavFirstKey, isNavLastKey } from '@/lib/hooks/useKeyScope'
 
@@ -85,8 +92,12 @@ function FrameRow({ frame, isActive, onClick, rowRef }: FrameRowProps) {
           </span>
         )}
       </span>
-      <span className="shrink-0 text-xs font-mono text-pewter mt-0.5">
-        #{frame.event.sequenceNumber}
+      {/* `~` when this frame's instant was inferred rather than measured. Sits
+          beside the sequence number, which on a derived run is the order we
+          LEARNED of the event — not the order it happened. */}
+      <span className="shrink-0 flex items-center gap-1 text-xs font-mono text-pewter mt-0.5">
+        <InferredTimingMark timing={readEventTiming(frame.event)} />#
+        {frame.event.sequenceNumber}
       </span>
       {frame.status === 'terminal' && (
         <span className="shrink-0 text-xs font-mono text-neon-glow mt-0.5">
@@ -108,6 +119,13 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
   const activeRowRef = useRef<HTMLButtonElement | null>(null)
 
   const activeFrame = total > 0 ? frames[currentIndex] : null
+
+  // What the rendered order of these frames is entitled to CLAIM. Derived from
+  // the frames themselves, so no service or contract change is needed to carry
+  // it: `buildReplayProjection` has already ordered them, and this reports which
+  // ordering it used. Returns `sequence-native` for every first-party run, in
+  // which case `OrderingBasisNote` renders nothing.
+  const ordering = useMemo(() => analyzeRunOrdering(frames.map((f) => f.event)), [frames])
 
   function goPrev() {
     setCurrentIndex((i) => Math.max(0, i - 1))
@@ -180,6 +198,13 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
       <div className="px-4 py-2 bg-graphite border border-graphite-light rounded-[4px] mx-6 mt-4 text-xs text-pewter font-medium shrink-0">
         Replay is a derived projection. The event log is not modified.
       </div>
+
+      {/* Ordering basis — silent for a natively-recorded run. */}
+      {ordering.basis !== 'sequence-native' && (
+        <div className="mx-6 mt-2 shrink-0">
+          <OrderingBasisNote ordering={ordering} subject="replay" />
+        </div>
+      )}
 
       {/* Truncation warning — shown when the run exceeds MAX_EVENTS_PER_REPLAY */}
       {projection.truncated && (
@@ -325,10 +350,10 @@ function FrameDetail({ frame }: FrameDetailProps) {
         <div className="text-neutral-500">Elapsed</div>
         <div className="font-mono text-neutral-300">{formatElapsed(frame.elapsed_ms)}</div>
 
-        <div className="text-neutral-500">Timestamp</div>
-        <div className="font-mono text-neutral-300">
-          {new Date(event.timestamp).toISOString()}
-        </div>
+        {/* Timestamp — plus, for a derived event whose instant was clamped, the
+            raw value and the skew. A clamped instant was NOT measured, and it is
+            rendered as inferred rather than presented as a reading. */}
+        <EventTimingRows event={event} />
 
         {event.parentEventId && (
           <>

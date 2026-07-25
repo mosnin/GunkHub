@@ -97,6 +97,72 @@ export interface Run {
    * aggregate, so it cannot drift out of sync with the event log.
    */
   modelsSeen?: string[];
+  /**
+   * ADR-007: the W3C trace id this run was DERIVED from, when it was derived
+   * from OpenTelemetry spans rather than recorded by the SDK.
+   *
+   * This field IS the trace->run ruling: one trace is exactly one run, keyed
+   * `(orgId, otelTraceId)`. Set only by `otelIngestSpans`
+   * (convex/otel_ingest.ts) and never by the SDK ingest path.
+   *
+   * Absent means "not derived from a trace". It is NOT a substitute for
+   * per-event provenance: a reader asking whether a given EVENT is our
+   * interpretation of somebody else's telemetry must read
+   * {@link Event.provenance}, which cannot be forged by the SDK path. This is
+   * the run-level correlation key, nothing more.
+   */
+  otelTraceId?: string;
+  /**
+   * ADR-007: the trace's true root span, recorded the first time one is
+   * observed CLOSED. Present only on OTel-derived runs.
+   *
+   * Its presence is what makes a derived run eligible to be settled — closed
+   * with a terminal event after a quiet period. Its absence means the root
+   * never arrived closed and the run's outcome is genuinely unknown, which
+   * Event Log Rule 5 already defines as in-progress.
+   */
+  otelRoot?: {
+    spanId: string;
+    spanName: string;
+    status: "unset" | "ok" | "error";
+    /** Root's end instant, epoch NANOSECONDS as a decimal string. */
+    endUnixNano: string;
+  };
+  /**
+   * ADR-007: the chosen root's START instant, epoch nanoseconds as a decimal
+   * string. Root selection is `min(start, spanId)` over the whole TRACE, and
+   * comparing a later batch's candidate against the recorded one needs it.
+   */
+  otelRootStartNano?: string;
+  /**
+   * ADR-007: the latest temporal instant of any event in this run, epoch
+   * nanoseconds as a decimal string. Monotonic max, add-only. Guarantees the
+   * synthesized terminal event sorts after everything it terminates.
+   */
+  otelMaxInstantNano?: string;
+  /**
+   * ADR-007: count of events on this run whose provenance is `otel`. Add-only,
+   * written at ingest. `0` (or absent) means every event was recorded
+   * first-party, so `sequenceNumber` IS temporal order.
+   */
+  derivedEventCount?: number;
+  /**
+   * ADR-007: count of DERIVED events stored without a usable temporal key.
+   * Add-only. Non-zero means the run can only be rendered in arrival order and
+   * must be LABELLED `ingest-unverified` rather than presented as a timeline.
+   *
+   * Together with {@link derivedEventCount} this gives the same three-way
+   * verdict as {@link analyzeRunOrdering} in O(1) instead of O(run) — which is
+   * what lets a paged consumer (MCP, CLI) state the verdict at all, rather than
+   * only the one-sided alarm a window can support.
+   *
+   * OBSERVABILITY-GRADE, per ADR-002. The event log remains the source of truth
+   * for the ordering itself; use {@link orderEventsForProjection} to actually
+   * order events.
+   */
+  otelUnkeyedDerivedCount?: number;
+  /** ADR-007: wall clock of the most recent derived append. Drives the settle window. */
+  otelLastAppendAt?: number;
 }
 
 export interface Event {
@@ -137,6 +203,28 @@ export interface Event {
    * explicitly rather than assuming it inline at each call site.
    */
   provenance?: EventProvenance;
+  /**
+   * The TEMPORAL truth for a derived event, carried separately from
+   * `sequenceNumber`.
+   *
+   * On the OTel ingest path `sequenceNumber` is THE ORDER WE LEARNED ABOUT THE
+   * EVENT, not the order it happened. Within one OTLP batch the two coincide;
+   * across batches they cannot, because a span arriving later that occurred
+   * earlier can only be APPENDED — inserting it would require renumbering, and
+   * renumbering an append-only log is permanent corruption (Event Log Rule 1).
+   *
+   * OPTIONAL, and absent by construction on native runs: an SDK-recorded event
+   * has no span, no clamp, and its `sequenceNumber` IS its temporal order.
+   * Absent on a DERIVED event means the ordering is unverifiable — see
+   * {@link OrderingBasis}'s `ingest-unverified`, which must be LABELLED rather
+   * than silently rendered as a timeline.
+   *
+   * Read it with {@link readTemporalOrder} (which validates before trusting)
+   * and sort with {@link orderEventsForProjection}. Do not compare the raw
+   * decimal-nanosecond strings — string order is wrong across differing
+   * lengths.
+   */
+  temporalOrder?: TemporalOrderKey;
 }
 
 export interface Artifact {
@@ -177,6 +265,7 @@ export interface Comment {
 import type { EventType, EventPayload } from "./events.js";
 import type { EventProvenance, OtelEventProvenance } from "./provenance.js";
 import type { RunStatus, RunTriageState } from "./status.js";
+import type { TemporalOrderKey } from "./temporal.js";
 
 /**
  * An `Event` KNOWN to have been derived from an OTel span.

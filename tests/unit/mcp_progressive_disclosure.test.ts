@@ -32,6 +32,7 @@
  * for each budget's derivation.
  */
 import {
+  ORDERING_UNVERIFIED_BASIS,
   TRANSITIONS_CAP,
   budgetEventRows,
   toEventRow,
@@ -43,6 +44,8 @@ import {
 import { describe, expect, it } from 'vitest'
 
 import {
+  ORDERING_BASIS_TOKEN_COST,
+  PAYLOAD_EXTERNALIZATION_THRESHOLD,
   RAW_DUMP_TOKENS,
   TIER1_PATTERN_COUNT,
   TIER1_TOKEN_BUDGET,
@@ -59,15 +62,17 @@ import {
   attributeTopLevelBytes,
   byteLength,
   estimateTokens,
+  externalizedEvent,
+  fatPattern,
+  fatRun,
   findForbiddenPaths,
+  nearThresholdEvent,
+  unkeyedDerivedEvent,
 } from './mcp_budgets.js'
 
 import type {
   Event,
-  ExternalizedPayload,
-  FailurePattern,
   PatternResolutionEvidence,
-  Run,
   RunExplanation,
 } from '@agent-flight-recorder/contracts'
 import type { V1ListFixConfidenceEnvelope } from '@agent-flight-recorder/sdk'
@@ -115,92 +120,22 @@ const { MAX_LIMIT: TIER4_MAX_LIMIT } = (await import(/* @vite-ignore */ GET_RUN_
 }
 
 // ---------------------------------------------------------------------------
-// FAT inputs — every field the contract permits, so the projection is proven
+// FAT inputs — SHARED, not re-declared here
 // ---------------------------------------------------------------------------
-
-const LABELS = [
-  'Tool call failed',
-  'LLM request timed out',
-  'HTTP 429 from provider',
-  'Retrieval returned no documents',
-  'Tool "search" returned malformed JSON',
-  'Model refused: content policy',
-  'Context length exceeded',
-  'Rate limited by upstream API',
-  'Unhandled exception in agent loop',
-  'Timed out waiting for tool result',
-]
-const CLASSES = [
-  'tool_error',
-  'timeout',
-  'http_error',
-  'retrieval_error',
-  'tool_error',
-  'llm_error',
-  'llm_error',
-  'http_error',
-  'unknown',
-  'timeout',
-]
-
-/**
- * A MAXIMAL `FailurePattern` — every optional field populated, including the
- * bounded-but-large arrays (`representativeRunIds` <= 5,
- * `affectedAgentVersionIds` <= 20) and the nested spike assessment and
- * confidence snapshot. Serialized whole, one of these is ~700 bytes; the
- * tier-1 row must be ~25 tokens. That gap is what is under test.
- */
-function fatPattern(i: number): FailurePattern {
-  return {
-    id: `fp_${String(i)}`,
-    orgId: 'org_caller',
-    fingerprintHash: String(i + 1).padStart(2, '0') + 'f3a9c1d4e7b2',
-    class: CLASSES[i % CLASSES.length]!,
-    label: LABELS[i % LABELS.length]!,
-    salientKey: 'search',
-    count: [128, 41, 7, 220, 3, 19, 66, 12, 5, 88][i % 10]!,
-    firstSeenAt: 1_750_000_000_000,
-    lastSeenAt: 1_753_400_000_000 + i * 97_000,
-    representativeRunIds: [`run_${String(i)}a`, `run_${String(i)}b`, `run_${String(i)}c`, `run_${String(i)}d`, `run_${String(i)}e`],
-    affectedAgentVersionIds: Array.from({ length: 20 }, (_, v) => `ver_${String(i)}_${String(v)}`),
-    affectedAgentIds: ['agent_a1', 'agent_b2'],
-    lastSpikeAssessment: {
-      assessedAt: 1_753_390_000_000,
-      isSpiking: true,
-      recentCount: 44,
-      baselineMean: 6.25,
-      z: 4.81,
-    },
-    lastPatternSpikeAlertFiredAt: 1_753_391_000_000,
-    muted: false,
-    mutedAt: 1_752_000_000_000,
-    status: (['open', 'acknowledged', 'resolved'] as const)[i % 3]!,
-    acknowledgedAt: 1_753_000_000_000,
-    acknowledgedByUserId: 'user_2f9',
-    resolvedAt: 1_753_100_000_000,
-    resolvedByUserId: 'user_2f9',
-    resolutionNote:
-      'Added retry with jitter on 429 from the provider, plus a circuit breaker after five consecutive failures.',
-    resolutionRef: 'https://github.com/acme/agent/pull/812',
-    regressedAt: 1_753_300_000_000,
-    resolvedInVersionId: 'ver_7c1',
-    resolvedAtRunCount: 1204,
-    resolvedAtOccurrenceCount: 41,
-    lastFixConfidence: {
-      computedAt: 1_753_395_000_000,
-      basisResolvedAt: 1_753_100_000_000,
-      state: 'proving',
-      score: 0.71,
-      exposureRuns: 1802,
-      observedRuns: 1900,
-      exposureTruncated: false,
-      versionAttribution: 'matched',
-      recurred: false,
-      limitingFactor: 'accumulating',
-    },
-    fixConfidenceRefreshAt: 1_753_500_000_000,
-  }
-}
+//
+// `fatPattern`, `fatRun`, `externalizedEvent` and `nearThresholdEvent` are
+// imported from `./mcp_budgets.js`, which is the single declaration of the
+// contract-maximal fixture family and the only copy `checkMaximality` proves
+// saturated. This file used to carry its own, and the copies did not stay
+// equal — for the SAME tool on the SAME scenario the budget script measured 294
+// where this suite measured 284. Ten tokens of tier-1 headroom that never
+// existed, invisible because each family was correct on its own terms.
+//
+// The OTel iteration made that worse rather than better: the local copies
+// predated `Run.otelTraceId`/`otelRoot`/`otelRootStartNano`/`otelLastAppendAt`
+// and `Event.temporalOrder`, so they under-stated the contract by five fields
+// and nothing here could say so — `checkMaximality` only ever inspected the
+// shared family.
 
 const FAT_PATTERNS = Array.from({ length: TIER1_PATTERN_COUNT }, (_, i) => fatPattern(i))
 
@@ -687,48 +622,6 @@ describe('tier 3 (afr_explain_run) — token budget', () => {
 // Tier 4 — afr_get_run_events
 // ---------------------------------------------------------------------------
 
-const PAYLOAD_EXTERNALIZATION_THRESHOLD = 10 * 1024
-
-function externalizedEvent(seq: number): Event {
-  const payload: ExternalizedPayload = {
-    type: '_externalized',
-    originalType: 'llm.request',
-    _artifact: {
-      artifactId: 'art_' + String(seq),
-      storageKey: `org_1/run_8f2c1a/ev_${String(seq)}.json`,
-      storageBucket: 'afr-artifacts',
-      checksum: 'sha256:9c1f2b7d4e8a3c6f1b9d2e5a8c4f7b1d3e6a9c2f5b8d1e4a7c3f6b9d2e5a8c4f',
-      size: 41_203,
-    },
-  }
-  return {
-    id: 'ev_' + String(seq),
-    runId: 'run_8f2c1a',
-    sequenceNumber: seq,
-    type: 'llm.request',
-    timestamp: 1_753_400_000_000 + seq * 1200,
-    payload,
-  } as unknown as Event
-}
-
-/**
- * An event whose payload is JUST UNDER the externalization threshold, so it is
- * NOT externalized and is therefore inlined verbatim. This is the worst case
- * the system can legally produce, and it is entirely reachable: the SDK
- * externalizes only ABOVE 10 KB.
- */
-function nearThresholdEvent(seq: number): Event {
-  const filler = 'x'.repeat(PAYLOAD_EXTERNALIZATION_THRESHOLD - 200)
-  return {
-    id: 'ev_' + String(seq),
-    runId: 'run_8f2c1a',
-    sequenceNumber: seq,
-    type: 'llm.response',
-    timestamp: 1_753_400_000_000 + seq * 1200,
-    payload: { type: 'llm.response', model: 'claude-opus-5', content: filler, finish_reason: 'stop' },
-  } as unknown as Event
-}
-
 describe('tier 4 (afr_get_run_events) — externalized payloads', () => {
   it('NEVER inlines an externalized payload — pointer and checksum only', () => {
     /**
@@ -860,13 +753,30 @@ describe('tier 4 (afr_get_run_events) — window is bounded and hard-capped', ()
         `second budget exists to stop.`,
     ).toBeLessThanOrEqual(WINDOW_PAYLOAD_BYTE_BUDGET)
 
-    // Unbudgeted, the same window is far larger. Asserting the gap is what
-    // proves the budget is doing work rather than being trivially satisfied.
-    const unbudgeted = estimateTokens({ events: events.map((e) => toEventRow(e)) })
-    const budgeted = estimateTokens({ events: rows })
+    /**
+     * Unbudgeted — per-event cap only, no whole-window budget — the same window
+     * carries far more payload. Asserting the gap is what proves the second
+     * budget is doing work rather than being trivially satisfied.
+     *
+     * MEASURED ON PAYLOAD BYTES, NOT ON THE WHOLE SERIALIZED WINDOW, and the
+     * distinction is not pedantry. Whole-window budgeting can only ever remove
+     * PAYLOAD; the rest of a row (`sequenceNumber`, `type`, `timestamp`, and the
+     * unconditional `derived`/`derivedLossy` badge) is incompressible
+     * scaffolding that both sides pay identically. A ratio taken over the whole
+     * serialized window therefore drifts toward 1 every time a row grows a
+     * NON-payload field, and says nothing about whether budgeting still works:
+     * it fell from ~2.03x to ~1.90x — through the `< /2` line — the moment the
+     * shared fixtures started carrying provenance, purely because every row
+     * gained a ~38 B derived badge on both sides of the comparison.
+     */
+    const payloadBytes = (rs: readonly { payload?: unknown }[]): number =>
+      rs.reduce((sum, row) => sum + (row.payload === undefined ? 0 : byteLength(JSON.stringify(row.payload) ?? '')), 0)
+    const unbudgeted = payloadBytes(events.map((e) => toEventRow(e)))
+    const budgeted = payloadBytes(rows)
     expect(
       budgeted,
-      `budgeting saved nothing: ${unbudgeted} tok unbudgeted vs ${budgeted} tok budgeted.`,
+      `budgeting saved nothing: ${unbudgeted} B of inline payload with the per-event cap alone, ` +
+        `${budgeted} B with the whole-window budget as well.`,
     ).toBeLessThan(unbudgeted / 2)
   })
 
@@ -891,6 +801,70 @@ describe('tier 4 (afr_get_run_events) — window is bounded and hard-capped', ()
       payload: { type: 'llm.response', ok: true },
     })) as unknown as Event[]
     expect(budgetEventRows(small).truncated).toBe(false)
+  })
+
+  /**
+   * THE ORDERING ALARM — tier 4's one honest ordering claim.
+   *
+   * The tier used to WARN that "on a derived run sequenceNumber is ingest
+   * order, not necessarily temporal order" and then hand the caller nothing to
+   * act on it with. A warning with no resolution mechanism is worse than
+   * silence: it makes the uncertainty unresolvable instead of merely unflagged,
+   * and MCP is the surface where a caller cannot go and look at the UI instead.
+   *
+   * The claim is ONE-DIRECTIONAL and these three tests are what keep it that
+   * way. `analyzeRunOrdering` returns `ingest-unverified` for the whole run iff
+   * ANY derived event lacks a key, so seeing one in a WINDOW proves the run's
+   * verdict. Nothing about a window can prove `temporal` or `sequence-native`,
+   * so the field must never appear in those cases — an alarm that fires on
+   * healthy runs is one a caller learns to ignore, which loses the real case.
+   */
+  it('PROVES ingest-unverified from a window when a derived event has no ordering key', () => {
+    const events = Array.from({ length: TIER4_MAX_LIMIT }, (_, i) => unkeyedDerivedEvent(18 + i))
+    expect(budgetEventRows(events).orderUnverified).toBe(true)
+    expect(ORDERING_UNVERIFIED_BASIS).toBe('ingest-unverified')
+  })
+
+  it('never claims an ordering verdict it cannot prove from a window', () => {
+    // Every derived event keyed: the run MIGHT be `temporal`, but an unkeyed
+    // event could sit one sequence number outside this window and force
+    // `ingest-unverified`. Silence is the only honest answer, and a `temporal`
+    // label here is precisely the confident-looking timeline that is wrong in
+    // an unmarked place.
+    const keyed = Array.from({ length: TIER4_MAX_LIMIT }, (_, i) => externalizedEvent(18 + i))
+    expect(budgetEventRows(keyed).orderUnverified).toBe(false)
+    // A native window must not pay for the question at all.
+    const native = keyed.map((e) => {
+      const copy = { ...e } as Event & { provenance?: unknown; temporalOrder?: unknown }
+      delete copy.provenance
+      delete copy.temporalOrder
+      return copy as Event
+    })
+    expect(budgetEventRows(native).orderUnverified).toBe(false)
+  })
+
+  it(`costs exactly ${String(ORDERING_BASIS_TOKEN_COST)} tokens when it fires, and nothing when it does not`, () => {
+    /**
+     * MEASURED AS A DELTA OVER AN OTHERWISE IDENTICAL WINDOW.
+     * `unkeyedDerivedEvent` differs from `externalizedEvent` in exactly one
+     * field, and that field is never projected — so the whole difference
+     * between these two responses IS the alarm. `scripts/check-token-budgets.ts`
+     * carries the same pair end to end through the registered handler
+     * (4,445 vs 4,454); this is the projection-level half.
+     */
+    const envelope = (unverified: boolean): unknown => ({
+      runId: 'run_8f2c1a',
+      fromSequence: 18,
+      events: [],
+      ...(unverified && { orderingBasis: ORDERING_UNVERIFIED_BASIS }),
+    })
+    const delta = estimateTokens(envelope(true)) - estimateTokens(envelope(false))
+    expect(
+      delta,
+      `the orderingBasis alarm costs ${String(delta)} tokens, not ${String(ORDERING_BASIS_TOKEN_COST)}. Both the ` +
+        'key and the value are fixed strings, so this figure cannot move with the data — if it moved, the key ' +
+        'was renamed or the contract’s OrderingBasis vocabulary changed. Either is worth seeing.',
+    ).toBe(ORDERING_BASIS_TOKEN_COST)
   })
 
   it('spends the budget on the events nearest the window start — the ones the caller aimed at', () => {
@@ -921,33 +895,6 @@ describe('tier 4 (afr_get_run_events) — window is bounded and hard-capped', ()
 // ---------------------------------------------------------------------------
 // Tier 5 — afr_list_runs
 // ---------------------------------------------------------------------------
-
-/** A MAXIMAL `Run`: unbounded metadata bag, tags, labels, searchText, counters. */
-function fatRun(i: number): Run {
-  return {
-    id: 'run_' + String(i + 1).padStart(6, '0'),
-    orgId: 'org_caller',
-    projectId: 'proj_1',
-    agentId: 'agent_a1',
-    agentVersionId: 'ver_7c1',
-    status: (['failed', 'completed', 'running', 'timed_out'] as const)[i % 4]!,
-    startedAt: 1_753_400_000_000 + i * 60_000,
-    endedAt: 1_753_400_030_000 + i * 60_000,
-    // Unbounded and caller-controlled — the whole reason this must not pass through.
-    metadata: { prompt: 'y'.repeat(2000), ticket: 'ACME-4412', region: 'us-east-1' },
-    tags: ['nightly', 'regression-suite', 'high-priority'],
-    triggeredBy: 'user_2f9',
-    sdkVersion: '0.7.5',
-    sessionId: 'sess_31b',
-    environment: 'production',
-    labels: ['triage', 'flaky'],
-    triageState: 'investigating',
-    tokensIn: 120_400,
-    tokensOut: 8_120,
-    searchText: 'z'.repeat(3000),
-    modelsSeen: ['claude-opus-5', 'claude-haiku-4'],
-  } as unknown as Run
-}
 
 describe('tier 5 (afr_list_runs) — compact rows', () => {
   const rows = Array.from({ length: 20 }, (_, i) => toRunRow(fatRun(i)))

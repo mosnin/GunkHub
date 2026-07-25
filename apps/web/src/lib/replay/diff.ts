@@ -1,4 +1,7 @@
+import { orderEventsForProjection } from "@agent-flight-recorder/contracts";
+
 import type { Event, EventDiff, FieldChange, RunDiff } from "@agent-flight-recorder/contracts";
+
 
 /**
  * Maximum number of events to compare per run in a diff computation.
@@ -68,10 +71,16 @@ function lastEvent(sorted: Event[]): Event | undefined {
 /**
  * Builds a deterministic position-aligned diff of two runs' event logs.
  *
- * Alignment is by sequence position (index), not by event ID or type.
- * sequenceNumber 1 in left corresponds to sequenceNumber 1 in right.
- * This reflects the intent to compare two runs that should have executed
- * the same logical steps, making positional drift visible.
+ * Alignment is by POSITION in each run's own projection order, not by event ID
+ * or type: the 1st event of the left run corresponds to the 1st of the right.
+ * This reflects the intent to compare two runs that should have executed the
+ * same logical steps, making positional drift visible.
+ *
+ * Position is not the same as `sequenceNumber`. For a natively-recorded run the
+ * two coincide and nothing changes; for a run derived from OTel spans the
+ * projection order is temporal while `sequenceNumber` is arrival order, so the
+ * `sequenceNumber` reported on each `EventDiff` is a LABEL identifying the
+ * left-hand event, not the alignment key.
  *
  * @param leftRunId - The ID of the baseline (left) run.
  * @param rightRunId - The ID of the comparison (right) run.
@@ -90,9 +99,25 @@ export function buildRunDiff(
   leftEvents: Event[],
   rightEvents: Event[]
 ): RunDiff {
-  // 1. Sort both arrays by sequenceNumber ascending.
-  const leftSorted = [...leftEvents].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
-  const rightSorted = [...rightEvents].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+  // 1. Order both sides.
+  //
+  // Each side is ordered INDEPENDENTLY, by its own basis: a native run keeps the
+  // literal pre-existing sequence sort, a derived run whose events carry
+  // `temporalOrder` is ordered temporally. This matters more here than in
+  // replay, because the diff is POSITION-ALIGNED: position i on the left is
+  // asserted to correspond to position i on the right. If one side is in
+  // temporal order and the other in the collector's flush order, position i
+  // aligns two events that did not correspond, and every downstream signal —
+  // first divergence, changed-field list, statusChanged — is computed against
+  // the wrong pairing. That is not a cosmetic reordering; it is a wrong answer
+  // to the question the page exists to answer.
+  //
+  // See `packages/contracts/src/temporal.ts`. A derived run whose ordering key
+  // is MISSING is ordered
+  // by arrival and reported as `ingest-unverified` by `analyzeRunOrdering`; the
+  // caller is responsible for telling the user the alignment is unverified.
+  const leftSorted = orderEventsForProjection(leftEvents);
+  const rightSorted = orderEventsForProjection(rightEvents);
 
   const maxLen = Math.max(leftSorted.length, rightSorted.length);
   const eventDiffs: EventDiff[] = [];

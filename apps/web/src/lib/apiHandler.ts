@@ -55,6 +55,68 @@ const AFR_CODE_TO_STATUS: Readonly<Record<AfrApiErrorCode, number>> = {
   ARTIFACT_LIMIT_EXCEEDED: 422,
   COMMENT_LIMIT_EXCEEDED: 422,
   RATE_LIMITED: 429,
+
+  // --- ADR-007 (OpenTelemetry span ingestion) ------------------------------
+  //
+  // All four are NON-RETRYABLE, and that is a deliberate choice with a cost on
+  // each side. The consumer that matters is not the SDK — it is an OTLP
+  // exporter, which reads the status class as a control signal and, per the
+  // OTLP/HTTP spec, retries ONLY 429/502/503/504. So the question for each
+  // code is: will the identical request ever succeed?
+  //
+  // If we mark a permanent failure retryable, a conforming exporter retries it
+  // with backoff forever while its bounded queue fills, and it drops LIVE
+  // spans to make room — we lose data that was never broken. If we mark a
+  // transient failure non-retryable, the exporter drops that batch. Both are
+  // data loss; the first is unbounded and self-inflicted.
+
+  /**
+   * 413. The batch exceeded the per-call span ceiling
+   * (`MAX_OTEL_SPANS_PER_BATCH`). Permanent for this batch by definition — the
+   * count does not change on resend. The fix is a smaller
+   * `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, which only the operator can make.
+   */
+  BATCH_TOO_LARGE: 413,
+
+  /**
+   * 413. A span-derived payload exceeded the 10 KB inline limit (Event Log
+   * Rule 3). Permanent: the mutation has no blob access and deliberately will
+   * NOT truncate, because a truncated payload is a falsified record of what
+   * the model was actually sent. Retrying the same span re-produces the same
+   * oversized payload.
+   */
+  PAYLOAD_TOO_LARGE: 413,
+
+  /**
+   * 422. The trace's earliest span predates the 24h stale-run ceiling
+   * (ADR-007 C3). Permanent and MONOTONE — the trace only gets older, so a
+   * retry is strictly further from succeeding than the attempt that failed.
+   * 422 rather than 400: the request is well-formed, it is the state of the
+   * world that makes it unprocessable.
+   */
+  OTEL_TRACE_TOO_OLD: 422,
+
+  /**
+   * 422. A fatal mapper diagnostic — an accepted span produced no event.
+   *
+   * I was asked to consider this one TRANSIENT. It is not, and marking it
+   * retryable would be actively harmful. `convex/helpers/otel_mapping.ts` is a
+   * PURE function of the span batch plus the run's prior state: the same spans
+   * deterministically produce the same fatal diagnostic. The known live
+   * instance of this (the unguarded `RangeError` in
+   * `compareDuplicateCandidates` on a deeply-nested attribute value, found by
+   * Team D) is a CODE DEFECT, not a load condition — it will reproduce on
+   * every retry until the mapper is fixed and redeployed, and telling every
+   * affected exporter to retry it turns one bad span into a permanent retry
+   * storm from every emitter that has one.
+   *
+   * `packages/contracts/src/api_errors.ts` documents this code as
+   * "NON-RETRYABLE: the same spans will fail identically", and that is the
+   * behaviour encoded here. If a genuinely transient mapper failure mode ever
+   * exists it needs its OWN code, because the exporter cannot tell two
+   * meanings of one code apart.
+   */
+  OTEL_MAPPING_FAILED: 422,
 }
 
 /**

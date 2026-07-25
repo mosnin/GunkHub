@@ -61,6 +61,7 @@ import type {
   PatternResolutionEvidence,
   Run,
   RunExplanation,
+  TemporalOrderKey,
 } from '@agent-flight-recorder/contracts'
 import type { V1ListFixConfidenceEnvelope } from '@agent-flight-recorder/sdk'
 
@@ -151,6 +152,27 @@ export const TIER3_TOKEN_BUDGET = 200
  * a prose field. Measured: tier 1's `scanTruncated` costs +5.
  */
 export const MARKER_TOKEN_ALLOWANCE = 8
+
+/**
+ * What tier 4's `orderingBasis` alarm costs when it fires. EXACT, not a budget.
+ *
+ * `,"orderingBasis":"ingest-unverified"` is 36 bytes, so 9 tokens, and unlike
+ * every other number in this file that is not an estimate with headroom — both
+ * the key and the value are fixed strings, the value being a member of the
+ * contract's closed `OrderingBasis` union. The cost cannot vary with the data,
+ * so there is nothing to leave room for.
+ *
+ * DELIBERATELY NOT {@link MARKER_TOKEN_ALLOWANCE}. That one is 8 and its
+ * assertion says "it is a boolean flag"; this is a string naming a contract
+ * vocabulary member and can never be 8. Stretching the boolean allowance to
+ * cover it would have been the cheap move and would have destroyed what the
+ * boolean allowance means. Two different things, two constants.
+ *
+ * An exact figure means the test goes red on a change nobody intended — the key
+ * renamed, the union member renamed, a second value added. Each of those is a
+ * contract change that should be seen, not absorbed.
+ */
+export const ORDERING_BASIS_TOKEN_COST = 9
 
 /**
  * The premise this package exists for: a 50-step run dumped raw is ~100k
@@ -336,6 +358,34 @@ export const FROZEN_NOW = 1_753_500_000_000
 export const HOUR = 3_600_000
 export const DAY = 24 * HOUR
 
+/**
+ * Epoch MILLISECONDS to the epoch-NANOSECOND decimal string the OTel contracts
+ * carry (`Run.otelRoot.endUnixNano`, `TemporalOrderKey.instantUnixNano`, …).
+ *
+ * A string, and never a `number`: float64 ULP at a 2026 epoch-nanosecond value
+ * (~1.75e18) is 256 ns, so `Number()` collapses distinct instants. See the
+ * argument on `TemporalOrderKey` in `packages/contracts/src/temporal.ts`.
+ */
+function nanosOfMs(ms: number): string {
+  return String(ms) + '000000'
+}
+
+/**
+ * The span id shared by an event's provenance and its temporal-order key — one
+ * span, one id.
+ *
+ * EXACTLY 16 LOWERCASE HEX CHARACTERS, which is a W3C span id and therefore the
+ * maximum by definition. It was 17 for a while, which errs in the safe
+ * direction (a maximality fixture that over-states cannot under-state a budget)
+ * and is still wrong: this family's whole claim is "contract-maximal and
+ * provably so", and a field that reaches its maximum by being INVALID weakens
+ * that claim for every reader who spot-checks it. Correcting it lowers a
+ * measurement; the baseline moves in the same commit, which is the point.
+ */
+function spanIdOf(seq: number): string {
+  return String(seq).padStart(4, '0') + 'b7ad6b716920'
+}
+
 const LABELS: readonly string[] = [
   'Tool call failed',
   'LLM request timed out',
@@ -437,7 +487,18 @@ export function fatEnvelope(
   }
 }
 
-/** Every field `Run` declares, with the unbounded bags filled hostilely. */
+/**
+ * Every field `Run` declares, with the unbounded bags filled hostilely.
+ *
+ * IT IS A MAXIMAL PAYLOAD, NOT A PRODUCIBLE ONE, and that is deliberate. This
+ * fixture carries `sdkVersion` AND the ADR-007 `otel*` block at the same time,
+ * which no ingest path emits — `otelTraceId` is set only by `otelIngestSpans`
+ * and never by the SDK path. `checkMaximality` demands every declared field be
+ * populated, and it is right to: a budget is a ceiling, and the ceiling is the
+ * largest document the SCHEMA permits, not the largest one today's two writers
+ * happen to produce. A projection that is lean against this is lean against
+ * either real shape.
+ */
 export function fatRun(i: number): Run {
   return {
     id: 'run_' + String(i + 1).padStart(6, '0'),
@@ -461,6 +522,51 @@ export function fatRun(i: number): Run {
     tokensOut: 8_120,
     searchText: 'z'.repeat(3000),
     modelsSeen: ['claude-opus-5', 'claude-haiku-4'],
+    // ADR-007 — the OTel-derived run block. Widths, not shapes, are what cost
+    // bytes here, and each is at its true maximum:
+    //   - a W3C trace id is EXACTLY 32 lowercase hex characters. Fixed width,
+    //     so this is the maximum by definition. Varied per run because one
+    //     trace is exactly one run — a hundred identical trace ids on one page
+    //     is a payload the key constraint forbids.
+    //   - a W3C span id is EXACTLY 16 lowercase hex characters.
+    //   - `status` is the closed union `unset | ok | error`; `error` and
+    //     `unset` tie at 5 characters, the widest available.
+    //   - the nano fields are epoch NANOSECONDS as decimal strings, which at a
+    //     2026 epoch are 19 digits — the widest they get this century.
+    //   - `spanName` is unbounded in the contract and uncapped by the mapper,
+    //     so it carries a realistically hostile fully-qualified span name, the
+    //     same convention `fatProvenance` established.
+    otelTraceId: String(i).padStart(4, '0') + '2f3577b34da6a3ce929d0e0e4736',
+    otelRoot: {
+      spanId: String(i).padStart(4, '0') + '67aa0ba902b7',
+      spanName: 'openinference.agent.workflow.execute',
+      status: 'error',
+      endUnixNano: nanosOfMs(FROZEN_NOW - DAY + 30_000 + i * 60_000),
+    },
+    otelRootStartNano: nanosOfMs(FROZEN_NOW - DAY + i * 60_000),
+    // Monotonic max over every event's temporal instant, so it is at or after
+    // the root's end — same 19-digit width as the other nano fields.
+    otelMaxInstantNano: nanosOfMs(FROZEN_NOW - DAY + 30_000 + i * 60_000),
+    otelLastAppendAt: FROZEN_NOW - DAY + 45_000 + i * 60_000,
+    // ADR-007 ordering counters. Both COUNT EVENTS IN ONE RUN, so their maximum
+    // is not arbitrary and is not a taste question: a run is full at
+    // `MAX_EVENTS_PER_RUN` (50,000 — `convex/helpers/pagination.ts`, which makes
+    // `sequenceNumber > MAX_EVENTS_PER_RUN` the O(1) "run is full" check), so no
+    // count of its events can exceed 50,000. Five digits, which is the width
+    // that costs the bytes — same derivation as `depth: 999` from
+    // `MAX_OTEL_SPANS_PER_BATCH` on the temporal key.
+    //
+    // BOTH AT THE CEILING, WHICH IS THE ONLY ASSIGNMENT THAT MAXIMISES BOTH AND
+    // STAYS COHERENT. `otelUnkeyedDerivedCount <= derivedEventCount` is an
+    // invariant, not a coincidence — the unkeyed events are a subset of the
+    // derived ones — so a fixture that maxed the second past the first would be
+    // INCOHERENT rather than maximal, the same failure `spanIdOf` exists to
+    // prevent by making one span carry one id. Equality at the ceiling is
+    // meaningful in its own right: every event derived and not one of them
+    // keyed is exactly the `ingest-unverified` verdict, the worst case for the
+    // ordering alarm this tier now raises.
+    derivedEventCount: 50_000,
+    otelUnkeyedDerivedCount: 50_000,
   } as unknown as Run
 }
 
@@ -488,7 +594,7 @@ export function fatProvenance(seq: number): OtelEventProvenance {
   return {
     source: 'otel',
     traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
-    spanId: String(seq).padStart(4, '0') + 'b7ad6b7169203',
+    spanId: spanIdOf(seq),
     parentSpanId: '00f067aa0ba902b7',
     spanName: 'openinference.chain.llm.invoke',
     scopeName: 'openinference.instrumentation.langchain',
@@ -506,6 +612,43 @@ export function fatProvenance(seq: number): OtelEventProvenance {
       'identity-synthesized',
     ],
     receivedAt: FROZEN_NOW + seq * 1200 + 40,
+  }
+}
+
+/**
+ * A MAXIMAL `TemporalOrderKey` — the ADR-007 sibling field that carries an
+ * OTel-derived event's TEMPORAL truth, separately from `sequenceNumber`.
+ *
+ * WHY EVERY EVENT FIXTURE CARRIES ONE, for the same reason they all carry
+ * {@link fatProvenance}: a derived event's `sequenceNumber` is only the order we
+ * LEARNED about it, so a multi-batch trace — the ordinary shape of anything an
+ * OTLP collector flushes — produces this key on every derived event. A tier-4
+ * budget measured against events that omit it is a budget measured against a
+ * payload the system does not produce.
+ *
+ * Every field at its true maximum, and each maximum is a WIDTH:
+ *   - both nano fields are 19-digit decimal strings (epoch ns at a 2026 epoch).
+ *   - they DIFFER, which is the expensive branch: equal values would be the
+ *     unclamped case, and `readEventTiming` only emits a skew when a clamp was
+ *     actually applied. The skew is sub-second so both stay 19 digits.
+ *   - `phase` is the closed union `open | close`; `close` is the wider.
+ *   - `depth` is unbounded in the contract, but its BYTE cost is its width. One
+ *     OTLP batch is capped at `MAX_OTEL_SPANS_PER_BATCH` (1,000 — see
+ *     `convex/helpers/pagination.ts`), and the deepest tree 1,000 spans can form
+ *     is a linear chain, so 999 is the widest depth a single batch can reach.
+ *   - `spanId` is {@link spanIdOf}, the SAME id the event's provenance carries.
+ *     Two ids for one span would be an incoherent fixture, not a fatter one.
+ */
+export function fatTemporalOrder(seq: number): TemporalOrderKey {
+  const effective = BigInt(nanosOfMs(FROZEN_NOW + seq * 1200))
+  // ~412 ms of forward clamp: a child pushed to its parent's start instant.
+  const skewNano = BigInt(412_837_009)
+  return {
+    instantUnixNano: effective.toString(),
+    rawInstantUnixNano: (effective - skewNano).toString(),
+    phase: 'close',
+    depth: 999,
+    spanId: spanIdOf(seq),
   }
 }
 
@@ -531,6 +674,7 @@ export function externalizedEvent(seq: number): Event {
       },
     },
     provenance: fatProvenance(seq),
+    temporalOrder: fatTemporalOrder(seq),
   } as unknown as Event
 }
 
@@ -556,7 +700,29 @@ export function nearThresholdEvent(seq: number): Event {
       finish_reason: 'stop',
     },
     provenance: fatProvenance(seq),
+    temporalOrder: fatTemporalOrder(seq),
   } as unknown as Event
+}
+
+/**
+ * A derived event with provenance but NO `temporalOrder` — the case that makes
+ * a run's ordering unverifiable.
+ *
+ * DELIBERATELY NOT CONTRACT-MAXIMAL, in exactly one field, and it is not the
+ * sample `checkMaximality` inspects (`nearThresholdEvent` is). `temporalOrder`
+ * is OPTIONAL on `Event` and its absence on a DERIVED event is a meaningful
+ * state, not a gap: the contract says it means "the ordering is unverifiable"
+ * (`OrderingBasis`'s `ingest-unverified`). A fixture family that could only
+ * express the populated case could not measure the alarm at all.
+ *
+ * Identical to {@link externalizedEvent} in every other respect, so a scenario
+ * pair over the two differs ONLY by the response's `orderingBasis` field. That
+ * is what makes the field's cost a measured delta rather than an estimate.
+ */
+export function unkeyedDerivedEvent(seq: number): Event {
+  const event = externalizedEvent(seq) as Event & { temporalOrder?: unknown }
+  delete event.temporalOrder
+  return event
 }
 
 /** 100 transitions — the maximum `PatternResolutionEvidence` permits — each with an unbounded metadata bag. */

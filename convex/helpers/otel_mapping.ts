@@ -679,6 +679,35 @@ const OPERATION_OPAQUE: ReadonlySet<string> = new Set([
 /** Bounds on what an `otel.span.unmapped` payload carries inline. */
 const MAX_UNMAPPED_ATTRIBUTES = 128;
 const MAX_ATTRIBUTE_STRING_LENGTH = 2048;
+/**
+ * TOTAL byte budget for an `otel.span.unmapped` payload's inline attribute bag.
+ *
+ * The two bounds above are per-KEY and per-STRING and do not compose into a
+ * total: 128 keys x 2048 chars is ~256 KB, which is 25x the 10 KB inline limit
+ * Event Log Rule 3 imposes and which the ingest boundary enforces. So a
+ * perfectly ordinary span with a fat attribute bag produced a payload the
+ * storage layer refuses, and the refusal took the whole batch with it.
+ *
+ * A per-key bound cannot fix that, because the failure is in the SUM. This is
+ * the sum. 8 KB leaves headroom under 10 KB for the payload's other fields.
+ * Exceeding it sets `payload-truncated` on the event AND `attributesTruncated`
+ * on the payload, so the loss is stated twice and never silent.
+ */
+const MAX_UNMAPPED_ATTRIBUTE_BYTES = 8 * 1024;
+/**
+ * Depth ceiling when walking an attribute VALUE.
+ *
+ * Attribute values are `any` for the Opt-In content attributes, so a caller
+ * controls their nesting depth completely. A 60,000-deep value is legal on the
+ * wire and makes every RECURSIVE consumer of it throw `RangeError: Maximum call
+ * stack size exceeded` — including `JSON.stringify`, which both the dedupe
+ * tiebreak and the ingest boundary's payload-size check call. A `RangeError`
+ * inside a Convex mutation is an untyped 500 that loses the entire batch, and
+ * it is triggerable by any holder of an ingest key.
+ *
+ * Every walk below is depth-bounded AND iterative for that reason.
+ */
+const MAX_ATTRIBUTE_VALUE_DEPTH = 12;
 /** Cap on `run.failed.errorSummary`, matching the SDK's own 512-char cap. */
 const MAX_ERROR_SUMMARY_LENGTH = 512;
 
@@ -740,6 +769,27 @@ export interface PriorRunState {
   lastSequenceNumber?: number;
   /** Span ids already mapped into this run. Spans in this set are REJECTED, not re-emitted. */
   knownSpanIds?: readonly string[];
+  /**
+   * True when a terminal event is ALREADY stored for this run.
+   *
+   * Without this the mapper had no way to be told the run was closed, so a
+   * continuation batch happily emitted appends after a terminal, and a second
+   * batch containing a true root emitted a SECOND `run.completed`. The ingest
+   * mutation's status gate caught both, so nothing was ever corrupted — but the
+   * batch was refused wholesale with no per-span accounting, which discards the
+   * trace's tail silently.
+   *
+   * When true the mapper emits NOTHING and reports every otherwise-acceptable
+   * span as `after-terminal` in `rejected`. It does not emit events that the
+   * caller would then have to throw away — doing so is what forced the caller
+   * into a whole-batch refusal.
+   *
+   * Set it whenever the run cannot accept appends, which is broader than "a
+   * terminal event exists": a run moved to a terminal STATUS without one (the
+   * stale sweep does exactly that) is equally closed, and needs the same
+   * per-span accounting rather than a different failure mode.
+   */
+  hasTerminal?: boolean;
 }
 
 export interface MapOptions extends PriorRunState {
@@ -756,6 +806,60 @@ export interface MapOptions extends PriorRunState {
    * events `timing-approximated`. A real ingest path MUST pass it.
    */
   receivedAt?: number;
+  /**
+   * Who decides when the run ends.
+   *
+   * `"batch"` (default, and what the pure-function tests use): the mapper emits
+   * a terminal event when this batch contains a closed true root and every span
+   * in it is closed.
+   *
+   * `"defer"`: the mapper NEVER emits a terminal event. **A MULTI-BATCH INGEST
+   * PATH MUST USE THIS**, and the reason is that `"batch"` does not converge.
+   * "every span is closed" is a fact about a BATCH, not about a TRACE, and it
+   * is not knowable from one batch. Concretely, with root A(0..100) and child
+   * B(10..20):
+   *
+   *   {A,B} together  -> run.started, B's pair, run.completed
+   *   {A} then {B}    -> batch 1 sees a closed root and a fully-closed batch,
+   *                      so it emits run.started AND run.completed. B then
+   *                      arrives against a CLOSED run and is lost entirely.
+   *   {B} then {A}    -> no terminal in batch 1; a terminal in batch 2.
+   *
+   * Three different outcomes, one of which loses a span permanently, from the
+   * same trace partitioned three ways. Terminality therefore cannot be a
+   * per-batch decision. Under `"defer"` the caller appends the terminal once,
+   * after a settle window in which no further spans arrived — see
+   * convex/otel_settle.ts.
+   */
+  terminalPolicy?: "batch" | "defer";
+  /**
+   * Effective START instants of spans that are NOT in this batch but whose
+   * children are, keyed by span id, epoch nanoseconds as decimal strings.
+   *
+   * THE PROBLEM THIS ADDRESSES. The causality clamp (PART 3, clause 1b) is
+   * BATCH-LOCAL: it can only clamp a child against a parent present in the same
+   * batch. Parent r(50-100ms) with child a(10-60ms) delivered together clamps
+   * a's open to 50ms; delivered as {a} alone there is nothing to clamp against
+   * and 10ms stands. That is a mapped `llm.request` — a real recorded
+   * operation, not the synthesized boundary — whose position in the timeline
+   * would otherwise be decided by exporter flush timing.
+   *
+   * Supplying anchors for already-recorded parents closes the case where the
+   * parent arrived FIRST. It cannot close the case where the child arrives
+   * first: the parent is not knowable yet, and the child's event is already
+   * written by the time it becomes knowable, with no update mutation to revise
+   * it. That remaining arm is therefore MARKED rather than silently left raw —
+   * see `orphan-span` handling in `buildTree`.
+   */
+  /**
+   * `inferred` says whether the ANCHOR'S OWN instant was itself inferred rather
+   * than measured. Not optional bookkeeping: an anchor recorded in an earlier
+   * batch may have been unverified when it was written (its own parent had not
+   * arrived yet), and clamping a child against it yields a child that LOOKS
+   * verified while resting on a value that can still move. Propagating the flag
+   * is what stops the subtree marker from ending at the batch boundary.
+   */
+  parentAnchors?: Readonly<Record<string, { instantUnixNano: string; inferred: boolean }>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +882,10 @@ export type DiagnosticCode =
   | "malformed-span-id"
   | "negative-duration"
   | "already-known-span"
+  /** Prior state says a terminal event is already stored for this run. */
+  | "already-terminal"
+  /** Two spans shared one id but are NOT the same operation; one was lost. */
+  | "span-id-collision"
   | "received-at-defaulted"
   /** SELF-CHECK FAILURE: an accepted span produced no event. Fatal, must never fire. */
   | "span-dropped";
@@ -807,7 +915,33 @@ export interface UnmappedSpanReport {
  */
 export interface RejectedSpanReport {
   spanId: string;
-  reason: "foreign-trace" | "already-known" | "duplicate";
+  reason:
+    /** Span named a different trace than this run's. */
+    | "foreign-trace"
+    /** Already recorded in this run; re-emitting would permanently double it. */
+    | "already-known"
+    /**
+     * Arrived after the run was closed. Event Log Rule 5 forbids appending
+     * after a terminal event and there is no update mutation, so the span is
+     * permanently unrecordable. DISTINCT from `already-known`: that is a
+     * harmless retry, this is data loss the caller must surface.
+     */
+    | "after-terminal"
+    /** A redundant copy of the SAME operation. Nothing was lost. */
+    | "duplicate"
+    /**
+     * Shared an id with a DIFFERENT operation. Something WAS lost — kept
+     * separate from `duplicate` precisely so it cannot be read as harmless.
+     */
+    | "span-id-collision"
+    /** Span/trace/parent id was not W3C hex. Refused at the boundary, per span. */
+    | "malformed-id"
+    /**
+     * The span's derived payload exceeded the 10 KB inline limit even after
+     * the mapper's own bounding, so it was excluded rather than allowed to
+     * refuse the whole batch.
+     */
+    | "payload-too-large";
 }
 
 export interface MapResult {
@@ -908,22 +1042,35 @@ function readStringArrayFirst(
 function readMessages(
   attrs: Readonly<Record<string, unknown>>,
   key: string,
-): Array<{ role: string; content: unknown }> | undefined {
+): { messages: Array<{ role: string; content: unknown }>; truncated: boolean } | undefined {
   const raw = attrs[key];
   if (raw === undefined || raw === null) return undefined;
+  // Truncation is REPORTED, not just applied. Bounding a value's depth and
+  // returning it without saying so stores a clipped record that reads as
+  // complete — the same condition-vs-property split as R2b/R3, one layer down.
+  let truncated = false;
+  const bound = (value: unknown): unknown => {
+    const result = boundValueDepth(value);
+    truncated = truncated || result.truncated;
+    return result.value;
+  };
+  // Content is caller-controlled `any`, so every branch below bounds its
+  // nesting depth — an unbounded value here reaches `JSON.stringify` in the
+  // ingest mutation and throws RangeError, losing the batch as an untyped 500.
   if (Array.isArray(raw)) {
-    return raw.map((item) => {
+    const messages = raw.map((item) => {
       if (typeof item === "object" && item !== null && "role" in item) {
         const rec = item as Record<string, unknown>;
         return {
           role: typeof rec["role"] === "string" ? rec["role"] : "unknown",
-          content: rec["parts"] ?? rec["content"] ?? item,
+          content: bound(rec["parts"] ?? rec["content"] ?? item),
         };
       }
-      return { role: "unknown", content: item };
+      return { role: "unknown", content: bound(item) };
     });
+    return { messages, truncated };
   }
-  return [{ role: "_raw", content: raw }];
+  return { messages: [{ role: "_raw", content: bound(raw) }], truncated };
 }
 
 /** Extract "1.41.1" out of "https://opentelemetry.io/schemas/1.41.1". */
@@ -940,6 +1087,188 @@ function truncateString(value: string): { value: string; truncated: boolean } {
 }
 
 /**
+ * Copy one attribute onto the bounded bag WITHOUT going through assignment.
+ *
+ * `out[key] = value` is wrong for exactly one key, and it is a key an OTLP/JSON
+ * body can carry: `__proto__`. Plain assignment invokes `Object.prototype`'s
+ * `__proto__` SETTER, which sets the object's prototype and creates no own
+ * property — so the attribute would vanish from the stored payload while
+ * `attributesTruncated` stayed false. That is a SILENT DROP, which this module
+ * exists to make impossible (PART 4), and it would additionally hand a
+ * caller-controlled prototype to every downstream reader of the payload.
+ *
+ * `JSON.parse` — the way a real OTLP/JSON body reaches us — creates a genuine
+ * own `__proto__` key, so this is reachable, not theoretical. An object
+ * LITERAL cannot reproduce it (there `__proto__:` is also the setter), which is
+ * why a literal-based fixture would show nothing wrong.
+ *
+ * `defineProperty` writes a plain own data property for every key, including
+ * that one, on a normal `Object.prototype`-backed object.
+ */
+function setAttribute(out: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(out, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+/**
+ * Prefix applied to an attribute key the STORAGE layer cannot carry verbatim.
+ * Chosen to be namespaced and obviously synthetic, so a reader seeing it knows
+ * the original name is the remainder and not something the emitter chose.
+ */
+const RESERVED_KEY_PREFIX = "otel.attr.";
+
+/**
+ * Rewrite an attribute key that Convex's document store cannot hold as-is.
+ *
+ * FOUND BY PROBING THE REAL STORE, not assumed. Two keys an OTLP/JSON body can
+ * legitimately carry are hostile to it, and they fail in OPPOSITE and equally
+ * unacceptable ways:
+ *
+ *   `__proto__`   — SILENTLY DROPPED. `ctx.db.insert` accepts the document and
+ *                   the key is simply not there on read-back. Under an
+ *                   append-only log that is an unrecoverable, unreported loss,
+ *                   and it is precisely the silent drop PART 4 forbids.
+ *   `$`-prefixed  — THROWS ("Field name ... starts with a '$', which is
+ *                   reserved"). Left alone, one such attribute anywhere in a
+ *                   batch fails the WHOLE ingest, so any emitter — hostile or
+ *                   merely unlucky — can make a trace permanently
+ *                   un-ingestable.
+ *
+ * Renaming loses nothing: the original key is preserved verbatim after the
+ * prefix, and the rewrite is deterministic, so it is reversible by inspection.
+ * This is a STORAGE-layer accommodation, not a semantic one, which is why it
+ * sets no loss reason — no information left the system.
+ */
+function storageSafeKey(key: string): string {
+  if (key === "__proto__" || key.startsWith("$")) return RESERVED_KEY_PREFIX + key;
+  return key;
+}
+
+/**
+ * Copy an attribute value, bounding its DEPTH.
+ *
+ * Iterative, with an explicit work stack — a recursive copy would itself
+ * `RangeError` on the very input this exists to defuse. A value at the depth
+ * ceiling is replaced by a marker string rather than dropped, so the shape of
+ * what was there is still visible.
+ *
+ * Cycles are handled by the depth bound rather than by a seen-set: a cyclic
+ * attribute value is not reachable from `JSON.parse` (the real ingest path) and
+ * the bound terminates the walk regardless.
+ */
+function boundValueDepth(value: unknown): { value: unknown; truncated: boolean } {
+  if (value === null || typeof value !== "object") return { value, truncated: false };
+
+  let truncated = false;
+  interface Job { src: Record<string, unknown> | unknown[]; dst: Record<string, unknown> | unknown[]; depth: number }
+  const root: Record<string, unknown> | unknown[] = Array.isArray(value) ? [] : {};
+  const stack: Job[] = [{ src: value as Record<string, unknown> | unknown[], dst: root, depth: 0 }];
+
+  while (stack.length > 0) {
+    const job = stack.pop() as Job;
+    const entries: Array<[string | number, unknown]> = Array.isArray(job.src)
+      ? job.src.map((v, i) => [i, v])
+      : Object.keys(job.src).map((k) => [k, (job.src as Record<string, unknown>)[k]]);
+
+    for (const [key, child] of entries) {
+      const isContainer = child !== null && typeof child === "object";
+      if (!isContainer) {
+        assignInto(job.dst, key, child);
+        continue;
+      }
+      if (job.depth + 1 >= MAX_ATTRIBUTE_VALUE_DEPTH) {
+        truncated = true;
+        assignInto(job.dst, key, `[truncated: nesting deeper than ${MAX_ATTRIBUTE_VALUE_DEPTH}]`);
+        continue;
+      }
+      const next: Record<string, unknown> | unknown[] = Array.isArray(child) ? [] : {};
+      assignInto(job.dst, key, next);
+      stack.push({ src: child as Record<string, unknown> | unknown[], dst: next, depth: job.depth + 1 });
+    }
+  }
+  return { value: root, truncated };
+}
+
+function assignInto(
+  target: Record<string, unknown> | unknown[],
+  key: string | number,
+  value: unknown,
+): void {
+  if (Array.isArray(target)) {
+    target[key as number] = value;
+    return;
+  }
+  setAttribute(target, storageSafeKey(String(key)), value);
+}
+
+/**
+ * Read an Opt-In content attribute with its nesting DEPTH BOUNDED.
+ *
+ * EVERY payload field that carries a caller-controlled value must come through
+ * here. `boundValueDepth` used to have exactly one call site — inside
+ * `boundAttributes`, which serves only `otel.span.unmapped` — so the four
+ * MAPPED fields fed by Opt-In content attributes (`tool.call.input`,
+ * `tool.result.output`, `llm.request.messages[].content`, and
+ * `custom.data.otel.systemInstructions`) still carried the caller's value raw.
+ * A deeply nested value in any of them throws `RangeError` in the FIRST
+ * recursive consumer downstream — the ingest mutation's `JSON.stringify` size
+ * check — with no duplicate span required. Fixing the mapper's dedupe tiebreak
+ * moved that crash rather than removing it.
+ *
+ * Bounding here rather than at each site is what stops the next payload field
+ * from reintroducing it: there is one guarded reader, and raw
+ * `span.attrs[SOME_CONTENT_ATTR]` in a payload is the thing to look for in
+ * review.
+ *
+ * Returns `{ value, truncated }`; `truncated` must be propagated as
+ * `payload-truncated`, because a clipped value IS a loss.
+ */
+function readBoundedContent(
+  attrs: Readonly<Record<string, unknown>>,
+  key: string,
+): { value: unknown; truncated: boolean } {
+  return boundValueDepth(attrs[key]);
+}
+
+/**
+ * A bounded, total, arrival-order-independent digest of an attribute bag, for
+ * the duplicate-span tiebreak.
+ *
+ * REPLACES `JSON.stringify(attributes)`, which is recursive in the engine and
+ * therefore throws `RangeError` on a deeply nested value — see
+ * MAX_ATTRIBUTE_VALUE_DEPTH. The tiebreak only needs to be DETERMINISTIC and
+ * INDEPENDENT OF ARRIVAL ORDER; it does not need to be injective, because the
+ * comparison it feeds already ran three more-significant clauses first, and two
+ * candidates that tie here are byte-equivalent for every purpose that matters.
+ */
+function attributeDigest(attrs: Readonly<Record<string, unknown>> | undefined): string {
+  if (attrs === undefined) return "";
+  const parts: string[] = [];
+  let budget = 2048;
+  for (const key of Object.keys(attrs).sort()) {
+    if (budget <= 0) break;
+    const raw = attrs[key];
+    let rendered: string;
+    if (raw === null) rendered = "null";
+    else if (typeof raw === "object") {
+      // Shape only, never a full serialization: the count of members and, for
+      // an object, its own sorted key names truncated to the budget.
+      rendered = Array.isArray(raw)
+        ? `[${raw.length}]`
+        : `{${Object.keys(raw).sort().join(",").slice(0, 64)}}`;
+    } else rendered = `${typeof raw}:${String(raw).slice(0, 64)}`;
+    const part = `${key}=${rendered}`;
+    parts.push(part);
+    budget -= part.length;
+  }
+  return parts.join(";");
+}
+
+/**
  * Bound the attribute bag carried inline on an `otel.span.unmapped` payload.
  * Keys are sorted first so the cap is deterministic rather than dependent on
  * the caller's object-construction order.
@@ -951,34 +1280,87 @@ function boundAttributes(attrs: Readonly<Record<string, unknown>>): {
   const keys = Object.keys(attrs).sort();
   let truncated = keys.length > MAX_UNMAPPED_ATTRIBUTES;
   const out: Record<string, unknown> = {};
+  // TOTAL byte budget, enforced alongside the per-key and per-string bounds.
+  // Those two do not compose into a total (128 x 2048 is ~256 KB against a
+  // 10 KB inline limit), which is what let an ordinary fat-attribute span
+  // produce a payload the storage layer refuses — and the refusal took the
+  // whole batch with it.
+  let usedBytes = 0;
   for (const key of keys.slice(0, MAX_UNMAPPED_ATTRIBUTES)) {
     const raw = attrs[key];
+    // Sorting above is on the ORIGINAL key, so the cap stays a function of the
+    // span's own attribute set rather than of this rewrite.
+    const safe = storageSafeKey(key);
+
+    let value: unknown;
     if (typeof raw === "string") {
       const t = truncateString(raw);
       truncated = truncated || t.truncated;
-      out[key] = t.value;
+      value = t.value;
     } else {
-      out[key] = raw;
+      const bounded = boundValueDepth(raw);
+      truncated = truncated || bounded.truncated;
+      value = bounded.value;
     }
+
+    // Measured per entry, against the depth-bounded value — so this
+    // measurement cannot itself RangeError the way a stringify of the raw
+    // value would.
+    const cost = safe.length + measureBytes(value);
+    if (usedBytes + cost > MAX_UNMAPPED_ATTRIBUTE_BYTES) {
+      truncated = true;
+      continue;
+    }
+    usedBytes += cost;
+    setAttribute(out, safe, value);
   }
   return { attributes: out, truncated };
+}
+
+/** Byte cost of a DEPTH-BOUNDED value. Safe to stringify by construction. */
+function measureBytes(value: unknown): number {
+  try {
+    return JSON.stringify(value ?? null)?.length ?? 0;
+  } catch {
+    // Unstringifiable (a BigInt, a cycle the depth bound did not cut). Charge
+    // the full budget so it is excluded rather than admitted unmeasured.
+    return MAX_UNMAPPED_ATTRIBUTE_BYTES + 1;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Prepared spans, tree reconstruction, and the causality clamp
 // ---------------------------------------------------------------------------
 
+/**
+ * NOTE ON `?: T | undefined` BELOW, rather than the shorter `?: T`.
+ *
+ * Under `exactOptionalPropertyTypes` — which the WORKSPACE typecheck enables
+ * and `convex/tsconfig.json` does not, so always verify from the repo root —
+ * `?: T` means "the key may be ABSENT", NOT "the value may be undefined".
+ *
+ * These three fields are genuinely the second thing. The key is always present
+ * and `undefined` is a MEANINGFUL VALUE: "this span has no parent within this
+ * batch", "this span never ended". The module reads them with `=== undefined`
+ * and WRITES `undefined` into `parentSpanId` to clear a parent when an orphan
+ * or a cycle is detected.
+ *
+ * So `| undefined` is the honest declaration. Declaring `?: T` and then
+ * assigning `undefined` is exactly the combination the flag is right to
+ * reject, and casting the error away would have hidden the distinction rather
+ * than settled it.
+ */
 interface PreparedSpan {
   input: OtelSpanInput;
   spanId: string;
   /** Resolved parent within this batch; undefined for any kind of root. */
-  parentSpanId?: string;
+  parentSpanId?: string | undefined;
   attrs: Readonly<Record<string, unknown>>;
   rawStartNs: bigint;
   /** Undefined means the span never ended (absent or zero end time). */
-  rawEndNs?: bigint;
+  rawEndNs?: bigint | undefined;
   effStartNs: bigint;
-  effEndNs?: bigint;
+  effEndNs?: bigint | undefined;
   depth: number;
   /** No parent reference at all (or self-parent): a genuine run boundary candidate. */
   isTrueRoot: boolean;
@@ -1001,7 +1383,10 @@ interface PreparedSpan {
  */
 function dedupeSpans(spans: readonly OtelSpanInput[]): {
   kept: OtelSpanInput[];
-  duplicateSpanIds: string[];
+  /** ONE ENTRY PER DISCARDED COPY, not per id — see the accounting note below. */
+  discardedDuplicates: string[];
+  /** Ids where the discarded copies were NOT the same operation. Distinct, and worse. */
+  collisionSpanIds: string[];
 } {
   const groups = new Map<string, OtelSpanInput[]>();
   for (const span of spans) {
@@ -1011,23 +1396,40 @@ function dedupeSpans(spans: readonly OtelSpanInput[]): {
   }
 
   const kept: OtelSpanInput[] = [];
-  const duplicateSpanIds: string[] = [];
+  const discardedDuplicates: string[] = [];
+  const collisionSpanIds: string[] = [];
   for (const [spanId, list] of groups) {
     const first = list[0] as OtelSpanInput;
     if (list.length === 1) {
       kept.push(first);
       continue;
     }
-    duplicateSpanIds.push(spanId);
     let best = first;
     for (const candidate of list.slice(1)) {
       if (compareDuplicateCandidates(candidate, best) < 0) best = candidate;
     }
     kept.push(best);
+
+    // ACCOUNTING: one entry per DISCARDED COPY. Pushing once per ID made the
+    // stats fail to balance — three copies of one span reported spansIn 3,
+    // spansAccepted 1, spansRejected 1, and the missing copy was in no
+    // category at all. `spansIn === spansAccepted + spansRejected` is now an
+    // arithmetic identity rather than an approximation.
+    for (const candidate of list) {
+      if (candidate === best) continue;
+      discardedDuplicates.push(spanId);
+      if (!isSameOperation(candidate, best) && !collisionSpanIds.includes(spanId)) {
+        collisionSpanIds.push(spanId);
+      }
+    }
   }
 
   kept.sort((a, b) => cmpString(a.spanId, b.spanId));
-  return { kept, duplicateSpanIds: duplicateSpanIds.sort() };
+  return {
+    kept,
+    discardedDuplicates: discardedDuplicates.sort(),
+    collisionSpanIds: collisionSpanIds.sort(),
+  };
 }
 
 function compareDuplicateCandidates(a: OtelSpanInput, b: OtelSpanInput): number {
@@ -1038,7 +1440,32 @@ function compareDuplicateCandidates(a: OtelSpanInput, b: OtelSpanInput): number 
   const be = b.endTimeUnixNano === undefined ? -1n : toNanos(b.endTimeUnixNano).ns;
   if (ae !== be) return cmpBigint(ae, be);
   if (a.name !== b.name) return cmpString(a.name, b.name);
-  return cmpString(JSON.stringify(a.attributes ?? {}), JSON.stringify(b.attributes ?? {}));
+  // NOT `JSON.stringify(attributes)`. That is recursive in the engine, so a
+  // deeply nested attribute value — legal on the wire, caller-controlled —
+  // throws `RangeError: Maximum call stack size exceeded` here and takes the
+  // whole batch down as an untyped 500. The single-copy path never reached
+  // this comparison, which is what made the dedupe tiebreak the culprit rather
+  // than the depth itself.
+  return cmpString(attributeDigest(a.attributes), attributeDigest(b.attributes));
+}
+
+/**
+ * Do two spans sharing one id actually describe the SAME operation?
+ *
+ * A retried export of one span differs only in ways a redelivery can differ.
+ * Two spans with the same id but a different NAME, a different START, or a
+ * different PARENT are not one span exported twice — they are an ID COLLISION,
+ * and discarding one of them as a "duplicate" loses a real operation under a
+ * reason that says nothing was lost. That is precisely the hole
+ * `verifySpanConservation` exists to close, and it slipped through because
+ * conservation is checked over ACCEPTED spans and the loser was never accepted.
+ */
+function isSameOperation(a: OtelSpanInput, b: OtelSpanInput): boolean {
+  if (a.name !== b.name) return false;
+  if (toNanos(a.startTimeUnixNano).ns !== toNanos(b.startTimeUnixNano).ns) return false;
+  const ap = a.parentSpanId === "" ? undefined : a.parentSpanId;
+  const bp = b.parentSpanId === "" ? undefined : b.parentSpanId;
+  return ap === bp;
 }
 
 interface TreeResult {
@@ -1061,7 +1488,10 @@ interface TreeResult {
  * whole batch), and a per-span ancestor walk is O(n^2) and times the ingest
  * out at the same scale.
  */
-function buildTree(spans: readonly OtelSpanInput[]): TreeResult {
+function buildTree(
+  spans: readonly OtelSpanInput[],
+  parentAnchors: Readonly<Record<string, { instantUnixNano: string; inferred: boolean }>> = {},
+): TreeResult {
   const byId = new Map<string, PreparedSpan>();
   const prepared: PreparedSpan[] = [];
   const precisionLossSpanIds: string[] = [];
@@ -1096,6 +1526,16 @@ function buildTree(spans: readonly OtelSpanInput[]): TreeResult {
     const selfParent = input.parentSpanId !== undefined && input.parentSpanId === input.spanId;
     if (selfParent) selfParentSpanIds.push(input.spanId);
 
+    // Resolve the parent ONCE and derive `isTrueRoot` from it, instead of
+    // computing the predicate and then patching `parentSpanId` in afterwards.
+    // The two are the same statement — a true root is exactly a span with no
+    // usable parent reference — so deriving one from the other makes them
+    // unable to disagree.
+    const parentSpanId =
+      input.parentSpanId === undefined || input.parentSpanId === "" || selfParent
+        ? undefined
+        : input.parentSpanId;
+
     const span: PreparedSpan = {
       input,
       spanId: input.spanId,
@@ -1104,24 +1544,69 @@ function buildTree(spans: readonly OtelSpanInput[]): TreeResult {
       rawEndNs,
       effStartNs: start.ns,
       effEndNs: rawEndNs,
+      parentSpanId,
       depth: 0,
-      isTrueRoot:
-        input.parentSpanId === undefined || input.parentSpanId === "" || selfParent,
+      isTrueRoot: parentSpanId === undefined,
       isOrphanRoot: false,
       status: normalizeStatusCode(input.status?.code),
       baseLoss,
     };
-    if (!span.isTrueRoot) span.parentSpanId = input.parentSpanId;
     prepared.push(span);
     byId.set(span.spanId, span);
   }
 
   // --- orphans: parent named but absent from this batch --------------------
+  //
+  // An orphan is a tree root but NEVER a run boundary. It is also the span the
+  // batch-local clamp cannot protect, so both arms are handled explicitly:
+  //
+  //   PARENT ALREADY RECORDED (anchor supplied) -> clamp against it, exactly as
+  //     an in-batch parent would have. This makes the parent-first delivery
+  //     order produce the same instants as single-batch delivery.
+  //   PARENT NOT KNOWN -> the instant is raw and UNVERIFIED against a parent
+  //     that may yet arrive. Marked `timing-approximated`, because the
+  //     alternative is that the same span renders one way when its parent
+  //     happened to be in the batch and another way when it did not, with only
+  //     one of those two arms admitting that anything was inferred. An unmarked
+  //     inferred timestamp is precisely the lie the marker exists to prevent.
   const orphanSpanIds: string[] = [];
+  const anchorClampedSpanIds: string[] = [];
+  /**
+   * Orphans whose true parent is NOT known — so their instant rests on nothing
+   * and could be pushed later by an ancestor that has not arrived. Collected
+   * here and propagated over the SUBTREE below; see that block for why the
+   * orphan itself is not the right unit.
+   */
+  const unverifiedInstantSpanIds: string[] = [];
   for (const span of prepared) {
     if (span.parentSpanId === undefined) continue;
     if (!byId.has(span.parentSpanId)) {
       span.isOrphanRoot = true;
+      const anchor = parentAnchors[span.parentSpanId];
+      if (anchor !== undefined && /^\d+$/.test(anchor.instantUnixNano)) {
+        const anchorNs = BigInt(anchor.instantUnixNano);
+        if (span.effStartNs < anchorNs) {
+          span.effStartNs = anchorNs;
+          if (span.effEndNs !== undefined && span.effEndNs < span.effStartNs) {
+            span.effEndNs = span.effStartNs;
+          }
+          anchorClampedSpanIds.push(span.spanId);
+          span.baseLoss.add("timing-approximated");
+        }
+        // An anchor whose OWN instant was inferred does not make this span
+        // verified — it relocates the uncertainty rather than resolving it, and
+        // the anchor's value can still move when ITS ancestor arrives. So the
+        // subtree stays unverified. Without this the R2b fix would hold within
+        // a batch and quietly fail across batches, which is the same
+        // condition-vs-property split one boundary further out.
+        if (anchor.inferred) {
+          span.baseLoss.add("timing-approximated");
+          unverifiedInstantSpanIds.push(span.spanId);
+        }
+      } else {
+        span.baseLoss.add("timing-approximated");
+        unverifiedInstantSpanIds.push(span.spanId);
+      }
       span.parentSpanId = undefined;
       orphanSpanIds.push(span.spanId);
     }
@@ -1185,7 +1670,7 @@ function buildTree(spans: readonly OtelSpanInput[]): TreeResult {
   // Starts clamp TOP-DOWN: a child can never begin before its parent.
   // Ends clamp BOTTOM-UP:  a parent can never end before its children.
   // Both deterministic; every clamp that actually moved a value is recorded.
-  const skewClamped = new Set<string>();
+  const skewClamped = new Set<string>(anchorClampedSpanIds);
   const byDepth = [...prepared].sort((a, b) => a.depth - b.depth || cmpString(a.spanId, b.spanId));
 
   for (const span of byDepth) {
@@ -1211,6 +1696,52 @@ function buildTree(spans: readonly OtelSpanInput[]): TreeResult {
       parent.effEndNs = span.effEndNs;
       skewClamped.add(parent.spanId);
       parent.baseLoss.add("timing-approximated");
+    }
+  }
+
+  // --- propagate the UNVERIFIED-INSTANT marker over the subtree ------------
+  //
+  // THE CONDITION AND THE PROPERTY HAVE TO COINCIDE. `timing-approximated` was
+  // attached in the orphan loop above, so its condition was "this span is an
+  // orphan". The property it exists to disclose is "this instant is unverified
+  // against its true ancestor" — and those two diverge for the orphan's
+  // DESCENDANTS.
+  //
+  // Concretely, with a(50-200) > b(10-100) > c(20-60), both children claiming
+  // to start before their parents:
+  //
+  //   all together  b@50 [marked]  c@50 [marked]
+  //   {b,c} then {a}  b@10 [marked]  c@20 [UNMARKED]   <- the hole
+  //
+  // When b and c arrive together, c is not an orphan — b is right there — so c
+  // never entered the loop that attaches the marker. But c was clamped to b,
+  // and b's own instant was unverified, so c inherited the unverified anchor
+  // WITHOUT inheriting the disclosure. Its instant varies 50 vs 20 across
+  // delivery orders and the row says nothing.
+  //
+  // Note the marker is owed to the whole subtree whether or not a clamp
+  // actually fired: an ancestor arriving later can push the entire subtree
+  // forward, so every descendant's position is contingent on it. The unit of
+  // the property is the SUBTREE, so that is the unit the marker is attached to.
+  //
+  // Iterative, memoized, O(n) — a recursive walk would blow the stack on the
+  // deep chains this module is explicitly built to survive.
+  if (unverifiedInstantSpanIds.length > 0) {
+    const childrenByParent = new Map<string, PreparedSpan[]>();
+    for (const span of prepared) {
+      if (span.parentSpanId === undefined) continue;
+      const siblings = childrenByParent.get(span.parentSpanId);
+      if (siblings) siblings.push(span);
+      else childrenByParent.set(span.parentSpanId, [span]);
+    }
+    const stack = [...unverifiedInstantSpanIds];
+    const marked = new Set<string>();
+    while (stack.length > 0) {
+      const spanId = stack.pop() as string;
+      if (marked.has(spanId)) continue;
+      marked.add(spanId);
+      byId.get(spanId)?.baseLoss.add("timing-approximated");
+      for (const child of childrenByParent.get(spanId) ?? []) stack.push(child.spanId);
     }
   }
 
@@ -1528,16 +2059,36 @@ export function mapOtelSpansToEvents(
   }
 
   // --- DEDUP within the batch ---------------------------------------------
-  const { kept: deduped, duplicateSpanIds } = dedupeSpans(ownTrace);
-  if (duplicateSpanIds.length > 0) {
-    for (const spanId of duplicateSpanIds) rejected.push({ spanId, reason: "duplicate" });
+  const { kept: deduped, discardedDuplicates, collisionSpanIds } = dedupeSpans(ownTrace);
+  if (discardedDuplicates.length > 0) {
+    const collisions = new Set(collisionSpanIds);
+    for (const spanId of discardedDuplicates) {
+      // A COLLIDING copy is reported distinctly. "duplicate" asserts nothing
+      // was lost; for a colliding id that assertion is false, and reporting it
+      // as a duplicate makes a lost operation indistinguishable from a
+      // harmless retry.
+      rejected.push({
+        spanId,
+        reason: collisions.has(spanId) ? "span-id-collision" : "duplicate",
+      });
+    }
     diagnostics.push(
       note(
         "duplicate-span-id",
-        duplicateSpanIds,
-        `${duplicateSpanIds.length} span id(s) appeared more than once; one copy per id was kept by a deterministic key and the rest discarded`,
+        [...new Set(discardedDuplicates)].sort(),
+        `${discardedDuplicates.length} duplicate span copies across ${new Set(discardedDuplicates).size} id(s); one copy per id was kept by a deterministic key and the rest discarded`,
       ),
     );
+    if (collisionSpanIds.length > 0) {
+      diagnostics.push(
+        note(
+          "span-id-collision",
+          collisionSpanIds,
+          `${collisionSpanIds.length} span id(s) were shared by spans that are NOT the same operation (differing name, start, or parent). ` +
+            `One real operation per colliding id has been LOST — it is reported as "span-id-collision" rather than "duplicate" so it is not mistaken for a harmless retry.`,
+        ),
+      );
+    }
   }
 
   // --- DEDUP across batches ------------------------------------------------
@@ -1563,6 +2114,39 @@ export function mapOtelSpansToEvents(
   if (accepted.length === 0) {
     // A redelivered batch whose every span is already known. The correct
     // output is nothing at all — not a second copy, not an empty run boundary.
+    return emptyResult(diagnostics, traceId, spansIn, rejected);
+  }
+
+  // --- THE RUN IS CLOSED: nothing may be appended, so nothing is emitted ---
+  //
+  // Event Log Rule 5 — once a terminal event is stored, nothing may follow it.
+  // The mapper previously KNEW this (it took `hasTerminal` and raised an
+  // `already-terminal` note) and then emitted a full set of events anyway.
+  // Those events were unwritable by construction, so the ingest mutation threw
+  // RUN_NOT_ACTIVE over the WHOLE batch — discarding the trace's tail with no
+  // per-span accounting, which is the outcome this module's own diagnostic
+  // text told the caller not to produce. The mechanism was landed and unwired.
+  //
+  // Emitting nothing is what lets the caller take its ordinary "no new events"
+  // path and return the per-span rejections below, so an OTLP exporter gets a
+  // partial success naming exactly which spans were lost instead of a 5xx it
+  // will retry forever.
+  //
+  // ALREADY-KNOWN SPANS KEEP THEIR OWN REASON, deliberately: they were filtered
+  // out above. A redelivery arriving after the run closed is a RETRY, not data
+  // loss, and must stay a clean no-op — conflating it with `after-terminal`
+  // would report a harmless retry as a dropped span.
+  if (options.hasTerminal === true) {
+    for (const span of accepted) rejected.push({ spanId: span.spanId, reason: "after-terminal" });
+    diagnostics.push(
+      note(
+        "already-terminal",
+        accepted.map((s) => s.spanId).sort(),
+        `the run is closed (a terminal event is stored, or the run reached a terminal status): ` +
+          `${accepted.length} span(s) arrived too late and were REJECTED, not recorded. Event Log Rule 5 ` +
+          `forbids appending after a terminal event, and there is no update mutation that could insert them.`,
+      ),
+    );
     return emptyResult(diagnostics, traceId, spansIn, rejected);
   }
 
@@ -1593,7 +2177,7 @@ export function mapOtelSpansToEvents(
   }
 
   // --- tree, clamp, classification ----------------------------------------
-  const tree = buildTree(accepted);
+  const tree = buildTree(accepted, options.parentAnchors ?? {});
 
   if (tree.selfParentSpanIds.length > 0) {
     diagnostics.push(
@@ -1704,8 +2288,11 @@ export function mapOtelSpansToEvents(
 
   // `run.started` only once per run: a continuation batch must not restart it.
   const emitRunStarted = !isContinuation;
-  // Terminal only when the outcome is actually known.
-  const emitTerminal = !noTrueRoot && allClosed;
+  // Terminal only when the outcome is actually known AND the caller has not
+  // taken ownership of terminality (see MapOptions.terminalPolicy for why a
+  // multi-batch path must, and what goes wrong when it does not).
+  const deferTerminal = options.terminalPolicy === "defer";
+  const emitTerminal = !noTrueRoot && allClosed && !deferTerminal && !options.hasTerminal;
   if (!emitTerminal) {
     diagnostics.push(
       note(
@@ -1716,17 +2303,23 @@ export function mapOtelSpansToEvents(
     );
   }
 
-  // A true-root span that is itself an inference or tool operation ALSO emits
-  // its own pair inside the boundary — folding a root `chat` span into
-  // run.started would drop a real LLM call.
-  const boundaryClass = classes.get(boundarySpan.spanId) as SpanClass;
-  const boundaryAlsoEmitsOwnPair =
-    !emitRunStarted ||
-    boundaryClass.kind === "inference" ||
-    boundaryClass.kind === "tool" ||
-    boundaryClass.kind === "retrieval" ||
-    boundaryClass.kind === "memory" ||
-    boundaryClass.kind === "unmapped";
+  // THE BOUNDARY SPAN ALWAYS EMITS ITS OWN EVENTS TOO. Never folded.
+  //
+  // This used to fold an OPAQUE true root (invoke_agent / invoke_workflow /
+  // plan / create_agent) into `run.started` and emit nothing else for it, while
+  // an inference or tool root emitted its own pair. That made the fold a
+  // function of "was this span the boundary IN THIS BATCH", which is a
+  // per-batch fact, so the same trace produced different EVENT TYPES depending
+  // on how the exporter partitioned it: `{A,B}` folded A away, while `{B}` then
+  // `{A}` emitted A as a custom pair because batch 2 was a continuation. Not
+  // merely different sequence numbers — a different set of events.
+  //
+  // Not folding converges, and it is independently more honest: `run.started`
+  // is SYNTHESIZED by us and the root span is a real recorded operation with
+  // its own name, attributes, status and duration. Folding them conflated a
+  // thing that happened with a thing we invented, and silently dropped the
+  // root's own status in the process.
+  const boundaryAlsoEmitsOwnPair = true;
 
   // --- emissions ----------------------------------------------------------
   const emissions: Emission[] = [];
@@ -1891,9 +2484,28 @@ export function mapOtelSpansToEvents(
           "run.started",
           { type: "run.started", input: null, config },
           undefined,
-          // Always lossy: a synthesized run boundary is by construction our
-          // interpretation, not something the agent reported.
-          ["attributes-dropped", ...(noTrueRoot ? (["identity-synthesized"] as const) : [])],
+          // ALWAYS lossy AND ALWAYS `identity-synthesized`, unconditionally.
+          //
+          // This used to attach `identity-synthesized` only when THIS BATCH
+          // contained no true root, which is the wrong condition and made the
+          // label a statement about the batch rather than about the event.
+          //
+          // The anchor is invented in EVERY case — OTel has no run concept, so
+          // nothing here was ever reported by the instrumented process — and
+          // its identity is arrival-dependent in every case too: the boundary
+          // is anchored to the earliest span in the FIRST batch, so which span
+          // it names is a fact about exporter flush timing. The two-true-roots
+          // shape is the sharp counterexample: the anchor points at a different
+          // span depending on arrival order, and under the old condition it
+          // carried the warning in NO arrival order at all, because every batch
+          // had a true root.
+          //
+          // That gap mattered beyond tidiness. The residue argument for this
+          // path is "the anchor cannot be made stable, so it is disclosed
+          // instead". Disclosing it only when a batch happened to lack a root
+          // is a weaker claim than the one being made, so the label has to be
+          // unconditional for the argument to be true as stated.
+          ["attributes-dropped", "identity-synthesized"],
         );
         boundaryOpenIndex = index;
         if (!boundaryAlsoEmitsOwnPair) openIndexBySpanId.set(span.spanId, index);
@@ -2003,7 +2615,8 @@ export function mapOtelSpansToEvents(
         spansMapped += 1;
         let index: number;
         if (cls.kind === "inference") {
-          const messages = readMessages(span.attrs, ATTR_INPUT_MESSAGES);
+          const inputMessages = readMessages(span.attrs, ATTR_INPUT_MESSAGES);
+          const messages = inputMessages?.messages;
           const temperature = readNumber(span.attrs, ATTR_REQUEST_TEMPERATURE);
           const maxTokens = readNumber(span.attrs, ATTR_REQUEST_MAX_TOKENS);
           index = push(
@@ -2020,11 +2633,13 @@ export function mapOtelSpansToEvents(
             },
             parentIndexFor(span),
             [...attrLoss, ...(messages === undefined ? (["attributes-dropped"] as const) : []),
+             ...(inputMessages?.truncated === true ? (["payload-truncated"] as const) : []),
              ...(cls.operation === "embeddings" ? (["status-approximated"] as const) : [])],
           );
         } else if (cls.kind === "tool") {
           const explicitCallId = readString(span.attrs, ATTR_TOOL_CALL_ID);
-          const args = span.attrs[ATTR_TOOL_CALL_ARGUMENTS];
+          const argsRead = readBoundedContent(span.attrs, ATTR_TOOL_CALL_ARGUMENTS);
+          const args = argsRead.value;
           index = push(
             span, emission, "tool.call",
             {
@@ -2035,6 +2650,7 @@ export function mapOtelSpansToEvents(
             },
             parentIndexFor(span),
             [...attrLoss, ...(args === undefined ? (["attributes-dropped"] as const) : []),
+             ...(argsRead.truncated ? (["payload-truncated"] as const) : []),
              ...(explicitCallId === undefined ? (["identity-synthesized"] as const) : [])],
           );
         } else if (cls.kind === "retrieval") {
@@ -2052,6 +2668,7 @@ export function mapOtelSpansToEvents(
           );
         } else {
           // opaque: invoke_agent / create_agent / invoke_workflow / plan.
+          const instructions = readBoundedContent(span.attrs, ATTR_SYSTEM_INSTRUCTIONS);
           index = push(
             span, emission, "custom",
             {
@@ -2065,12 +2682,13 @@ export function mapOtelSpansToEvents(
                   agentName: readString(span.attrs, ATTR_AGENT_NAME),
                   agentId: readString(span.attrs, ATTR_AGENT_ID),
                   conversationId: readString(span.attrs, ATTR_CONVERSATION_ID),
-                  systemInstructions: span.attrs[ATTR_SYSTEM_INSTRUCTIONS],
+                  systemInstructions: instructions.value,
                 },
               },
             },
             parentIndexFor(span),
-            [...attrLoss, "status-approximated"],
+            [...attrLoss, "status-approximated",
+             ...(instructions.truncated ? (["payload-truncated"] as const) : [])],
           );
         }
         openIndexBySpanId.set(span.spanId, index);
@@ -2095,7 +2713,8 @@ export function mapOtelSpansToEvents(
           const outputTokens =
             readNumber(span.attrs, ATTR_USAGE_OUTPUT_TOKENS) ??
             readNumber(span.attrs, ATTR_USAGE_COMPLETION_TOKENS);
-          const outMessages = readMessages(span.attrs, ATTR_OUTPUT_MESSAGES);
+          const outRead = readMessages(span.attrs, ATTR_OUTPUT_MESSAGES);
+          const outMessages = outRead?.messages;
           const responseId = readString(span.attrs, ATTR_RESPONSE_ID);
           push(
             span, emission, "llm.response",
@@ -2122,22 +2741,36 @@ export function mapOtelSpansToEvents(
                 ? (["usage-partial"] as const)
                 : []),
               ...(outMessages === undefined ? (["attributes-dropped"] as const) : []),
+              ...(outRead?.truncated === true ? (["payload-truncated"] as const) : []),
             ],
           );
           break;
         }
 
         if (cls.kind === "tool") {
-          const callId = readString(span.attrs, ATTR_TOOL_CALL_ID) ?? synthesizedCallId(span.spanId);
+          const explicitCloseCallId = readString(span.attrs, ATTR_TOOL_CALL_ID);
+          const callId = explicitCloseCallId ?? synthesizedCallId(span.spanId);
+          // The CLOSE event must disclose a synthesized `call_id` exactly as
+          // loudly as the OPEN event does. It was not, and the split is the
+          // same condition-vs-property confusion as R2b: `identity-synthesized`
+          // was attached where the id is first CONSTRUCTED (tool.call) rather
+          // than wherever it is CARRIED. `call_id` is the correlation key
+          // joining a call to its result, so a reader pairing them is relying
+          // on precisely the field that may be fictional — and the pairing is
+          // the thing the synthesized id makes fictional.
+          const callIdLoss = explicitCloseCallId === undefined
+            ? (["identity-synthesized"] as const)
+            : ([] as const);
           if (span.status === "error") {
             push(
               span, emission, "tool.error",
               { type: "tool.error", error: errorOf(span), call_id: callId },
               parentEventIndex,
-              [...attrLoss, "status-approximated"],
+              [...attrLoss, "status-approximated", ...callIdLoss],
             );
           } else {
-            const result = span.attrs[ATTR_TOOL_CALL_RESULT];
+            const resultRead = readBoundedContent(span.attrs, ATTR_TOOL_CALL_RESULT);
+            const result = resultRead.value;
             push(
               span, emission, "tool.result",
               {
@@ -2147,7 +2780,9 @@ export function mapOtelSpansToEvents(
                 duration_ms: durationMsOf(span),
               },
               parentEventIndex,
-              [...attrLoss, ...(result === undefined ? (["attributes-dropped"] as const) : [])],
+              [...attrLoss, ...(result === undefined ? (["attributes-dropped"] as const) : []),
+               ...(resultRead.truncated ? (["payload-truncated"] as const) : []),
+               ...callIdLoss],
             );
           }
           break;
@@ -2267,15 +2902,35 @@ export function mapTraceToEvents(
   }
   const input = inputOrSpans as MapTraceInput;
   const prior = input.prior;
-  const resolved: MapOptions = {
-    ...(input.receivedAt !== undefined ? { receivedAt: input.receivedAt } : {}),
-    ...(input.lastSequenceNumber ?? prior?.lastSequenceNumber) !== undefined
-      ? { lastSequenceNumber: input.lastSequenceNumber ?? prior?.lastSequenceNumber }
-      : {},
-    ...((input.knownSpanIds ?? prior?.knownSpanIds) !== undefined
-      ? { knownSpanIds: input.knownSpanIds ?? prior?.knownSpanIds }
-      : {}),
-  };
+  // Built by ASSIGNMENT rather than by conditional spreads.
+  //
+  // Spreading `cond ? { k: v } : {}` infers `k?: V | undefined`, which under
+  // `exactOptionalPropertyTypes` is not assignable to a `k?: V` target. The
+  // previous form also leaned on the precedence between `...` and a ternary,
+  // and one of the five lines below was in fact missing the parentheses the
+  // other four had — it happened to parse the same way, which is exactly the
+  // kind of thing that stops being true after an innocuous edit.
+  //
+  // Assigning only DEFINED values means the key is absent when there is
+  // nothing to say, which is precisely what these optional properties mean.
+  //
+  // `terminalPolicy` and `hasTerminal` MUST be forwarded. They were not, and
+  // the silent consequence was that an ingest path asking to defer terminality
+  // got a terminal anyway — the option existed and did nothing.
+  const resolved: MapOptions = {};
+  if (input.terminalPolicy !== undefined) resolved.terminalPolicy = input.terminalPolicy;
+  if (input.receivedAt !== undefined) resolved.receivedAt = input.receivedAt;
+  if (input.parentAnchors !== undefined) resolved.parentAnchors = input.parentAnchors;
+
+  const hasTerminal = input.hasTerminal ?? prior?.hasTerminal;
+  if (hasTerminal !== undefined) resolved.hasTerminal = hasTerminal;
+
+  const lastSequenceNumber = input.lastSequenceNumber ?? prior?.lastSequenceNumber;
+  if (lastSequenceNumber !== undefined) resolved.lastSequenceNumber = lastSequenceNumber;
+
+  const knownSpanIds = input.knownSpanIds ?? prior?.knownSpanIds;
+  if (knownSpanIds !== undefined) resolved.knownSpanIds = knownSpanIds;
+
   return mapOtelSpansToEvents(input.spans ?? [], resolved);
 }
 

@@ -2,7 +2,7 @@
  * Tier 1 — `afr_list_failure_patterns`.
  *
  * The cheapest question in the product: "what is currently broken?" One row per
- * recurring failure fingerprint, ~25 tokens each, carrying the
+ * recurring failure fingerprint, ~28 tokens each, carrying the
  * `fingerprintHash` that buys tier 2.
  *
  * What this tool deliberately does NOT return: representative run ids, event
@@ -61,7 +61,7 @@ export function registerListFailurePatterns(server: McpServer, reader: AfrReader
       title: 'List failure patterns',
       description:
         'Answers "what is broken, in full?" — every recurring failure fingerprint for your org, most-recently-seen ' +
-        `first, ~28 tokens per row (~284 for the default ${String(DEFAULT_LIMIT)}). ` +
+        `first, ~28 tokens per row (~561 for the default ${String(DEFAULT_LIMIT)}). ` +
         'COLUMNAR RESULT: {fields, rows} — each row is positional; look a column up by its name in `fields`, never ' +
         'by a hardcoded index. Columns: fingerprintHash, class, label, count, lastSeenAt, status, confidenceState, ' +
         'confidenceStale (null where absent). ' +

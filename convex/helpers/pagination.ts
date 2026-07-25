@@ -69,6 +69,44 @@ export const PURGE_BATCH_SIZE = 100;
 export const MAX_COMMENTS_PER_TARGET = 500;
 
 /**
+ * ADR-007 write ceiling: maximum SPANS accepted in one otelIngestSpans call.
+ *
+ * An OTLP ExportTraceServiceRequest is caller-controlled and unbounded — the
+ * protocol names no limit, and a misconfigured BatchSpanProcessor with a large
+ * `maxExportBatchSize` will happily post tens of thousands. Three separate
+ * ceilings are at stake and this one bounds all of them: the per-span index
+ * probes the dedupe pass performs, the O(n log n) ordering the mapper runs, and
+ * the Convex transaction's own read/write budget.
+ *
+ * 1000 spans is roughly 2000 derived events — well inside a Convex transaction
+ * and still an order of magnitude above the OTel SDK default batch size (512).
+ *
+ * An over-sized batch is REJECTED with BATCH_TOO_LARGE, never truncated. A
+ * truncating ingest returns success to an exporter that then drops the spans it
+ * believes were recorded, and the resulting run is missing events that nothing
+ * in the system knows are missing — the exact failure the loss accounting in
+ * convex/helpers/otel_mapping.ts exists to prevent.
+ */
+export const MAX_OTEL_SPANS_PER_BATCH = 1_000;
+
+/**
+ * ADR-007: how long a trace must go with NO new spans before its run is closed.
+ *
+ * OTel defines no trace-completion signal. "Every span in the batch is closed"
+ * is a fact about a BATCH and says nothing about the TRACE, so terminality
+ * cannot be decided per batch — doing so meant `{A}` then `{B}` closed the run
+ * on batch 1 and lost B forever, while `{A,B}` kept both. Completion is
+ * therefore a TIMEOUT, and this is it.
+ *
+ * 5 minutes: comfortably above any reasonable BatchSpanProcessor delay
+ * (`scheduledDelayMillis` defaults to 5s) plus exporter retry backoff, and far
+ * enough below the 24h STALE_RUN_TIMEOUT_MS that a settled run never races the
+ * stale sweep. A trace still arriving after this closes the run has its tail
+ * refused with per-span accounting rather than silently dropped.
+ */
+export const OTEL_TRACE_SETTLE_MS = 5 * 60 * 1000;
+
+/**
  * Artifact GC scan bounds. The GC's pointer scan reads a run's events in pages
  * of GC_EVENT_SCAN_PAGE_SIZE instead of `.collect()`ing them (a ~50k-event run
  * would blow the query read limit). GC_MAX_EVENTS_PER_INVOCATION caps the TOTAL
