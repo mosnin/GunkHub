@@ -27,6 +27,18 @@ export { SDK_VERSION } from './version.js'
 export { redactPayload } from './redaction.js'
 export { buildErrorSummary, ERROR_SUMMARY_MAX_LENGTH } from './error-summary.js'
 export { decideSampling, hashString } from './sampling.js'
+
+// Structured agent config snapshots — what makes the divergence engine able to
+// PROVE anything rather than answering "I cannot tell" on a free-form blob.
+// Additive and opt-in: free-form snapshots stay legal and unchanged.
+export {
+  buildAgentConfigSnapshot,
+  enumeratedTools,
+  partialTools,
+  toolsFromCalls,
+  digestSystemPrompt,
+} from './agent-config.js'
+export type { AgentConfigSnapshotInput } from './agent-config.js'
 export {
   FlightReader,
   DEFAULT_EVENT_WINDOW_SIZE,
@@ -113,6 +125,10 @@ export type {
   V1PatternEvidenceData,
   V1ListFixConfidenceEnvelope,
   FixConfidenceEntry,
+  RunDivergenceParams,
+  AgentDivergenceParams,
+  V1RunDivergenceData,
+  V1AgentDivergenceData,
 } from './reader.js'
 export type { V1ApiConfig, V1FetchLike, V1ApiErrorKind, V1Envelope } from './v1-client.js'
 
@@ -139,4 +155,69 @@ export type {
   PatternResolutionMetadata,
   PatternResolutionExposure,
   PatternLifecycleTransition,
+  // Divergence ("would this run still have been possible on version X?").
+  // The proven/speculative separation is STRUCTURAL — `ProvenDivergence` and
+  // `SpeculativeDivergence` are mutually unassignable and share no message
+  // field, so a consumer cannot render speculation as evidence by accident.
+  // Re-exported here, and NOT collapsed into a convenience union, for the
+  // reasons written up in `packages/contracts/src/divergence.ts`.
+  DivergenceReport,
+  FleetDivergenceReport,
+  ProvenDivergence,
+  SpeculativeDivergence,
+  IndeterminateDivergence,
+  ProvenDivergenceKind,
+  SpeculativeDivergenceKind,
+  IndeterminateDivergenceKind,
+  ProvenDivergenceReason,
+  SpeculativeDivergenceReason,
+  IndeterminateDivergenceReason,
+  DivergenceProof,
+  DivergenceEventCitation,
+  DivergenceCoverage,
+  DivergenceDimension,
+  DivergenceUnassessedDimension,
+  DivergenceUnassessedReason,
+  DivergenceScanWindow,
+  DivergenceVerdict,
+  DivergenceVerdictInput,
+  ConfigDivergenceReport,
+  DimensionOutcome,
+  DimensionState,
+  // Structured config snapshot (contracts) — the declaration side of the same
+  // feature. `configSnapshot` stays `v.any()`; this is what a producer can
+  // choose to put in it.
+  AgentConfigSnapshot,
+  DeclaredTool,
+  DeclaredToolset,
+  DeclaredModels,
+  DeclaredBudgets,
+  DeclaredDecodingParams,
+  DeclaredPrompt,
+  DeclaredCapabilities,
+  DeclarationCompleteness,
+} from '@agent-flight-recorder/contracts'
+
+// Divergence verdict/coverage RULES (runtime). One implementation of "is this
+// complete?" and "what does this add up to?", shared by the CLI gate, the web
+// UI, and `FlightReader`'s own response verification — a second copy is how a
+// list view and a detail view come to disagree about whether a version ships.
+export {
+  computeDivergenceVerdict,
+  divergenceReportVerdict,
+  fleetDivergenceVerdict,
+  isDivergenceAnalysisComplete,
+  isFleetDivergenceAnalysisComplete,
+  isDivergenceCoverageComplete,
+  isFleetScanComplete,
+  divergenceByDimension,
+  mergeFleetDivergenceReports,
+  DIVERGENCE_DIMENSIONS,
+  MAX_DIVERGENCE_REPRESENTATIVE_RUNS,
+  // Snapshot readers — one tolerant parser, shared, so nothing invents a
+  // second opinion about what a stored blob declares.
+  readAgentConfigSnapshot,
+  declaredDimensions,
+  supportsProof,
+  AGENT_CONFIG_SNAPSHOT_SCHEMA,
 } from '@agent-flight-recorder/contracts'

@@ -167,9 +167,20 @@ completed, which must never be reported as "all clear."**
 >   40 events).
 > - The enforcement described in
 >   [What keeps these numbers true](#what-keeps-these-numbers-true): the script and
->   `scripts/token-budget-baseline.json` exist and run; the eight `mcp_*` suites pass
->   (171 tests) under `pnpm test`; `createServer` registers exactly six tools and the
->   script enumerates them from that registry.
+>   `scripts/token-budget-baseline.json` exist and run; the `mcp_*` suites plus
+>   `token_budget_guard.test.ts` pass (205 tests across 9 files) under
+>   `npx vitest run` in `tests/`; `createServer` registers exactly eight tools and
+>   the script enumerates them from that registry.
+> - **Re-measured a fourth time when the version-divergence pair landed (ADR-008).**
+>   `afr_assess_version` and `afr_get_run_divergence` are registered, budgeted
+>   (**1,300** and **1,700**), baselined, and measured at **1,233** / **83** and
+>   **1,562** / **119**. **No pre-existing figure moved** — the two tools add
+>   projections and touch none of the existing ones. Their ceilings are the two
+>   largest on this page after tier 4's, and the derivation is written into their
+>   scenarios in `scripts/check-token-budgets.ts`: three disjoint finding classes
+>   cost roughly three times a single-envelope tier, and a merged single list would
+>   have fit under 450. The measured cost of *not* merging them is the number to
+>   quote at anyone proposing that it be merged.
 >
 > **Unverified — treat as design intent, not measurement:**
 > - **Token cost against real data.** The figures above are measured against
@@ -309,6 +320,10 @@ resolves `@agent-flight-recorder/sdk` and `/contracts` to their `dist/`.
 | `afr_get_run_events` ordering unverifiable | **4,454** | 10,000 | the same externalized window with no `temporalOrder` on any event — the `orderingBasis` alarm firing, and the pair that measures its cost (2.6x) |
 | `afr_list_runs`, 20 | **475** | 600 | a default page of maximal `Run` documents, ADR-007 `otel*` block included (62.6x) |
 | `afr_list_runs`, 100 | **2,250** | 2,800 | a saturated page at `MAX_LIMIT` (66.1x) |
+| `afr_assess_version` fleet | **1,233** | 1,300 | 12 proven + 12 speculative + 12 indeterminate reasons over a truncated 10,000-run scan, capped to 4 per kind |
+| `afr_assess_version` clean | **83** | 1,300 | nothing proven, scan complete — the closest this tool comes to a green light |
+| `afr_get_run_divergence` full | **1,562** | 1,700 | 8 + 8 + 8 findings on one run, coverage incomplete, capped to 3 per kind |
+| `afr_get_run_divergence` clean | **119** | 1,700 | nothing found and the analysis complete — pays for the full per-dimension roll-up, which is what makes a clean answer readable |
 
 The ratios in the fixture column are **commentary**. Nothing passes on one — every
 budget is an absolute integer, because a ratio against a fat fixture gets easier as the
@@ -339,7 +354,7 @@ Three layers, and they are not redundant:
 
 | Layer | What it does |
 |---|---|
-| `scripts/check-token-budgets.ts` | the standing gate. Enumerates tools from `createServer()`'s registry, measures 17 scenarios through the registered handlers, asserts absolutes, and ratchets `scripts/token-budget-baseline.json` |
+| `scripts/check-token-budgets.ts` | the standing gate. Enumerates tools from `createServer()`'s registry, measures 21 scenarios through the registered handlers, asserts absolutes, and ratchets `scripts/token-budget-baseline.json` |
 | `tests/unit/mcp_budgets.ts` | the single declaration of every budget, of the estimator, **and of the contract-maximal fixture family** — all imported by every mcp suite. `450` used to appear in three files and `300` in two, only one of each carrying the derivation; `fatPattern` appeared in four, and the copies measured 284 where the script measured 294 for the same tool on the same scenario. The suites now import all three from here, so `FIXTURE_DUPLICATION` reports clean |
 | `tests/unit/mcp_progressive_disclosure.test.ts`, `mcp_triage.test.ts`, `mcp_triage_measure.test.ts`, `mcp_triage_next_hops.test.ts` | projection-level budgets plus the shape guards — a projection that starts emitting a field it is not allowed to fails here even when the byte count would still fit |
 
@@ -990,6 +1005,185 @@ for when you arrive with a run ID or an agent name rather than a failure pattern
 
 ---
 
+## Version divergence — `afr_assess_version` and `afr_get_run_divergence`
+
+A second question, with its own cheap-first pair. Given a run's recorded event
+history and two `AgentVersion` `configSnapshot`s, the divergence engine reports
+where a **target** version would have diverged from what was **recorded**. It
+executes nothing: it is structural analysis over the event log, the same shape of
+answer as Temporal's replay test.
+
+This is the most agent-native question the product answers — an agent asking whether
+its own next version is safe to ship — which is exactly why both tools are shaped by
+what they are *not* allowed to claim. The decision record is
+`docs/adr/008-version-divergence-analysis.md`; read its "What the engine can never
+know" section before building a gate on either tool.
+
+| Tool | Question | Role |
+|---|---|---|
+| `afr_assess_version` | "If I ship this version, what breaks across the fleet, and for how many distinct reasons?" | the entry point: agent + target version, no run id needed |
+| `afr_get_run_divergence` | "Where does this one run's trajectory become impossible?" | the drill-down, reached from the entry point's `next` pointers |
+
+**Start at `afr_assess_version`.** Its unit is the *reason*, not the run: "340 of
+10,000 runs would break, for 12 distinct reasons" is a tractable morning, and a list
+of 340 run ids is not. It also hands back the run ids worth drilling into — which is
+the thing you did not know when you asked. Opening with `afr_get_run_divergence`
+means choosing a run id first, the same mistake as opening with tier 4.
+
+**These two are NOT priced an order of magnitude apart, and that is honest.** The
+fleet call is not cheap because it returns little; it is cheap *relative to what it
+covers* — one call over ten thousand runs. The reason to call it first is that it
+answers the question you actually have and tells you where to look next, not that it
+is a tenth the price.
+
+### Three kinds of finding, and they are not three confidence levels
+
+Every finding belongs to exactly one of three classes, returned in three separate
+arrays that are never merged, never summed, and never sorted together:
+
+- **`proven`** — a FACT. "This run called `search_web` at sequence 42; the target
+  declares no such tool, so that step could not have happened." Each carries
+  `provenBy`: the recorded sequence number, the event type, the target config path,
+  the value the run recorded, and what the target declares there (`null` meaning
+  absent — which is itself the proof). Safe to gate a deploy on.
+- **`speculative`** — NOT EVIDENCE. "The system prompt changed, so behaviour may
+  differ." It may differ everywhere or nowhere, and no recorded history can decide
+  which. Carries `because`: why it cannot be proven. Never a gate signal by default.
+- **`indeterminate`** — a question the analysis COULD NOT ANSWER. "Whether the tool
+  calls at sequences 12 and 19 target tools this version still declares" — because
+  their payloads were externalized past the 10 KB ceiling (Event Log Rule 3), so the
+  event survived and the deciding field did not. Not a break, and not the absence of
+  one. **This is the common case, not an edge case**, because `configSnapshot` is
+  free-form and `compatible` requires every dimension declared. Each entry carries a
+  `remedy`: the action that would make it answerable ("re-publish this version with a
+  structured `tools` declaration"). That is the only field on either response that
+  tells an autonomous caller what to *do* rather than what it cannot know, and it is
+  what makes an unanswerable question a fixable state rather than a dead end.
+
+The third class exists because two are not enough, and a two-bucket answer corrupts
+both: an engine with nowhere to put an unanswerable question either files it as proof
+(a guess rendered as evidence), files it as speculation ("could not check" rendered as
+"checked, only a maybe" — wrong in the safe-looking direction), or drops it. Dropping
+is the worst of the three and is what a two-bucket type quietly encourages.
+
+Every finding carries its `certainty` discriminant explicitly, even though the array
+it arrived in already implies it. **That redundancy is deliberate and must not be
+optimized away.** The array name is context; the field is content, and only the field
+survives an agent lifting one finding out of the response and carrying it into its own
+reasoning, a log line, or another tool call — which is exactly what an LLM consumer
+does with a structured result. This is the [`orderingBasis`](#ordering-on-a-derived-run)
+decision at higher stakes: **you cannot open the run view to disambiguate.** Where a
+budget and this rule conflict, the budget gives — cut a finding, cut a sample, cut a
+sentence, never the discriminant.
+
+### `complete` is the field that stops a false clean
+
+`proven: []` means one of two entirely different things, and only one of them is safe
+to ship on:
+
+- we checked, and nothing is proven to break; or
+- we did not finish checking.
+
+So both tools return a top-level **`complete`**, derived from contracts'
+`isDivergenceAnalysisComplete` / `isFleetDivergenceAnalysisComplete` rather than
+re-implemented here. It is stricter than the coverage record nested beside it,
+because there are two ways not to have looked: a dimension never reached
+(`coverage.unassessed`, each entry naming why — an absent `configSnapshot`, a
+dimension the snapshot is silent on, an unreadable shape, an engine limit) and a
+specific question reached but unanswerable (`indeterminate`). **An empty `proven`
+list authorises nothing unless `complete` is true.**
+
+Every finding on both tools carries its `dimension`, and `afr_get_run_divergence`
+additionally returns **`byDimension`** — one outcome per dimension,
+`{ tools: 'incompatible', model: 'clean', budgets: 'undeclared', … }`, derived by
+contracts' `divergenceByDimension` rather than re-folded here.
+
+**That field is what stops a caller reading past the verdict.** A single global word
+collapses six independent questions and is almost always the worst of the six, so a
+version whose tools are provably fine and whose budgets were never declared reads as
+one undifferentiated failure. `undeclared` and `unanswered` are separated carefully:
+both mean "not checked", but only `undeclared` is *yours* to fix. The fleet tool has
+no roll-up, deliberately — `FleetDivergenceReport` carries no coverage record, so
+`undeclared` and `clean` are not derivable from it, and folding one anyway would mean
+a second copy of a precedence rule that must exist exactly once.
+
+The fleet call additionally reports `window`, and its `complete` folds in **four**
+separate ways of not having looked: `scanTruncated` (stopped on the row ceiling),
+`runsUnassessable` (visited but unreadable), `runsSkippedForBudget` (inside the window
+but never reached), and `nextCursor` (pages remain). The last is the one most easily
+missed, because a full, clean first page looks exactly like a finished scan — and a
+first page presented as a fleet verdict is the worst failure this feature has. The
+cursor is forwarded so an agent told "incomplete" can actually do something about it.
+This is the same posture as
+[`scanTruncated` on pattern listings](#an-unfinished-scan-is-not-a-clean-scan) — the
+server states the incompleteness in a field, and the gate decides that an incomplete
+scan is not a pass.
+
+### The asymmetry that is easiest to misread when the news is good
+
+**A clean report says the target would not have BROKEN on recorded history. It never
+says the target would BEHAVE THE SAME.** Added capability is invisible to a replay by
+construction — nothing recorded can be contradicted by an addition, so a tool the
+target adds appears only as a speculative `tool_added`. Reading `compatible` as
+"behaves identically" is a conclusion the method cannot support, drawn in the one
+situation where nobody is inclined to check.
+
+Two more one-directional limits worth knowing before you build a gate: a surviving
+tool call can be proven **invalid** against the target schema but never proven
+**valid** (enums, formats and cross-field constraints are not evaluated), and
+`capability_removed` is never emitted at all, because no event type records which
+named capability produced it — a removed capability surfaces speculatively instead.
+`docs/adr/008-version-divergence-analysis.md` §5.1 is the full list.
+
+### There is no "safe" verdict, deliberately
+
+`verdict` is `incompatible` | `compatible_with_caveats` | `compatible` |
+`indeterminate`. There is no value meaning "safe", because the engine never executes
+and therefore:
+
+- It can **prove** a recorded step was impossible — a tool or model the target does
+  not declare, a hard recorded budget the target lowers.
+- It can **never prove** a prompt change, an added tool, or a decoding-parameter
+  change is harmless. That is a property of not running the agent, not a gap better
+  analysis closes.
+- Recorded history is a **sample, not a specification**. A fleet analysis that finds
+  nothing has established a fact about the runs it read and nothing about the next
+  one.
+
+The strongest true statement a clean result supports is: *no recorded run is proven to
+break on the dimensions that were checked.* Neither tool says anything stronger.
+
+`verdict` is forwarded from the server, which `FlightReader` has already cross-checked
+against the report's own contents — a response whose verdict contradicts its arrays,
+whose `targetVersionId` is not echoed back, or whose `proven` list contains something
+unprovable never reaches these projections. It is not recomputed here: a second
+derivation of one rule is a second rule.
+
+### Arguments, caps, and next hops
+
+Both take `targetVersionId` as a **required** argument. There is no "compare against
+the latest" default anywhere in this stack — a gate whose subject is implicit silently
+changes meaning the moment somebody publishes a new version. `afr_assess_version` also
+takes `agentId`, and optional `since` / `limit`; `afr_get_run_divergence` takes
+`runId`.
+
+Findings and reasons are capped **per class** (4 per class on the fleet call, 3 on the
+drill-down) and never against a shared budget: a shared cap would let a version with
+one broken tool and eleven prompt tweaks push its single proven reason off the end of
+the list. Whatever is cut is counted, never silently dropped. On the drill-down,
+proven findings are emitted earliest-first so the cut always falls on the tail — the
+**first** proven break is the meaningful one, since everything after it describes a
+trajectory the target was never going to reach.
+
+Proven reasons carry a `next` pointing at the drill-down for a representative run; the
+drill-down carries a `next` pointing at an event window around the first proven break.
+**Speculative and indeterminate reasons carry no `next`, on purpose** — drilling in
+returns the same unprovable sentence, or the same unanswerable question, one level
+down, having spent a tool call to do it. A pointer implies there is something at the
+end of it.
+
+---
+
 ## Configuration
 
 ### Environment variables
@@ -1130,5 +1324,8 @@ seeded org — the server has no fixture or offline mode.
   verdict tier 2 returns
 - `docs/adr/004-run-explanations.md`, `docs/design/explanations.md` — how tier 3's
   explanation is produced and grounded
+- `docs/adr/008-version-divergence-analysis.md` — the divergence engine, the
+  provable/speculative invariant, and the normative specification of the two proposed
+  tools above (including their budgets and what may never be compressed to meet one)
 - `CLAUDE.md` — System Boundaries; the binding constraints on this package
 - `packages/mcp/README.md` — the owning team's package-level docs

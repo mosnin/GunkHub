@@ -343,6 +343,13 @@ export interface McpFixtures {
   contractMaxExplanation(): Record<string, unknown>
   realisticExplanation(): Record<string, unknown>
   readonly WIDE_CITATIONS: readonly number[]
+  fatProvenDivergence(i: number): Record<string, unknown>
+  fatSpeculativeDivergence(i: number): Record<string, unknown>
+  fatDivergenceCoverage(): Record<string, unknown>
+  fatDivergenceReport(): Record<string, unknown>
+  fatIndeterminateDivergence(i: number): Record<string, unknown>
+  fatDivergenceScanWindow(): Record<string, unknown>
+  fatFleetDivergenceReport(): Record<string, unknown>
 }
 
 const FIXTURES_MODULE = path.join(REPO_ROOT, 'tests/unit/mcp_budgets.ts')
@@ -351,6 +358,8 @@ const REQUIRED_FIXTURE_EXPORTS: readonly (keyof McpFixtures)[] = [
   'FROZEN_NOW', 'fatPattern', 'fatEnvelope', 'fatRun', 'externalizedEvent',
   'nearThresholdEvent', 'unkeyedDerivedEvent', 'fatEvidence', 'contractMaxExplanation', 'realisticExplanation',
   'WIDE_CITATIONS',
+  'fatProvenDivergence', 'fatSpeculativeDivergence', 'fatDivergenceCoverage', 'fatDivergenceReport',
+  'fatDivergenceScanWindow', 'fatFleetDivergenceReport', 'fatIndeterminateDivergence',
 ]
 
 export async function loadFixtures(file: string = FIXTURES_MODULE): Promise<McpFixtures> {
@@ -440,6 +449,96 @@ export const maximalityClaims = (f: McpFixtures): readonly MaximalityClaim[] => 
     interfaceName: 'FixConfidenceSnapshot',
     sample: () => f.fatPattern(0)['lastFixConfidence'] as Record<string, unknown>,
   },
+  // ── Divergence (ADR-008) ────────────────────────────────────────────────
+  //
+  // Eleven claims for two tools, which is more than any other tier carries,
+  // and deliberately so. A divergence report is a COMPOSED envelope — findings
+  // containing proofs containing citations, plus a coverage record — and
+  // `checkMaximality` only inspects the top level of whatever object a claim
+  // hands it. Claiming only `DivergenceReport` would prove its four fields are
+  // present and prove nothing at all about the shapes nested inside them,
+  // which is where every byte actually is. Each nested shape is therefore
+  // claimed against the fixture instance that is really nested in the report.
+  {
+    label: 'DivergenceReport',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'DivergenceReport',
+    sample: () => f.fatDivergenceReport(),
+  },
+  {
+    label: 'DivergenceCoverage',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'DivergenceCoverage',
+    sample: () => f.fatDivergenceCoverage(),
+  },
+  {
+    label: 'DivergenceUnassessedDimension',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'DivergenceUnassessedDimension',
+    sample: () => (f.fatDivergenceCoverage()['unassessed'] as Record<string, unknown>[])[0] ?? {},
+  },
+  {
+    label: 'ProvenDivergence',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'ProvenDivergence',
+    sample: () => f.fatProvenDivergence(0),
+  },
+  {
+    label: 'DivergenceProof',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'DivergenceProof',
+    sample: () => (f.fatProvenDivergence(0)['provenBy'] as Record<string, unknown>[])[0] ?? {},
+  },
+  {
+    label: 'DivergenceEventCitation',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'DivergenceEventCitation',
+    sample: () =>
+      ((f.fatProvenDivergence(0)['provenBy'] as Record<string, unknown>[])[0]?.['citedEvent'] ??
+        {}) as Record<string, unknown>,
+  },
+  {
+    label: 'SpeculativeDivergence',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'SpeculativeDivergence',
+    sample: () => f.fatSpeculativeDivergence(0),
+  },
+  {
+    label: 'IndeterminateDivergence',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'IndeterminateDivergence',
+    sample: () => f.fatIndeterminateDivergence(0),
+  },
+  {
+    label: 'FleetDivergenceReport',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'FleetDivergenceReport',
+    sample: () => f.fatFleetDivergenceReport(),
+  },
+  {
+    label: 'DivergenceScanWindow',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'DivergenceScanWindow',
+    sample: () => f.fatDivergenceScanWindow(),
+  },
+  {
+    label: 'ProvenDivergenceReason',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'ProvenDivergenceReason',
+    sample: () => (f.fatFleetDivergenceReport()['provenReasons'] as Record<string, unknown>[])[0] ?? {},
+  },
+  {
+    label: 'SpeculativeDivergenceReason',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'SpeculativeDivergenceReason',
+    sample: () => (f.fatFleetDivergenceReport()['speculativeReasons'] as Record<string, unknown>[])[0] ?? {},
+  },
+  {
+    label: 'IndeterminateDivergenceReason',
+    file: path.join(CONTRACTS_SRC, 'divergence.ts'),
+    interfaceName: 'IndeterminateDivergenceReason',
+    sample: () => (f.fatFleetDivergenceReport()['indeterminateReasons'] as Record<string, unknown>[])[0] ?? {},
+  },
 ]
 
 // ─── Scenarios and their budgets ──────────────────────────────────────────────
@@ -452,6 +551,8 @@ export interface StubReader {
   getExplanation?: (runId: string) => Promise<unknown>
   getRunEventWindow?: (runId: string, options: { limit?: number }) => Promise<unknown>
   iterateEvents?: (runId: string, options?: unknown) => AsyncIterable<unknown>
+  getRunDivergence?: (runId: string, params: unknown) => Promise<unknown>
+  getAgentDivergence?: (agentId: string, params: unknown) => Promise<unknown>
 }
 
 export interface Scenario {
@@ -770,6 +871,108 @@ export function buildScenarios(f: McpFixtures): readonly Scenario[] {
       reader: { listRuns: () => Promise.resolve(runsPage(100)) },
       rawInput: () => Array.from({ length: 100 }, (_, i) => f.fatRun(i)),
     },
+
+  // ── afr_assess_version — version divergence, fleet-wide (ADR-008) ─────────
+  {
+    tool: 'afr_assess_version',
+    name: 'twelve distinct proven reasons over a truncated 10,000-run scan',
+    budget: 1_300,
+    why:
+      'WELL ABOVE TIER 0’s 450, AND THE DIFFERENCE IS THE ENTIRE FEATURE. `afr_triage` returns ONE ranked list ' +
+      'and fits in 450. This returns THREE DISJOINT ranked lists — proven, speculative, indeterminate — plus a ' +
+      'run count and a scan-completeness record, because the three classes are different KINDS OF CLAIM and not ' +
+      'three confidence levels: merging them is the one thing this feature may never do (ADR-008), and dropping ' +
+      'the third is worse than either place a two-bucket type would have forced it into. ' +
+      'A SINGLE MERGED RANKED LIST WOULD FIT UNDER 450 COMFORTABLY. That is not an argument for 450; it is the ' +
+      'measurement of what the honest encoding costs, and it is the number to quote at anyone who proposes ' +
+      'flattening this to hit a rounder ceiling. ' +
+      'Held by FLEET_REASON_CAP (4 per kind, SEPARATE so conjecture and unanswered questions cannot crowd out ' +
+      'proof) and FLEET_PROSE_BYTE_CAP, which keeps a fleet row a LABEL — the full sentence is one hop away in ' +
+      'afr_get_run_divergence. The rest is a FOUR-WAY completeness record (truncated / unassessable / skipped ' +
+      'for budget / pages remaining) and a per-row `remedy` on the unanswered questions, which is the only ' +
+      'field on this response that tells an autonomous caller what to DO rather than what it cannot know. ' +
+      'Still around a tenth of one tier-4 window, which is the bound that matters.',
+    args: { agentId: 'agent_5b7e', targetVersionId: 'ver_9a04e6f1' },
+    reader: { getAgentDivergence: () => Promise.resolve({ report: f.fatFleetDivergenceReport() }) },
+    rawInput: () => f.fatFleetDivergenceReport(),
+  },
+  {
+    tool: 'afr_assess_version',
+    name: 'nothing proven, complete scan — the closest this tool comes to a green light',
+    budget: 1_300,
+    why:
+      'THE CASE A DEPLOY GETS AUTHORISED ON, so it is budgeted rather than assumed cheap. It must still carry ' +
+      'the whole window record: `complete`, the scanned/analysed/unassessable counts and `scanTruncated` are ' +
+      'what separate "we checked and found nothing" from "we did not finish looking", and an empty-list ' +
+      'response that dropped them to save bytes would be the false clean this feature exists to prevent.',
+    args: { agentId: 'agent_5b7e', targetVersionId: 'ver_9a04e6f1' },
+    reader: {
+      getAgentDivergence: () =>
+        Promise.resolve({
+          report: {
+            ...f.fatFleetDivergenceReport(),
+            verdict: 'compatible',
+            provenReasons: [],
+            speculativeReasons: [],
+            indeterminateReasons: [],
+            runsWithProvenDivergence: 0,
+            window: {
+              ...f.fatDivergenceScanWindow(),
+              runsUnassessable: 0,
+              runsSkippedForBudget: 0,
+              scanTruncated: false,
+              nextCursor: undefined,
+            },
+          },
+        }),
+    },
+  },
+
+  // ── afr_get_run_divergence — one run's trajectory (ADR-008) ───────────────
+  {
+    tool: 'afr_get_run_divergence',
+    name: 'eight proven + eight speculative + eight indeterminate findings, incomplete coverage',
+    budget: 1_700,
+    why:
+      'DERIVED FROM WHAT IT RETURNS, NOT FROM THE SHAPE OF THE LADDER. The tempting derivation is by analogy — ' +
+      'the fleet call is triage-shaped, so the drill-down must be tier-4-shaped at 10,000 — and it is wrong by ' +
+      'an order of magnitude: tier 4 is expensive because it returns EVENT PAYLOADS, which are unbounded caller ' +
+      'data, while this returns FINDINGS, bounded by how many tools and models a config declares. The analogy ' +
+      'that holds is to tier 2 (450): "drill into one item the previous tier ranked". TRIPLED, and the multiple ' +
+      'is not a fudge — it is one tier-2 envelope per epistemic class. This response carries three disjoint ' +
+      'finding lists, each with its own required prose (a claim in the past tense, a concern in the ' +
+      'conditional, a question), the proven ones each carrying a proof, plus the coverage record that decides ' +
+      'whether an empty proven list means anything at all — call it three-and-a-half envelopes once the ' +
+      'per-dimension attribution and the remedies are paid for. Cutting a class to reach a rounder number would ' +
+      'delete an answer, not a field. If this tool is ever made to carry proof BODIES rather than proof ' +
+      'pointers it becomes a tier-4 tool and this number must be re-derived from scratch, never raised.',
+    args: { runId: 'run_8f2c1a', targetVersionId: 'ver_9a04e6f1' },
+    reader: { getRunDivergence: () => Promise.resolve({ report: f.fatDivergenceReport() }) },
+    rawInput: () => f.fatDivergenceReport(),
+  },
+  {
+    tool: 'afr_get_run_divergence',
+    name: 'nothing found and coverage complete — the only genuinely clean single-run answer',
+    budget: 1_700,
+    why:
+      'The counterpart of the fleet clean case. `coverage` is emitted in full here too: an empty `proven` array ' +
+      'is the same three bytes whether the analysis examined every dimension or none, and this is the response ' +
+      'a caller is most likely to act on without reading further.',
+    args: { runId: 'run_8f2c1a', targetVersionId: 'ver_9a04e6f1' },
+    reader: {
+      getRunDivergence: () =>
+        Promise.resolve({
+          report: {
+            ...f.fatDivergenceReport(),
+            verdict: 'compatible',
+            proven: [],
+            speculative: [],
+            indeterminate: [],
+            coverage: { ...f.fatDivergenceCoverage(), unassessed: [], eventHistoryComplete: true },
+          },
+        }),
+    },
+  },
   ]
 }
 

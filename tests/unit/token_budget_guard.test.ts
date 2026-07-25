@@ -540,8 +540,10 @@ describe('the real MCP surface', () => {
     // tool module that registers a tool but is never wired in — dead today,
     // unmeasured the day somebody wires it.
     expect(staticallyRegisteredTools()).toEqual([
+      'afr_assess_version',
       'afr_explain_run',
       'afr_get_pattern_evidence',
+      'afr_get_run_divergence',
       'afr_get_run_events',
       'afr_list_failure_patterns',
       'afr_list_runs',

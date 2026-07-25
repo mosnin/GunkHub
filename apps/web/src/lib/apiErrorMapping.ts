@@ -192,3 +192,27 @@ export function v1UnauthorizedNoKey(requestId: string): NextResponse {
     { status: 401, headers: { 'x-request-id': requestId } },
   )
 }
+
+/**
+ * A v1 `INVALID_ARGUMENT` for a malformed or missing QUERY PARAMETER, in the
+ * same envelope shape as `v1UnauthorizedNoKey`.
+ *
+ * Exists because parameter validation must happen BEFORE the API key is
+ * resolved and before any Convex call. That ordering is what keeps a malformed
+ * request from being an existence oracle: `?target=` missing must produce an
+ * identical response whether the run exists, does not exist, or belongs to
+ * another org.
+ *
+ * `message` must be static route copy naming the parameter and what it expects
+ * — never anything derived from a caught exception or echoed back from user
+ * input, per the rule in services/serviceResult.ts.
+ */
+export function v1InvalidArgument(message: string, requestId: string): NextResponse {
+  return NextResponse.json(
+    {
+      apiVersion: API_V1_VERSION,
+      error: { code: 'INVALID_ARGUMENT', message, details: { requestId } },
+    },
+    { status: 400, headers: { 'x-request-id': requestId } },
+  )
+}

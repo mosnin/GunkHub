@@ -25,13 +25,22 @@ import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js'
  * and is the ONLY input to that choice — never the id, never the server's
  * message.
  */
-export type ResourceKind = 'run' | 'pattern'
+export type ResourceKind = 'run' | 'pattern' | 'divergence'
 
 const NOT_FOUND_MESSAGE: Record<ResourceKind, string> = {
   // Deliberately identical in shape and deliberately vague about cause. Do not
   // add the id, the org, or any server-supplied detail to these strings.
   run: 'No run is readable with that id for this API key.',
   pattern: 'No failure pattern is readable with that fingerprint hash for this API key.',
+  // The divergence tools take TWO ids — a subject (run or agent) and a target
+  // `AgentVersion` — and either being unreadable yields the same 404. Naming
+  // both possibilities without saying which is more honest than borrowing the
+  // `run` sentence, which would assert the run is the missing one, and it
+  // leaks no more: "does not exist" and "belongs to another org" stay
+  // indistinguishable, which is the property that matters.
+  divergence:
+    'No divergence analysis is readable for that id and target version with this API key. Either the subject ' +
+    'or the target agent version is unreadable; which one is deliberately not disclosed.',
 }
 
 /**

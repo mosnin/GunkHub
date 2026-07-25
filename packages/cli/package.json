@@ -1,6 +1,6 @@
 {
   "name": "@agent-flight-recorder/cli",
-  "version": "0.11.0",
+  "version": "0.13.1",
   "description": "Command-line interface for Agent Flight Recorder (afr)",
   "type": "module",
   "bin": {

@@ -175,8 +175,33 @@ describe('sibling reads on this surface — which ones were already correct, and
    * future read added to this file is a deliberate addition here too.
    */
   it('no other read on this surface paginates at all', () => {
-    const paginating = ['apiListRuns', 'apiGetRunEvents', 'apiListFailurePatterns']
-    const nonPaginating = ['apiGetRun', 'apiGetReplay', 'apiGetExplanation', 'apiGetFailurePatternEvidence']
+    const paginating = [
+      'apiListRuns',
+      'apiGetRunEvents',
+      'apiListFailurePatterns',
+      // ADR-008 divergence reads. Both paginate and both are ordering-safe:
+      //  - apiGetRunDivergence filters by event `type` INSIDE the query
+      //    (`.filter(...).paginate(...)`), the same shape as apiListRuns, so
+      //    Convex applies the predicate during pagination rather than to a
+      //    finished page.
+      //  - apiGetFleetDivergence paginates `runs` by
+      //    `by_agent_version_started` with no query-level filter. It does carry
+      //    a post-page `run.orgId !== apiKey.orgId` guard, which LOOKS like the
+      //    defect this file exists to catch, but cannot shorten a page: the
+      //    index is keyed on `agentVersionId`, and that version's org was
+      //    already verified against the key before the scan, so every row is
+      //    necessarily same-org. The guard is defense in depth, not a filter.
+      'apiGetRunDivergence',
+      'apiGetFleetDivergence',
+    ]
+    const nonPaginating = [
+      'apiGetRun',
+      'apiGetReplay',
+      'apiGetExplanation',
+      'apiGetFailurePatternEvidence',
+      // Reads no runs and no events at all — that is the point of the tier.
+      'apiCompareVersionConfigs',
+    ]
     for (const fnName of nonPaginating) {
       expect(bodyOf(fnName), `${fnName} now paginates — it needs the same ordering audit`).not.toContain(
         '.paginate(',

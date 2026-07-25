@@ -12,14 +12,18 @@ import { FlightReader } from '@agent-flight-recorder/sdk'
 import type { McpConfig } from './env.js'
 import type { Event } from '@agent-flight-recorder/contracts'
 import type {
+  AgentDivergenceParams,
   EventWindowParams,
   ListFailurePatternsParams,
   ListRunsParams,
+  RunDivergenceParams,
+  V1AgentDivergenceData,
   V1EventWindowData,
   V1GetExplanationData,
   V1ListFailurePatternsData,
   V1ListRunsData,
   V1PatternEvidenceData,
+  V1RunDivergenceData,
 } from '@agent-flight-recorder/sdk'
 
 /**
@@ -63,6 +67,27 @@ export interface AfrReader {
    */
   getRunEventWindow?: (runId: string, options: EventWindowParams) => Promise<V1EventWindowData>
   iterateEvents(runId: string, options?: { pageSize?: number; maxPages?: number }): AsyncIterable<Event>
+  /**
+   * Version divergence, per run and across an agent's recent history.
+   *
+   * NO FIELD SELECTION, for the same reason as tiers 2 and 3: a divergence
+   * report is a composed envelope (findings + proofs + coverage), not one
+   * projectable document, so there is no `fields` vocabulary for it.
+   *
+   * Both take `targetVersionId` as a REQUIRED parameter. There is deliberately
+   * no "compare against the latest" default anywhere in this stack — a gate
+   * whose subject is implicit silently changes meaning the moment somebody
+   * publishes a new version, which is the one kind of drift a deploy gate must
+   * not have.
+   *
+   * `FlightReader` verifies both responses before they reach a projection: the
+   * echoed `targetVersionId`, the presence of `coverage`, the segregation of
+   * proven from speculative findings, and the report's `verdict` against its
+   * own contents. Every one of those checks exists because its failure mode
+   * looks exactly like a clean report to a caller reading `proven.length === 0`.
+   */
+  getRunDivergence(runId: string, params: RunDivergenceParams): Promise<V1RunDivergenceData>
+  getAgentDivergence(agentId: string, params: AgentDivergenceParams): Promise<V1AgentDivergenceData>
 }
 
 /**

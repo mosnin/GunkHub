@@ -2307,17 +2307,104 @@ describe('tenancy — two orgs, one trace id', () => {
    * Ratio bound is deliberately loose (a CI box is noisy); the case exists to
    * catch an order-of-magnitude difference, which is what a db probe costs.
    */
-  it('mapping cost does not depend on another tenant having used the trace id', () => {
-    const time = (spans: SpanInput[]): number => {
-      const t0 = performance.now()
-      for (let i = 0; i < 200; i += 1) mapper.mapOtelSpansToEvents(spans, { receivedAt: RECEIVED_AT })
-      return performance.now() - t0
+  /**
+   * TRACE-ID SUBSTITUTION INVARIANCE — the deterministic replacement for a
+   * wall-clock timing probe.
+   *
+   * WHAT THIS REPLACED, AND WHY. The previous version timed 200 mapper calls
+   * with one trace id against 200 with another and failed if the ratio exceeded
+   * 10x. It measured something real and concluded something false: a wall-clock
+   * ratio between two samples of a PURE function cannot distinguish "this code
+   * branches on tenant data" from "the scheduler preempted one of the samples".
+   * Run alone it passed; run under `pnpm test`, where turbo runs eight package
+   * tasks concurrently, the noise floor exceeded any signal a branch could
+   * produce and it went red for reasons unrelated to its subject. A test that
+   * fails for unrelated reasons is deleted by whoever is unblocking a release,
+   * which would have cost the property entirely.
+   *
+   * THE PROPERTY IS STRUCTURAL, so it does not need a stopwatch. If the mapper
+   * consulted the trace id as anything other than opaque data — a lookup, a
+   * comparison against a known value, any branch — then substituting one
+   * well-formed trace id for another would change SOMETHING about the result.
+   * So: map a fixed batch under several trace ids, replace the id with a
+   * placeholder in each result, and require the renderings to be byte-identical.
+   * Deterministic, instant, and load-independent.
+   *
+   * WELL-FORMED IDS ONLY. Shape validation (`TRACE_ID_RE`) is a legitimate
+   * branch on the id's FORM, and a malformed id correctly produces a different
+   * result. The claim under test is about tenant IDENTITY, not syntax.
+   *
+   * WHAT IT CANNOT SEE, STATED PLAINLY. Output invariance rules out an
+   * observable dependence on tenant identity. It cannot rule out a branch that
+   * burns time and returns the same bytes. Nothing available in-process can:
+   * that is a timing side channel, it needs a quiet host and statistical
+   * sampling to measure, and this is a unit suite running beside seven others.
+   * It is recorded as untested, on the same footing as the runtime tenancy
+   * checks in the ingest mutation.
+   */
+  it('mapping is invariant under trace-id substitution (tenant identity is never a branch)', () => {
+    const WELL_FORMED = [
+      '1'.repeat(32),
+      '9'.repeat(32),
+      '0'.repeat(32),
+      'f'.repeat(32),
+      'deadbeefcafebabe0123456789abcdef',
+      '00000000000000000000000000000001',
+    ]
+
+    /** Map a fixed batch under `traceId`, with the id itself neutralized. */
+    const render = (traceId: string): string => {
+      const result = mapper.mapOtelSpansToEvents(
+        [
+          agentSpan({ spanId: sid('r'), traceId }),
+          llmSpan({ spanId: sid('a'), parentSpanId: sid('r'), traceId, startTimeUnixNano: ns(10n), endTimeUnixNano: ns(20n) }),
+          { traceId, spanId: sid('u'), name: 'no rule for this', startTimeUnixNano: ns(30n), endTimeUnixNano: ns(40n) },
+        ],
+        { receivedAt: RECEIVED_AT },
+      )
+      return JSON.stringify(result).split(traceId).join('<TRACE_ID>')
     }
-    time(spansA)
-    const cold = time([agentSpan({ spanId: sid('r'), traceId: '9'.repeat(32) })])
-    const warm = time(spansA)
-    const ratio = Math.max(cold, warm) / Math.max(1e-6, Math.min(cold, warm))
-    expect(ratio, 'mapping cost varies with the trace id — that is a cross-tenant existence oracle').toBeLessThan(10)
+
+    const baseline = render(WELL_FORMED[0] as string)
+    for (const traceId of WELL_FORMED.slice(1)) {
+      expect(
+        render(traceId),
+        `substituting trace id ${traceId} changed the mapping. The trace id is being consulted, not ` +
+          'merely carried — which is a cross-tenant existence oracle: one org could learn whether ' +
+          "another org's trace exists by observing its own result.",
+      ).toBe(baseline)
+    }
+
+    // ANTI-VACUITY 1: the renderings must be substantial, or "identical" is the
+    // observation that two empty strings match.
+    expect(baseline.length, 'the probe rendered almost nothing').toBeGreaterThan(500)
+    expect(baseline, 'the trace id was never substituted, so the comparison is trivially true').toContain(
+      '<TRACE_ID>',
+    )
+    expect(baseline, 'a raw trace id survived substitution and will differ for unrelated reasons').not.toContain(
+      WELL_FORMED[0] as string,
+    )
+
+    // ANTI-VACUITY 2: the checker must REJECT a mapper that genuinely branches
+    // on the trace id. Without this the case proves only that the current
+    // implementation happens to agree with itself.
+    const branching = (traceId: string): string => {
+      const result = mapper.mapOtelSpansToEvents(
+        [agentSpan({ spanId: sid('r'), traceId })],
+        { receivedAt: RECEIVED_AT },
+      ) as MapResult & { diagnostics: Array<{ code: string; fatal: boolean; spanIds: string[]; message: string }> }
+      // The shape a real oracle takes: a lookup against known tenants that
+      // leaks its hit through the result.
+      const KNOWN_TO_ANOTHER_ORG = new Set(['9'.repeat(32)])
+      const leaked = KNOWN_TO_ANOTHER_ORG.has(traceId)
+        ? { ...result, diagnostics: [...result.diagnostics, { code: 'seen-before', fatal: false, spanIds: [], message: 'x' }] }
+        : result
+      return JSON.stringify(leaked).split(traceId).join('<TRACE_ID>')
+    }
+    expect(
+      branching('9'.repeat(32)) === branching('1'.repeat(32)),
+      'the substitution check cannot detect a mapper that branches on the trace id — it proves nothing',
+    ).toBe(false)
   })
 
   it('foreign-trace spans never consume this run’s sequence numbers', () => {

@@ -101,6 +101,18 @@ export const convex = {
     apiGetReplay: makeFunctionReference<M>('read_api:apiGetReplay'),
     apiGetExplanation: makeFunctionReference<M>('read_api:apiGetExplanation'),
     apiListFailurePatterns: makeFunctionReference<M>('read_api:apiListFailurePatterns'),
+    // ADR-008 replay divergence, key-authed public read surface. MUTATIONS
+    // like every other read_api function (they all do per-key rate-limit /
+    // lastUsedAt bookkeeping) even though they are reads to the caller.
+    //
+    // These are what let anything OUTSIDE the web app reach the engine: `afr
+    // compat` in CI, and the MCP tools an agent uses to ask whether its own
+    // next version is safe to ship. The Clerk-authed `convex.divergence.*`
+    // refs above cannot serve them — they resolve a Clerk org from the
+    // session, and an API key has none.
+    apiCompareVersionConfigs: makeFunctionReference<M>('read_api:apiCompareVersionConfigs'),
+    apiGetRunDivergence: makeFunctionReference<M>('read_api:apiGetRunDivergence'),
+    apiGetFleetDivergence: makeFunctionReference<M>('read_api:apiGetFleetDivergence'),
     // ADR-006 cycle 2 — the v1 public read API's per-pattern resolution
     // evidence (Team D's services/api_v1.ts + app/api/v1 route, backing
     // `afr patterns evidence`). A MUTATION like every other read_api
@@ -173,6 +185,22 @@ export const convex = {
   // Team B's analytics/insights surface (convex/insights.ts) — dashboard
   // stats, per-agent cost estimates, version-comparison cohorts, and the
   // per-version eval pass-rate rollup. Landed this cycle.
+  // ADR-008 replay divergence (convex/divergence.ts, Team A). READ-ONLY: every
+  // member is a `query`, because a divergence report is a DERIVED PROJECTION
+  // over the event log (CLAUDE.md Event Log Rule 2) and is never stored back.
+  //
+  // The three refs are a progressive-disclosure ladder, cheapest first:
+  //   compareVersionConfigs  zero run reads, zero event reads — answers every
+  //                          SPECULATIVE question for the whole fleet at once.
+  //   analyzeRun             one run, paged over its events.
+  //   analyzeFleet           one bounded batch of runs, grouped by reason.
+  // Consumed by services/divergence.ts; see lib/divergence/adapt.ts for the
+  // mapping onto the contracts types.
+  divergence: {
+    compareVersionConfigs: makeFunctionReference<Q>('divergence:compareVersionConfigs'),
+    analyzeRun: makeFunctionReference<Q>('divergence:analyzeRun'),
+    analyzeFleet: makeFunctionReference<Q>('divergence:analyzeFleet'),
+  },
   insights: {
     getDashboardStats: makeFunctionReference<Q>('insights:getDashboardStats'),
     getAgentCostStats: makeFunctionReference<Q>('insights:getAgentCostStats'),

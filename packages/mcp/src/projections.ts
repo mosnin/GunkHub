@@ -47,7 +47,15 @@
  * Server-side projection is defense in depth's cheap half. This file is the
  * half that is load-bearing.
  */
-import { isDerivedProvenance, readTemporalOrder } from '@agent-flight-recorder/contracts'
+import {
+  divergenceByDimension,
+  isDerivedProvenance,
+  isDivergenceAnalysisComplete,
+  isDivergenceCoverageComplete,
+  isFleetDivergenceAnalysisComplete,
+  isFleetScanComplete,
+  readTemporalOrder,
+} from '@agent-flight-recorder/contracts'
 import {
   columnsOf,
   isPatternScanComplete,
@@ -56,10 +64,17 @@ import {
 } from '@agent-flight-recorder/sdk'
 
 import type {
+  DivergenceCoverage,
+  DivergenceReport,
+  DivergenceVerdict,
   Event,
   EventProvenance,
   ExternalizedPayload,
   FailurePattern,
+  FleetDivergenceReport,
+  IndeterminateDivergence,
+  ProvenDivergence,
+  SpeculativeDivergence,
   OtelMappingLossReason,
   PatternResolutionEvidence,
   Run,
@@ -1268,4 +1283,657 @@ export function toRunRow(run: Run): RunRow {
   if (run.environment !== undefined) row.environment = run.environment
   if (run.sessionId !== undefined) row.sessionId = run.sessionId
   return row
+}
+
+// ---------------------------------------------------------------------------
+// Version divergence — `afr_assess_version` and `afr_get_run_divergence`
+// ---------------------------------------------------------------------------
+//
+// "If I ship this version, what breaks?" See docs/adr/008-version-divergence-
+// analysis.md for the decision record and docs/mcp.md for the caller-facing
+// contract.
+//
+// THE ONE THING THESE PROJECTIONS MAY NOT DO IS FLATTEN PROOF INTO CONJECTURE.
+// `packages/contracts/src/divergence.ts` separates the two structurally — two
+// mutually-unassignable types, no shared `message` field, no exported union —
+// and `packages/sdk/src/reader.ts` re-checks that segregation on the wire,
+// because TypeScript's guarantee stops at the JSON boundary.
+//
+// This layer is where the guarantee is most fragile and most load-bearing. It
+// is a TOKEN BUDGET applied to a safety claim, and every compression that would
+// help is a compression that costs the distinction:
+//
+//   - merging the two lists (fits easily, destroys the feature)
+//   - dropping `certainty` as redundant with the array it sits in
+//   - dropping `coverage` as boring metadata
+//   - keeping the prose and dropping the structure, or the reverse
+//
+// None of them is taken. Where a budget and the distinction conflict, the
+// budget gives: cut a finding, cut a sample, cut a sentence — never the
+// discriminant, never `coverage`, and never the separation of the arrays.
+//
+// AN MCP CALLER IS THE REASON THIS IS STRICTER HERE THAN ELSEWHERE. A human in
+// the web UI who misreads a speculative finding can click into the run and see
+// the difference. An agent holding a tool result cannot. It has these bytes and
+// nothing else, and the decision it makes from them may be a deploy.
+
+/**
+ * Byte caps on the free-text fields of a finding.
+ *
+ * BYTES, NOT ITEMS, for the reason {@link CITED_SEQUENCE_BYTE_CAP} spells out
+ * at length: an item cap bounds a field only for as long as items happen to be
+ * small, and nothing bounds how long an engine-written claim can get. The
+ * engine's own sentences are one line by construction, so these caps admit
+ * realistic output untouched and cut only a runaway.
+ *
+ * `speculativeBecause` gets the smallest cap of the three deliberately: it is
+ * the most formulaic of the sentences ("recorded history cannot show what a
+ * different prompt would have produced") and the least likely to carry a
+ * detail unique to this finding.
+ */
+export const PROVEN_CLAIM_BYTE_CAP = 180
+export const SPECULATIVE_CONCERN_BYTE_CAP = 160
+export const SPECULATIVE_BECAUSE_BYTE_CAP = 130
+/**
+ * The third bucket's two required strings.
+ *
+ * `undecidedQuestion` gets the LARGEST prose cap of any field on either tool,
+ * and that is deliberate. It is the only field that tells a caller what it does
+ * not know, and a truncated question is worse than a truncated claim: a claim
+ * cut short is still a claim, whereas "whether the tool calls at sequences…"
+ * with the sequences cut off is an unanswerable question about an unidentified
+ * thing. If a budget has to give somewhere on this tier, it gives on a proven
+ * claim — which the caller can re-read in full from the run — before it gives
+ * here.
+ */
+export const UNDECIDED_QUESTION_BYTE_CAP = 200
+export const UNKNOWN_BECAUSE_BYTE_CAP = 130
+/** The action that would make an unanswerable question answerable. Generous: a remedy that is cut short is not a remedy. */
+export const REMEDY_BYTE_CAP = 160
+/** Cap on a coverage entry's optional elaboration. The `reason` code carries the fact; this only names the path. */
+export const UNASSESSED_DETAIL_BYTE_CAP = 80
+
+/**
+ * How many findings of each kind one run's report emits.
+ *
+ * SEPARATE CAPS, NOT A SHARED ONE. A shared cap lets a flood of speculative
+ * findings evict the proven ones — conjecture crowding out proof, which is this
+ * feature's central defect arriving through the back door. With separate caps
+ * that is not expressible.
+ *
+ * Three is not only a budget number. The FIRST proven break is the meaningful
+ * one: once a run provably could not have taken a step it recorded, the rest of
+ * the recorded trajectory is counterfactual, because the target version was
+ * never going to be in that state. Findings are emitted in proof order
+ * (earliest cited sequence number first) so the cut always falls on the tail,
+ * never on the first break — and whatever is cut is counted, never silently
+ * dropped.
+ */
+export const RUN_PROVEN_CAP = 3
+export const RUN_SPECULATIVE_CAP = 3
+/**
+ * The indeterminate cap, and why it is not smaller than the other two.
+ *
+ * An indeterminate finding is COMPLETENESS-BEARING: one of them makes
+ * `verdict: 'compatible'` unreachable. Cutting this list hardest to save bytes
+ * would mean the response most likely to be over budget — a messy analysis — is
+ * also the one that under-reports how messy it was. The dropped count is
+ * emitted for the same reason.
+ */
+export const RUN_INDETERMINATE_CAP = 3
+
+/**
+ * How many distinct reasons the fleet answer ranks per kind.
+ *
+ * FOUR, NOT `afr_triage`'s FIVE, and the difference is the third bucket rather
+ * than a byte squeeze. Triage ranks one list; this ranks three, so five per
+ * kind is fifteen rows, and fifteen rows measured MORE than the per-run
+ * drill-down this call exists to make unnecessary — an entry point that costs
+ * more than the thing it saves you from is not an entry point. Four per kind
+ * keeps twelve rows and keeps the ordering of the ladder true.
+ *
+ * SEPARATE CAPS PER KIND, for the same reason as {@link RUN_PROVEN_CAP}: a
+ * shared cap of twelve would let a version with one broken tool and eleven
+ * prompt tweaks push its single PROVEN reason off the end of the list.
+ */
+export const FLEET_REASON_CAP = 4
+
+/**
+ * The fleet tier's own prose cap, much tighter than the per-run caps above.
+ *
+ * NOT AN ARBITRARY SQUEEZE — the two tiers are answering different questions.
+ * The fleet answer is a RANKED HEADLINE: what an agent needs from a row is the
+ * certainty class, the kind, the subject, how many runs it accounts for, and
+ * the way in. The sentence is a label on that, not the payload; the payload is
+ * one hop away in `afr_get_run_divergence`, where the same finding is emitted
+ * at four times this width with its proof attached.
+ *
+ * Fifteen rows at the per-run caps cost more than this entire tool's budget in
+ * prose alone, and would buy the same fifteen facts spelled out at length.
+ * A truncation marker is emitted in-band by `truncateProse`, so a cut sentence
+ * announces itself rather than reading as a complete short one.
+ */
+export const FLEET_PROSE_BYTE_CAP = 96
+
+/** One recorded event a proof cites, flattened. Positional handle into `afr_get_run_events`. */
+interface ProjectedProof {
+  /** `sequenceNumber` of the recorded event that could not have happened. */
+  at: number
+  eventType: string
+  /** Path into the TARGET config that decides it. */
+  targetPath: string
+  /** What the run actually recorded. */
+  recorded: string
+  /** What the target declares there — `null` means ABSENT, which is itself the proof for every `*_removed` kind. */
+  target: string | null
+}
+
+/**
+ * A proven divergence, projected.
+ *
+ * `certainty` is emitted even though every element of a `proven` array is
+ * trivially proven. THAT REDUNDANCY IS DELIBERATE AND MUST NOT BE OPTIMIZED
+ * AWAY. The array name is context; the field is content, and only the field
+ * survives an agent lifting one finding out of the response and carrying it
+ * into its own reasoning, a log line, or another tool call — which is exactly
+ * what an LLM consumer does with a structured result. `packages/contracts`
+ * makes the same call on `ProvenDivergenceReason.certainty` and says so.
+ *
+ * It is also the field a future columnar encoding would delete first: a column
+ * whose value is identical in every row looks like pure waste to a byte-counting
+ * eye. It is not waste. It is the warrant.
+ */
+export interface ProjectedProvenDivergence {
+  certainty: 'proven'
+  kind: string
+  /**
+   * Which config dimension this belongs to. Emitted on all three finding types
+   * so an agent can see that `tools` is provably broken WHILE `budgets` went
+   * unanswered — a partial analysis attributed per dimension is actionable, and
+   * the same analysis reported as one undifferentiated verdict is a shrug.
+   */
+  dimension: string
+  reasonKey: string
+  /** Past tense, about what WAS RECORDED. Safe to gate a deploy on. */
+  claim: string
+  /** The earliest proof. Further proofs of the same reason are counted, not listed. */
+  provenBy: ProjectedProof
+  /** Additional cited events beyond the first, when the engine found several. Omitted when there are none. */
+  furtherProofs?: number
+}
+
+/**
+ * A speculative divergence, projected.
+ *
+ * Note what is NOT here: no `provenBy`, no sequence number presented as
+ * evidence, and no field named anything a proof-shaped consumer would read.
+ * `possiblyAffectedSequenceNumbers` is dropped entirely at this tier — it is a
+ * navigation aid on a surface with room to explain that, and on this surface it
+ * is a list of sequence numbers sitting next to a claim, which is the visual
+ * shape of a citation. Costing tokens to manufacture the appearance of evidence
+ * is the worst available trade.
+ */
+export interface ProjectedSpeculativeDivergence {
+  certainty: 'speculative'
+  kind: string
+  /** See {@link ProjectedProvenDivergence.dimension}. */
+  dimension: string
+  reasonKey: string
+  /** Phrased as a possibility. Never the past tense. */
+  concern: string
+  /** Why this cannot be proven from recorded history. Required by the contract, kept here. */
+  because: string
+  changedPath: string
+}
+
+/**
+ * A question the analysis could not answer.
+ *
+ * THE THIRD BUCKET, and the one a token budget is most tempted to delete —
+ * it is neither a break nor a caveat, so it reads as metadata. It is not. With
+ * only two buckets available an engine that cannot decide a question has three
+ * places to put it and all three are lies: as proof (a guess rendered as
+ * evidence), as speculation ("could not check" rendered as "checked, only a
+ * maybe" — a lie in the safe-looking direction), or dropped. Dropping is the
+ * worst, and dropping is exactly what a projection does when it decides two
+ * arrays are enough.
+ *
+ * It is also completeness-bearing: one of these makes `verdict: 'compatible'`
+ * unreachable, which means deleting the list here would leave a caller holding
+ * an `indeterminate` verdict with nothing on the response explaining why.
+ */
+export interface ProjectedIndeterminateDivergence {
+  certainty: 'indeterminate'
+  kind: string
+  reasonKey: string
+  /** Phrased as the open question. Not a claim, not a concern. */
+  question: string
+  /** What specifically stopped the analysis. Required by the contract; an unexplained "unknown" gets ignored. */
+  because: string
+  dimension: string
+  /**
+   * What would make this answerable, as an action the caller can take.
+   *
+   * CARRIED, not dropped as advisory prose, and it is the field most worth its
+   * bytes on this whole surface. Everything else here tells an autonomous
+   * caller what it cannot know; this is the only field that tells it what to DO
+   * about that. A dimension that is unanswerable because nobody ever declared
+   * it is a FIXABLE state, and an agent that is told so can fix it and ask
+   * again — which is the difference between a gate and a dead end. Absent when
+   * the engine had no action to offer; never invented here.
+   */
+  remedy?: string
+}
+
+function toProjectedIndeterminate(finding: IndeterminateDivergence): ProjectedIndeterminateDivergence {
+  const projected: ProjectedIndeterminateDivergence = {
+    certainty: 'indeterminate',
+    kind: finding.kind,
+    reasonKey: finding.reasonKey,
+    question: truncateProse(finding.undecidedQuestion, UNDECIDED_QUESTION_BYTE_CAP),
+    because: truncateProse(finding.unknownBecause, UNKNOWN_BECAUSE_BYTE_CAP),
+    dimension: finding.dimension,
+  }
+  if (finding.remedy !== undefined) projected.remedy = truncateProse(finding.remedy, REMEDY_BYTE_CAP)
+  return projected
+}
+
+/** What the analysis actually examined. NEVER omitted — an empty `proven` list is meaningless without it. */
+export interface ProjectedCoverage {
+  /**
+   * Whether every DIMENSION was reached. Narrower than the response's own
+   * `complete` — see {@link RunDivergenceResult.complete} — because a dimension
+   * can be fully reached and still leave a specific question unanswerable.
+   * Forwards `isDivergenceCoverageComplete` rather than re-deriving it.
+   */
+  complete: boolean
+  assessed: string[]
+  unassessed: { dimension: string; reason: string; detail?: string }[]
+  eventsExamined: number
+  eventHistoryComplete: boolean
+}
+
+function toProjectedCoverage(coverage: DivergenceCoverage): ProjectedCoverage {
+  return {
+    complete: isDivergenceCoverageComplete(coverage),
+    assessed: [...coverage.assessed],
+    unassessed: coverage.unassessed.map((u) => {
+      const entry: { dimension: string; reason: string; detail?: string } = {
+        dimension: u.dimension,
+        reason: u.reason,
+      }
+      if (u.detail !== undefined) entry.detail = truncateProse(u.detail, UNASSESSED_DETAIL_BYTE_CAP)
+      return entry
+    }),
+    eventsExamined: coverage.eventsExamined,
+    eventHistoryComplete: coverage.eventHistoryComplete,
+  }
+}
+
+function toProjectedProven(finding: ProvenDivergence): ProjectedProvenDivergence {
+  const [first, ...rest] = finding.provenBy
+  const projected: ProjectedProvenDivergence = {
+    certainty: 'proven',
+    kind: finding.kind,
+    dimension: finding.dimension,
+    reasonKey: finding.reasonKey,
+    claim: truncateProse(finding.provenClaim, PROVEN_CLAIM_BYTE_CAP),
+    provenBy: {
+      at: first.citedEvent.sequenceNumber,
+      eventType: first.citedEvent.eventType,
+      targetPath: first.targetConfigPath,
+      recorded: first.recordedValue,
+      target: first.targetValue,
+    },
+  }
+  if (rest.length > 0) projected.furtherProofs = rest.length
+  return projected
+}
+
+function toProjectedSpeculative(finding: SpeculativeDivergence): ProjectedSpeculativeDivergence {
+  return {
+    certainty: 'speculative',
+    kind: finding.kind,
+    dimension: finding.dimension,
+    reasonKey: finding.reasonKey,
+    concern: truncateProse(finding.speculativeConcern, SPECULATIVE_CONCERN_BYTE_CAP),
+    because: truncateProse(finding.speculativeBecause, SPECULATIVE_BECAUSE_BYTE_CAP),
+    changedPath: finding.changedConfigPath,
+  }
+}
+
+/** Earliest cited sequence number on a proven finding — the ordering key, and the cut's safe end. */
+function earliestProof(finding: ProvenDivergence): number {
+  let earliest = finding.provenBy[0].citedEvent.sequenceNumber
+  for (const proof of finding.provenBy) {
+    if (proof.citedEvent.sequenceNumber < earliest) earliest = proof.citedEvent.sequenceNumber
+  }
+  return earliest
+}
+
+/** `afr_get_run_divergence` response. */
+export interface RunDivergenceResult {
+  runId: string
+  targetVersionId: string
+  /** The version the run actually ran under, or `null` — in which case every speculative dimension is unassessable. */
+  baselineVersionId: string | null
+  /**
+   * `incompatible` | `compatible_with_caveats` | `compatible` | `indeterminate`.
+   *
+   * Forwarded from the report, which `FlightReader` has already cross-checked
+   * against the report's own contents — a server whose verdict contradicts its
+   * arrays never reaches this projection. NOT recomputed here: a second
+   * derivation of the same rule is a second rule.
+   *
+   * `indeterminate` is the honest answer, not a hedge, and there is no
+   * `"safe"` in the vocabulary at all.
+   */
+  verdict: DivergenceVerdict
+  /** Proven-impossible steps, earliest first. Empty is meaningful ONLY alongside `coverage.complete`. */
+  proven: ProjectedProvenDivergence[]
+  /** How many proven findings were cut to fit. Present only when something was cut. */
+  provenDropped?: number
+  /** Config changes that may alter behaviour. Never a gate signal, never evidence. */
+  speculative: ProjectedSpeculativeDivergence[]
+  speculativeDropped?: number
+  /** Questions the analysis could not answer. Non-empty makes `complete` false and `compatible` unreachable. */
+  indeterminate: ProjectedIndeterminateDivergence[]
+  indeterminateDropped?: number
+  /**
+   * THE ANTI-FALSE-CLEAN FIELD, pre-derived so no caller reconstructs it wrongly.
+   *
+   * `isDivergenceAnalysisComplete` in contracts is the single definition, and it
+   * is deliberately STRICTER than `coverage.complete`: there are two ways not to
+   * have looked — a dimension never reached, and a specific question reached but
+   * unanswerable — and both count. A caller that read only `coverage.complete`
+   * would call an analysis finished while holding a list of things it could not
+   * decide, which is the exact false clean this whole feature is built against.
+   *
+   * `proven: []` is a statement about the target version ONLY when this is true.
+   */
+  complete: boolean
+  /**
+   * ONE OUTCOME PER DIMENSION: `{ tools: 'incompatible', model: 'clean',
+   * budgets: 'undeclared', … }`.
+   *
+   * THE FIELD THAT STOPS A CALLER READING PAST THE VERDICT. A single global
+   * verdict collapses six independent questions into one word, and the word is
+   * almost always the worst of the six — so a version whose tools are provably
+   * fine and whose budgets were never declared reads as one undifferentiated
+   * failure, and an agent has no way to see that four dimensions passed
+   * cleanly.
+   *
+   * The two states worth separating carefully are `undeclared` and
+   * `unanswered`. Both mean "not checked", but only `undeclared` is the
+   * CALLER'S to fix, by publishing a structured snapshot — see the class note
+   * on `indeterminate` above. Telling them which is the difference between a
+   * shrug and a next step.
+   *
+   * Derived by contracts' `divergenceByDimension`, never re-folded here: its
+   * within-dimension precedence mirrors the global verdict rule (a proof
+   * outranks an unanswered question, because a proof does not weaken because
+   * something else went unchecked), and a second implementation of that rule
+   * is a second rule.
+   *
+   * Emitted as a state map rather than as the contract's richer
+   * `DimensionOutcome[]`: the per-dimension COUNTS are recoverable by filtering
+   * the three arrays above on `dimension`, so carrying them here would be the
+   * one genuinely redundant thing on this response. The STATE is not
+   * recoverable — `undeclared` and `clean` both show zero findings — so the
+   * state is what is kept. Every dimension is listed, including the clean ones:
+   * an omitted dimension would be indistinguishable from an unlisted one.
+   */
+  byDimension: Record<string, string>
+  coverage: ProjectedCoverage
+  /**
+   * The handle into tier 4, at the first proven break — the point where the
+   * recorded trajectory becomes impossible. Present only when something is
+   * proven, because a window around a speculative concern shows an agent a
+   * perfectly ordinary event and invites it to read meaning into it.
+   */
+  next?: { tool: string; args: Record<string, unknown> }
+}
+
+/**
+ * Project one run's divergence report.
+ *
+ * @param report - the report, already verified by `FlightReader`.
+ */
+export function toRunDivergenceResult(report: DivergenceReport): RunDivergenceResult {
+  const provenOrdered = [...report.proven].sort((a, b) => earliestProof(a) - earliestProof(b))
+  const provenKept = provenOrdered.slice(0, RUN_PROVEN_CAP)
+  const speculativeKept = report.speculative.slice(0, RUN_SPECULATIVE_CAP)
+  const indeterminateKept = report.indeterminate.slice(0, RUN_INDETERMINATE_CAP)
+
+  const result: RunDivergenceResult = {
+    runId: report.runId,
+    targetVersionId: report.targetVersionId,
+    baselineVersionId: report.baselineVersionId,
+    verdict: report.verdict,
+    proven: provenKept.map(toProjectedProven),
+    speculative: speculativeKept.map(toProjectedSpeculative),
+    indeterminate: indeterminateKept.map(toProjectedIndeterminate),
+    complete: isDivergenceAnalysisComplete(report),
+    byDimension: Object.fromEntries(divergenceByDimension(report).map((d) => [d.dimension, d.state])),
+    coverage: toProjectedCoverage(report.coverage),
+  }
+  if (indeterminateKept.length < report.indeterminate.length) {
+    result.indeterminateDropped = report.indeterminate.length - indeterminateKept.length
+  }
+  if (provenKept.length < provenOrdered.length) result.provenDropped = provenOrdered.length - provenKept.length
+  if (speculativeKept.length < report.speculative.length) {
+    result.speculativeDropped = report.speculative.length - speculativeKept.length
+  }
+  const firstBreak = provenOrdered[0]
+  if (firstBreak !== undefined) {
+    result.next = {
+      tool: 'afr_get_run_events',
+      args: { runId: report.runId, aroundSequence: earliestProof(firstBreak), limit: 10 },
+    }
+  }
+  return result
+}
+
+/** One distinct proven reason across the fleet, projected. */
+export interface ProjectedProvenReason {
+  certainty: 'proven'
+  kind: string
+  /**
+   * Which config dimension this reason belongs to.
+   *
+   * On every fleet row, including here, so a caller can group the fleet answer
+   * the way an operator actually reads it — "tools is broken, model is fine,
+   * budgets was never declared" — instead of scanning twelve reasons for a
+   * pattern. There is deliberately NO pre-derived per-dimension roll-up on this
+   * tool, unlike `afr_get_run_divergence`: `FleetDivergenceReport` carries no
+   * coverage record, so the `undeclared` and `clean` states are not derivable
+   * from it, and folding one anyway would mean inventing a second copy of the
+   * precedence rule that contracts states must exist exactly once.
+   */
+  dimension: string
+  reasonKey: string
+  /** Analysed runs carrying a proven divergence with this `reasonKey`. The ranking key, and the actionable number. */
+  runs: number
+  /** The exemplar's claim — a real finding from a real run, not a synthesised summary. */
+  claim: string
+  /** Path into the target config that decides it. */
+  targetPath: string
+  /**
+   * The drill-down, pre-built: one representative run, the same target version.
+   * PROVEN REASONS ONLY — see {@link ProjectedSpeculativeReason}.
+   */
+  next: { tool: string; args: Record<string, unknown> }
+}
+
+/**
+ * One distinct speculative reason, projected.
+ *
+ * NO `next`. Not an oversight and not a budget saving: drilling into a
+ * representative run for a speculative reason returns the same unprovable
+ * sentence one level down, having spent a whole tool call to do it. Handing an
+ * agent a pointer implies there is something at the end of it, and here there
+ * is not. The absence is the honest answer, and it is stated in the tool
+ * description rather than as a per-row field.
+ */
+export interface ProjectedSpeculativeReason {
+  certainty: 'speculative'
+  kind: string
+  /** See {@link ProjectedProvenReason.dimension}. */
+  dimension: string
+  reasonKey: string
+  runs: number
+  concern: string
+  changedPath: string
+}
+
+/**
+ * One distinct question the fleet scan could not answer.
+ *
+ * Grouped like the other two because "the tool list was unreadable on 300 runs"
+ * is one fixable fact about the version, not 300 incidents. No `next`, for the
+ * same reason speculative reasons have none — and more strongly here, since the
+ * drill-down would return the same unanswerable question one level down.
+ */
+export interface ProjectedIndeterminateReason {
+  certainty: 'indeterminate'
+  kind: string
+  reasonKey: string
+  runs: number
+  question: string
+  dimension: string
+  /** See {@link ProjectedIndeterminateDivergence.remedy}. The one field on a fleet row that is an instruction. */
+  remedy?: string
+}
+
+/** What the fleet scan covered. Same anti-false-clean role as {@link ProjectedCoverage}. */
+export interface ProjectedScanWindow {
+  /**
+   * From `isFleetScanComplete`: the SCAN neither truncated nor skipped a run.
+   * Narrower than the response's own `complete`, which also requires that no
+   * question went unanswered.
+   */
+  complete: boolean
+  runsScanned: number
+  runsAnalyzed: number
+  /** Visited but not analysable. NOT clean — one of four separate ways of not having looked. */
+  runsUnassessable: number
+  /** Inside the window but never reached, because the execution's own budget ran out. Unexamined is not passed. */
+  runsSkippedForBudget: number
+  scanTruncated: boolean
+  /**
+   * PAGES REMAIN — pass it back to continue the scan.
+   *
+   * Carried because an agent told only "incomplete" can do nothing about it,
+   * and this is the one field that turns that into an action. A full, clean
+   * first page looks exactly like a finished scan; its presence alone is what
+   * says otherwise, and it is already folded into `complete`.
+   */
+  nextCursor?: string
+}
+
+/** `afr_assess_version` response. */
+export interface FleetDivergenceResult {
+  agentId: string
+  targetVersionId: string
+  verdict: DivergenceVerdict
+  /**
+   * Runs with at least one PROVEN divergence.
+   *
+   * THERE IS NO COMBINED TOTAL HERE, AND THERE MUST NEVER BE ONE. Adding a run
+   * count for speculative reasons to this one produces a single headline that
+   * reads as proven breakage and mostly is not. The contract refuses to offer
+   * the field; this projection refuses to compute it.
+   */
+  runsWithProvenDivergence: number
+  /**
+   * THE ANTI-FALSE-CLEAN FIELD for the fleet answer, from
+   * `isFleetDivergenceAnalysisComplete` — the scan must be whole AND no
+   * question may have gone unanswered. `provenReasons: []` authorises nothing
+   * unless this is true.
+   */
+  complete: boolean
+  window: ProjectedScanWindow
+  /** Distinct proven reasons, most-affecting first. THE HEADLINE, and the tractable number. */
+  provenReasons: ProjectedProvenReason[]
+  provenReasonsDropped?: number
+  /** Distinct speculative reasons. Not a gate signal. */
+  speculativeReasons: ProjectedSpeculativeReason[]
+  speculativeReasonsDropped?: number
+  /** Distinct unanswerable questions. Non-empty makes `complete` false whatever the other two lists say. */
+  indeterminateReasons: ProjectedIndeterminateReason[]
+  indeterminateReasonsDropped?: number
+}
+
+/**
+ * Project an agent's fleet divergence report.
+ *
+ * @param report - the report, already verified by `FlightReader`.
+ */
+export function toFleetDivergenceResult(report: FleetDivergenceReport): FleetDivergenceResult {
+  const provenKept = report.provenReasons.slice(0, FLEET_REASON_CAP)
+  const speculativeKept = report.speculativeReasons.slice(0, FLEET_REASON_CAP)
+  const indeterminateKept = report.indeterminateReasons.slice(0, FLEET_REASON_CAP)
+
+  const result: FleetDivergenceResult = {
+    agentId: report.agentId,
+    targetVersionId: report.targetVersionId,
+    verdict: report.verdict,
+    runsWithProvenDivergence: report.runsWithProvenDivergence,
+    complete: isFleetDivergenceAnalysisComplete(report),
+    window: {
+      complete: isFleetScanComplete(report.window),
+      runsScanned: report.window.runsScanned,
+      runsAnalyzed: report.window.runsAnalyzed,
+      runsUnassessable: report.window.runsUnassessable,
+      runsSkippedForBudget: report.window.runsSkippedForBudget,
+      scanTruncated: report.window.scanTruncated,
+      ...(report.window.nextCursor !== undefined && { nextCursor: report.window.nextCursor }),
+    },
+    provenReasons: provenKept.map((reason) => ({
+      certainty: 'proven' as const,
+      kind: reason.kind,
+      dimension: reason.exemplar.dimension,
+      reasonKey: reason.reasonKey,
+      runs: reason.affectedRunCount,
+      claim: truncateProse(reason.exemplar.provenClaim, FLEET_PROSE_BYTE_CAP),
+      targetPath: reason.exemplar.provenBy[0].targetConfigPath,
+      next: {
+        tool: 'afr_get_run_divergence',
+        args: { runId: reason.representativeRunIds[0] ?? '', targetVersionId: report.targetVersionId },
+      },
+    })),
+    speculativeReasons: speculativeKept.map((reason) => ({
+      certainty: 'speculative' as const,
+      kind: reason.kind,
+      dimension: reason.exemplar.dimension,
+      reasonKey: reason.reasonKey,
+      runs: reason.affectedRunCount,
+      concern: truncateProse(reason.exemplar.speculativeConcern, FLEET_PROSE_BYTE_CAP),
+      changedPath: reason.exemplar.changedConfigPath,
+    })),
+    indeterminateReasons: indeterminateKept.map((reason) => {
+      const row: ProjectedIndeterminateReason = {
+        certainty: 'indeterminate',
+        kind: reason.kind,
+        reasonKey: reason.reasonKey,
+        runs: reason.affectedRunCount,
+        question: truncateProse(reason.exemplar.undecidedQuestion, FLEET_PROSE_BYTE_CAP),
+        dimension: reason.exemplar.dimension,
+      }
+      if (reason.exemplar.remedy !== undefined) {
+        row.remedy = truncateProse(reason.exemplar.remedy, FLEET_PROSE_BYTE_CAP)
+      }
+      return row
+    }),
+  }
+  if (indeterminateKept.length < report.indeterminateReasons.length) {
+    result.indeterminateReasonsDropped = report.indeterminateReasons.length - indeterminateKept.length
+  }
+  if (provenKept.length < report.provenReasons.length) {
+    result.provenReasonsDropped = report.provenReasons.length - provenKept.length
+  }
+  if (speculativeKept.length < report.speculativeReasons.length) {
+    result.speculativeReasonsDropped = report.speculativeReasons.length - speculativeKept.length
+  }
+  return result
 }

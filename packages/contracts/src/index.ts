@@ -10,6 +10,8 @@ export * from "./auth.js";
 export * from "./artifacts.js";
 export * from "./replay.js";
 export * from "./diff.js";
+export * from "./divergence.js";
+export * from "./agent_config.js";
 export * from "./protocol.js";
 export * from "./evals.js";
 export * from "./alerts.js";

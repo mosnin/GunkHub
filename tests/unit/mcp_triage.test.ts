@@ -197,6 +197,11 @@ const REAL_TOOLS = new Set([
   'afr_explain_run',
   'afr_get_run_events',
   'afr_list_runs',
+  // ADR-008. Not reachable from a triage `next` pointer — a failure pattern and
+  // a version divergence are different questions — but listed so this set stays
+  // the real tool inventory rather than the subset triage happens to point at.
+  'afr_assess_version',
+  'afr_get_run_divergence',
 ])
 
 /** The argument names each pointed-at tool accepts. A pointer with a bogus arg is rejected at the schema. */

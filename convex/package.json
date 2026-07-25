@@ -9,7 +9,8 @@
     "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
   },
   "dependencies": {
-    "convex": "^1.42.2"
+    "convex": "^1.42.2",
+    "@agent-flight-recorder/contracts": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

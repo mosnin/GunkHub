@@ -16,11 +16,15 @@
 import { FlightReader, V1ApiError } from '@agent-flight-recorder/sdk'
 
 import type {
+  AgentDivergenceParams,
   ListEventsParams,
   ListFailurePatternsParams,
   ListRunsParams,
+  RunDivergenceParams,
+  V1AgentDivergenceData,
   V1ApiErrorKind,
   V1FetchLike,
+  V1RunDivergenceData,
   V1GetExplanationData,
   V1GetRunData,
   V1ListEventsData,
@@ -114,6 +118,10 @@ export type {
   ListRunsParams,
   ListEventsParams,
   ListFailurePatternsParams,
+  V1RunDivergenceData,
+  V1AgentDivergenceData,
+  RunDivergenceParams,
+  AgentDivergenceParams,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +188,44 @@ export async function listFailurePatterns(
 ): Promise<V1ListFailurePatternsData> {
   try {
     return await new FlightReader(config, fetchImpl).getFailurePatterns(params)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/**
+ * "Would this recorded run still have been possible on `targetVersionId`?"
+ *
+ * Thin `FlightReader` wrapper like every other function here — which matters
+ * more than usual on this one: the reader's refusal to return an unverifiable
+ * clean report (ignored `targetVersionId`, missing coverage, a speculative
+ * finding served as proven, a verdict that contradicts its own findings) is
+ * what stands between `afr compat` and a green exit code it did not earn.
+ * Those checks arrive here as `ApiClientError` with `kind: 'invalid_response'`
+ * and therefore exit code 4 — a wire failure, not a pass.
+ */
+export async function getRunDivergence(
+  config: ApiClientConfig,
+  runId: string,
+  params: RunDivergenceParams,
+  fetchImpl?: ApiFetchLike
+): Promise<V1RunDivergenceData> {
+  try {
+    return await new FlightReader(config, fetchImpl).getRunDivergence(runId, params)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/** The fleet form of {@link getRunDivergence}: the same question over an agent's recent runs. */
+export async function getAgentDivergence(
+  config: ApiClientConfig,
+  agentId: string,
+  params: AgentDivergenceParams,
+  fetchImpl?: ApiFetchLike
+): Promise<V1AgentDivergenceData> {
+  try {
+    return await new FlightReader(config, fetchImpl).getAgentDivergence(agentId, params)
   } catch (err) {
     toApiClientError(err)
   }

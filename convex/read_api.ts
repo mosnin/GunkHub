@@ -45,6 +45,21 @@ import { mutation } from "./_generated/server.js";
 // `computePatternFixConfidence` is now the single canonical implementation
 // that this endpoint, `getPatternResolutionEvidence`, and the snapshot writer
 // all call.
+// Constants and the shared event-observation seam ONLY — not that module's
+// registered Convex functions, which are Clerk-authed and uncallable here.
+// Importing the seam (rather than re-implementing it) is what guarantees both
+// doors observe a run identically; a re-implementation would let the two drift
+// silently, which is the failure this file's header already documents once.
+import {
+  DIVERGENCE_EVENT_PAGE_SIZE,
+  DIVERGENCE_FLEET_EVENT_BUDGET,
+  DIVERGENCE_FLEET_EVENTS_PER_RUN,
+  DIVERGENCE_FLEET_MAX_RUNS_PER_BATCH,
+  DIVERGENCE_FLEET_RUNS_PER_BATCH,
+  OBSERVED_EVENT_TYPES,
+  takeObservableEvents,
+  toObservableEvent,
+} from "./divergence.js";
 import {
   computePatternFixConfidence,
   FIX_CONFIDENCE_SNAPSHOT_STALE_AFTER_MS,
@@ -52,6 +67,13 @@ import {
   isFixConfidenceSnapshotUsable,
   MAX_PATTERN_LIFECYCLE_TRANSITIONS,
 } from "./failure_patterns.js";
+import {
+  analyzeConfigPair,
+  analyzeRunAgainstDelta,
+  extractRunObservation,
+  foldFleetDivergence,
+  type RunDivergenceAnalysis,
+} from "./helpers/divergence.js";
 import { DEFAULT_PAGE_SIZE, MAX_EVENTS_PER_REPLAY, MAX_PAGE_SIZE } from "./helpers/pagination.js";
 import { buildReplayProjectionMirror } from "./helpers/replay_projection.js";
 import { fixConfidence } from "./insights.js";
@@ -1276,5 +1298,402 @@ export const apiGetFailurePatternEvidence = mutation({
     };
 
     return { pattern: projectDoc(pattern, selection), resolution, exposure, transitions, confidence: computation.confidence };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// REPLAY DIVERGENCE (ADR-008) — key-authed counterparts to convex/divergence.ts
+//
+// "Would this recorded run still have been possible on version X?", reachable
+// with an `x-api-key` carrying the `read` scope. Without these, the engine is
+// callable only from the web app's Clerk-authed Convex client, and the two
+// surfaces our users actually gate deploys with — `afr compat` in CI, and an
+// agent asking over MCP whether its own next version is safe — both dead-end.
+//
+// Same posture as every function above: org comes from the key and is never a
+// client argument; a version or run in another org is indistinguishable from
+// one that does not exist; `read` scope required; one rate-limit unit.
+//
+// COST ASYMMETRY, STATED RATHER THAN HIDDEN: `apiGetFleetDivergence` reads up
+// to DIVERGENCE_FLEET_EVENT_BUDGET (3,000) event rows for one unit, where
+// `apiGetRunDivergence` reads at most one page. They are deliberately in the
+// SAME rate class (the requirement), so a caller can walk a fleet without a
+// second budget to reason about — but a key hammering the fleet endpoint is
+// materially more expensive per unit than any other function on this surface,
+// and that is a known property, not an oversight.
+// ---------------------------------------------------------------------------
+
+
+
+/**
+ * FIELD PROJECTION FOR DERIVED REPORTS.
+ *
+ * The `fields` machinery above projects TABLE documents and derives its valid
+ * set from `schema.ts`. A divergence report is not a table document — it is a
+ * derived projection (Event Log Rule 2) — so its valid set is declared here,
+ * explicitly, and is the only such list in this file that a schema change
+ * cannot keep honest. Keep it in step with the return shapes below; the
+ * `divergence_read_api` tests assert the two agree.
+ *
+ * Same four rules as §FIELD PROJECTION: omitting `fields` returns everything;
+ * an unknown field is an error; an empty array is an error, not "return
+ * nothing"; and the identity fields are always included whether asked for or
+ * not.
+ */
+type DivergenceReportKind = "run" | "fleet" | "config";
+
+const DIVERGENCE_REPORT_FIELDS: Record<DivergenceReportKind, string[]> = {
+  run: [
+    "runId", "baselineVersionId", "targetVersionId", "baselineVersion", "targetVersion",
+    "analyzedAt", "verdict", "proven", "speculative", "indeterminate", "coverage", "nextEventCursor",
+  ],
+  fleet: [
+    "agentId", "baselineVersionId", "targetVersionId", "baselineVersion", "targetVersion",
+    "analyzedAt", "verdict", "provenReasons", "speculativeReasons", "indeterminateReasons",
+    "runsWithProvenDivergence", "runsPartiallyAnalyzed", "window", "nextCursor",
+  ],
+  config: [
+    "baselineVersionId", "targetVersionId", "baselineVersion", "targetVersion",
+    "analyzedAt", "verdict", "verdictUnavailableBecause", "provenUnavailableBecause",
+    "speculative", "indeterminate", "coverage", "snapshotStatus", "provenKindsReachable",
+  ],
+};
+
+/**
+ * Identity fields, never projectable away.
+ *
+ * A report stripped of WHICH VERSION IT IS ABOUT is worse than no report: it
+ * still renders as a verdict, and the reader has no way to notice it is
+ * answering about something else. `targetVersionId` in particular is the
+ * ignored-parameter detector the contract calls out.
+ */
+const DIVERGENCE_IDENTITY_FIELDS: Record<DivergenceReportKind, string[]> = {
+  run: ["runId", "targetVersionId"],
+  fleet: ["agentId", "targetVersionId"],
+  config: ["baselineVersionId", "targetVersionId"],
+};
+
+/**
+ * CONCLUSION-BEARING FIELDS, and the CAVEATS they drag in with them.
+ *
+ * Identity alone is not enough. `?fields=verdict` used to return
+ * `{runId, targetVersionId, verdict}` — no `coverage`, no `nextEventCursor` —
+ * and the fleet form stripped `window` AND `nextCursor`. That is a false clean
+ * produced by the single most reasonable request an integrator can make: ask
+ * for the one field you care about.
+ *
+ * WHY IT MATTERS BEYOND ITS SIZE: `afr compat` is built so a page budget can
+ * cost a conclusive answer but can never buy a green build — stopping early
+ * leaves a cursor in the merged window, which forces `indeterminate` and exit
+ * 11. That guarantee is only as strong as the cursor SURVIVING THE RESPONSE.
+ * Projection was quietly able to delete it.
+ *
+ * THE RULE IS WIDER THAN `verdict`, because `verdict` is not the only field a
+ * caller draws a conclusion from: `?fields=proven` returning `[]` is equally a
+ * false clean — a caller who asked for the finding list and got an empty array
+ * concludes the version is safe. So EVERY field that can carry a conclusion
+ * pulls the caveats in.
+ *
+ * A metadata-only projection (`?fields=analyzedAt`) is deliberately left alone:
+ * there is no claim there to caveat, and the token saving is the whole point of
+ * the feature.
+ *
+ * This is the DURABLE half of the fix. `apps/web`'s route layer carries a
+ * mirror of these names because it may not import from `convex/`; that mirror
+ * is built to be a no-op once this lands and should now be deleted, so the two
+ * layers do not each assume the other is handling it.
+ */
+const DIVERGENCE_CONCLUSION_FIELDS: Record<DivergenceReportKind, string[]> = {
+  run: ["verdict", "proven", "speculative", "indeterminate"],
+  fleet: [
+    "verdict", "provenReasons", "speculativeReasons", "indeterminateReasons",
+    "runsWithProvenDivergence", "runsPartiallyAnalyzed",
+  ],
+  config: ["verdict", "speculative", "indeterminate", "coverage"],
+};
+
+const DIVERGENCE_CAVEAT_FIELDS: Record<DivergenceReportKind, string[]> = {
+  // `coverage` says what was examined; `nextEventCursor` says the history is
+  // not finished being read. Either one absent lets a partial answer read whole.
+  run: ["coverage", "nextEventCursor"],
+  fleet: ["window", "nextCursor"],
+  // This tier structurally cannot prove anything. A caller who does not see
+  // that reads "nothing changed that I could name" as "safe to ship".
+  config: ["coverage", "verdictUnavailableBecause", "provenUnavailableBecause", "provenKindsReachable", "snapshotStatus"],
+};
+
+function validateDivergenceFieldSelection(
+  kind: DivergenceReportKind,
+  fields: string[] | undefined,
+): ReadonlySet<string> | undefined {
+  if (fields === undefined) return undefined;
+  const valid = DIVERGENCE_REPORT_FIELDS[kind];
+  if (fields.length === 0) {
+    throw new Error(
+      `INVALID_ARGUMENT: fields must not be empty for divergence.${kind}; omit the argument to receive the full report (valid fields are: ${valid.join(", ")})`,
+    );
+  }
+  const validSet = new Set(valid);
+  for (const name of fields) {
+    if (!validSet.has(name)) {
+      throw new Error(
+        `INVALID_ARGUMENT: unknown field "${name}" for divergence.${kind}; valid fields are: ${valid.join(", ")}`,
+      );
+    }
+  }
+  const selected = new Set([...fields, ...DIVERGENCE_IDENTITY_FIELDS[kind]]);
+  if (DIVERGENCE_CONCLUSION_FIELDS[kind].some((f) => selected.has(f))) {
+    for (const caveat of DIVERGENCE_CAVEAT_FIELDS[kind]) selected.add(caveat);
+  }
+  return selected;
+}
+
+/** Resolve a version id under the key's org. Cross-org and nonexistent collapse to one outcome. */
+async function resolveOrgVersion(
+  ctx: MutationCtx,
+  apiKey: Doc<"api_keys">,
+  versionId: string,
+): Promise<Doc<"agent_versions">> {
+  const version = await ctx.db.get(versionId as Id<"agent_versions">);
+  if (!version || version.orgId !== apiKey.orgId) {
+    throw new Error("Agent version not found in this organization");
+  }
+  return version;
+}
+
+/**
+ * TIER 1 — compare two versions' configSnapshots. Zero run reads, zero event
+ * reads, and therefore ZERO CAPACITY TO PRODUCE PROOF.
+ *
+ * THE SHAPE IS THE ARGUMENT. This endpoint deliberately has NO `proven` key
+ * and NO usable `verdict`, because a tier that reads no events cannot have
+ * looked for a proven divergence — so a `proven: []` here would be a lie by
+ * SHAPE, and the cheapest possible false clean: an agent or CI gate reading
+ * "proven is empty" would conclude nothing was found, when in fact nothing was
+ * sought. `verdict` is pinned to `null` alongside a required
+ * `verdictUnavailableBecause`, so it can never read `compatible`.
+ *
+ * The permissive alternative — return the same envelope as tier 2 with empty
+ * arrays — is exactly what must not ship, and is far harder to withdraw from a
+ * public API than to withhold now. Callers that want a verdict call
+ * `apiGetRunDivergence` or `apiGetFleetDivergence`.
+ */
+export const apiCompareVersionConfigs = mutation({
+  args: {
+    apiKeyHash: v.string(),
+    baselineVersionId: v.string(),
+    targetVersionId: v.string(),
+    fields: FIELDS_ARG,
+  },
+  handler: async (ctx, args) => {
+    const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+    // Selection validated BEFORE any read, same ordering rule as the table
+    // endpoints: a bad `fields` must not be distinguishable by whether the
+    // version existed.
+    const selection = validateDivergenceFieldSelection("config", args.fields);
+
+    const baseline = await resolveOrgVersion(ctx, apiKey, args.baselineVersionId);
+    const target = await resolveOrgVersion(ctx, apiKey, args.targetVersionId);
+    if (baseline.agentId !== target.agentId) {
+      throw new Error(
+        "INVALID_ARGUMENT: both versions must belong to the same agent; a divergence report is only meaningful against that agent's own recorded history",
+      );
+    }
+
+    const delta = analyzeConfigPair(baseline.configSnapshot, target.configSnapshot);
+
+    return projectDoc(
+      {
+        baselineVersionId: args.baselineVersionId,
+        targetVersionId: args.targetVersionId,
+        baselineVersion: baseline.version,
+        targetVersion: target.version,
+        analyzedAt: Date.now(),
+        verdict: null,
+        verdictUnavailableBecause:
+          "This tier reads no recorded events, so it cannot establish a verdict. Call apiGetRunDivergence or apiGetFleetDivergence for one.",
+        provenUnavailableBecause:
+          "No proven divergence can be reported here: proof requires citing a recorded event, and this tier reads none. An empty proven list would mean 'nothing was sought', not 'nothing was found', so the key is omitted entirely rather than returned empty.",
+        speculative: delta.speculative,
+        coverage: {
+          assessed: delta.assessed,
+          unassessed: delta.unassessed,
+          eventsExamined: 0,
+          eventHistoryComplete: false,
+        },
+        snapshotStatus: { baseline: delta.baseline.snapshotStatus, target: delta.target.snapshotStatus },
+        provenKindsReachable: [
+          ...(delta.targetToolsByName !== null ? ["tool_removed", "tool_call_rejected_by_schema"] : []),
+          ...(delta.targetModels !== null ? ["model_removed"] : []),
+          ...(Object.keys(delta.targetBudgets).length > 0 ? ["budget_exceeded"] : []),
+        ],
+      },
+      selection,
+    );
+  },
+});
+
+/**
+ * TIER 2 — one recorded run against a target version.
+ *
+ * `eventCursor` continues this run's event history across calls; until it comes
+ * back `null`, `coverage.eventHistoryComplete` is false and the verdict cannot
+ * be `compatible`. A run with no recorded `agentVersionId` is still analysed —
+ * proven kinds need only the target — with every speculative dimension marked
+ * `baseline_config_missing`.
+ */
+export const apiGetRunDivergence = mutation({
+  args: {
+    apiKeyHash: v.string(),
+    runId: v.string(),
+    targetVersionId: v.string(),
+    eventCursor: v.optional(v.string()),
+    limit: v.optional(v.number()),
+    fields: FIELDS_ARG,
+  },
+  handler: async (ctx, args) => {
+    const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+    const selection = validateDivergenceFieldSelection("run", args.fields);
+
+    const runId = args.runId as Id<"runs">;
+    const run = await ctx.db.get(runId);
+    if (!run || run.orgId !== apiKey.orgId) {
+      throw new Error("Run not found in this organization");
+    }
+    const target = await resolveOrgVersion(ctx, apiKey, args.targetVersionId);
+    if (target.agentId !== run.agentId) {
+      throw new Error(
+        "INVALID_ARGUMENT: the target version belongs to a different agent than this run; its configuration cannot be replayed against this history",
+      );
+    }
+
+    let baseline: Doc<"agent_versions"> | null = null;
+    if (run.agentVersionId) {
+      const found = await ctx.db.get(run.agentVersionId);
+      baseline = found && found.orgId === apiKey.orgId ? found : null;
+    }
+
+    const delta = analyzeConfigPair(baseline?.configSnapshot, target.configSnapshot);
+
+    const limit = Math.min(args.limit ?? DIVERGENCE_EVENT_PAGE_SIZE, DIVERGENCE_EVENT_PAGE_SIZE);
+    const page = await ctx.db
+      .query("events")
+      .withIndex("by_run", (q) => q.eq("runId", runId))
+      .filter((q) => q.or(...OBSERVED_EVENT_TYPES.map((t) => q.eq(q.field("type"), t))))
+      .paginate({ numItems: limit, cursor: args.eventCursor ?? null });
+
+    const analysis = analyzeRunAgainstDelta(
+      delta,
+      extractRunObservation(page.page.map(toObservableEvent), { scanTruncated: !page.isDone }),
+    );
+
+    return projectDoc(
+      {
+        runId: args.runId,
+        baselineVersionId: run.agentVersionId ? String(run.agentVersionId) : null,
+        targetVersionId: args.targetVersionId,
+        baselineVersion: baseline?.version ?? null,
+        targetVersion: target.version,
+        analyzedAt: Date.now(),
+        verdict: analysis.verdict,
+        proven: analysis.proven,
+        speculative: analysis.speculative,
+        indeterminate: analysis.indeterminate,
+        coverage: analysis.coverage,
+        nextEventCursor: page.isDone ? null : page.continueCursor,
+      },
+      selection,
+    );
+  },
+});
+
+/**
+ * TIER 3 — a bounded batch of the baseline version's runs, grouped by DISTINCT
+ * REASON.
+ *
+ * `window.scanTruncated` is set while pages remain OR runs were dropped on the
+ * event budget, and every run whose own coverage is incomplete is counted in
+ * `window.runsUnassessable` — so a first page of a large population correctly
+ * reports `indeterminate`, never `compatible`. A caller walks `nextCursor` to
+ * the end and merges with the engine's `mergeFleetAnalyses`.
+ */
+export const apiGetFleetDivergence = mutation({
+  args: {
+    apiKeyHash: v.string(),
+    baselineVersionId: v.string(),
+    targetVersionId: v.string(),
+    cursor: v.optional(v.string()),
+    limit: v.optional(v.number()),
+    fields: FIELDS_ARG,
+  },
+  handler: async (ctx, args) => {
+    const apiKey = await resolveReadApiKey(ctx, args.apiKeyHash);
+    const selection = validateDivergenceFieldSelection("fleet", args.fields);
+
+    const baseline = await resolveOrgVersion(ctx, apiKey, args.baselineVersionId);
+    const target = await resolveOrgVersion(ctx, apiKey, args.targetVersionId);
+    if (baseline.agentId !== target.agentId) {
+      throw new Error(
+        "INVALID_ARGUMENT: both versions must belong to the same agent; a divergence report is only meaningful against that agent's own recorded history",
+      );
+    }
+
+    const delta = analyzeConfigPair(baseline.configSnapshot, target.configSnapshot);
+    const limit = Math.min(args.limit ?? DIVERGENCE_FLEET_RUNS_PER_BATCH, DIVERGENCE_FLEET_MAX_RUNS_PER_BATCH);
+
+    const page = await ctx.db
+      .query("runs")
+      .withIndex("by_agent_version_started", (q) =>
+        q.eq("agentVersionId", args.baselineVersionId as Id<"agent_versions">),
+      )
+      .order("desc")
+      .paginate({ numItems: limit, cursor: args.cursor ?? null });
+
+    const analyses: Array<{ runId: string; analysis: RunDivergenceAnalysis }> = [];
+    let eventBudget = DIVERGENCE_FLEET_EVENT_BUDGET;
+    let runsSkippedForBudget = 0;
+
+    for (const run of page.page) {
+      if (run.orgId !== apiKey.orgId) continue;
+      if (eventBudget <= 0) {
+        runsSkippedForBudget += 1;
+        continue;
+      }
+      const perRun = Math.min(DIVERGENCE_FLEET_EVENTS_PER_RUN, eventBudget);
+      const { events, truncated } = await takeObservableEvents(ctx, run._id, perRun);
+      eventBudget -= events.length;
+      analyses.push({
+        runId: String(run._id),
+        analysis: analyzeRunAgainstDelta(delta, extractRunObservation(events, { scanTruncated: truncated })),
+      });
+    }
+
+    const fleet = foldFleetDivergence(analyses, {
+      runsScanned: page.page.length,
+      runsSkippedForBudget,
+      scanTruncated: false,
+      scanRowCeiling: limit,
+      ...(page.isDone ? {} : { nextCursor: page.continueCursor }),
+    });
+
+    return projectDoc(
+      {
+        agentId: String(baseline.agentId),
+        baselineVersionId: args.baselineVersionId,
+        targetVersionId: args.targetVersionId,
+        baselineVersion: baseline.version,
+        targetVersion: target.version,
+        analyzedAt: Date.now(),
+        verdict: fleet.verdict,
+        provenReasons: fleet.provenReasons,
+        speculativeReasons: fleet.speculativeReasons,
+        indeterminateReasons: fleet.indeterminateReasons,
+        runsWithProvenDivergence: fleet.runsWithProvenDivergence,
+        runsPartiallyAnalyzed: fleet.runsPartiallyAnalyzed,
+        window: fleet.window,
+        nextCursor: page.isDone ? null : page.continueCursor,
+      },
+      selection,
+    );
   },
 });

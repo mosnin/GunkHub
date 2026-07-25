@@ -359,3 +359,145 @@ export async function apiGetFailurePatternEvidence(
   )
   return result as PatternResolutionEvidence | null
 }
+
+// ---------------------------------------------------------------------------
+// ADR-008 replay divergence — the key-authed public read surface.
+//
+// WHY THESE EXIST ALONGSIDE services/divergence.ts
+// -----------------------------------------------
+// `services/divergence.ts` serves the WEB UI and authenticates with a Clerk
+// session. `convex/divergence.ts` resolves the caller's org from that session,
+// so it cannot serve an API key — and an API key is what every caller outside
+// the browser has. These three functions are the same questions asked through
+// `convex/read_api.ts`, which resolves an org from a hashed key with the `read`
+// scope instead.
+//
+// They are what make the feature reachable at all by the two surfaces the ICP
+// actually uses: `afr compat` in CI, and the MCP tools an agent uses to ask
+// whether its own next version is safe to ship.
+//
+// THE COMPLETENESS FIELDS ARE THE POINT, AND THEY ARE PASSED THROUGH WHOLE
+// ----------------------------------------------------------------------
+// `coverage`, `eventHistoryComplete`, `scanTruncated`, `runsUnassessable`,
+// `runsSkippedForBudget` and the cursors are what separate an honest
+// `indeterminate` from a false `compatible`. A forwarder that "tidies" the
+// response shape and drops one of them turns a partial scan into a green build
+// in somebody's CI.
+//
+// So these functions do NOT reshape, filter or re-derive the response. They
+// return the backend result verbatim — the same posture as `apiGetReplay` — and
+// tests/unit/blast_radius_v1_route.test.ts asserts each completeness field
+// survives the round trip by name.
+// ---------------------------------------------------------------------------
+
+export interface ApiV1CompareVersionConfigsParams {
+  baselineVersionId: string
+  targetVersionId: string
+  /** See `ApiV1ListRunsParams.fields`. */
+  fields?: string[]
+}
+
+/**
+ * TIER 1 — zero run reads, zero event reads. Answers every SPECULATIVE question
+ * for a whole fleet at once, because those depend only on the (baseline,
+ * target) config pair. The cheapest rung of the progressive-disclosure ladder.
+ */
+export async function apiCompareVersionConfigs(
+  apiKeyHash: string,
+  params: ApiV1CompareVersionConfigsParams,
+): Promise<unknown> {
+  const client = getPublicClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await withConvexTimeout(
+    client.mutation(convex.read_api.apiCompareVersionConfigs, {
+      apiKeyHash,
+      baselineVersionId: params.baselineVersionId,
+      targetVersionId: params.targetVersionId,
+      ...(params.fields !== undefined && { fields: params.fields }),
+    }),
+  )
+  // Cast to `unknown`, not to a contract type. convex/read_api.ts owns these
+  // response shapes and they are passed through VERBATIM — asserting a contract
+  // type here would be a claim this layer cannot check, and the completeness
+  // fields are exactly the ones a wrong assertion would quietly drop. Callers
+  // narrow with the contract's own predicates.
+  return result as unknown
+}
+
+export interface ApiV1GetRunDivergenceParams {
+  runId: string
+  targetVersionId: string
+  /**
+   * Continuation over the RUN'S EVENTS. Until the caller has consumed every
+   * page the analysis reports `eventHistoryComplete: false`, and the verdict
+   * cannot be `compatible`. Forwarding this is not optional: dropping it
+   * re-reads page one forever and the caller never reaches a complete answer.
+   */
+  eventCursor?: string
+  limit?: number
+  fields?: string[]
+}
+
+/** TIER 2 — one run, paged over its recorded events. */
+export async function apiGetRunDivergence(
+  apiKeyHash: string,
+  params: ApiV1GetRunDivergenceParams,
+): Promise<unknown> {
+  const client = getPublicClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await withConvexTimeout(
+    client.mutation(convex.read_api.apiGetRunDivergence, {
+      apiKeyHash,
+      runId: params.runId,
+      targetVersionId: params.targetVersionId,
+      ...(params.eventCursor !== undefined && { eventCursor: params.eventCursor }),
+      ...(params.limit !== undefined && { limit: params.limit }),
+      ...(params.fields !== undefined && { fields: params.fields }),
+    }),
+  )
+  // Cast to `unknown`, not to a contract type. convex/read_api.ts owns these
+  // response shapes and they are passed through VERBATIM — asserting a contract
+  // type here would be a claim this layer cannot check, and the completeness
+  // fields are exactly the ones a wrong assertion would quietly drop. Callers
+  // narrow with the contract's own predicates.
+  return result as unknown
+}
+
+export interface ApiV1GetFleetDivergenceParams {
+  baselineVersionId: string
+  targetVersionId: string
+  /**
+   * Continuation over RUNS. A fleet scan is a BOUNDED BATCH, not a whole-history
+   * query, so a caller that has not walked to the final page has not seen the
+   * population — `window.nextCursor` says so and `isFleetScanComplete` folds it
+   * into the verdict.
+   */
+  cursor?: string
+  limit?: number
+  fields?: string[]
+}
+
+/** TIER 3 — a bounded batch of runs, grouped by DISTINCT REASON. */
+export async function apiGetFleetDivergence(
+  apiKeyHash: string,
+  params: ApiV1GetFleetDivergenceParams,
+): Promise<unknown> {
+  const client = getPublicClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const result = await withConvexTimeout(
+    client.mutation(convex.read_api.apiGetFleetDivergence, {
+      apiKeyHash,
+      baselineVersionId: params.baselineVersionId,
+      targetVersionId: params.targetVersionId,
+      ...(params.cursor !== undefined && { cursor: params.cursor }),
+      ...(params.limit !== undefined && { limit: params.limit }),
+      ...(params.fields !== undefined && { fields: params.fields }),
+    }),
+  )
+  // Cast to `unknown`, not to a contract type. convex/read_api.ts owns these
+  // response shapes and they are passed through VERBATIM — asserting a contract
+  // type here would be a claim this layer cannot check, and the completeness
+  // fields are exactly the ones a wrong assertion would quietly drop. Callers
+  // narrow with the contract's own predicates.
+  return result as unknown
+}

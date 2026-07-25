@@ -322,6 +322,22 @@ jobs:
           fi
 
       # pnpm does not hoist, so there is no root `node_modules/convex` and no
+      # `convex/` now imports `@agent-flight-recorder/contracts` (the divergence
+      # vocabulary — the engine holds no copy of it, deliberately). That package
+      # resolves through its `dist/`, which is gitignored, so on a fresh checkout
+      # nothing in convex/ resolves until contracts is built.
+      #
+      # `codegen` below passes --typecheck=disable and so does not need it TODAY.
+      # This step exists for the day a deploy key lands: `convex deploy` bundles
+      # convex/ for real and WILL need the dependency present. Building it here
+      # costs seconds and turns a confusing first-deploy failure — module not
+      # found, on a package that is right there in the workspace — into a
+      # non-event. Do not delete this because codegen appears not to need it.
+      - name: Build workspace dependencies of convex/
+        if: steps.gate.outputs.configured == 'true'
+        run: pnpm turbo run build --filter=@agent-flight-recorder/contracts
+
+      # pnpm does not hoist, so there is no root `node_modules/convex` and no
       # root `node_modules/.bin/convex`. The CLI is resolved from the workspace
       # package that actually depends on it, while cwd stays the repo root so
       # `convex.json` (and therefore `functions: "convex/"`) resolves correctly.

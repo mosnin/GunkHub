@@ -55,12 +55,23 @@ import {
 } from '@agent-flight-recorder/mcp'
 
 import type {
+  DivergenceCoverage,
+  DivergenceProof,
+  DivergenceReport,
+  DivergenceScanWindow,
   Event,
   FailurePattern,
+  FleetDivergenceReport,
+  IndeterminateDivergence,
+  IndeterminateDivergenceKind,
   OtelEventProvenance,
   PatternResolutionEvidence,
+  ProvenDivergence,
+  ProvenDivergenceKind,
   Run,
   RunExplanation,
+  SpeculativeDivergence,
+  SpeculativeDivergenceKind,
   TemporalOrderKey,
 } from '@agent-flight-recorder/contracts'
 import type { V1ListFixConfidenceEnvelope } from '@agent-flight-recorder/sdk'
@@ -808,5 +819,205 @@ export function realisticExplanation(): RunExplanation {
     rootCause: 'Upstream search provider rate-limited the agent and no backoff was configured.',
     suggestedFix: 'Add exponential backoff with jitter to the search tool client.',
     citedSequenceNumbers: [1, 14, 22, 23, 24],
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Version divergence — `afr_assess_version` / `afr_get_run_divergence`
+// ---------------------------------------------------------------------------
+//
+// Maximal in the two directions that matter for these tools, which are not the
+// same direction:
+//
+//   PROSE — the engine's own `provenClaim` / `speculativeConcern` /
+//   `speculativeBecause` sentences are "one line by construction", which is a
+//   property of the engine and not a guarantee of the contract. The contract
+//   states no length bound at all, so the fixture writes long ones and the
+//   projection's byte caps have to do the work. A fixture that wrote realistic
+//   one-liners would measure a budget that holds only while the engine stays
+//   terse.
+//
+//   LIST LENGTH — both reports carry unbounded finding and reason arrays
+//   (`MAX_DIVERGENCE_REPRESENTATIVE_RUNS` bounds only the run-id samples). The
+//   fixtures overflow every cap so the drop counters are exercised, and the
+//   fleet fixture uses twelve reasons because "340 runs, 12 distinct reasons"
+//   is the shape the tool exists to produce.
+
+/** A long engine sentence. Deliberately past the projection's caps. */
+function longClaim(subject: string, seq: number): string {
+  return (
+    `called tool \`${subject}\` at sequence ${String(seq)}; the target version declares no such tool, so this ` +
+    'step could not have happened on it. The recorded arguments were accepted by the version that actually ran, ' +
+    'and no equivalent tool is declared under a different name in the target snapshot either.'
+  )
+}
+
+const DIVERGENCE_TOOLS: readonly string[] = [
+  'search_web', 'read_file', 'run_sql', 'send_email', 'vector_lookup',
+  'browse_page', 'write_file', 'shell_exec', 'calendar_read', 'crm_lookup',
+  'ticket_create', 'pager_notify',
+]
+
+const PROVEN_KINDS: readonly ProvenDivergenceKind[] = [
+  'tool_removed', 'tool_call_rejected_by_schema', 'model_removed', 'budget_exceeded', 'capability_removed',
+]
+
+const SPECULATIVE_KINDS: readonly SpeculativeDivergenceKind[] = [
+  'system_prompt_changed', 'model_substituted', 'decoding_params_changed', 'tool_added',
+  'tool_description_changed', 'tool_schema_widened', 'config_changed',
+]
+
+/** One proven divergence, with several proofs so `furtherProofs` is exercised. */
+export function fatProvenDivergence(i: number): ProvenDivergence {
+  const subject = DIVERGENCE_TOOLS[i % DIVERGENCE_TOOLS.length] ?? 'search_web'
+  const seq = 42 + i * 7
+  const proof = (n: number): DivergenceProof => ({
+    citedEvent: { sequenceNumber: n, eventId: 'evt_' + String(n).padStart(8, '0'), eventType: 'tool.call' },
+    targetConfigPath: 'tools[].name',
+    recordedValue: subject,
+    targetValue: null,
+  })
+  return {
+    certainty: 'proven',
+    kind: PROVEN_KINDS[i % PROVEN_KINDS.length] ?? 'tool_removed',
+    dimension: 'tools',
+    reasonKey: `tool_removed:${subject}`,
+    provenClaim: longClaim(subject, seq),
+    provenBy: [proof(seq), proof(seq + 3), proof(seq + 11)],
+  }
+}
+
+/** One speculative divergence, every optional field populated. */
+export function fatSpeculativeDivergence(i: number): SpeculativeDivergence {
+  const subject = DIVERGENCE_TOOLS[(i + 5) % DIVERGENCE_TOOLS.length] ?? 'read_file'
+  return {
+    certainty: 'speculative',
+    kind: SPECULATIVE_KINDS[i % SPECULATIVE_KINDS.length] ?? 'system_prompt_changed',
+    dimension: 'system_prompt',
+    reasonKey: `system_prompt_changed:${subject}`,
+    speculativeConcern:
+      'the system prompt differs between the recorded version and the target; tool selection, phrasing and the ' +
+      'number of reasoning steps may all differ, or may be identical. Nothing recorded distinguishes these.',
+    speculativeBecause:
+      'recorded history cannot show what a different prompt would have produced, because the run was never ' +
+      'executed under it and this analysis executes nothing.',
+    changedConfigPath: 'systemPrompt',
+    possiblyAffectedSequenceNumbers: Array.from({ length: 24 }, (_, n) => 100_001 + n),
+  }
+}
+
+const INDETERMINATE_KINDS: readonly IndeterminateDivergenceKind[] = [
+  'target_config_unreadable', 'recorded_history_incomplete', 'evidence_externalized', 'engine_limit',
+]
+
+/** One unanswerable question, every optional field populated. */
+export function fatIndeterminateDivergence(i: number): IndeterminateDivergence {
+  return {
+    certainty: 'indeterminate',
+    kind: INDETERMINATE_KINDS[i % INDETERMINATE_KINDS.length] ?? 'target_config_unreadable',
+    reasonKey: `evidence_externalized:tool.call:${String(i)}`,
+    undecidedQuestion:
+      'whether the tool calls recorded at sequences 12, 19, 27, 44 and 61 target tools this version still ' +
+      'declares. Their payloads were externalized past the 10 KB inline ceiling, so the event type survived and ' +
+      'the tool name did not.',
+    unknownBecause:
+      'the deciding field was written to blob storage under Event Log Rule 3, and this analysis reads the event ' +
+      'log only — it never fetches an artifact.',
+    dimension: 'tools',
+    remedy:
+      're-publish this version with a structured `tools` declaration, or lower the payload size so `tool.call` ' +
+      'arguments stay inline and the tool name survives in the event log.',
+    possiblyAffectedSequenceNumbers: [12, 19, 27, 44, 61],
+  }
+}
+
+/** Coverage with both halves populated: several dimensions assessed, several not, each with a detail. */
+export function fatDivergenceCoverage(): DivergenceCoverage {
+  return {
+    assessed: ['tools', 'model', 'budgets', 'capabilities'],
+    unassessed: [
+      {
+        dimension: 'system_prompt',
+        reason: 'baseline_config_missing',
+        detail: 'the run’s own agent version carries no configSnapshot, so "changed" cannot be established',
+      },
+      {
+        dimension: 'decoding_params',
+        reason: 'unsupported_config_shape',
+        detail: 'target snapshot declares `sampling` as a string, not an object: sampling.temperature',
+      },
+    ],
+    eventsExamined: 2_048,
+    eventHistoryComplete: false,
+  }
+}
+
+/** A single-run report that overflows every projection cap. */
+export function fatDivergenceReport(): DivergenceReport {
+  return {
+    runId: 'run_8f2c1a',
+    baselineVersionId: 'ver_3d91b7c2',
+    targetVersionId: 'ver_9a04e6f1',
+    analyzedAt: FROZEN_NOW - HOUR,
+    // `incompatible` is what `computeDivergenceVerdict` yields for a report with
+    // proven findings, whatever the coverage. Kept consistent with the contents
+    // because `FlightReader` refuses a report whose verdict contradicts them —
+    // an inconsistent fixture would measure a response the stack cannot deliver.
+    verdict: 'incompatible',
+    proven: Array.from({ length: 8 }, (_, i) => fatProvenDivergence(i)),
+    speculative: Array.from({ length: 8 }, (_, i) => fatSpeculativeDivergence(i)),
+    indeterminate: Array.from({ length: 8 }, (_, i) => fatIndeterminateDivergence(i)),
+    coverage: fatDivergenceCoverage(),
+  }
+}
+
+/** The scan window, every optional field populated and truncated. */
+export function fatDivergenceScanWindow(): DivergenceScanWindow {
+  return {
+    since: FROZEN_NOW - 30 * DAY,
+    until: FROZEN_NOW,
+    runsScanned: 10_000,
+    runsAnalyzed: 9_640,
+    runsUnassessable: 360,
+    runsSkippedForBudget: 1_240,
+    scanTruncated: true,
+    scanRowCeiling: 10_000,
+    nextCursor: 'cursor_9f3a1c7e42b8',
+  }
+}
+
+/** The fleet answer this pair exists to produce: many runs, twelve distinct reasons. */
+export function fatFleetDivergenceReport(): FleetDivergenceReport {
+  return {
+    agentId: 'agent_5b7e',
+    targetVersionId: 'ver_9a04e6f1',
+    analyzedAt: FROZEN_NOW - HOUR,
+    verdict: 'incompatible',
+    provenReasons: Array.from({ length: 12 }, (_, i) => ({
+      reasonKey: fatProvenDivergence(i).reasonKey,
+      kind: fatProvenDivergence(i).kind,
+      certainty: 'proven' as const,
+      affectedRunCount: 340 - i * 21,
+      representativeRunIds: Array.from({ length: 5 }, (_, n) => `run_${String(i)}${String(n)}c4f9a1b`),
+      exemplar: fatProvenDivergence(i),
+    })),
+    speculativeReasons: Array.from({ length: 12 }, (_, i) => ({
+      reasonKey: fatSpeculativeDivergence(i).reasonKey,
+      kind: fatSpeculativeDivergence(i).kind,
+      certainty: 'speculative' as const,
+      affectedRunCount: 900 - i * 40,
+      representativeRunIds: Array.from({ length: 5 }, (_, n) => `run_${String(i)}${String(n)}e7b2d3c`),
+      exemplar: fatSpeculativeDivergence(i),
+    })),
+    indeterminateReasons: Array.from({ length: 12 }, (_, i) => ({
+      reasonKey: fatIndeterminateDivergence(i).reasonKey,
+      kind: fatIndeterminateDivergence(i).kind,
+      certainty: 'indeterminate' as const,
+      affectedRunCount: 300 - i * 17,
+      representativeRunIds: Array.from({ length: 5 }, (_, n) => `run_${String(i)}${String(n)}a9f4e6d`),
+      exemplar: fatIndeterminateDivergence(i),
+    })),
+    runsWithProvenDivergence: 340,
+    window: fatDivergenceScanWindow(),
   }
 }

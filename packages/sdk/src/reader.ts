@@ -19,16 +19,20 @@
  * Uses only the native `fetch` — no HTTP framework dependency, consistent
  * with the rest of the SDK.
  */
+import { divergenceReportVerdict, fleetDivergenceVerdict } from '@agent-flight-recorder/contracts'
+
 import { warnIfInsecureEndpoint } from './transport.js'
 import { fetchV1, V1ApiError } from './v1-client.js'
 
 import type { V1ApiConfig, V1FetchLike } from './v1-client.js'
 import type {
+  DivergenceReport,
   Event,
   FailurePattern,
   FailurePatternStatus,
   FailureSummary,
   FixConfidenceState,
+  FleetDivergenceReport,
   PatternResolutionEvidence,
   ReplayProjection,
   Run,
@@ -552,10 +556,10 @@ export interface FlightReaderConfig {
  * 4), so `fromSequence: 0` or `limit: 2.5` is a caller bug, not something to
  * forward to the server and let it interpret.
  */
-function assertPositiveInteger(value: number | undefined, name: string): void {
+function assertPositiveInteger(value: number | undefined, name: string, method = 'getRunEventWindow'): void {
   if (value === undefined) return
   if (!Number.isInteger(value) || value < 1) {
-    throw new RangeError(`getRunEventWindow: ${name} must be a positive integer, got ${value}.`)
+    throw new RangeError(`${method}: ${name} must be a positive integer, got ${value}.`)
   }
 }
 
@@ -665,6 +669,319 @@ function assertProjectionHonored(
         `return a full document as though it were the requested projection.`
     )
   }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/runs/:id/divergence  and  GET /api/v1/agents/:id/divergence
+//
+// "Would this recorded run still have been possible on version X?" — and the
+// same question across an agent's recent history. The report types are
+// contracts' (`packages/contracts/src/divergence.ts`); the engine is Team A's
+// (`convex/helpers/`). This is the read door onto it.
+//
+// SERVER SUPPORT: neither route exists yet at the time of writing. Both
+// methods are written against the exact contract shape above, so wiring the
+// routes should require no SDK change — the same position `getExplanation()`
+// shipped in. Until then, calling either surfaces a `V1ApiError` with
+// `kind: 'not_found'`.
+// ---------------------------------------------------------------------------
+
+/** Parameters for {@link FlightReader.getRunDivergence}. */
+export interface RunDivergenceParams {
+  /**
+   * The `AgentVersion` id to test the recorded run against. REQUIRED — there
+   * is no "compare against the latest" default, because a gate whose subject
+   * is implicit is a gate that silently changes meaning when someone publishes
+   * a new version.
+   */
+  targetVersionId: string
+}
+
+/** Parameters for {@link FlightReader.getAgentDivergence}. */
+export interface AgentDivergenceParams {
+  /** The `AgentVersion` id to test the agent's recent runs against. REQUIRED, same reasoning as {@link RunDivergenceParams.targetVersionId}. */
+  targetVersionId: string
+  /**
+   * Lower bound (inclusive) on `run.startedAt`, epoch ms. Echoed back in
+   * `window.since`, and VERIFIED — see {@link FlightReader.getAgentDivergence}.
+   */
+  since?: number
+  /** Max runs to scan in this page. Server-capped; hitting the cap sets `window.scanTruncated`. */
+  limit?: number
+  /**
+   * Continue a previous page's scan — pass `window.nextCursor` back.
+   *
+   * A fleet scan is a BOUNDED BATCH, not a whole-history query, so a complete
+   * fleet answer is assembled from pages. Merge them with
+   * `mergeFleetDivergenceReports` (contracts) rather than by hand: reason keys
+   * are run-independent and pages partition the run set, so the merge is
+   * exact — but only if everyone does it the same way.
+   */
+  cursor?: string
+}
+
+/** Response shape for `GET /api/v1/runs/:runId/divergence`. */
+export interface V1RunDivergenceData {
+  report: DivergenceReport
+}
+
+/** Response shape for `GET /api/v1/agents/:agentId/divergence`. */
+export interface V1AgentDivergenceData {
+  report: FleetDivergenceReport
+}
+
+/**
+ * Refuse a divergence report that cannot be trusted with a deploy decision.
+ *
+ * THE FAILURE THIS EXISTS TO PREVENT IS A FALSE CLEAN. Every check below is
+ * one where the wrong answer looks exactly like the right one to a caller
+ * reading `report.proven.length === 0` — which is the whole reason this class
+ * checks rather than trusts (same posture as
+ * {@link FlightReader.getRunEventWindow}'s ignored-floor check and
+ * {@link assertProjectionHonored}: servers lie by omission, and a dropped
+ * query parameter is the most common lie).
+ *
+ * 1. IGNORED `targetVersionId`. A deployment that predates this route's
+ *    parameter — or a proxy that strips it — answers about SOME version, quite
+ *    possibly the run's own, against which a recorded run is trivially
+ *    compatible. "No divergence found" is then not just wrong, it is wrong in
+ *    the direction that authorises the deploy. The echo is checked exactly:
+ *    absent is as fatal as mismatched, because absence proves nothing was
+ *    honored either.
+ *
+ * 2. MISSING `coverage`. `proven: []` means "safe" or "checked nothing" and
+ *    coverage is the only thing that distinguishes them. A report without it
+ *    is not a weaker answer; it is an unreadable one.
+ *
+ * 3. A SPECULATIVE FINDING IN `proven[]`. The type system makes this
+ *    impossible in OUR code (contracts' `ProvenDivergence` and
+ *    `SpeculativeDivergence` are mutually unassignable, by construction — see
+ *    `packages/contracts/src/divergence.ts`). It cannot make it impossible in
+ *    a JSON body: TypeScript's guarantee stops at the wire. So the same
+ *    segregation is re-checked here at runtime, on the response, before any
+ *    caller can render an unprovable concern as proof. A `proven` entry with
+ *    an empty `provenBy` is the same defect in its purest form — a claim of
+ *    proof with no proof attached.
+ *
+ * 4. A `verdict` THAT CONTRADICTS THE REPORT'S OWN CONTENTS. The verdict is
+ *    the field an operator (and a script) actually reads. Recomputing it from
+ *    the arrays and comparing costs nothing, and a server that says
+ *    `compatible` while carrying proven divergences is a server whose other
+ *    fields have earned no benefit of the doubt either.
+ *
+ * NOT CHECKED, deliberately: an incomplete `coverage`, or `scanTruncated`.
+ * Those are the server TELLING THE TRUTH in a field, and the correct response
+ * is a verdict of `indeterminate` — which the contract already produces — plus
+ * a gate that declines to pass it. That decision belongs to the gate, not the
+ * client; `afr compat` makes it (exit 11), exactly as `afr patterns` does for
+ * a truncated pattern scan.
+ */
+function assertDivergenceReportTrustworthy(
+  report: DivergenceReport,
+  requestedTargetVersionId: string,
+  runId: string
+): void {
+  const context = `getRunDivergence(${runId})`
+  assertEchoedTarget(report as { targetVersionId?: unknown }, requestedTargetVersionId, context)
+
+  const coverage = (report as { coverage?: unknown }).coverage
+  if (
+    coverage === null ||
+    typeof coverage !== 'object' ||
+    !Array.isArray((coverage as { assessed?: unknown }).assessed) ||
+    !Array.isArray((coverage as { unassessed?: unknown }).unassessed) ||
+    typeof (coverage as { eventHistoryComplete?: unknown }).eventHistoryComplete !== 'boolean'
+  ) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the report carried no usable \`coverage\`. Without it, an empty \`proven\` list cannot be ` +
+        `distinguished from an analysis that examined nothing — and the two answers differ by an entire ` +
+        `production deploy. Refusing to report an unmeasured run as clean.`
+    )
+  }
+
+  assertFindingsSegregated(report.proven, report.speculative, report.indeterminate, context)
+  assertVerdictConsistent(report.verdict, divergenceReportVerdict(report), context)
+}
+
+/**
+ * The fleet counterpart of {@link assertDivergenceReportTrustworthy}, plus one
+ * check that only applies to a scan.
+ *
+ * IGNORED `since`. A server that drops the window parameter scans a different
+ * — usually older, usually larger — set of runs and reports reasons that may
+ * have nothing to do with the period the operator asked about. Unlike a
+ * dropped `targetVersionId`, this can fail in either direction (findings that
+ * are stale, or a clean answer over runs that predate the change), and both
+ * are answers to a question nobody asked. `window.since` is checked exactly
+ * against what was requested, and only when a bound was requested — an absent
+ * `since` on an unbounded scan is correct, not evidence.
+ */
+function assertFleetDivergenceReportTrustworthy(
+  report: FleetDivergenceReport,
+  params: AgentDivergenceParams,
+  agentId: string
+): void {
+  const context = `getAgentDivergence(${agentId})`
+  assertEchoedTarget(report as { targetVersionId?: unknown }, params.targetVersionId, context)
+
+  const window = (report as { window?: unknown }).window
+  if (
+    window === null ||
+    typeof window !== 'object' ||
+    typeof (window as { scanTruncated?: unknown }).scanTruncated !== 'boolean' ||
+    typeof (window as { runsUnassessable?: unknown }).runsUnassessable !== 'number'
+  ) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the report carried no usable \`window\`. Without it there is no way to tell a scan that ` +
+        `examined the agent's history from one that examined nothing, and "no reasons found" would read as ` +
+        `a fleet-wide all-clear. Refusing.`
+    )
+  }
+
+  if (params.since !== undefined && (window as { since?: unknown }).since !== params.since) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: requested since=${params.since} but the scan window reports since=` +
+        `${JSON.stringify((window as { since?: unknown }).since)}. This deployment ignored the window bound and ` +
+        `scanned a different set of runs, so these reasons do not answer the question that was asked. ` +
+        `Refusing to return an unrequested window as though it were the requested one.`
+    )
+  }
+
+  for (const reason of report.provenReasons ?? []) {
+    assertFindingsSegregated([reason.exemplar], [], [], `${context} provenReasons[${reason.reasonKey}]`)
+    if (reason.certainty !== 'proven') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: a grouped reason in \`provenReasons\` declares certainty ${JSON.stringify(reason.certainty)}.`
+      )
+    }
+  }
+  for (const reason of report.speculativeReasons ?? []) {
+    assertFindingsSegregated([], [reason.exemplar], [], `${context} speculativeReasons[${reason.reasonKey}]`)
+    if (reason.certainty !== 'speculative') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: a grouped reason in \`speculativeReasons\` declares certainty ${JSON.stringify(reason.certainty)}.`
+      )
+    }
+  }
+  for (const reason of report.indeterminateReasons ?? []) {
+    assertFindingsSegregated([], [], [reason.exemplar], `${context} indeterminateReasons[${reason.reasonKey}]`)
+    if (reason.certainty !== 'indeterminate') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: a grouped reason in \`indeterminateReasons\` declares certainty ${JSON.stringify(reason.certainty)}.`
+      )
+    }
+  }
+
+  assertVerdictConsistent(report.verdict, fleetDivergenceVerdict(report), context)
+}
+
+/** Shared by both reports: the target version echo is the ignored-parameter tell. */
+function assertEchoedTarget(report: { targetVersionId?: unknown }, requested: string, context: string): void {
+  if (report.targetVersionId !== requested) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: asked about targetVersionId=${JSON.stringify(requested)} but the report describes ` +
+        `${JSON.stringify(report.targetVersionId ?? null)}. This deployment ignored the parameter (an older ` +
+        `deployment silently drops an unknown query parameter and answers about the run's own version, against ` +
+        `which every recorded run is trivially compatible). Refusing to return an answer about a different ` +
+        `version as though it were about the one you named.`
+    )
+  }
+}
+
+/**
+ * Re-check contracts' compile-time proven/speculative segregation on the WIRE.
+ *
+ * See {@link assertDivergenceReportTrustworthy} point 3 for why a runtime copy
+ * of a type-level guarantee is not redundant here.
+ */
+function assertFindingsSegregated(
+  proven: readonly unknown[],
+  speculative: readonly unknown[],
+  indeterminate: readonly unknown[],
+  context: string
+): void {
+  if (!Array.isArray(proven) || !Array.isArray(speculative) || !Array.isArray(indeterminate)) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the report's findings were not arrays. An absent \`proven\` list reads as "nothing proven", ` +
+        `and an absent \`indeterminate\` list reads as "nothing went unanswered" — both are wrong in the one ` +
+        `direction that authorises a deploy. Refusing.`
+    )
+  }
+
+  for (const finding of proven) {
+    const f = finding as { certainty?: unknown; provenBy?: unknown }
+    if (f?.certainty !== 'proven') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: a finding in \`proven\` declares certainty ${JSON.stringify(f?.certainty)}. A speculative ` +
+          `finding served in the proven list would be rendered as evidence that a run could not have happened — ` +
+          `the exact conflation the divergence contract is built to make impossible. Refusing.`
+      )
+    }
+    if (!Array.isArray(f.provenBy) || f.provenBy.length === 0) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: a finding in \`proven\` carries no \`provenBy\` evidence. A proven divergence that cannot ` +
+          `cite the recorded event it contradicts is not proven. Refusing to present it as such.`
+      )
+    }
+  }
+
+  for (const finding of speculative) {
+    const f = finding as { certainty?: unknown; speculativeBecause?: unknown }
+    if (f?.certainty !== 'speculative') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: a finding in \`speculative\` declares certainty ${JSON.stringify(f?.certainty)}.`
+      )
+    }
+    if (typeof f.speculativeBecause !== 'string' || f.speculativeBecause.length === 0) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: a finding in \`speculative\` does not state why it is unprovable (\`speculativeBecause\`). ` +
+          `An unexplained speculative finding is indistinguishable from a proven one at a glance. Refusing.`
+      )
+    }
+  }
+
+  for (const finding of indeterminate) {
+    const f = finding as { certainty?: unknown; unknownBecause?: unknown }
+    if (f?.certainty !== 'indeterminate') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: a finding in \`indeterminate\` declares certainty ${JSON.stringify(f?.certainty)}. An ` +
+          `unanswered question filed as speculative reads as "we checked, and it is only a maybe" — the false ` +
+          `clean this band exists to prevent. Refusing.`
+      )
+    }
+    if (typeof f.unknownBecause !== 'string' || f.unknownBecause.length === 0) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: a finding in \`indeterminate\` does not state what stopped the analysis ` +
+          `(\`unknownBecause\`). An unexplained "unknown" is indistinguishable from laziness and gets ignored. Refusing.`
+      )
+    }
+  }
+}
+
+/** A verdict that disagrees with the contents it summarises makes every other field suspect. */
+function assertVerdictConsistent(served: unknown, computed: string, context: string): void {
+  if (served === computed) return
+  throw new V1ApiError(
+    'invalid_response',
+    `${context}: the server reported verdict ${JSON.stringify(served)}, but this report's own contents imply ` +
+      `${JSON.stringify(computed)} (contracts' computeDivergenceVerdict is the single rule). A verdict that ` +
+      `contradicts the findings it summarises cannot be used to gate a deploy, and neither can the rest of the ` +
+      `response. Refusing.`
+  )
 }
 
 /**
@@ -1121,6 +1438,138 @@ export class FlightReader {
       `/api/v1/patterns/${encodeURIComponent(fingerprintHash)}/evidence`,
       {},
       this.fetchImpl
+    )
+  }
+
+  /**
+   * Would this RECORDED run still have been possible on a different agent
+   * version? — the replay-test question, answered structurally, with nothing
+   * executed.
+   *
+   * The report separates what is PROVEN (the run called a tool the target does
+   * not declare: it could not have done this) from what is SPECULATIVE (the
+   * system prompt changed: behaviour may differ). Those are two different
+   * types in contracts, deliberately mutually unassignable, and this method
+   * re-checks that separation on the response — see
+   * {@link assertDivergenceReportTrustworthy}. Read `report.proven` to gate;
+   * read `report.speculative` to think.
+   *
+   * **Never trusts a clean answer it cannot verify.** A missing
+   * `targetVersionId` echo, a missing `coverage` record, a speculative finding
+   * smuggled into `proven[]`, or a `verdict` that contradicts the report's own
+   * contents each throw rather than resolve. All four have the same shape of
+   * consequence: a report that reads as "safe to ship" without having
+   * established it. The one thing NOT refused is an honestly-declared
+   * incomplete coverage — that already produces a verdict of `indeterminate`,
+   * and deciding whether an unfinished analysis blocks a deploy is the gate's
+   * call, not the client's.
+   *
+   * **Server-side status:** `GET /api/v1/runs/:runId/divergence` does not
+   * exist yet — the divergence engine lives in `convex/helpers/` and its v1
+   * route is not wired. This method is written against the contract shape, so
+   * no SDK change should be needed once it is. Calling it today surfaces a
+   * {@link V1ApiError} with `kind: 'not_found'`.
+   *
+   * @param runId - the recorded run to analyse.
+   * @param params - `{ targetVersionId }`. Required: there is no implicit
+   *   "latest version" subject.
+   * @returns `{ report }` — a {@link DivergenceReport}.
+   * @throws {@link V1ApiError} with `kind: 'not_found'` if the run or the
+   *   target version does not exist or does not belong to the key's org — the
+   *   two are deliberately indistinguishable, as everywhere else here.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if the response
+   *   cannot be trusted with a deploy decision (see above).
+   * @throws {RangeError} if `targetVersionId` is empty — a caller bug, before
+   *   any request is made.
+   */
+  async getRunDivergence(runId: string, params: RunDivergenceParams): Promise<V1RunDivergenceData> {
+    assertNonEmptyTarget(params.targetVersionId, 'getRunDivergence')
+    const data = await fetchV1<V1RunDivergenceData>(
+      this.config,
+      `/api/v1/runs/${encodeURIComponent(runId)}/divergence`,
+      { targetVersionId: params.targetVersionId },
+      this.fetchImpl
+    )
+    assertDivergenceReportTrustworthy(data.report, params.targetVersionId, runId)
+    return data
+  }
+
+  /**
+   * The same question across an agent's recent recorded history: can this
+   * version ship at all?
+   *
+   * **Leads with DISTINCT REASONS, not affected runs.** `provenReasons` is the
+   * headline: 340 broken runs with 12 root causes is a tractable morning, 340
+   * individual reports is not. `runsWithProvenDivergence` is the scale of the
+   * problem; the reasons are the problem.
+   *
+   * Verified exactly as {@link getRunDivergence} is, plus one check that only
+   * a scan needs: an ignored `since` means the server scanned a different set
+   * of runs than the one asked about, and the answer — clean or otherwise —
+   * belongs to a different question.
+   *
+   * `window.scanTruncated` / `window.runsUnassessable` /
+   * `window.runsSkippedForBudget` / `window.nextCursor` are NOT refused: an
+   * incomplete scan is the server telling the truth, and it already forces
+   * `verdict: 'indeterminate'`. Gate on that (`afr compat` exits 11), never on
+   * an empty reason list alone.
+   *
+   * **ONE CALL RETURNS ONE PAGE, AND A PAGE IS NOT A FLEET ANSWER.** The scan
+   * is a bounded batch — one paginated pass per execution, over runs whose
+   * event logs run to `MAX_EVENTS_PER_RUN` — so a `window.nextCursor` means
+   * the twelfth reason may be on page four. Continue with `cursor` and merge
+   * with `mergeFleetDivergenceReports`; `isFleetScanComplete` counts an
+   * outstanding cursor as incomplete precisely so a first page can never read
+   * as `compatible`.
+   *
+   * **Server-side status:** `GET /api/v1/agents/:agentId/divergence` does not
+   * exist yet — see {@link getRunDivergence}. Note this would be the first v1
+   * endpoint scoped to an agent rather than a run or a pattern.
+   *
+   * @param agentId - the agent whose recent runs to analyse.
+   * @param params - `{ targetVersionId, since?, limit? }`.
+   * @returns `{ report }` — a {@link FleetDivergenceReport}.
+   * @throws {@link V1ApiError} with `kind: 'not_found'` if the agent or target
+   *   version is unknown to the key's org.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if the response
+   *   cannot be trusted (ignored `targetVersionId`, ignored `since`, missing
+   *   `window`, conflated findings, inconsistent verdict).
+   * @throws {RangeError} on an empty `targetVersionId` or a non-positive
+   *   `limit`/`since`.
+   */
+  async getAgentDivergence(agentId: string, params: AgentDivergenceParams): Promise<V1AgentDivergenceData> {
+    assertNonEmptyTarget(params.targetVersionId, 'getAgentDivergence')
+    assertPositiveInteger(params.limit, 'limit', 'getAgentDivergence')
+    assertPositiveInteger(params.since, 'since', 'getAgentDivergence')
+    const data = await fetchV1<V1AgentDivergenceData>(
+      this.config,
+      `/api/v1/agents/${encodeURIComponent(agentId)}/divergence`,
+      {
+        targetVersionId: params.targetVersionId,
+        ...(params.since !== undefined && { since: params.since }),
+        ...(params.limit !== undefined && { limit: params.limit }),
+        ...(params.cursor !== undefined && { cursor: params.cursor }),
+      },
+      this.fetchImpl
+    )
+    assertFleetDivergenceReportTrustworthy(data.report, params, agentId)
+    return data
+  }
+}
+
+/**
+ * An empty target version is a caller bug, and a dangerous one: forwarded as
+ * `?targetVersionId=`, a lenient server could treat it as "unset" and answer
+ * about the run's own version — a guaranteed clean report about a question
+ * nobody asked. Caught before the request, like every other caller-bug check
+ * on this class.
+ */
+function assertNonEmptyTarget(targetVersionId: string, method: string): void {
+  if (typeof targetVersionId !== 'string' || targetVersionId.length === 0) {
+    throw new RangeError(
+      `${method}: targetVersionId is required and must be a non-empty agent version id — there is no ` +
+        `"compare against the latest version" default, because a gate whose subject is implicit silently ` +
+        `changes meaning the next time someone publishes a version.`
     )
   }
 }

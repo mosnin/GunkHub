@@ -6,8 +6,10 @@
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 
+import { registerAssessVersion } from './tools/assess-version.js'
 import { registerExplainRun } from './tools/explain-run.js'
 import { registerGetPatternEvidence } from './tools/get-pattern-evidence.js'
+import { registerGetRunDivergence } from './tools/get-run-divergence.js'
 import { registerGetRunEvents } from './tools/get-run-events.js'
 import { registerListFailurePatterns } from './tools/list-failure-patterns.js'
 import { registerListRuns } from './tools/list-runs.js'
@@ -39,6 +41,14 @@ export function createServer(reader: AfrReader, version: string): McpServer {
         '3) afr_explain_run — why one run failed plus the event sequence numbers that matter, ~121 tokens. ' +
         '4) afr_get_run_events — a capped WINDOW of raw events, ~3 800 tokens, only when tier 3 was not enough. ' +
         'afr_list_runs is for orientation when you need a runId. ' +
+        'A SEPARATE QUESTION, WITH ITS OWN CHEAP-FIRST PAIR: "is my next version safe to ship?" Start at ' +
+        'afr_assess_version (agent + target AgentVersion, grouped by distinct reason across recorded runs), then ' +
+        'afr_get_run_divergence for one run’s detail. Neither executes anything; both replay RECORDED history ' +
+        'against a target config. Their findings come in two kinds that must never be merged, summed, or treated ' +
+        'as one scale: PROVEN findings are facts backed by a cited recorded event, SPECULATIVE findings are ' +
+        'config changes that may or may not matter and are never evidence of a break. Neither tool emits a ' +
+        '"safe" verdict, and an empty proven list is only meaningful when the accompanying coverage/window ' +
+        'reports complete — otherwise it means the analysis did not finish looking. ' +
         'Every response carries the handle for the next step; working down from triage is always cheaper than ' +
         'starting at the bottom. ' +
         'Everything is scoped to the API key’s organization; ids from other orgs are indistinguishable from ids that never existed.',
@@ -51,6 +61,8 @@ export function createServer(reader: AfrReader, version: string): McpServer {
   registerExplainRun(server, reader)
   registerGetRunEvents(server, reader)
   registerListRuns(server, reader)
+  registerAssessVersion(server, reader)
+  registerGetRunDivergence(server, reader)
 
   return server
 }

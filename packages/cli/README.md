@@ -26,6 +26,95 @@ export AFR_BASE_URL="https://your-afr-instance.example.com"
 
 ## Command reference
 
+### `afr compat`
+
+**Can I ship this version?** Takes what a run *actually did* — its recorded event
+log — and asks whether the same run would still have been possible on a different
+agent version. Nothing is executed: this is a structural analysis over stored
+history and the two versions' config snapshots, the same idea as a Temporal replay
+test (run the new code against the old history, fail on divergence).
+
+```bash
+$ afr compat --agent ag_7f3 --target ver_2026_07_25
+DO NOT SHIP — 3 distinct proven reasons across 340 runs
+verdict: incompatible   gate: --fail-on proven   target: ver_2026_07_25
+
+PROVEN REASONS — distinct root causes, most-affecting first
+    211 runs  [tool_removed] called tool `search_web`; target declares no such tool
+           e.g. run_9f2c1a…, run_3b8e44…
+     97 runs  [model_removed] called model `claude-3-opus`; target permits neither
+           e.g. run_11ade0…
+     32 runs  [budget_exceeded] used 14 tool calls; target caps maxToolCalls at 8
+           e.g. run_77c001…
+
+SPECULATIVE REASONS — behaviour may differ. NOT evidence.
+    512 runs  [system_prompt_changed] system prompt changed; tool selection may differ
+           not provable: a prompt's effect on behaviour is not derivable from a recorded history
+
+SCAN  512 of 512 runs analysed since 2026-07-18T00:00:00.000Z
+$ echo $?
+10
+```
+
+Single-run mode is `afr compat <runId> --target <versionId>`, which prints each
+proven finding with the recorded event it contradicts (`seq 42 tool.call — recorded
+"search_web"; target tools[].name = (absent)`) so you can go straight from a claim
+to the event log.
+
+Options: `--target <versionId>` (required), `--agent <agentId>` (fleet mode),
+`--since-days <n>`, `--limit <n>`, `--fail-on <proven|any|none>`, `--json`, `--help`.
+
+**Three kinds of finding, and they are not the same kind of thing.**
+
+| Section | Claim | Gates a deploy? |
+|---|---|---|
+| **PROVEN** | "called tool `search_web` at sequence 42; target declares no such tool" — checkable against stored data, and it cites the event | Yes, by default |
+| **SPECULATIVE** | "the system prompt changed, so behaviour may differ" — unfalsifiable, printed with why it cannot be proven | Only with `--fail-on any` |
+| **COULD NOT ANSWER** | "the target's `tools` key is a string, not an array" — reached and left open | Never exits `0` |
+
+The separation is enforced by the types in `@agent-flight-recorder/contracts`
+(three mutually unassignable types with no shared `message` field), not by a
+severity column this command chooses to render. That matters because the output
+authorises fleet-wide deploys: "the consumer was supposed to check the enum" is
+not a safety property.
+
+**The fleet answer leads with distinct reasons, not affected runs.** 340 broken
+runs with 12 root causes is a tractable morning; 340 individual reports is not.
+
+**Exit codes — read this before scripting it:**
+
+| Code | Meaning |
+|---|---|
+| `0` | Nothing at or above the threshold, **and** the analysis was complete |
+| `10` | Findings at or above `--fail-on` |
+| `11` | Nothing found, **but the analysis did not finish** — an unreadable config dimension, a truncated event history, a fleet scan that hit the row ceiling, or a question left open |
+
+`1`/`2`/`3`/`4` keep their usual meanings (usage / auth / not-found / network).
+
+**`10` wins over `11`** — a proof does not weaken because something else went
+unchecked, so a proven divergence inside a partial analysis is still "do not ship".
+**Exit `0` is unreachable on an incomplete analysis** under any real threshold;
+`--fail-on none` can reach it, and is documented as not being a gate.
+
+Exit `4` additionally covers a report the SDK refused to trust: one that came back
+about a *different* version than the one requested (an older deployment silently
+drops an unknown query parameter and answers about the run's own version, against
+which every recorded run is trivially compatible), one with no coverage record, one
+serving a speculative finding inside the proven list, or one whose verdict
+contradicts its own findings. All four look exactly like a clean bill of health to
+a caller that trusts them. None of them can reach exit `0`.
+
+**Why `--fail-on` defaults to `proven` and not `any`.** Speculative findings fire
+on every prompt edit, which is most deploys. A gate that is red on every deploy is
+a gate that gets switched off within a fortnight, taking the proven findings with
+it. `--fail-on any` exists for teams who want it, opted into explicitly, on the
+record — and the threshold in force is printed on every run, so a CI log always
+says what was actually being checked.
+
+> Server support: the divergence read endpoints (`GET /api/v1/runs/:id/divergence`,
+> `GET /api/v1/agents/:id/divergence`) are not wired yet. Until they are, this
+> command exits `3`.
+
 ### `afr triage`
 
 **Start here.** One call, zero required arguments, answering the question you actually arrive with: *what is wrong right now, and what should I look at first?* Ranks your organization's recurring failure patterns and prints the top few, each row carrying the exact next command to run.
@@ -448,6 +537,18 @@ Options: `--out <file>` (default: print to stdout), `--format ndjson|json`
 (default: `ndjson`).
 
 ## Version
+
+v0.13.1 — **Fix: `afr compat` could exit 0 on an analysis that examined nothing.** Picks up the contracts fix (>= 0.16.1) for vacuous completeness: an empty fleet scan (`runsAnalyzed: 0` — what you get once a version's runs age out of retention) and an empty single-run analysis (no dimension assessed, no event read) both computed `compatible`, and this command exited `0` on them. Both now compute `indeterminate`, so the gate exits `11` — "cannot tell", which is the truth. No flag, output format or exit-code meaning changed; the affected inputs are exactly the analyses that had no evidence behind them.
+
+v0.13.0 — **A first page is no longer a fleet verdict, and a partial analysis now says what it DID establish.** `afr compat --agent` follows the scan cursor and merges pages with contracts' `mergeFleetDivergenceReports` (>= 0.16.0) instead of reporting page one: a fleet scan is a bounded batch (one paginated pass per execution, over runs whose logs run to `MAX_EVENTS_PER_RUN`), so a full, clean first page looks exactly like a finished scan while the twelfth reason sits on page four. The merge is exact — reason keys are run-independent and pages partition the run set, so counts add and causes collide correctly — and it lives in contracts so a CI gate and a dashboard cannot add the same pages up differently. New `--max-pages <n>` (default 20) bounds the loop, because an unbounded loop in a CI step is a hung build; **stopping early never buys a pass** — the outstanding `nextCursor` stays in the merged window, `isFleetScanComplete` counts it, the verdict stays `indeterminate`, and the exit code is 11. A non-advancing cursor is refused (exit 4) rather than looped on. `--limit` is now per page. New **BY DIMENSION** table in single-run output: `tools INCOMPATIBLE / model CLEAN / budgets UNDECLARED` instead of one word, so a partial analysis is actionable rather than a shrug — and an `UNDECLARED` dimension names its fix (publish a version whose `configSnapshot` declares it, via `buildAgentConfigSnapshot` in `@agent-flight-recorder/sdk` >= 0.19.0) instead of leaving operators to learn that the verdict can be ignored. Third finding section, **COULD NOT ANSWER**, is now surfaced for grouped fleet reasons too. No exit code changed meaning.
+
+v0.12.0 — **`afr compat` — can I ship this version?** New command, two modes: `afr compat <runId> --target <versionId>` takes what one run ACTUALLY DID (its recorded event log) and reports what the target version would have broken about it; `afr compat --agent <agentId> --target <versionId>` asks the same question across the agent's recent runs. Nothing is executed — it is a structural analysis over stored history and two config snapshots, the Temporal replay-test idea. **The fleet answer leads with DISTINCT REASONS, not a run count**: 340 broken runs with 12 root causes is a tractable morning; 340 individual reports is not. `--since-days` / `--limit` bound the scan, `--json` emits the raw report.
+
+**Findings are reported in three separate sections because they are three different kinds of claim.** PROVEN ("called tool `search_web` at sequence 42; target declares no such tool") cites the recorded event and the config path that decides it, and is the only kind that gates a deploy by default. SPECULATIVE ("the system prompt changed") is printed with why it cannot be proven, and is never counted as a failure unless asked for. COULD NOT ANSWER ("the target's `tools` key is a string, not an array") is neither: it is unchecked, and it can never exit 0. The separation is enforced by the contract's types (`@agent-flight-recorder/contracts` >= 0.15.0), not by a severity column this command chooses to render.
+
+**New exit codes — this is a CI gate.** `0` = nothing at or above the threshold AND the analysis was complete; `10` = findings at or above `--fail-on`; `11` = nothing found but the analysis did not finish (an unreadable config dimension, a truncated event history, a fleet scan that hit the row ceiling, or a question left open). `1`/`2`/`3`/`4` keep their usual meanings. **10 wins over 11** — a proof does not weaken because something else went unchecked. **Exit 0 is unreachable on an incomplete analysis** under any real threshold. Exit 4 additionally covers a report the SDK refused to trust: one that came back about a different version than the one requested (an older deployment silently drops an unknown query parameter and answers about the run's own version, against which every recorded run is trivially compatible), one with no coverage record, one serving a speculative finding as proven, or one whose verdict contradicts its own findings — all four look exactly like a clean bill of health to a caller that trusts them, and none of them exits 0 here.
+
+**`--fail-on proven|any|none`, default `proven`, printed on every run.** Not `any`: speculative findings fire on every prompt edit, which is most deploys, and a gate that is red on every deploy is a gate that gets switched off within a fortnight — taking the proven findings with it. A typo (`--fail-on nay`) is a usage error, never a silent fall back to the default. Server-side note: the divergence read endpoints are not wired yet, so the command currently exits 3.
 
 v0.11.0 — **`afr triage` — the cheap first hop.** New command: `afr triage`, zero required arguments, answering "what is wrong right now, and what should I look at first?" in one call. Ranks your org's recurring failure patterns and prints the top few as a table, each row carrying the exact next `afr` command to run; `--agent <id>` narrows to one agent, `--json` emits the raw result. This is the **same ranking, the same scores and the same next-hop targets** the `afr_triage` MCP tool serves — the implementation moved into `@agent-flight-recorder/sdk` (>= 0.17.0) and both surfaces import it, because two rankings that can disagree is worse than either. `--json` is the ranking's result **verbatim**, pointers in their MCP tool-name form, so a machine diffing the CLI against the MCP tool finds nothing; only the human table translates a pointer into a runnable `afr` command. No new API endpoint and no new query parameter: triage composes the existing `GET /api/v1/patterns` with the ranking's own field selection and scan limit.
 

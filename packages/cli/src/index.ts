@@ -10,6 +10,7 @@
  * `explain` talk to the public v1 read API (`GET /api/v1/runs...`, see
  * `src/apiClient.ts`) via `x-api-key` auth.
  */
+import { COMPAT_HELP, exitCodeForCompat, parseCompatArgs, printCompat, runCompat } from './commands/compat.js'
 import { printConfigCheck, runConfigCheck } from './commands/config-check.js'
 import { EXPLAIN_HELP, parseExplainArgs, printExplain, runExplain } from './commands/explain.js'
 import { EXPORT_HELP, parseExportArgs, printExport, runExport } from './commands/export.js'
@@ -33,6 +34,23 @@ export { readEnv } from './env.js'
 export type { CliEnv } from './env.js'
 export { CLI_VERSION } from './version.js'
 export { runVersion } from './commands/version.js'
+export {
+  parseCompatArgs,
+  runCompat,
+  printCompat,
+  exitCodeForCompat,
+  COMPAT_EXIT_DIVERGENCE,
+  COMPAT_EXIT_INDETERMINATE,
+  DEFAULT_FAIL_ON,
+  DEFAULT_MAX_PAGES,
+} from './commands/compat.js'
+export type {
+  CompatArgs,
+  CompatCommandResult,
+  CompatRunResult,
+  CompatFleetResult,
+  CompatFailOn,
+} from './commands/compat.js'
 export { runConfigCheck, printConfigCheck } from './commands/config-check.js'
 export type { ConfigCheck, ConfigCheckResult, FetchLike } from './commands/config-check.js'
 export { runRecordDemo, printRecordDemo } from './commands/record-demo.js'
@@ -91,6 +109,11 @@ Commands:
   afr explain <runId>            Root-cause explanation for a run — failure class, summary, root cause, suggested fix
   afr patterns [options]         List recurring failure patterns for your organization
   afr patterns evidence <hash>   Show whether a pattern's fix actually held (exposure + confidence)
+  afr compat <runId> --target <versionId>
+                                 Can I ship this version? Replays a recorded run's
+                                 history against another version's config and reports
+                                 what it PROVABLY breaks (and, separately, what it
+                                 might). --agent <id> for the fleet-wide answer.
 
 Run 'afr <command> --help' for command-specific options.
 
@@ -163,6 +186,21 @@ export async function main(argv: string[], log: (line: string) => void = console
       // triage maps its verdict to 0/10/11. Exit 0 is unreachable unless the
       // verdict is 'clear', which is only produced by a complete scan.
       return result.ok ? exitCodeForTriage(result) : result.exitCode
+    }
+
+    case 'compat': {
+      const args = parseCompatArgs(afterCommand)
+      if (args.help) {
+        log(COMPAT_HELP)
+        return 0
+      }
+      const result = await runCompat(args)
+      printCompat(args, result, log)
+      // Transport/usage failures keep the shared 0-4 convention; a SUCCESSFUL
+      // analysis maps its own findings to 0/10/11 through the explicit
+      // --fail-on threshold. Exit 0 is unreachable on an incomplete analysis
+      // unless --fail-on none was passed, which is not a gate.
+      return result.ok ? exitCodeForCompat(result) : result.exitCode
     }
 
     case 'explain': {

@@ -34,7 +34,15 @@ function mapRun(doc: Record<string, unknown>): Run {
     ...(doc.sessionId !== undefined && { sessionId: doc.sessionId as string }),
     ...(doc.environment !== undefined && { environment: doc.environment as string }),
     ...(doc.labels !== undefined && { labels: doc.labels as string[] }),
-    ...(doc.triageState !== undefined && { triageState: doc.triageState as Run['triageState'] }),
+    // `NonNullable`, not `Run['triageState']`: the contract type is
+    // `RunTriageState | undefined`, so casting to it lets the conditional
+    // spread produce `{ triageState: undefined }` — which is a DIFFERENT value
+    // from an absent key under `exactOptionalPropertyTypes` (the setting the
+    // tests package typechecks with). The guard above already proves it is
+    // defined here.
+    ...(doc.triageState !== undefined && {
+      triageState: doc.triageState as NonNullable<Run['triageState']>,
+    }),
     ...(doc.tokensIn !== undefined && { tokensIn: doc.tokensIn as number }),
     ...(doc.tokensOut !== undefined && { tokensOut: doc.tokensOut as number }),
   }
@@ -101,7 +109,12 @@ export async function listRuns(params: ListRunsParams): Promise<ListRunsResponse
   return {
     runs: (res.runs ?? []).map(mapRun),
     total: res.pageSize ?? 0,
-    nextCursor: res.nextCursor,
+    // Spread rather than assigned: `nextCursor` is OPTIONAL on
+    // `ListRunsResponse`, and under `exactOptionalPropertyTypes` an explicit
+    // `undefined` is not the same as an absent key. Assigning it also puts
+    // `nextCursor: undefined` on the JSON, which a client can misread as "the
+    // server answered the cursor question" rather than "there is no next page".
+    ...(res.nextCursor !== undefined && { nextCursor: res.nextCursor }),
   }
 }
 
