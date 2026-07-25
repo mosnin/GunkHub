@@ -5,6 +5,7 @@ import { v } from "convex/values";
 
 import { query, mutation } from "./_generated/server.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { projectEventCausalEdges } from "./causality.js";
 import { afrError } from "./helpers/errors.js";
 import {
   DEFAULT_PAGE_SIZE,
@@ -293,6 +294,14 @@ export const createEvent = mutation({
       payload: args.payload,
       parentEventId: args.parentEventId,
     });
+
+    // CROSS-RUN CAUSAL GRAPH: project any handoff this event RECORDS into the
+    // derived `run_causal_edges` index. Same category as the token counters
+    // below — computed at insert time because the payload is already in hand,
+    // never a second source of truth. The log remains the record; see
+    // convex/helpers/causal_derive.ts.
+    const insertedEvent = await ctx.db.get(eventId);
+    if (insertedEvent) await projectEventCausalEdges(ctx, insertedEvent);
 
     // ADR-002: incremental token-usage counters, updated at event-insert time
     // rather than recomputed from a full replay (the log itself remains the

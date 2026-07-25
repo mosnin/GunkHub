@@ -20,6 +20,7 @@
  * with the rest of the SDK.
  */
 import {
+  causalTraversalVerdict,
   divergenceReportVerdict,
   fleetDivergenceVerdict,
   SHARED_ATTRIBUTE_HYPOTHESIS_KINDS,
@@ -27,6 +28,9 @@ import {
   fleetReportIncoherences,
   fleetReportUnusableFields,
   orphanHypotheses,
+  traversalClaimContradictions,
+  traversalIncoherences,
+  traversalUnusableFields,
 } from '@agent-flight-recorder/contracts'
 
 import { warnIfInsecureEndpoint } from './transport.js'
@@ -34,6 +38,8 @@ import { fetchV1, V1ApiError } from './v1-client.js'
 
 import type { V1ApiConfig, V1FetchLike } from './v1-client.js'
 import type {
+  CausalDirection,
+  CausalTraversal,
   DivergenceReport,
   Event,
   FailurePattern,
@@ -1304,6 +1310,406 @@ function assertEchoedWindow(scan: Record<string, unknown>, field: string, reques
   )
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/v1/runs/:id/causality
+//
+// "What caused this, and what did it break?" — the cross-run altitude.
+// Traversal types are contracts' (`packages/contracts/src/causality.ts`); the
+// engine is Team A's.
+//
+// SERVER SUPPORT: the route does not exist yet at the time of writing. The
+// method is written against the exact contract shape, so wiring the route
+// should require no SDK change. Until then, calling it surfaces a
+// `V1ApiError` with `kind: 'not_found'`.
+// ---------------------------------------------------------------------------
+
+/** Parameters for {@link FlightReader.getCausalTrace}. */
+export interface CausalTraceParams<D extends CausalDirection = CausalDirection> {
+  /** The run to trace from. */
+  runId: string
+  /**
+   * Which way to walk. REQUIRED — there is deliberately no default. "What
+   * caused this" and "what did this break" are opposite questions with opposite
+   * operational consequences, and a default would let a monitoring loop change
+   * which one it asks the day a server is retuned.
+   *
+   * ---------------------------------------------------------------------
+   * TYPED `D`, NOT `CausalDirection`, AND THIS IS THE TOKEN THE WHOLE
+   * PLACEMENT RESTS ON
+   * ---------------------------------------------------------------------
+   *
+   * Passing the literal `'component'` narrows the returned traversal to one
+   * whose frontiers cannot be origins (contracts' `ComponentTerminus`): a
+   * component walk closed both sides, so "nothing produced this" is a claim it
+   * structurally cannot establish.
+   *
+   * IT WAS WRITTEN AS `CausalDirection`, WHICH MADE `D` PHANTOM. Nothing in the
+   * parameter object mentioned `D`, so `getCausalTrace<D>` had no site to infer
+   * from; `D` fell back to its default, and `TerminusFor<CausalDirection>`
+   * widens to the full `ChainTerminus` — origin included. The barrier existed
+   * and was never reached. It also left this legal:
+   *
+   *   getCausalTrace<'upstream'>({ direction: 'component', ... })
+   *
+   * which is the origin/component conflation spelled out in full, returning a
+   * traversal whose termini include `RecordedOrigin`. With `D` here, the literal
+   * flows from the argument and that call no longer typechecks.
+   *
+   * `tests/unit/causal_reader_honesty.test.ts` pins the INFERENCE path
+   * specifically. The earlier proof did not: it read `.originRunId` off the
+   * result under `@ts-expect-error`, which errors on the ordinary three-band
+   * union whether or not `D` infers — a proof that passes whether or not the
+   * mechanism works.
+   */
+  direction: D
+  /**
+   * Hop ceiling. REQUIRED, echoed, and VERIFIED. A server that drops it walks to
+   * its own — typically much shallower — default and reports a
+   * `depth_limit_reached` at a depth nobody chose, which is indistinguishable
+   * from an honest bounded answer.
+   */
+  maxDepth: number
+  /** Max nodes in this page. Server-capped; hitting the cap sets `scan.scanTruncated`. */
+  limit?: number
+  /**
+   * Continue a previous node page.
+   *
+   * THERE IS NO MERGE HELPER, ON PURPOSE. Paging is for listing the NODES of a
+   * graph the engine already walked whole; it is not a way to assemble a
+   * traversal out of fragments. An outstanding cursor keeps the traversal
+   * incomplete however many pages are fetched.
+   */
+  cursor?: string
+}
+
+/** Response shape for `GET /api/v1/runs/:id/causality`. */
+export interface V1CausalTraceData<D extends CausalDirection = CausalDirection> {
+  traversal: CausalTraversal<D>
+}
+
+/** Prose fields a {@link SuspectedLink} must never carry. See ground 7. */
+const BANNED_SUSPICION_HEADLINES = [
+  'message',
+  'summary',
+  'title',
+  'description',
+  'headline',
+  'explanation',
+  'causedBy',
+] as const
+
+/** Direction fields a {@link SuspectedLink} must never carry. See ground 6. */
+const BANNED_SUSPICION_DIRECTION_FIELDS = [
+  'producerRunId',
+  'consumerRunId',
+  'fromRunId',
+  'toRunId',
+  'causeRunId',
+  'effectRunId',
+] as const
+
+/**
+ * Refuse a causal traversal that cannot be trusted.
+ *
+ * SAME POSTURE AS {@link assertFleetHealthReportTrustworthy}, applied to a
+ * different and in one respect sharper danger. A fleet report can put a wrong
+ * hypothesis at the top of a screen; a causal traversal draws ARROWS, and an
+ * arrow is the most persuasive object this product can produce. Nobody reads a
+ * confidence badge next to an arrow — they follow it, read the run it lands on,
+ * and act.
+ *
+ * ELEVEN GROUNDS. The first five are the fleet gate's, restated for this shape,
+ * because the failures they catch are shape-independent. The last five are new,
+ * and four of them exist because of invariants the type system enforces in OUR
+ * code and cannot enforce on a JSON body.
+ *
+ * 1. MISSING `scan`. `edges: []` means "this run is an island" or "we walked
+ *    nothing", and the scan record is the only thing that distinguishes them. A
+ *    traversal without it is not a weaker answer; it is an unreadable one.
+ *
+ * 2. IGNORED PARAMETERS (`subjectRunId` / `direction` / `maxDepthRequested`).
+ *    The ignored-parameter tell. `direction` is the one that has no analogue
+ *    anywhere else in this client: a deployment that silently walks upstream
+ *    when asked to walk downstream returns a perfectly well-formed answer to the
+ *    OPPOSITE question — "here is what caused it" rendered under a heading that
+ *    says "here is what it broke". Absent is as fatal as mismatched.
+ *
+ * 3. CONTENTS THAT ARE NOT USABLE AT ALL. Checked before any arithmetic, for
+ *    the reason written up in contracts: a guard written as a comparison does
+ *    not reject a non-number, it takes the other branch, and whether that branch
+ *    is safe is luck.
+ *
+ * 4. CONTENTS THAT DO NOT AGREE WITH EACH OTHER — a self-loop, an arrow to a run
+ *    the traversal never reached, or (the serious one) an edge whose cited
+ *    record was written in NEITHER of its endpoints. That last is exactly what
+ *    an inference engine produces when it dresses a correlation up as a record:
+ *    a third-party row that mentions both runs and establishes nothing.
+ *
+ * 5. A SUSPECTED LINK SERVED AS A RECORDED EDGE, or vice versa. The type system
+ *    makes this impossible in our code; TypeScript's guarantee stops at the
+ *    wire. An edge with an empty `recordedBy` is the same defect in its purest
+ *    form — an arrow with nothing behind it.
+ *
+ * 6. A SUSPECTED LINK CARRYING A DIRECTION. NEW, AND THE CENTRAL ONE FOR THIS
+ *    FEATURE'S FIRST INVARIANT. Contracts gives `SuspectedLink` no from/to field
+ *    of any name, so a coincidence is not merely marked unwalkable, it is
+ *    unwalkable. A JSON body can add `fromRunId` back, and a consumer reading
+ *    raw objects would then have everything it needs to draw the arrow. The
+ *    absence is therefore re-checked here, at the one layer every consumer
+ *    passes through.
+ *
+ * 7. A SUSPECTED LINK CARRYING A PROSE HEADLINE. Its sentence is COMPOSED by
+ *    contracts' `suspicionQuestion()` from `kind` and `sharedValue`, so it is
+ *    always a question and never directional. A transmitted sentence is the one
+ *    route by which an ENGINE — rather than a forgetful consumer — turns "these
+ *    ran close together" into "run_a caused run_b".
+ *
+ * 8. AN UNPROVEN ORIGIN. THE GROUND THIS WHOLE FEATURE TURNS ON. "The origin is
+ *    run X" and "we lost the trail at run X" are opposite claims about the same
+ *    run id: the first ends an investigation, the second says it is unfinished,
+ *    and the second is the more common case in production because the SDK may
+ *    simply not have recorded the edge. Contracts makes an unproven origin
+ *    UNSPELLABLE — `OriginProof.inboundReadComplete` is the literal type `true`
+ *    and `inboundEdgesFound` the literal type `0`, so a truncated or non-empty
+ *    read cannot be typed as an origin. A wire body has no such constraint, and
+ *    a `terminus: 'recorded_origin'` with no proof behind it is a LOST TRAIL
+ *    WEARING AN ORIGIN'S CLOTHES — the single output that tells an operator to
+ *    stop looking. Contracts' `traversalUnusableFields` reports it as
+ *    `unproven_origin`; ground 3 is what makes this one bite.
+ *
+ *    THE SAME APPLIES TO THE OTHER COMPLETE DISPOSITION. A `cycle_reentry` also
+ *    terminates a frontier cleanly and also lets a trace exit 0, and it is the
+ *    EASIER forgery — a `trail_lost` an engine cannot be bothered to explain is
+ *    one relabel away from "oh, it looped". So its `cyclePath` must be a closed
+ *    loop naming the run it claims to re-enter, reported as `unclosed_cycle`.
+ *
+ * 9. AN EMPTY `termini`. NEW, AND IT IS A VACUITY, WHICH IS WHY IT NEEDS ITS OWN
+ *    GROUND RATHER THAN FALLING OUT OF GROUND 8. The natural completeness check
+ *    — "did every frontier reach an origin?" — is `termini.every(...)`, and
+ *    `.every()` OVER AN EMPTY ARRAY IS TRUE. A server returning no frontiers at
+ *    all would therefore read as a fully-traced graph to the most obvious code
+ *    anyone would write. Contracts' `isCausalTraversalComplete` has the
+ *    positive clause; this refuses the response outright, because a walk that
+ *    reports stopping nowhere did not happen.
+ *
+ * 10. A CLAIM THE TRAVERSAL'S OWN EDGE SET REFUTES. NEW, AND IT IS A CLASS
+ *     RATHER THAN A CHECK — the same class this codebase has now met three
+ *     times: verifying that a claim is PRESENT and INTERNALLY WELL-FORMED is not
+ *     verifying that it AGREES WITH THE DATA BESIDE IT. Four holes came from it
+ *     here, every one decidable from the edges already in hand and every one
+ *     producing `complete: true`:
+ *
+ *       - an origin whose proof asserts an empty adjacency set WHILE THE SAME
+ *         TRAVERSAL CARRIES AN EDGE INTO THAT RUN (a lost trail certifying as an
+ *         origin — the exact distinction this feature exists to preserve,
+ *         defeated by a self-reported claim nobody audited);
+ *       - a cycle of length >= 2, invisible to every per-edge rule because only
+ *         a self-loop is decidable from a SINGLE edge;
+ *       - a `cyclePath` naming hops that are not recorded edges, buying an
+ *         all-clear from a COMPLETING disposition;
+ *       - an edge citing nothing at all, which graded BETTER than an edge with
+ *         one bad citation.
+ *
+ *     Contracts' `traversalClaimContradictions` is the single enumeration, and
+ *     it is driven by a TOTAL table over the claim kinds so a new claim cannot
+ *     ship unaudited. This gate calls it rather than re-implementing an
+ *     emptiness check of its own — three layers each had one, all three caught
+ *     the empty-citation case, and the redundancy is precisely what hid the hole
+ *     in the shared primitive underneath them.
+ *
+ * 11. A `verdict` THAT CONTRADICTS THE TRAVERSAL'S OWN CONTENTS.
+ *
+ * (The count in this list has outgrown its heading twice. It is eleven grounds,
+ * and the number is not the point — the ordering is: structure, then usability,
+ * then arithmetic, then claims against data, then the verdict.)
+ *
+ * NOT CHECKED, deliberately: `scanTruncated`, `edgeSetsComplete: false`,
+ * `nextCursor`, and a `trail_lost` terminus. Those are the server TELLING THE
+ * TRUTH in a field, and the correct response is a verdict of `indeterminate` —
+ * which the contract already produces — plus a gate that declines to call it a
+ * finished trace. That decision belongs to the gate; `afr cause` makes it
+ * (exit 11).
+ */
+function assertCausalTraversalTrustworthy(traversal: CausalTraversal, params: CausalTraceParams<CausalDirection>): void {
+  const context = 'getCausalTrace'
+
+  const scan = (traversal as { scan?: unknown })?.scan
+  if (
+    scan === null ||
+    typeof scan !== 'object' ||
+    typeof (scan as { scanTruncated?: unknown }).scanTruncated !== 'boolean' ||
+    typeof (scan as { runsVisited?: unknown }).runsVisited !== 'number' ||
+    typeof (scan as { edgeSetsComplete?: unknown }).edgeSetsComplete !== 'boolean'
+  ) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the traversal carried no usable \`scan\`. Without it there is no way to tell a walk that ` +
+        `reached every frontier from one that walked nothing, and "no edges found" would read as "this run has no ` +
+        `causal neighbours". Refusing to report an unwalked graph as an island.`
+    )
+  }
+
+  const record = scan as Record<string, unknown>
+  assertEchoedParam(record, 'subjectRunId', params.runId, context)
+  assertEchoedParam(record, 'direction', params.direction, context)
+  assertEchoedParam(record, 'maxDepthRequested', params.maxDepth, context)
+
+  if (
+    !Array.isArray(traversal.edges) ||
+    !Array.isArray(traversal.termini) ||
+    !Array.isArray(traversal.suspected) ||
+    !Array.isArray(traversal.unanswered)
+  ) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the traversal's collections were not arrays. An absent \`edges\` list reads as "this run is an ` +
+        `island", an absent \`termini\` list reads as "the walk finished", and an absent \`unanswered\` list reads ` +
+        `as "nothing went unchecked" — all three wrong in the one direction that ends an investigation early. ` +
+        `Refusing.`
+    )
+  }
+
+  // GROUND 9, AND IT IS CHECKED BEFORE ANYTHING ELSE READS `termini`. An empty
+  // frontier set satisfies `every(...)` by vacuity, so the most natural
+  // completeness check anyone writes would read "the walk stopped nowhere" as
+  // "the walk finished everywhere".
+  if (traversal.termini.length === 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the traversal reports NO termini. A walk always stops somewhere — at an established origin or ` +
+        `at a lost trail — and an empty frontier list is not a walk that finished, it is a walk that did not say. ` +
+        `It is also the shape that defeats the obvious check: \`termini.every(t => t.terminus === ` +
+        `'recorded_origin')\` is TRUE on an empty array, so this would read as a fully-traced graph. Refusing.`
+    )
+  }
+
+  for (const edge of traversal.edges) {
+    const e = edge as { basis?: unknown; recordedBy?: unknown; edgeKey?: unknown }
+    if (e?.basis !== 'recorded') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: an entry in \`edges\` declares basis ${JSON.stringify(e?.basis)}. A suspected link served in ` +
+          `the edge list would be WALKED and DRAWN AS AN ARROW — the exact conflation this contract is built to ` +
+          `make impossible. Two runs adjacent in time, sharing a session, or touching the same resource are not ` +
+          `thereby causally linked, and an operator follows an arrow to a run and acts on it. Refusing.`
+      )
+    }
+    if (!Array.isArray(e.recordedBy) || e.recordedBy.length === 0) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: the edge ${JSON.stringify(e.edgeKey)} cites no record (\`recordedBy\`). A causal edge is ` +
+          `RECORDED, never inferred: an edge that cannot cite the event, artifact or run field that captured the ` +
+          `handoff is an inference wearing an edge's clothes. Refusing.`
+      )
+    }
+  }
+
+  for (const link of traversal.suspected) {
+    const l = link as { basis?: unknown; linkKey?: unknown }
+    if (l?.basis !== 'suspected') {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: an entry in \`suspected\` declares basis ${JSON.stringify(l?.basis)}. A recorded edge filed ` +
+          `as a suspicion buries a fact among the guesses; a guess filed as an edge is worse. Refusing.`
+      )
+    }
+    const raw = link as unknown as Record<string, unknown>
+    // GROUND 6. Contracts gives a suspicion no direction, which is what makes
+    // it unwalkable rather than merely marked-do-not-walk. The wire can put one
+    // back, and then a consumer reading raw objects has everything it needs to
+    // draw the arrow.
+    for (const banned of BANNED_SUSPICION_DIRECTION_FIELDS) {
+      if (banned in raw) {
+        throw new V1ApiError(
+          'invalid_response',
+          `${context}: the suspected link ${JSON.stringify(l.linkKey)} carries a DIRECTION (\`${banned}\`). A ` +
+            `suspicion has no direction in this contract, and that is not an oversight: "these two runs are ` +
+            `related" is sometimes computable, "this one caused that one" never is. A directed coincidence is ` +
+            `walkable and drawable, and it is indistinguishable on screen from a recorded handoff. Refusing.`
+        )
+      }
+    }
+    // GROUND 7.
+    for (const banned of BANNED_SUSPICION_HEADLINES) {
+      if (banned in raw) {
+        throw new V1ApiError(
+          'invalid_response',
+          `${context}: the suspected link ${JSON.stringify(l.linkKey)} carries a prose headline ` +
+            `(\`${banned}\`). A suspicion has no headline field: its sentence is COMPOSED by contracts' ` +
+            `suspicionQuestion() from \`kind\` and \`sharedValue\`, so it is always a question and never names one ` +
+            `run as the cause of another. A transmitted sentence is the route by which an engine, rather than a ` +
+            `forgetful consumer, turns a coincidence into a finding. Refusing.`
+        )
+      }
+    }
+  }
+
+  // USABILITY BEFORE ANY ARITHMETIC — and this is also GROUND 8, because
+  // `unproven_origin` is reported here. It runs AFTER the structural checks
+  // above so that a conflated entry is reported as the conflation it is rather
+  // than as the missing-field symptom of one.
+  const unusable = traversalUnusableFields(traversal)
+  if (unusable.length > 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the traversal carries fields whose contents cannot be used — ` +
+        unusable.map((f) => `${f.path} (${f.reason})`).join('; ') +
+        `. Note \`unproven_origin\` in particular: a terminus claiming \`recorded_origin\` without a complete, ` +
+        `empty adjacency read behind it is a LOST TRAIL WEARING AN ORIGIN'S CLOTHES. "The origin is run X" ends ` +
+        `an investigation; "we lost the trail at run X" says it is unfinished, and in production the second is ` +
+        `the common case because the SDK may never have recorded the edge. Refusing.`
+    )
+  }
+
+  const incoherences = traversalIncoherences(traversal)
+  if (incoherences.length > 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the traversal's own contents contradict each other — ` +
+        incoherences.map((f) => `${f.edgeKey}: ${f.incoherence}`).join('; ') +
+        `. An edge whose cited record was written in NEITHER of its endpoints is a third-party row that mentions ` +
+        `both runs and establishes nothing — which is precisely what an inference engine produces when it dresses ` +
+        `a correlation up as a record. An arrow to a run the traversal never reached is one nobody can check. ` +
+        `Refusing.`
+    )
+  }
+
+  const contradictions = traversalClaimContradictions(traversal)
+  if (contradictions.length > 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the traversal makes claims about its own shape that its own edges refute — ` +
+        contradictions.map((f) => `${f.at} (${f.contradiction})`).join('; ') +
+        `. A COMPONENT walk claiming an origin asked a direction-free scan a directional question — it closed both ` +
+        `sides, so "nothing produced this" is not a claim it can establish; run an upstream walk instead. An ` +
+        `origin whose proof says "nothing is adjacent" while an edge into that very run sits in the same ` +
+        `response is a LOST TRAIL CERTIFYING AS AN ORIGIN, which is the one output that ends an investigation on ` +
+        `the wrong run. An undeclared cycle, a cycle path naming hops that are not recorded edges, and an edge ` +
+        `citing nothing at all each certify a finished investigation over data that contradicts it. Refusing.`
+    )
+  }
+
+  assertVerdictConsistent(traversal.verdict, causalTraversalVerdict(traversal), context)
+}
+
+/**
+ * The parameter echo is the ignored-parameter tell — see
+ * {@link assertCausalTraversalTrustworthy} point 2. Generalised over string and
+ * number parameters, because `direction` is a string and dropping it produces
+ * a well-formed answer to the opposite question.
+ */
+function assertEchoedParam(scan: Record<string, unknown>, field: string, requested: unknown, context: string): void {
+  if (scan[field] === requested) return
+  throw new V1ApiError(
+    'invalid_response',
+    `${context}: asked for ${field}=${JSON.stringify(requested)} but the scan reports ` +
+      `${JSON.stringify(scan[field] ?? null)}. This deployment ignored the parameter (an older deployment silently ` +
+      `drops an unknown query parameter and answers over its own default), so this traversal describes a different ` +
+      `question than the one asked. Walked the wrong way, it is a perfectly well-formed answer to the OPPOSITE ` +
+      `question: "what caused this" rendered under a heading that says "what did this break". Refusing.`
+  )
+}
+
 /**
  * Read-only client over the v1 read API.
  *
@@ -1959,6 +2365,105 @@ export class FlightReader {
       this.fetchImpl
     )
     assertFleetHealthReportTrustworthy(data.report, params)
+    return data
+  }
+
+  /**
+   * Walk the recorded causal graph around one run: UP to what produced its
+   * input, DOWN to what consumed its output, or OUTWARD to the whole connected
+   * component for an incident.
+   *
+   * Traversal types are contracts' — see `packages/contracts/src/causality.ts`.
+   *
+   * **Every edge here was RECORDED, never inferred.** Two runs adjacent in time,
+   * sharing a session, or touching the same resource are not thereby causally
+   * linked; coincidences arrive in `traversal.suspected`, which carries no
+   * direction of any kind and therefore cannot be walked.
+   *
+   * **ASKING FOR `'component'` NARROWS THE RESULT.** A component walk closed
+   * both sides, so it cannot establish that nothing produced a run — "origin" is
+   * a directional claim. Pass the literal and the returned traversal's frontiers
+   * are `CycleReEntry | LostTrail`, so `termini[0].originRunId` does not
+   * compile. To ask where a chain started, run an `'upstream'` walk; two
+   * snapshots stated separately are honest, and one claim stitched out of the
+   * other is not.
+   *
+   * **A CHAIN THAT ENDED, A CHAIN THAT LOOPED, AND A CHAIN WHOSE TRAIL WAS LOST
+   * ARE DIFFERENT TYPES.** Read `traversal.termini` by narrowing on `terminus`:
+   * a `RecordedOrigin` says the investigation is over and carries the proof, a
+   * `CycleReEntry` says the chain loops and the walk closed it (also complete —
+   * retry loops are ordinary, and reporting one as unfinished would mean no
+   * retry chain could ever exit 0), and a `LostTrail` says the investigation is
+   * unfinished and carries what would recover it. The three share no field but
+   * the discriminant, so there is no template that renders any two — which is
+   * the point. In production the lost trail is the most common terminus, because
+   * the SDK may simply never have recorded the edge.
+   *
+   * **Never trusts an answer it cannot verify.** An ignored parameter (including
+   * a walk in the wrong DIRECTION, which is a well-formed answer to the opposite
+   * question), a missing `scan`, a suspected link served as an edge, a suspicion
+   * carrying a direction or a prose headline, an edge citing a record written in
+   * neither of its endpoints, an `artifact_handoff` with no recorded read by the
+   * consumer (a shared SHA-256 found by an outside join is a coincidence, not a
+   * handoff), an origin with no proof behind it, a cycle whose path does not
+   * close, an EMPTY terminus list, or a `verdict` contradicting the traversal's
+   * own contents each throw rather than resolve. The one thing NOT refused is an honestly-declared
+   * lost trail — that already produces a verdict of `indeterminate`, and deciding
+   * what an unfinished walk means is the gate's call, not the client's.
+   *
+   * **Server-side status:** `GET /api/v1/runs/:id/causality` does not exist yet.
+   * This method is written against the contract shape, so no SDK change should be
+   * needed once it is wired. Calling it today surfaces a {@link V1ApiError} with
+   * `kind: 'not_found'`.
+   *
+   * @param params - `{ runId, direction, maxDepth }` (all required — a default
+   *   direction would let a monitoring loop change which question it asks, and an
+   *   implicit depth would report a `depth_limit_reached` at a depth nobody
+   *   chose), plus optional `limit` / `cursor`.
+   * @returns `{ traversal }` — a `CausalTraversal`.
+   * @throws {@link V1ApiError} with `kind: 'not_found'` if the run does not exist,
+   *   does not belong to the key's org, or the deployment does not serve this route.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if the response
+   *   cannot be trusted (see above).
+   * @throws {RangeError} if `runId` is empty, `direction` is not one of the three
+   *   legal values, or `maxDepth`/`limit` are not positive integers — caller bugs,
+   *   surfaced before any request.
+   */
+  async getCausalTrace<D extends CausalDirection>(params: CausalTraceParams<D>): Promise<V1CausalTraceData<D>> {
+    if (typeof params?.runId !== 'string' || params.runId.length === 0) {
+      throw new RangeError(
+        `getCausalTrace: runId is required and must be a non-empty run id. Forwarded as an empty path segment, a ` +
+          `lenient server could answer about some other run entirely.`
+      )
+    }
+    if (params.direction !== 'upstream' && params.direction !== 'downstream' && params.direction !== 'component') {
+      throw new RangeError(
+        `getCausalTrace: direction must be 'upstream', 'downstream' or 'component' — got ` +
+          `${JSON.stringify(params.direction)}. There is deliberately no default: "what caused this" and "what did ` +
+          `this break" are opposite questions with opposite operational consequences.`
+      )
+    }
+    assertPositiveInteger(params.maxDepth, 'maxDepth', 'getCausalTrace')
+    if (params.maxDepth === undefined) {
+      throw new RangeError(
+        `getCausalTrace: maxDepth is required. A walk whose ceiling is implicit reports "depth limit reached" at a ` +
+          `depth nobody chose, and that is indistinguishable from an honest bounded answer.`
+      )
+    }
+    assertPositiveInteger(params.limit, 'limit', 'getCausalTrace')
+
+    const data = await fetchV1<V1CausalTraceData<D>>(
+      this.config,
+      `/api/v1/runs/${encodeURIComponent(params.runId)}/causality`,
+      {
+        direction: params.direction,
+        maxDepth: params.maxDepth,
+        ...(params.limit !== undefined && { limit: params.limit }),
+        ...(params.cursor !== undefined && { cursor: params.cursor }),
+      },
+      this.fetchImpl
+    )
+    assertCausalTraversalTrustworthy(data.traversal as CausalTraversal, params)
     return data
   }
 }

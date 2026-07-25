@@ -216,15 +216,23 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         </div>
       )}
 
-      {/* Trace hierarchy — parent link, child runs, session link. Hidden
-          entirely when the run has none of the three. */}
-      {(run.parentRunId !== undefined || run.sessionId !== undefined || childRuns.length > 0) && (
-        <RunHierarchyPanel
-          parentRunId={run.parentRunId}
-          sessionId={run.sessionId}
-          children={childRuns}
-        />
-      )}
+      {/* Trace hierarchy — parent link, child runs, session link, and the
+          causal walk.
+
+          NO LONGER HIDDEN when the run has none of parent/session/children.
+          That condition was the defect this feature exists to fix: a run with
+          no recorded parent showed no trace panel at all, and an absent panel
+          reads as "this run has no lineage" — which is a conclusion the data
+          does not support. Absence of a recorded edge is absence of a record,
+          not a record of absence. The causal link is always offered, and the
+          walk itself is what says whether the chain ENDED or the trail was
+          LOST. */}
+      <RunHierarchyPanel
+        runId={run.id}
+        parentRunId={run.parentRunId}
+        sessionId={run.sessionId}
+        children={childRuns}
+      />
 
       {/* "Why did this fail?" — the flagship explainability panel. Only for
           failed/timed_out runs; completed runs never render an empty card.

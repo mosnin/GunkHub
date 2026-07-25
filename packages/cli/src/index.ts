@@ -10,6 +10,7 @@
  * `explain` talk to the public v1 read API (`GET /api/v1/runs...`, see
  * `src/apiClient.ts`) via `x-api-key` auth.
  */
+import { CAUSE_HELP, exitCodeForCause, parseCauseArgs, printCause, runCause } from './commands/cause.js'
 import { COMPAT_HELP, exitCodeForCompat, parseCompatArgs, printCompat, runCompat } from './commands/compat.js'
 import { printConfigCheck, runConfigCheck } from './commands/config-check.js'
 import { EXPLAIN_HELP, parseExplainArgs, printExplain, runExplain } from './commands/explain.js'
@@ -52,6 +53,16 @@ export type {
   CompatFleetResult,
   CompatFailOn,
 } from './commands/compat.js'
+export {
+  parseCauseArgs,
+  runCause,
+  printCause,
+  exitCodeForCause,
+  CAUSE_EXIT_IMPACT,
+  CAUSE_EXIT_TRUNCATED,
+  DEFAULT_CAUSE_FAIL_ON,
+} from './commands/cause.js'
+export type { CauseArgs, CauseCommandResult, CauseResult, CauseFailOn } from './commands/cause.js'
 export {
   parseFleetArgs,
   runFleet,
@@ -110,6 +121,11 @@ Usage:
 
 Commands:
   afr triage                    START HERE: what is wrong right now, and what to look at first
+  afr cause <runId> --direction up|down|both
+                                What caused this run, and what did it break? Walks the
+                                RECORDED cross-run graph — never an inferred one. A chain
+                                that ENDS and a chain whose TRAIL IS LOST are reported as
+                                different things, and a lost trail never exits 0.
   afr fleet                     Org-wide sweep: is something wrong ACROSS agents right now?
                                  Roster health plus cross-agent correlations (same
                                  fingerprint on N agents; N agents failing inside one
@@ -219,6 +235,22 @@ export async function main(argv: string[], log: (line: string) => void = console
       // --fail-on threshold. Exit 0 is unreachable on an incomplete analysis
       // unless --fail-on none was passed, which is not a gate.
       return result.ok ? exitCodeForCompat(result) : result.exitCode
+    }
+
+    case 'cause': {
+      const args = parseCauseArgs(afterCommand)
+      if (args.help) {
+        log(CAUSE_HELP)
+        return 0
+      }
+      const result = await runCause(args)
+      printCause(args, result, log)
+      // Transport/usage failures keep the shared 0-4 convention; a SUCCESSFUL
+      // walk maps its own contents to 0/10/11. Exit 0 is unreachable on a
+      // truncated trace AT EVERY THRESHOLD — unlike `fleet`, `--fail-on none`
+      // does not buy one here, because "this answer is partial" is the primary
+      // output of a tracing command rather than an alarm bolted onto it.
+      return result.ok ? exitCodeForCause(result) : result.exitCode
     }
 
     case 'fleet': {

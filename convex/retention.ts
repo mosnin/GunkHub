@@ -63,7 +63,8 @@ interface BatchResult {
 
 /**
  * Delete up to `budget` documents belonging to one RUN, in dependency order:
- * run-targeted comments → verification_results → evals → artifacts → events
+ * run-targeted comments → verification_results → causal-edge index rows →
+ * evals → artifacts → events
  * (plus any event-targeted comments) → finally the run document itself.
  * Returns done=true once the run document has been deleted.
  */
@@ -99,6 +100,35 @@ async function purgeRunSlice(
     for (const r of results) {
       await ctx.db.delete(r._id);
       deleted++;
+    }
+  }
+
+  // 2a. CROSS-RUN CAUSAL GRAPH: index rows PROJECTED FROM THIS RUN'S LOG.
+  //
+  // A CASCADE, NOT AN ORPHAN SWEEP. `run_causal_edges` is a derived, rebuildable
+  // index over the append-only log (convex/causality.ts); a row's own source of
+  // truth is exactly this run's log and no other. Once the log is deleted the
+  // row is UNREBUILDABLE, and an unrebuildable row in a derived index is a fact
+  // with no record behind it — the one thing that table must never hold.
+  //
+  // Rows projected from the OTHER endpoint's log are deliberately NOT touched:
+  // that log still exists and still records the handoff. The traversal then
+  // finds an edge naming a run it cannot read and reports a `LostTrail` with
+  // kind `adjacent_run_unavailable`, which is the truth and is exactly the
+  // ended-versus-lost distinction the feature exists to preserve.
+  if (remaining() > 0) {
+    const run = await ctx.db.get(runId);
+    if (run) {
+      const edgeRows = await ctx.db
+        .query("run_causal_edges")
+        .withIndex("by_org_derived_from", (q) =>
+          q.eq("orgId", run.orgId).eq("derivedFromRunId", runId),
+        )
+        .take(remaining());
+      for (const row of edgeRows) {
+        await ctx.db.delete(row._id);
+        deleted++;
+      }
     }
   }
 

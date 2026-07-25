@@ -97,7 +97,30 @@ export interface RuleResult {
 }
 
 export interface EvalResult {
+  /**
+   * Did EVERY rule pass — over a NON-EMPTY rule set?
+   *
+   * NEVER TRUE ON ZERO RULES. `results.every(...)` alone is vacuously `true` on
+   * an empty array, and this value is written straight into an `eval_summary`
+   * row's `passed` field, so a version with no rules certified every one of its
+   * runs as having passed an evaluation that never ran. That is the same shape
+   * as `unobserved` collapsing into `healthy` in helpers/fleet.ts and
+   * "could not analyse" reading as `compatible` in helpers/divergence.ts, and it
+   * is the most dangerous direction for this particular field: a false PASS
+   * certifies a run as good.
+   *
+   * READ IT WITH {@link EvalResult.rulesEvaluated}. On an empty rule set this is
+   * `false`, which is NOT a failure — nothing was tested. A caller that treats
+   * `overallPassed: false` as a failing run without checking `rulesEvaluated > 0`
+   * has traded a false pass for a false alarm. The one production caller
+   * (`convex/insights.ts` `runEvalsForRun`) never reaches either case: it
+   * returns `skipped: "no_rules"` first. That guard stays, and this one exists
+   * because it is HERE, in the primitive, rather than a property of one call
+   * site somebody has to know about.
+   */
   overallPassed: boolean;
+  /** How many rules actually produced a result. The positive clause behind {@link overallPassed}. */
+  rulesEvaluated: number;
   results: RuleResult[];
 }
 
@@ -493,7 +516,10 @@ export function evaluateRules(
   });
 
   return {
-    overallPassed: results.every((r) => r.passed),
+    // POSITIVE CLAUSE FIRST. Without it this is vacuously `true` on an empty
+    // rule set — see EvalResult.overallPassed.
+    overallPassed: results.length > 0 && results.every((r) => r.passed),
+    rulesEvaluated: results.length,
     results,
   };
 }

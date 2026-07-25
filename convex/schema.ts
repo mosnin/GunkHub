@@ -223,6 +223,15 @@ export default defineSchema({
     // ADR-002: session correlation, run hierarchy, environment filtering.
     .index("by_org_session", ["orgId", "sessionId"])
     .index("by_parent", ["parentRunId"])
+    // CROSS-RUN CAUSAL GRAPH (convex/causality.ts). The org-PREFIXED form of
+    // by_parent. It exists because a graph traversal makes one child lookup per
+    // hop, and `by_parent` alone can return a run from another org (the field
+    // is validated same-org at write time, but a traversal must not depend on
+    // every historical write having been correct). With orgId in the index
+    // prefix, a foreign child is not filtered out AFTER being read — it is
+    // never in the range at all, so cross-org is structurally indistinguishable
+    // from absent at every hop rather than at the first one.
+    .index("by_org_parent", ["orgId", "parentRunId"])
     .index("by_org_environment_started", ["orgId", "environment", "startedAt"])
     // Cycle 3 (for Team B's convex/insights.ts compareVersions): exact,
     // O(matches) lookup of a version's runs instead of the bounded
@@ -1102,4 +1111,105 @@ export default defineSchema({
   })
     .index("by_org_date", ["orgId", "date"])
     .index("by_agent_date", ["agentId", "date"]),
+
+  // -------------------------------------------------------------------------
+  // CROSS-RUN CAUSAL EDGES — a DERIVED, REBUILDABLE INDEX. NOT the record.
+  //
+  // READ THIS BEFORE TRUSTING A ROW HERE. The RECORD of a causal handoff is the
+  // append-only event log: an event in one run's log that NAMES the other run's
+  // id (convex/helpers/causal_derive.ts), the immutable `runs.parentRunId`
+  // field, or a shared artifact checksum. Every row in this table is a
+  // PROJECTION of one of those, and carries the citation that locates it.
+  //
+  // WHY IT IS NOT THE RECORD, WHICH IS THE WHOLE POINT OF THE REDESIGN. A side
+  // table is mutable and deletable. A lost row silently relaunders the fact —
+  // and the absence of a causal-edge row is INDISTINGUISHABLE from "there was
+  // never a handoff", which is exactly the recorded-origin-versus-lost-trail
+  // distinction this feature exists to preserve, defeated by its own storage.
+  // The same argument put `provenance` on the event record rather than in a
+  // side table.
+  //
+  // WHY IT EXISTS ANYWAY. The downward question — "which OTHER run's log names
+  // run X?" — is a lookup keyed on a value buried inside `payload`, which is
+  // `v.any()`. No index the `events` table can carry answers it. So this is the
+  // same category as `runs.tokensIn` / `runs.modelsSeen` /
+  // `runs.otelMaxInstantNano` under ADR-002: written at event-insert time, when
+  // the payload is already in hand, purely so a read is affordable.
+  //
+  // REBUILDABILITY IS THE INVARIANT THAT KEEPS IT HONEST, and it is enforced
+  // rather than asserted: `causality:rebuildRunCausalEdges` deletes every row
+  // derived from a run's log and re-derives them from that log alone, and a
+  // test asserts the set is identical. IF A ROW CANNOT BE REBUILT FROM THE LOG,
+  // IT SHOULD NOT EXIST.
+  //
+  // RETENTION: `convex/retention.ts` deletes rows whose `derivedFromRunId` is a
+  // deleted run — a cascade, not an orphan sweep, because the row's own source
+  // of truth is exactly that run's log and no other.
+  // -------------------------------------------------------------------------
+  run_causal_edges: defineTable({
+    orgId: v.id("organizations"),
+    /** The run whose work came FIRST. Direction is read off the payload key, never inferred. */
+    producerRunId: v.id("runs"),
+    /** The run that consumed it. */
+    consumerRunId: v.id("runs"),
+    // Spelling is `RecordedCausalEdgeKind` from
+    // packages/contracts/src/causality.ts, which is canonical. FROZEN this
+    // cycle: `kind` is a STORED value, so aligning the two vocabularies is free
+    // today and a migration tomorrow.
+    kind: v.union(
+      v.literal("spawned"),
+      v.literal("artifact_handoff"),
+      v.literal("output_consumed"),
+      v.literal("retry_of"),
+      v.literal("delegated_to"),
+    ),
+    /** When the handoff was recorded, epoch ms. Taken from the citing event/run, never from now(). */
+    handoffAt: v.number(),
+    // ---- THE CITATION. REQUIRED, because a row that cannot name the log
+    // ---- position it came from is not a projection, it is an assertion.
+    /**
+     * The run whose LOG carries the record. Always one of the two endpoints —
+     * the contract requires it (`CausalEvidence.recordedInRunId`) and the write
+     * path enforces it. This is also the rebuild key: re-deriving run R's log
+     * reproduces exactly the rows with `derivedFromRunId === R`.
+     */
+    derivedFromRunId: v.id("runs"),
+    citation: v.union(
+      v.object({
+        cites: v.literal("event"),
+        eventId: v.id("events"),
+        sequenceNumber: v.number(),
+        eventType: v.string(),
+        /** The payload key that carried the other run's id. */
+        payloadPath: v.string(),
+      }),
+      v.object({
+        cites: v.literal("artifact"),
+        artifactId: v.id("artifacts"),
+        /** SHA-256 of the blob. An identity claim, not a filename collision. */
+        sha256: v.string(),
+        // WHAT THIS RUN'S OWN LOG SAYS IT DID WITH THE ARTIFACT. Required, and
+        // it is what carries DIRECTION: a shared hash has none, a recorded read
+        // does. Deriving an edge from a digest match alone would be a
+        // coincidence, however cryptographically exact.
+        role: v.union(v.literal("produced"), v.literal("consumed")),
+      }),
+      v.object({
+        cites: v.literal("run_field"),
+        /** e.g. `"parentRunId"`. */
+        field: v.string(),
+      }),
+    ),
+  })
+    // Upward traversal ("what caused this?"): edges INTO a run. Org-prefixed so
+    // a hop cannot read another org's rows even if a row were mis-stamped.
+    .index("by_org_consumer", ["orgId", "consumerRunId"])
+    // Downward traversal ("what did this poison?"): edges OUT of a run.
+    .index("by_org_producer", ["orgId", "producerRunId"])
+    // Rebuild and retention cascade: every row projected from one run's log.
+    .index("by_org_derived_from", ["orgId", "derivedFromRunId"])
+    // Idempotent projection: an event re-derived (SDK retry, rebuild) must
+    // return the existing row rather than insert a duplicate, which would
+    // otherwise inflate every fan-out count in the graph.
+    .index("by_org_triple", ["orgId", "producerRunId", "consumerRunId", "kind"]),
 });

@@ -20,3 +20,4 @@ export * from "./usage.js";
 export * from "./run_explanations.js";
 export * from "./failure_patterns.js";
 export * from "./fleet_health.js";
+export * from "./causality.js";

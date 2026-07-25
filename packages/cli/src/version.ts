@@ -7,4 +7,4 @@
  * unit test asserts this stays in sync with `package.json` — update BOTH when
  * bumping the version.
  */
-export const CLI_VERSION = '0.16.0'
+export const CLI_VERSION = '0.17.0'

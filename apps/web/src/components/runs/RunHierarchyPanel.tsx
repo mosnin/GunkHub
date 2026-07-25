@@ -9,6 +9,8 @@ interface RunHierarchyPanelProps {
   parentRunId?: string
   sessionId?: string
   children: Run[]
+  /** The run this panel is about, so it can link to its causal chain. */
+  runId?: string
 }
 
 /**
@@ -16,7 +18,7 @@ interface RunHierarchyPanelProps {
  * session's sibling runs. Hidden entirely (by the caller) when a run has
  * none of parentRunId/sessionId/children, so it never renders an empty shell.
  */
-export function RunHierarchyPanel({ parentRunId, sessionId, children }: RunHierarchyPanelProps) {
+export function RunHierarchyPanel({ parentRunId, sessionId, children, runId }: RunHierarchyPanelProps) {
   return (
     <div className="px-6 py-3 border-b border-neutral-800 flex flex-col gap-2">
       <h2 className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
@@ -44,6 +46,27 @@ export function RunHierarchyPanel({ parentRunId, sessionId, children }: RunHiera
             title="View all runs in this session"
           >
             {sessionId}
+          </Link>
+        </div>
+      )}
+
+      {runId !== undefined && (
+        // The parent/child links above are ONE recorded relation. The causal
+        // walk follows every recorded relation in both directions, and — the
+        // part this panel cannot show — states whether the chain ENDED or the
+        // trail was LOST. A panel that shows a parent and stops invites the
+        // reader to conclude there is nothing further up.
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-pewter font-mono shrink-0">causal</span>
+          <Link
+            href={`/runs/${encodeURIComponent(runId)}/causal`}
+            // Canonical tokens, not the `neutral-*` ramp the rows above use.
+            // design.md's appendix marks those stops as interpolated and
+            // explicitly not for new work; the ratchet in
+            // scripts/check-design-tokens.ts fails on a new one.
+            className="font-mono text-cloud hover:text-whiteout transition-colors duration-100"
+          >
+            walk the recorded chain
           </Link>
         </div>
       )}

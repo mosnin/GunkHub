@@ -8,6 +8,23 @@ type Q = 'query'
 type M = 'mutation'
 type A = 'action'
 
+/**
+ * Args for both directional causal walks, mirroring
+ * `convex/causality.ts`'s `{ runId: v.id("runs"), maxDepth: v.optional(v.number()) }`.
+ *
+ * Declared once so the two refs cannot drift apart from each other, which is
+ * how one of them ends up called with a field the other renamed.
+ *
+ * A `type` and not an `interface`, and that is load-bearing rather than style:
+ * Convex constrains args to `DefaultFunctionArgs` (`Record<string, unknown>`),
+ * and TypeScript gives type aliases an implicit index signature while
+ * interfaces get none. As an interface this does not compile.
+ */
+type CausalWalkArgs = {
+  runId: string
+  maxDepth?: number
+}
+
 export const convex = {
   agents: {
     listAgents: makeFunctionReference<Q>('agents:listAgents'),
@@ -52,6 +69,54 @@ export const convex = {
     searchRuns: makeFunctionReference<Q>('runs:searchRuns'),
     listSessionRuns: makeFunctionReference<Q>('runs:listSessionRuns'),
     listChildRuns: makeFunctionReference<Q>('runs:listChildRuns'),
+  },
+  // Cross-run causal graph (Team A, convex/causality.ts). Read-only here: the
+  // web app never records an edge from a page, because an edge must be written
+  // at the moment of the handoff by whatever performed it — a UI that could
+  // add one after the fact would be a UI that can manufacture evidence.
+  //
+  // ---------------------------------------------------------------------
+  // THE ONLY REFS IN THIS FILE THAT DECLARE THEIR ARGS AND RETURN
+  // ---------------------------------------------------------------------
+  //
+  // `makeFunctionReference<type, args = any, ret = any>` — BOTH DEFAULT TO
+  // `any`. Every bare ref above therefore hands `any` to its caller, and
+  // `client.query(...)` returns `any` with nothing objecting. That is the seam
+  // scripts/check-convex-refs.ts exists to police precisely because there is no
+  // structural typecheck across it.
+  //
+  // ARGS ARE DECLARED, and that part is a real check: a call whose shape drifts
+  // from `convex/causality.ts`'s validator is now a compile error here rather
+  // than an ArgumentValidationError at runtime.
+  //
+  // THE RETURN IS `unknown`, DELIBERATELY, AND NOT `CausalTraversal`.
+  //
+  // Declaring the contract type here would be an ASSERTION, not a check —
+  // nothing verifies a string-named reference against the function it names, so
+  // the type parameter would promise a guarantee the value never had. That is
+  // exactly the phantom-type-parameter shape that made
+  // `getCausalTrace<'upstream'>({ direction: 'component' })` typecheck and
+  // return a traversal containing a `RecordedOrigin`: a type parameter that
+  // looked like a barrier and constrained nothing.
+  //
+  // `unknown` is the true statement. It removes the `any` — which silently
+  // switches off every rule downstream — while forcing the response through
+  // `auditTraversal`, whose whole job is to establish what actually arrived.
+  causality: {
+    traceRunOrigin: makeFunctionReference<Q, CausalWalkArgs, unknown>(
+      'causality:traceRunOrigin',
+    ),
+    traceRunImpact: makeFunctionReference<Q, CausalWalkArgs, unknown>(
+      'causality:traceRunImpact',
+    ),
+    // Kept so an existing caller gets the engine's explanation rather than a
+    // missing-function error. It THROWS `INVALID_ARGUMENT`: a component
+    // traversal cannot be represented under the causal contract, because
+    // `ComponentTerminus` has no origin arm and a fully-closed component then
+    // has no valid terminus for a non-empty tuple. Nothing in apps/web calls it.
+    getIncidentGraph: makeFunctionReference<Q, CausalWalkArgs, never>(
+      'causality:getIncidentGraph',
+    ),
   },
   events: {
     listEvents: makeFunctionReference<Q>('events:listEvents'),

@@ -1246,6 +1246,15 @@ export const runEvalsForRun = internalMutation({
     }));
 
     const result = evaluateRules(rules, runLike, eventLikes);
+    // DEFENCE IN DEPTH against the vacuity above. `rules.length === 0` already
+    // returned `skipped: "no_rules"`, but that guard is 20 lines away and this
+    // is the write that stamps a boolean verdict onto a run. `evaluateRules` now
+    // refuses to report `overallPassed: true` on an empty rule set; this refuses
+    // to STORE a summary derived from one at all, so neither a false pass nor
+    // the false failure that replaced it can reach an `eval_summary` row.
+    if (result.rulesEvaluated === 0) {
+      return { skipped: true, reason: "no_rules" };
+    }
     const now = Date.now();
     const agentVersionId = run.agentVersionId;
 

@@ -803,7 +803,29 @@ export const listSessionRuns = query({
   },
 });
 
-/** Direct children of a run (one level of the parent hierarchy), org-checked via the parent. */
+/**
+ * Direct children of a run (one level of the parent hierarchy), org-checked.
+ *
+ * TWO DEFECTS FIXED HERE, and the second is the one that would fool a reader who
+ * knew about the first.
+ *
+ * 1. IT TRUNCATED SILENTLY. The page was capped with no cursor and no marker, so
+ *    a run with 500 children returned 200 and said nothing. A caller counting
+ *    the result to decide a blast radius read 200 as the total.
+ *
+ * 2. IT FILTERED **AFTER** TAKING, which made "a short page is therefore
+ *    complete" unsound as well. `by_parent` carries no `orgId`, so a foreign
+ *    child (a data defect, but the whole point of defence in depth is not to
+ *    assume there are none) was read into the page and then dropped — and the
+ *    page came back short WITHOUT the ceiling having been reached. Every natural
+ *    completeness test (`runs.length < limit`) then reports complete on a page
+ *    that silently lost rows. The fix is structural: read through the
+ *    ORG-PREFIXED `by_org_parent` index, so a foreign child is not in the range
+ *    at all and there is nothing to filter out afterwards.
+ *
+ * `complete` is therefore an honest positive claim: the index range was
+ * exhausted inside the ceiling, and no row was dropped after the fact.
+ */
 export const listChildRuns = query({
   args: {
     parentRunId: v.id("runs"),
@@ -820,13 +842,33 @@ export const listChildRuns = query({
     if (!parent || parent.orgId !== orgId) throw new Error("Run not found");
 
     const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
-    const children = await ctx.db
+    // ORG-PREFIXED: a foreign child is not in the range, so nothing is dropped
+    // after the take and a short page really does mean the range ended.
+    // Overfetch by ONE — the only way to distinguish "exactly `limit` children"
+    // from "at least `limit`, and there are more".
+    const page = await ctx.db
       .query("runs")
-      .withIndex("by_parent", (q) => q.eq("parentRunId", args.parentRunId))
-      .take(limit);
+      .withIndex("by_org_parent", (q) =>
+        q.eq("orgId", orgId).eq("parentRunId", args.parentRunId),
+      )
+      .take(limit + 1);
 
-    // Defence in depth: a child stamped with a different org than its parent is
-    // a data defect, not something to hand back across the boundary.
-    return { runs: children.filter((c) => c.orgId === orgId) };
+    const truncated = page.length > limit;
+    const runs = truncated ? page.slice(0, limit) : page;
+
+    return {
+      runs,
+      /** POSITIVE claim: the range was exhausted, and no row was dropped after the take. */
+      complete: !truncated,
+      /** True when more children exist than this page carries. `runs.length` is then a FLOOR. */
+      truncated,
+      limit,
+      /**
+       * Cursor for the next page: the last child's id. Callers that need the
+       * whole set should prefer `causality:traceRunImpact`, which walks the
+       * hierarchy transitively and reports its own bounds as termini.
+       */
+      ...(truncated ? { nextCursor: runs[runs.length - 1]?._id } : {}),
+    };
   },
 });

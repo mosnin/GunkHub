@@ -17,6 +17,8 @@ import { FlightReader, V1ApiError } from '@agent-flight-recorder/sdk'
 
 import type {
   AgentDivergenceParams,
+  CausalDirection,
+  CausalTraceParams,
   FleetHealthParams,
   ListEventsParams,
   ListFailurePatternsParams,
@@ -24,6 +26,7 @@ import type {
   RunDivergenceParams,
   V1AgentDivergenceData,
   V1ApiErrorKind,
+  V1CausalTraceData,
   V1FleetHealthData,
   V1FetchLike,
   V1RunDivergenceData,
@@ -251,6 +254,32 @@ export async function getFleetHealth(
 ): Promise<V1FleetHealthData> {
   try {
     return await new FlightReader(config, fetchImpl).getFleetHealth(params)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/**
+ * Walk the recorded causal graph around one run — up, down, or the whole
+ * connected component. See `FlightReader.getCausalTrace`.
+ *
+ * Routes through `FlightReader`, so every refusal in that gate (a suspected
+ * link served as an edge, a suspicion carrying a direction, an ORIGIN WITH NO
+ * PROOF, an empty terminus list) reaches the CLI as an `ApiClientError` with
+ * exit code 4 rather than as a plausible-looking traversal.
+ *
+ * GENERIC OVER `D` SO THE COMPONENT BARRIER SURVIVES THE WRAPPER. Declaring
+ * `params: CausalTraceParams` here would flatten `D` to its default for every
+ * caller of this module and re-open, one layer out, the phantom-parameter hole
+ * that made the barrier inert inside `FlightReader` itself.
+ */
+export async function getCausalTrace<D extends CausalDirection>(
+  config: ApiClientConfig,
+  params: CausalTraceParams<D>,
+  fetchImpl?: ApiFetchLike
+): Promise<V1CausalTraceData<D>> {
+  try {
+    return await new FlightReader(config, fetchImpl).getCausalTrace(params)
   } catch (err) {
     toApiClientError(err)
   }

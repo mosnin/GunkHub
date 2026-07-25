@@ -6,6 +6,7 @@ import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
 import { mutation, query } from "./_generated/server.js";
+import { projectEventCausalEdges } from "./causality.js";
 import { afrError } from "./helpers/errors.js";
 import { validateEvalFields } from "./helpers/eval_fields.js";
 import {
@@ -533,6 +534,14 @@ export const sdkCreateEvents = mutation({
         parentEventId,
       });
 
+      // CROSS-RUN CAUSAL GRAPH: project any handoff this event RECORDS into the
+      // derived `run_causal_edges` index. Same category as the token counters
+      // and `modelsSeen` — computed at insert time because the payload is
+      // already in hand, never a second source of truth. The log remains the
+      // record; see convex/helpers/causal_derive.ts.
+      const insertedEvent = await ctx.db.get(eventId);
+      if (insertedEvent) await projectEventCausalEdges(ctx, insertedEvent);
+
       // Sticky-reference backfill for artifact GC: an `_externalized` payload
       // points at an artifact record; stamp that artifact with this event's id
       // so it permanently leaves the GC's orphan-candidate set. Patching the
@@ -852,3 +861,4 @@ export const sdkRecordEval = mutation({
     return created;
   },
 });
+

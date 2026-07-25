@@ -401,9 +401,16 @@ describe("evaluateRules — rule combinations", () => {
     expect(result.results[1].passed).toBe(false);
   });
 
-  it("handles an empty rule list as vacuously passing", () => {
+  it("does NOT treat an empty rule list as passing", () => {
+    // THIS TEST PREVIOUSLY ASSERTED THE OPPOSITE — "handles an empty rule list
+    // as vacuously passing" — which is what made the defect look deliberate and
+    // kept it alive through review. `overallPassed` is written straight into an
+    // `eval_summary` row's `passed` field, so "vacuously passing" meant a
+    // version with no rules certified every one of its runs as having passed an
+    // evaluation that never ran.
     const result = evaluateRules([], baseRun(), []);
-    expect(result.overallPassed).toBe(true);
+    expect(result.overallPassed).toBe(false);
+    expect(result.rulesEvaluated).toBe(0);
     expect(result.results).toEqual([]);
   });
 });
@@ -417,5 +424,43 @@ describe("runLlmJudge", () => {
     );
     expect(result.status).toBe("not_configured");
     expect(result.message).toBeTruthy();
+  });
+});
+
+describe("evaluateRules — the empty rule set cannot certify anything", () => {
+  it("does NOT report overallPassed on zero rules", () => {
+    // `results.every(...)` is vacuously true on an empty array, and this value
+    // is written straight into an `eval_summary` row's `passed` field — so a
+    // version with no rules certified every one of its runs as having passed an
+    // evaluation that never ran. A false PASS is the dangerous direction here.
+    const result = evaluateRules([], baseRun(), []);
+    expect(result.results).toEqual([]);
+    expect(result.rulesEvaluated).toBe(0);
+    expect(result.overallPassed).toBe(false);
+  });
+
+  it("rulesEvaluated is what distinguishes 'nothing ran' from 'something failed'", () => {
+    // Both report `overallPassed: false`, and they are completely different
+    // claims. The count is the only thing that separates them, which is why it
+    // is a required field rather than something a caller derives.
+    const nothingRan = evaluateRules([], baseRun(), []);
+    const somethingFailed = evaluateRules(
+      [{ kind: "terminal_status", expect: ["completed"] }],
+      baseRun({ status: "failed" }),
+      [],
+    );
+    expect(nothingRan.overallPassed).toBe(somethingFailed.overallPassed);
+    expect(nothingRan.rulesEvaluated).toBe(0);
+    expect(somethingFailed.rulesEvaluated).toBe(1);
+  });
+
+  it("a single passing rule still reports overallPassed, so the guard is not blanket", () => {
+    const result = evaluateRules(
+      [{ kind: "terminal_status", expect: ["completed"] }],
+      baseRun({ status: "completed" }),
+      [],
+    );
+    expect(result.overallPassed).toBe(true);
+    expect(result.rulesEvaluated).toBe(1);
   });
 });

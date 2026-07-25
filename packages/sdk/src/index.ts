@@ -131,6 +131,8 @@ export type {
   V1AgentDivergenceData,
   FleetHealthParams,
   V1FleetHealthData,
+  CausalTraceParams,
+  V1CausalTraceData,
 } from './reader.js'
 export type { V1ApiConfig, V1FetchLike, V1ApiErrorKind, V1Envelope } from './v1-client.js'
 
@@ -229,6 +231,63 @@ export type {
   UnusableReason,
   UnusableFieldFinding,
   BaseRateUsability,
+  // Cross-run causality ("what caused this, and what did it break?"). TWO
+  // structural separations, and both are load-bearing:
+  //
+  //   RECORDED vs INFERRED — `RecordedCausalEdge` and `SuspectedLink` are
+  //   mutually unassignable, and a suspicion carries NO DIRECTION of any name,
+  //   so it is unwalkable rather than merely marked do-not-walk. Every
+  //   collection a walk consumes is typed `RecordedCausalEdge[]`.
+  //
+  //   ENDED vs LOOPED vs LOST — `RecordedOrigin`, `CycleReEntry` and
+  //   `LostTrail` are three dispositions of a frontier sharing NO FIELD except
+  //   the discriminant (`originRunId`/`hopsToOrigin` vs
+  //   `reEnteredRunId`/`hopsToReEntry` vs `lastReachedRunId`/`hopsBeforeLoss`),
+  //   so no template can render one as another by forgetting a field and
+  //   `originRunId ?? lastReachedRunId` cannot be written. Two of the three mean
+  //   the investigation FINISHED and one means it did not; an origin can only be
+  //   built from an `OriginProof` whose `inboundReadComplete` is the literal type
+  //   `true` and whose `inboundEdgesFound` is the literal type `0`.
+  //
+  // NOT collapsed into convenience unions, for the reasons written up in
+  // `packages/contracts/src/causality.ts`. `ChainTerminus` is the one exception
+  // and its own doc explains why a single-slot union of two field-disjoint types
+  // is safe where a findings union is not.
+  CausalTraversal,
+  CausalScan,
+  CausalVerdict,
+  CausalVerdictInput,
+  CausalDirection,
+  DirectedWalk,
+  ComponentTerminus,
+  TerminusFor,
+  ComponentTraversal,
+  DirectedTraversal,
+  CausalNode,
+  EdgeAdjacency,
+  RecordedCausalEdge,
+  RecordedCausalEdgeKind,
+  CausalEvidence,
+  CausalEventCitation,
+  CausalArtifactCitation,
+  CausalRunFieldCitation,
+  SuspectedLink,
+  SuspectedLinkKind,
+  ChainTerminus,
+  RecordedOrigin,
+  OriginProof,
+  CycleReEntry,
+  LostTrail,
+  TrailLossKind,
+  UnansweredCausalQuestion,
+  UnansweredCausalQuestionKind,
+  CausalIncoherence,
+  CausalIncoherenceFinding,
+  CausalUnusableReason,
+  CausalUnusableFieldFinding,
+  CausalClaim,
+  CausalClaimContradiction,
+  CausalClaimFinding,
 } from '@agent-flight-recorder/contracts'
 
 // Divergence verdict/coverage RULES (runtime). One implementation of "is this
@@ -293,4 +352,48 @@ export {
   discriminationOf,
   FLEET_DISCRIMINATION_MARGIN,
   MAX_FLEET_CORRELATION_AGENTS,
+  // Causality RULES (runtime). Same single-definition posture: one completeness
+  // predicate, one verdict rule, one coherence sweep, one usability sweep —
+  // shared by `afr cause`, the web UI, the MCP surface and `FlightReader`'s own
+  // response verification. A second copy is how a monitoring loop and a graph
+  // view come to disagree about whether a trace finished.
+  computeCausalVerdict,
+  causalTraversalVerdict,
+  isCausalTraversalComplete,
+  lostTrails,
+  recordedOrigins,
+  cycleReEntries,
+  convergencePoints,
+  edgesInto,
+  edgesOutOf,
+  downstreamRunCount,
+  // "Do the traversal's own contents agree with each other?" — the one a GATE
+  // calls, because it is the only entry point holding both the edges and the
+  // node set they must live inside.
+  traversalIncoherences,
+  // "Do the traversal's CLAIMS agree with its own edge set?" — the prior
+  // question to both of the above, and the one that four defects came through.
+  // Driven by a total table over the claim kinds, so a new self-claim is a
+  // compile error until it has an audit. Do NOT re-implement any part of it at
+  // a call site: three layers each had their own emptiness check, all three
+  // caught the empty-citation case, and that redundancy is what hid the hole in
+  // the primitive underneath them.
+  traversalClaimContradictions,
+  edgeIncoherences,
+  citedEndpointCount,
+  // "Is what arrived something arithmetic can be done with?" — asked at the
+  // boundary, BEFORE any coherence check or verdict. It is also where
+  // `unproven_origin` is reported: an origin without a complete, empty
+  // adjacency read behind it is a lost trail wearing an origin's clothes.
+  traversalUnusableFields,
+  // The suspicion sentence is COMPOSED, never transmitted — always
+  // interrogative, never directional. Render this, never a string from the wire.
+  suspicionQuestion,
+  // The terminus sentence, likewise composed, so no surface can render a lost
+  // trail in the confident register.
+  originStatement,
+  RECORDED_CAUSAL_EDGE_KINDS,
+  MAX_SUSPECTED_LINK_RUNS,
+  MAX_CAUSAL_NODES,
+  DEFAULT_CAUSAL_MAX_DEPTH,
 } from '@agent-flight-recorder/contracts'
