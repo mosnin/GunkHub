@@ -1,5 +1,6 @@
 import type { Run, Event, Comment } from "./entities.js";
 import type { EventType } from "./events.js";
+import type { OtelEventProvenance } from "./provenance.js";
 import type { RunStatus } from "./status.js";
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,69 @@ export interface CreateEventRequest {
 
 export interface CreateEventResponse {
   event: Event;
+}
+
+// ---------------------------------------------------------------------------
+// OTel-derived event writes
+//
+// This is where "required" actually bites. `Event.provenance` is optional
+// (existing rows have none and the log is append-only, so there is nothing to
+// backfill); the invariant is held here instead, on the ONLY contract that
+// describes writing a derived event. A derived event with no provenance is not
+// a bug to be caught in review — it does not typecheck.
+// ---------------------------------------------------------------------------
+
+/**
+ * One event derived from one OpenTelemetry span.
+ *
+ * `provenance` is REQUIRED and non-optional. Note also that it is typed as
+ * {@link OtelEventProvenance}, not {@link EventProvenance}: this path cannot
+ * even claim `source: "sdk"`. The ingest mapper is structurally incapable of
+ * laundering a derived event into a first-party-looking one.
+ *
+ * Deliberately does NOT extend `CreateEventRequest`. Sharing the base would
+ * let a future optional field added for the SDK path leak silently onto the
+ * derived path; these two writers have different obligations and are typed
+ * separately on purpose.
+ */
+export interface OtelDerivedEventWrite {
+  runId: string;
+  type: EventType;
+  sequenceNumber: number;
+  timestamp: number;
+  payload: import("./events.js").EventPayload;
+  parentEventId?: string;
+  /** REQUIRED. See the block comment above. */
+  provenance: OtelEventProvenance;
+}
+
+/**
+ * A batch of events derived from one OTel export request.
+ *
+ * Batched because OTLP arrives batched, and because the unmapped-span count
+ * below is only meaningful per batch.
+ */
+export interface IngestOtelSpansRequest {
+  /**
+   * Mapped events, plus `otel.span.unmapped` events for spans that matched no
+   * rule. Both kinds are ordinary appends carrying OTel provenance — the
+   * unmapped ones are RECORDED, never dropped.
+   */
+  events: OtelDerivedEventWrite[];
+}
+
+export interface IngestOtelSpansResponse {
+  /** Ids of the events actually appended, in submission order. */
+  eventIds: string[];
+  /** How many of `eventIds` are `otel.span.unmapped` events. */
+  unmappedCount: number;
+  /**
+   * Spans REJECTED before any append — malformed provenance, a run that is no
+   * longer `running`, a sequence-number conflict. Distinct from unmapped: an
+   * unmapped span was recorded, a rejected one was not, and a caller must be
+   * able to tell those apart rather than inferring silence.
+   */
+  rejected: Array<{ spanId: string; reason: string }>;
 }
 
 export interface ListEventsRequest {

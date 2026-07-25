@@ -57,6 +57,7 @@ import {
 import type {
   Event,
   FailurePattern,
+  OtelEventProvenance,
   PatternResolutionEvidence,
   Run,
   RunExplanation,
@@ -465,6 +466,49 @@ export function fatRun(i: number): Run {
 
 export const PAYLOAD_EXTERNALIZATION_THRESHOLD = 10 * 1024
 
+/**
+ * A MAXIMAL `OtelEventProvenance` — every optional field set, `lossReasons`
+ * filled to the full closed union.
+ *
+ * WHY EVERY EVENT FIXTURE CARRIES ONE. `Event.provenance` is optional on the
+ * stored entity but REQUIRED on the only contract that describes a derived
+ * write (`OtelDerivedEventWrite`), so a window of derived events with full
+ * provenance is not a hypothetical worst case — it is the ordinary shape of a
+ * run ingested from OpenTelemetry. A tier-4 budget measured against events that
+ * omit it is a budget measured against a payload the system does not produce,
+ * which is the same class of fiction as the CONTRACT_MAX_EXPLANATION that cited
+ * 5 sequence numbers where the contract permitted 20.
+ *
+ * `lossy: true` with all eight `lossReasons` is the largest record
+ * `isProvenanceConsistent` will accept: `lossReasons` must be non-empty when
+ * `lossy` is true, and must be absent or empty when it is false, so the maximum
+ * is only reachable on the lossy branch.
+ */
+export function fatProvenance(seq: number): OtelEventProvenance {
+  return {
+    source: 'otel',
+    traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+    spanId: String(seq).padStart(4, '0') + 'b7ad6b7169203',
+    parentSpanId: '00f067aa0ba902b7',
+    spanName: 'openinference.chain.llm.invoke',
+    scopeName: 'openinference.instrumentation.langchain',
+    semconvVersion: '1.29.0',
+    mapperVersion: '2026.7.1',
+    lossy: true,
+    lossReasons: [
+      'attributes-dropped',
+      'span-events-dropped',
+      'span-links-dropped',
+      'timing-approximated',
+      'usage-partial',
+      'payload-truncated',
+      'status-approximated',
+      'identity-synthesized',
+    ],
+    receivedAt: FROZEN_NOW + seq * 1200 + 40,
+  }
+}
+
 /** An event whose payload was externalized: the row must carry the pointer only. */
 export function externalizedEvent(seq: number): Event {
   return {
@@ -486,6 +530,7 @@ export function externalizedEvent(seq: number): Event {
         size: 41_203,
       },
     },
+    provenance: fatProvenance(seq),
   } as unknown as Event
 }
 
@@ -510,6 +555,7 @@ export function nearThresholdEvent(seq: number): Event {
       content: 'x'.repeat(PAYLOAD_EXTERNALIZATION_THRESHOLD - 200),
       finish_reason: 'stop',
     },
+    provenance: fatProvenance(seq),
   } as unknown as Event
 }
 

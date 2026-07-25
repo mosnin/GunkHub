@@ -16,7 +16,15 @@ export type EventType =
   | "retrieval.result"
   | "http.request"
   | "http.response"
-  | "custom";
+  | "custom"
+  /**
+   * An ingested OpenTelemetry span that matched NO mapping rule.
+   *
+   * Recorded rather than dropped — see {@link OtelSpanUnmappedPayload}. This
+   * is the only event type no first-party SDK emits; it exists solely on the
+   * OTel ingest path and always carries `provenance.source === "otel"`.
+   */
+  | "otel.span.unmapped";
 
 export interface ErrorPayload {
   message: string;
@@ -153,6 +161,74 @@ export interface CustomPayload {
   data: unknown;
 }
 
+// ---------------------------------------------------------------------------
+// Unmapped OTel spans
+// ---------------------------------------------------------------------------
+
+/** OTel `SpanKind`, lowercased. `unspecified` covers a missing/unknown kind. */
+export type OtelSpanKind =
+  | "unspecified"
+  | "internal"
+  | "server"
+  | "client"
+  | "producer"
+  | "consumer";
+
+/**
+ * Why a span produced no typed event.
+ *
+ * CLOSED union: "we didn't map it" is not an answer an engineer can act on.
+ * Each member points at a different fix — write a rule, implement a convention
+ * version, disambiguate two rules, or go fix the emitting instrumentation.
+ */
+export type OtelUnmappedReason =
+  /** No mapping rule matched this span's name/attributes. */
+  | "no-matching-rule"
+  /** The span declared a semantic-convention version the mapper does not implement. */
+  | "unsupported-semconv-version"
+  /** More than one rule matched. The mapper refuses to guess rather than pick one. */
+  | "ambiguous-match"
+  /** A rule matched but the attributes it requires were absent from the span. */
+  | "missing-required-attributes";
+
+/**
+ * A span that mapped to no event type, recorded AS an unmapped span.
+ *
+ * Dropping it would be the same failure this whole provenance design exists to
+ * prevent, one level up: a trace with a silent hole reads, to a debugging
+ * engineer, exactly like a trace where nothing happened. Recording it keeps
+ * the gap visible, keeps it in `sequenceNumber` order next to its siblings,
+ * and makes it appear in replay, export and the timeline for free — without a
+ * side table nobody thinks to open.
+ *
+ * The span's identity (trace id, span id, parent, scope, convention version)
+ * is NOT duplicated here: it lives in the event's `provenance`, which is the
+ * single place any derived event carries it.
+ */
+export interface OtelSpanUnmappedPayload {
+  type: "otel.span.unmapped";
+  /** The raw span name, verbatim. */
+  spanName: string;
+  spanKind: OtelSpanKind;
+  reason: OtelUnmappedReason;
+  /**
+   * The span's attributes, preserved so the span is recorded rather than
+   * merely counted. Bounded at ingest — see `attributesTruncated`. Values are
+   * `unknown` because OTel attribute values are a union of scalars and
+   * homogeneous arrays and this layer does not narrow them.
+   */
+  attributes: Record<string, unknown>;
+  /** True when `attributes` was capped at ingest and is an incomplete view. */
+  attributesTruncated: boolean;
+  /** OTel span status, when the span carried one. */
+  status?: {
+    code: "unset" | "ok" | "error";
+    message?: string;
+  };
+  /** Span end minus span start, when both were present. */
+  durationMs?: number;
+}
+
 /**
  * ExternalizedPayload — stored in place of an oversized inline payload.
  *
@@ -209,4 +285,5 @@ export type EventPayload =
   | HttpRequestPayload
   | HttpResponsePayload
   | CustomPayload
+  | OtelSpanUnmappedPayload
   | ExternalizedPayload;

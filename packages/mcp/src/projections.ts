@@ -47,6 +47,7 @@
  * Server-side projection is defense in depth's cheap half. This file is the
  * half that is load-bearing.
  */
+import { isDerivedProvenance } from '@agent-flight-recorder/contracts'
 import {
   columnsOf,
   isPatternScanComplete,
@@ -56,8 +57,10 @@ import {
 
 import type {
   Event,
+  EventProvenance,
   ExternalizedPayload,
   FailurePattern,
+  OtelMappingLossReason,
   PatternResolutionEvidence,
   Run,
   RunExplanation,
@@ -751,11 +754,178 @@ export interface PayloadPreview {
   preview: string
 }
 
+// ---------------------------------------------------------------------------
+// Provenance — projected DOWN by default, never projected AWAY
+// ---------------------------------------------------------------------------
+
+/**
+ * Byte cap for the two free-text strings on an OTel provenance record.
+ *
+ * `traceId`, `spanId`, `semconvVersion`, `mapperVersion`, `receivedAt` and
+ * `lossReasons` are all bounded by their own contracts (hex of fixed width, a
+ * version string, an epoch integer, a CLOSED union of eight reasons). `spanName`
+ * and `scopeName` are not: they are whatever the emitting instrumentation chose
+ * to call the operation, preserved VERBATIM by design. An unbounded string on a
+ * per-event field is the same cheap-by-luck bound {@link SUMMARY_BYTE_CAP} and
+ * {@link CITED_SEQUENCE_BYTE_CAP} exist to close, one field further down — so it
+ * is closed the same way, in bytes, with {@link truncateProse}'s in-band marker
+ * so a cut name cannot be mistaken for a short one.
+ *
+ * 120 admits every realistic span name whole (`openinference.instrumentation.
+ * langchain` is 44; the longest names in the OTel GenAI conventions are under
+ * 80) and only cuts a pathological one.
+ */
+export const PROVENANCE_NAME_BYTE_CAP = 120
+
+/** Full provenance of a first-party SDK recording, as the detail view emits it. */
+export interface ProjectedNativeProvenance {
+  source: 'sdk'
+  sdkVersion?: string
+}
+
+/**
+ * Full provenance of a DERIVED event, as the detail view emits it.
+ *
+ * Field-for-field `OtelEventProvenance`, with `spanName`/`scopeName` bounded by
+ * {@link PROVENANCE_NAME_BYTE_CAP}. Nothing is dropped: a caller that has paid
+ * for this is correlating against its own OTel backend, and a trace id with a
+ * missing sibling field is not a correlation key, it is half of one.
+ */
+export interface ProjectedOtelProvenance {
+  source: 'otel'
+  traceId: string
+  spanId: string
+  parentSpanId?: string
+  spanName: string
+  scopeName?: string
+  semconvVersion: string
+  mapperVersion: string
+  lossy: boolean
+  lossReasons?: OtelMappingLossReason[]
+  receivedAt: number
+}
+
+/** What `includeProvenance: true` puts on a row. */
+export type ProjectedProvenance = ProjectedNativeProvenance | ProjectedOtelProvenance
+
+/**
+ * Project a stored provenance record onto the DETAIL shape.
+ *
+ * Switches on `source` rather than probing for `traceId`, as
+ * `packages/contracts/src/provenance.ts` asks, so a third ingest source becomes
+ * a compiler error here instead of a silently mis-projected row.
+ */
+export function toProvenanceDetail(provenance: EventProvenance): ProjectedProvenance {
+  if (provenance.source === 'sdk') {
+    return provenance.sdkVersion === undefined
+      ? { source: 'sdk' }
+      : { source: 'sdk', sdkVersion: provenance.sdkVersion }
+  }
+  return {
+    source: 'otel',
+    traceId: provenance.traceId,
+    spanId: provenance.spanId,
+    ...(provenance.parentSpanId !== undefined && { parentSpanId: provenance.parentSpanId }),
+    spanName: truncateProse(provenance.spanName, PROVENANCE_NAME_BYTE_CAP),
+    ...(provenance.scopeName !== undefined && {
+      scopeName: truncateProse(provenance.scopeName, PROVENANCE_NAME_BYTE_CAP),
+    }),
+    semconvVersion: provenance.semconvVersion,
+    mapperVersion: provenance.mapperVersion,
+    lossy: provenance.lossy,
+    ...(provenance.lossReasons !== undefined && { lossReasons: [...provenance.lossReasons] }),
+    receivedAt: provenance.receivedAt,
+  }
+}
+
+/**
+ * Emitted ONCE per window, and only when the window actually contains a derived
+ * event. Never per event — the same rule {@link TRUNCATION_NOTE} follows.
+ *
+ * WHY A NOTE AND NOT MORE FIELDS. The two facts an agent must have on every row
+ * (`derived`, `derivedLossy`) are on every row. What this adds is the two things
+ * a row cannot carry cheaply: what derivation MEANS for reading the window
+ * (`sequenceNumber` is ingest order on a derived run, not necessarily temporal
+ * order — replay and diff assume the opposite), and how to buy the detail. Both
+ * are constant per window, so paying for them per event would be paying 50 times
+ * for one sentence.
+ */
+export const PROVENANCE_NOTE =
+  'Some events in this window were DERIVED from OpenTelemetry spans (derived:"otel") rather than recorded ' +
+  'first-party by the SDK. Their payloads are this system’s interpretation of somebody else’s telemetry, and ' +
+  'sequenceNumber on a derived run is ingest order — NOT necessarily the order the operations occurred in, which ' +
+  'is what replay and diff assume. derivedLossy:true means the mapping dropped information. Call again with ' +
+  'includeProvenance:true for trace/span ids, semconv and mapper versions, and the specific loss reasons.'
+
 /** One event in a window. */
 export interface EventRow {
   sequenceNumber: number
   type: string
   timestamp: number
+  /**
+   * THE BADGE. Present, and only ever `'otel'`, when this event was DERIVED
+   * from an OpenTelemetry span rather than recorded first-party by the SDK.
+   * Absent means native (or unrecorded, which per
+   * `packages/contracts/src/provenance.ts` reads as native — every row written
+   * before OTel ingestion existed came from the SDK path, there being no other
+   * writer).
+   *
+   * **THIS FIELD IS NOT OPTIONAL BEHAVIOUR.** The whole reason provenance was
+   * made mandatory on the derived write path is that an agent must never see an
+   * event that LOOKS first-party when it is our interpretation of somebody
+   * else's telemetry. Projecting that away at the last hop would defeat the
+   * chain end-to-end while every upstream layer stayed correct — which is
+   * exactly how {@link ListPatternsResult.scanTruncated} was lost: computed by
+   * Convex, forwarded by the route, typed by the SDK, and dropped here. A
+   * marker nobody reads is the same as no marker.
+   *
+   * It costs nothing on a native run: absent fields are not serialized, so a
+   * window with no derived events pays zero bytes for this.
+   */
+  derived?: 'otel'
+  /**
+   * Present, and only ever `true`, when the span→event mapping did NOT carry
+   * over everything the span contained.
+   *
+   * A SEPARATE CLAIM FROM {@link EventRow.derived}, deliberately, and not
+   * foldable into it. "This event is derived" and "this event is a derived
+   * approximation that LOST information" are different statements about
+   * evidentiary strength, and an agent reasoning about why a run failed needs
+   * the second: a field it cannot find may be a field that was never there, or
+   * a field the mapper dropped, and only this distinguishes them.
+   *
+   * Absent WITH `derived` present means lossless — unambiguously, because
+   * `lossy` is a REQUIRED boolean on `OtelEventProvenance`, so "not stated" is
+   * not a state the source record can be in. WHAT was lost is behind
+   * `includeProvenance` (`lossReasons`); see {@link PROVENANCE_NOTE}.
+   *
+   * A PACKED ENCODING WAS REJECTED. `derived: 'otel-lossy'` would save ~21 B an
+   * event, and it would make the more important of the two facts reachable only
+   * by string-matching a value whose vocabulary is not the contract's. The
+   * badge has to be readable without parsing.
+   */
+  derivedLossy?: true
+  /**
+   * The FULL provenance record. Present only when the caller passed
+   * `includeProvenance: true`, and only when the stored event carries one.
+   *
+   * WHY IT IS OPT-IN. A full `OtelEventProvenance` projects to ~500 B of JSON
+   * at the contract maximum (`lossReasons` is a closed union of EIGHT, and a
+   * maximal record carries all of them); across a 50-event window that is
+   * ~25 KB, which does not merely eat this tier's headroom, it BREACHES its
+   * 10,000-token ceiling outright — measured 10,857. Paid on every window
+   * whether or not anyone reads a trace id.
+   *
+   * The four-tier ladder exists to stop exactly that: a LIST needs the
+   * badge, a DETAIL view needs the ids, and only when someone is actually
+   * correlating against an OTel backend. The two facts that change how the log
+   * must be READ are above and are never optional; the coordinates that let
+   * somebody go LOOK are here and are bought deliberately.
+   *
+   * ABSENT DOES NOT MEAN NATIVE — read {@link EventRow.derived} for that. On a
+   * derived event with `includeProvenance` unset this is simply not present.
+   */
+  provenance?: ProjectedProvenance
   /**
    * The inline payload, present only when the payload was NOT externalized.
    * Replaced by a {@link PayloadPreview} when it exceeds
@@ -790,6 +960,17 @@ export interface EventRow {
  * externalized payload carries the pointer INSIDE itself, so the three columns
  * cost one field on the wire. {@link requestFieldsOf} dedupes them.
  *
+ * `derived`, `derivedLossy` and `provenance` all read `provenance`, so the
+ * badge, the loss flag and the opt-in detail cost ONE field on the wire.
+ * {@link requestFieldsOf} dedupes them.
+ *
+ * REQUESTING `provenance` IS LOAD-BEARING, not bookkeeping. The read API's
+ * `fields` selection is what the server serializes, so a column table that
+ * omits `provenance` makes the server drop it — and then `toEventRow` reads
+ * `undefined` on every row and emits no badge, on a deployment that had the
+ * data all along. The badge would be lost server-side rather than in this file,
+ * which is worse, not better: nothing here would look wrong.
+ *
  * What is deliberately NOT requested: `runId` (the caller passed it in and it
  * is echoed from the argument), `orgId` (never emitted — the tenancy boundary
  * is the key's, not a value to hand an agent) and `parentEventId`.
@@ -802,6 +983,9 @@ export const EVENT_COLUMNS = [
   { column: 'artifact', source: 'payload' },
   { column: 'originalType', source: 'payload' },
   { column: 'errorSummary', source: 'payload' },
+  { column: 'derived', source: 'provenance' },
+  { column: 'derivedLossy', source: 'provenance' },
+  { column: 'provenance', source: 'provenance' },
 ] as const satisfies readonly ProjectedColumn<keyof EventRow>[]
 
 /** The columns tier 4 emits. DERIVED from {@link EVENT_COLUMNS}. */
@@ -867,11 +1051,16 @@ export const TRUNCATION_NOTE =
  *   {@link TRUNCATION_NOTE} exactly when it is true. A caller that is not told
  *   its result was trimmed will read a partial payload as a complete one.
  */
-export function budgetEventRows(events: Event[]): { rows: EventRow[]; truncated: boolean } {
+export function budgetEventRows(
+  events: Event[],
+  options: EventRowOptions = {},
+): { rows: EventRow[]; truncated: boolean; derived: boolean } {
   let spent = 0
   let truncated = false
+  let derived = false
   const rows = events.map((event) => {
-    const row = toEventRow(event)
+    const row = toEventRow(event, options)
+    if (row.derived !== undefined) derived = true
     if (row.payload === undefined) return row
     const bytes = Buffer.byteLength(JSON.stringify(row.payload) ?? '', 'utf8')
     if (spent + bytes > WINDOW_PAYLOAD_BYTE_BUDGET) {
@@ -883,7 +1072,17 @@ export function budgetEventRows(events: Event[]): { rows: EventRow[]; truncated:
     if (typeof row.payload === 'object' && row.payload !== null && 'truncated' in row.payload) truncated = true
     return row
   })
-  return { rows, truncated }
+  return { rows, truncated, derived }
+}
+
+/** Per-window options for {@link toEventRow} / {@link budgetEventRows}. */
+export interface EventRowOptions {
+  /**
+   * Emit the FULL provenance record on every event that has one. Default
+   * `false` — the badge (`derived` / `derivedLossy`) is emitted either way and
+   * is not affected by this flag. See {@link EventRow.provenance}.
+   */
+  includeProvenance?: boolean
 }
 
 /**
@@ -892,12 +1091,33 @@ export function budgetEventRows(events: Event[]): { rows: EventRow[]; truncated:
  *
  * This is the single place the "never inline an artifact payload" rule is
  * enforced. Do not add a branch that reads the blob.
+ *
+ * @param event - the stored event.
+ * @param options - see {@link EventRowOptions}. Optional and additive: an
+ *   omitted argument is the default projection, which is what every caller had
+ *   before provenance existed.
  */
-export function toEventRow(event: Event): EventRow {
+export function toEventRow(event: Event, options: EventRowOptions = {}): EventRow {
   const row: EventRow = {
     sequenceNumber: event.sequenceNumber,
     type: event.type,
     timestamp: event.timestamp,
+  }
+  // THE BADGE IS UNCONDITIONAL. It is computed before anything else and is not
+  // gated on `options`, because the one thing a caller must never be able to
+  // turn off is being told that what it is reading is derived. `lossy` rides
+  // with it for the same reason — see EventRow.derivedLossy.
+  //
+  // `isDerivedProvenance` is the contract's own predicate rather than a local
+  // `=== 'otel'`: a third ingest source must become a compiler error at every
+  // site, and a re-implemented check here would be the site that silently
+  // classified it as native.
+  if (isDerivedProvenance(event.provenance)) {
+    row.derived = 'otel'
+    if (event.provenance.lossy) row.derivedLossy = true
+  }
+  if (options.includeProvenance === true && event.provenance !== undefined) {
+    row.provenance = toProvenanceDetail(event.provenance)
   }
   const payload: unknown = event.payload
   if (isExternalized(payload)) {

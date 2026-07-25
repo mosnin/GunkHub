@@ -173,6 +173,45 @@ export default defineSchema({
     timestamp: v.number(),
     payload: v.any(),
     parentEventId: v.optional(v.id("events")),
+    // How this event came to exist: recorded first-party by the SDK, or
+    // DERIVED by the backend from an ingested OpenTelemetry span. Mirrors
+    // `EventProvenance` in packages/contracts/src/provenance.ts.
+    //
+    // OPTIONAL, and absent means "sdk". That reading is sound rather than a
+    // guess: every row written before OTel ingestion existed came from the
+    // first-party path, there being no other writer. Making it required would
+    // mean rewriting history in an append-only table.
+    //
+    // EXPLICIT UNION, NOT `v.any()`. The type is fully known and expressible.
+    // `events.payload` is the ONE justified `v.any()` in this schema (Convex's
+    // validator DSL cannot express a discriminated union of arbitrarily
+    // nested payloads); this is not a second one.
+    //
+    // `lossReasons` is `v.array(v.string())` and NOT a closed union on
+    // purpose: Convex cannot express the union, so `OtelMappingLossReason` in
+    // contracts is the enforcement point. Do not "tighten" this — it breaks
+    // scripts/check-schema-drift.ts, which compares against the contract.
+    provenance: v.optional(
+      v.union(
+        v.object({
+          source: v.literal("sdk"),
+          sdkVersion: v.optional(v.string()),
+        }),
+        v.object({
+          source: v.literal("otel"),
+          traceId: v.string(),
+          spanId: v.string(),
+          parentSpanId: v.optional(v.string()),
+          spanName: v.string(),
+          scopeName: v.optional(v.string()),
+          semconvVersion: v.string(),
+          mapperVersion: v.string(),
+          lossy: v.boolean(),
+          lossReasons: v.optional(v.array(v.string())),
+          receivedAt: v.number(),
+        }),
+      ),
+    ),
   }).index("by_run", ["runId", "sequenceNumber"]),
 
   artifacts: defineTable({

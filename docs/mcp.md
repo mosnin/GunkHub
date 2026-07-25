@@ -33,12 +33,12 @@ of magnitude apart:
 | 1 | `afr_list_failure_patterns` | "What is broken?" — *all* of it, beyond triage's top 5 | ~294 tokens (10 patterns) |
 | 2 | `afr_get_pattern_evidence` | "Did the fix hold?" | ~423 tokens (one pattern, capped history) |
 | 3 | `afr_explain_run` | "Why did *this run* fail?" | **~121 tokens** (one run) |
-| 4 | `afr_get_run_events` | "Show me the literal events." | **~3,844 tokens** (one saturated 50-event window) |
+| 4 | `afr_get_run_events` | "Show me the literal events." | **~4,445 tokens** (one saturated 50-event window; ~8,717 with `includeProvenance`) |
 | — | `afr_list_runs` | Orientation: which runs exist | ~475 tokens (20 runs) |
 
 Read the last row of the ladder before you read anything else on this page. **One
-tier-4 window costs about 12x a triage call, about 32x a tier-3 explanation, and
-about 13x a tier-1 pattern list** — and a window is not the whole run, it is fifty
+tier-4 window costs about 13x a triage call, about 37x a tier-3 explanation, and
+about 15x a tier-1 pattern list** — and a window is not the whole run, it is fifty
 events of it. The tiers above it are not a warm-up you skip to get to the real data;
 they are the reason the tier-4 call is affordable at all, because they tell you
 *which fifty events* to ask for.
@@ -79,16 +79,16 @@ look. That is the normal starting state. The path, with the running cost:
        (Reached directly from triage when an item's `next` points at a run —
         ~332 + ~121, not ~755.)
 
-4. afr_get_run_events(runId, from: 12, limit: 10)   ≤3,844 tok  (running: ≤4,297)
+4. afr_get_run_events(runId, from: 12, limit: 10)   ≤4,445 tok  (running: ≤4,898)
      → the literal event records, only around the numbers tier 3 cited
 ```
 
 Triage plus an explanation — enough to name the worst thing in the org *and* explain
-a concrete instance of it — costs about **453 tokens**. That is roughly an eighth of
+a concrete instance of it — costs about **453 tokens**. That is roughly a tenth of
 one tier-4 window.
 
 **The naive path, for contrast.** An agent that skips the ladder and opens with
-`afr_get_run_events` pays up to **~3,844 tokens** for a fifty-event window and gets
+`afr_get_run_events` pays up to **~4,445 tokens** for a fifty-event window and gets
 back… fifty event records. No root cause, no fingerprint, no verdict on whether this
 is new or the thing that has been failing all week. It has spent roughly 12x the cost
 of `afr_triage()` to buy the raw material for an answer rather than the answer, and it
@@ -130,6 +130,12 @@ completed, which must never be reported as "all clear."**
 >   and are corrected here: tier 0 typical (333 → **332**), tier 1 (284 → **294**), and
 >   tier 4 externalized (3,838 → **3,844**). Two others (`afr_list_runs` **475**, tier 4
 >   inline **3,390**) are confirmed unchanged.
+> - **Re-measured again after OTel provenance landed** (ADR-007): every event a
+>   derived run returns now carries a compact `derived`/`derivedLossy` marker, which
+>   moved both tier-4 rows by +601 (externalized **3,844 → 4,445**, inline
+>   **3,390 → 3,991**) and added a fourth tier-4 row for the opt-in full-record path
+>   (`includeProvenance: true`, **8,717** at its lower `MAX_LIMIT_WITH_PROVENANCE`
+>   of 40). Native-only windows pay none of this. No other figure moved.
 > - The enforcement described in
 >   [What keeps these numbers true](#what-keeps-these-numbers-true): the script and
 >   `scripts/token-budget-baseline.json` exist and run; the seven `mcp_*` suites pass
@@ -156,15 +162,15 @@ completed, which must never be reported as "all clear."**
 >   re-export, and `packages/cli` imports the same function. There is one
 >   implementation, so the CLI and the MCP tool cannot rank differently.
 >
-> **Landed but not yet finished — do not read these as fully wired:**
-> - `scripts/check-token-budgets.ts` runs, enforces, and its baseline is seeded with all
->   14 scenarios — but it is in neither `scripts/validate.sh` nor
->   `.github/workflows/ci.yml`, so nothing runs it automatically.
-> - `scripts/check-build-integrity.ts` is in `validate.sh` (as `build-integrity`, after
->   `build`) but not in CI.
-> - `afr_explain_run`'s contract-maximal scenario is **over budget (203 / 200)**, frozen
->   as a `knownBreach`. That is a real, owned defect in `packages/mcp`, not a
->   documentation caveat.
+> **Since resolved — the caveats this section used to carry are gone:**
+> - `scripts/check-token-budgets.ts` and `scripts/check-build-integrity.ts` are both in
+>   `scripts/validate.sh` **and** in the `build` job of `.github/workflows/ci.yml` (they
+>   run there because they need that job's artifacts). Nothing about these numbers is
+>   enforced by hand any more.
+> - `afr_explain_run`'s contract-maximal scenario is **no longer over budget**: the
+>   citation array is now byte-capped the way the prose fields are, and it measures
+>   **198** for any citation count at any sequence-number width. The `knownBreach` entry
+>   was deleted with the fix.
 >
 > **Freshness.** Verified against the working tree at commit `600b4f8` **plus
 > uncommitted changes**: `scripts/check-token-budgets.ts`,
@@ -265,10 +271,11 @@ resolves `@agent-flight-recorder/sdk` and `/contracts` to their `dist/`.
 | `afr_list_failure_patterns`, 100 | **2,681** | 2,800 | a saturated page at `MAX_LIMIT` (14.2x) |
 | `afr_get_pattern_evidence` | **423** | 450 | one pattern, 100 inbound lifecycle transitions, capped to 10 (34.7x) |
 | `afr_explain_run` realistic | **121** | 200 | a realistic `RunExplanation` |
-| `afr_explain_run` contract-maximal | **203** ⚠ | 200 | 2 KB summary + 1 KB root cause + 1 KB fix — **over budget by 3, see below** |
+| `afr_explain_run` contract-maximal | **198** | 200 | 2 KB summary + 1 KB root cause + 1 KB fix |
 | `afr_explain_run` pending | **24** | 200 | no explanation generated yet |
-| `afr_get_run_events` externalized | **3,844** | 10,000 | a saturated 50-event window, every payload externalized |
-| `afr_get_run_events` inline | **3,390** | 10,000 | a saturated 50-event window of 10,040-byte inline payloads, just under the externalization threshold |
+| `afr_get_run_events` externalized | **4,445** | 10,000 | a saturated 50-event window, every payload externalized, every event OTel-derived |
+| `afr_get_run_events` inline | **3,991** | 10,000 | a saturated 50-event window of 10,040-byte inline payloads, just under the externalization threshold |
+| `afr_get_run_events` + `includeProvenance` | **8,717** | 10,000 | 40 fully-derived events at `MAX_LIMIT_WITH_PROVENANCE` — the full `OtelEventProvenance` record per event, not the compact marker |
 | `afr_list_runs`, 20 | **475** | 600 | a default page of maximal `Run` documents (58.8x) |
 | `afr_list_runs`, 100 | **2,250** | 2,800 | a saturated page at `MAX_LIMIT` (62.0x) |
 
@@ -276,19 +283,24 @@ The ratios in the fixture column are **commentary**. Nothing passes on one — e
 budget is an absolute integer, because a ratio against a fat fixture gets easier as the
 fixture gets fatter, which is not the property under test.
 
-> ⚠ **`afr_explain_run`'s contract-maximal scenario is over budget: 203 against 200.**
-> The guard found it on its first run and it is recorded as a `knownBreach` — frozen, not
-> waived: the script exits `0`, but the number may only fall, one token more blocks, and
-> the guard fails if the entry outlives the breach.
+> ⚠ **`afr_explain_run`'s contract-maximal scenario used to be over budget: 203 against
+> 200.** It is not any more, and the history is worth keeping because the fix is not the
+> obvious one.
 >
-> The cause is that `toExplainRunResult` caps the three prose fields and forwards
+> The cause was that `toExplainRunResult` capped the three prose fields and forwarded
 > `citedSequenceNumbers` **verbatim**. The long-published "192 worst case" was measured
 > against an explanation citing five sequence numbers; `RunExplanation` documents the
 > bound as ≤ 20. Measured: 5 citations → 192, 10 → 196, 15 → 200, 20 → **204**. So this
 > tier was under budget only because real explanations happen to cite few events — a
-> property of the generator, not a guarantee of this layer. The fix (capping the citation
-> array the way the prose is capped) belongs to the `packages/mcp` owner. Do not raise
-> the 200.
+> property of the generator, not a guarantee of this layer.
+>
+> **The fix caps BYTES, not citations.** Capping the array at ten would have been the
+> same cheap-by-luck bound one level down: a sequence number's *width* grows with run
+> length (Event Log Rule 4 numbers events from 1 per run), so ten six-digit citations on
+> a 100k-event run cost what twenty four-digit ones do. The byte cap holds **198** for
+> any count and any width, and `scripts/check-token-budgets.ts` carries a dedicated
+> 20-six-digit-citation scenario so that claim is falsifiable rather than asserted.
+> The 200 was never raised.
 
 ### What keeps these numbers true
 
@@ -370,8 +382,8 @@ against a fully saturated, maximally caveated response — 97% of the ceiling, a
 tokens of headroom, well under half a triage item. Widening an item will go red almost
 immediately, which is the intended behaviour.
 
-**The ratios are the durable part.** ~3,844 vs ~121 is ~32x; vs ~294 it is ~13x; vs
-~332 it is ~12x. Those gaps are structural — they follow from what each tier returns,
+**The ratios are the durable part.** ~4,445 vs ~121 is ~37x; vs ~294 it is ~15x; vs
+~332 it is ~13x. Those gaps are structural — they follow from what each tier returns,
 not from the fixtures — and they are the reason to work down the ladder rather than up
 it.
 

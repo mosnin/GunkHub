@@ -108,6 +108,35 @@ export interface Event {
   timestamp: number;
   payload: EventPayload;
   parentEventId?: string;
+  /**
+   * How this event came to exist — first-party SDK recording, or DERIVED from
+   * an ingested OpenTelemetry span. See packages/contracts/src/provenance.ts
+   * for the full argument.
+   *
+   * OPTIONAL ON THE STORED ENTITY, REQUIRED ON THE DERIVED WRITE PATH
+   * ({@link OtelDerivedEventWrite}). The asymmetry is the whole design, and it
+   * is deliberate:
+   *
+   *  - Making it required HERE would break every existing consumer and, worse,
+   *    every existing ROW — the events table is append-only, so there is no
+   *    backfill that does not amount to rewriting history. It would also buy
+   *    less than it appears to: a required field forces every PRODUCER of an
+   *    `Event` value to make a claim, but TypeScript never forces a READER to
+   *    look at a field, so it would not have made any UI render a "derived"
+   *    badge.
+   *
+   *  - The hole a required field would actually close is on the WRITE side — a
+   *    derived event stored with no provenance. That hole is closed instead by
+   *    {@link OtelDerivedEventWrite}, the only contract describing a derived
+   *    write, where provenance is required and non-nullable. Nothing can write
+   *    a derived event without one, so `undefined` here provably means "native".
+   *
+   * Absent = recorded natively. That reading is sound because every row
+   * written before OTel ingestion existed came from the first-party SDK path,
+   * there being no other writer. Use `resolveEventProvenance` to apply it
+   * explicitly rather than assuming it inline at each call site.
+   */
+  provenance?: EventProvenance;
 }
 
 export interface Artifact {
@@ -146,4 +175,14 @@ export interface Comment {
 
 // Forward references resolved by importing from events.ts and status.ts
 import type { EventType, EventPayload } from "./events.js";
+import type { EventProvenance, OtelEventProvenance } from "./provenance.js";
 import type { RunStatus, RunTriageState } from "./status.js";
+
+/**
+ * An `Event` KNOWN to have been derived from an OTel span.
+ *
+ * Use this as the parameter type anywhere a function only makes sense for
+ * derived events (rendering the source-span link, re-running a mapping,
+ * auditing a mapper bug). Narrow into it with `isDerivedProvenance`.
+ */
+export type DerivedEvent = Event & { provenance: OtelEventProvenance };

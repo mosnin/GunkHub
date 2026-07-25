@@ -44,6 +44,12 @@ export type { McpConfig, McpEnv } from './env.js'
 export { MCP_VERSION } from './version.js'
 export * from './projections.js'
 export * from './triage.js'
+/**
+ * Tier 4's event-count ceilings. Exported so a suite reads them from the ONE
+ * place they are declared rather than restating a literal — the same rule
+ * `tests/unit/mcp_budgets.ts` follows for every byte cap in this package.
+ */
+export { MAX_LIMIT, MAX_LIMIT_WITH_PROVENANCE } from './tools/get-run-events.js'
 
 /**
  * Boot the server on stdio. Resolves only when the transport closes.

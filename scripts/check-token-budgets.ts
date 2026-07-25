@@ -714,6 +714,23 @@ export function buildScenarios(f: McpFixtures): readonly Scenario[] {
     reader: eventWindow(f.nearThresholdEvent),
     rawInput: () => Array.from({ length: 50 }, (_, i) => f.nearThresholdEvent(18 + i)),
   },
+  {
+    tool: 'afr_get_run_events',
+    name: 'includeProvenance — 40 fully-derived events at MAX_LIMIT_WITH_PROVENANCE',
+    budget: 10_000,
+    why:
+      'THE OPT-IN PATH SHIPPED WITH NO DECLARED BUDGET, which is precisely the `NO_BUDGET` hole this file ' +
+      'exists to close — the guard measures declared scenarios, and a scenario nobody wrote is a ceiling ' +
+      'nobody holds. `includeProvenance: true` swaps the ~38 B compact marker for the full ~500 B ' +
+      'OtelEventProvenance record, a >13x per-event increase on the single most expensive tier. The reduced ' +
+      'limit (MAX_LIMIT_WITH_PROVENANCE = 40, REJECTED not clamped) is the only thing keeping it under the ' +
+      'same 10,000 ceiling the compact path holds; this scenario is what makes that dependency falsifiable. ' +
+      'Fifty of these events measured 10,857 — the ceiling was held and the limit was lowered, not the ' +
+      'reverse.',
+    args: { runId: 'run_8f2c1a', fromSequence: 18, limit: 40, includeProvenance: true },
+    reader: eventWindow(f.externalizedEvent),
+    rawInput: () => Array.from({ length: 40 }, (_, i) => f.externalizedEvent(18 + i)),
+  },
 
   // ── afr_list_runs — orientation ───────────────────────────────────────────
   {

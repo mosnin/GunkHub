@@ -107,7 +107,11 @@ Clerk-session path `convex/events.ts`).
    package path) as `VALID_EVENT_TYPES` in both `convex/events.ts` and
    `convex/sdk_ingest.ts`; both carry a `MUST stay in sync` comment. Adding an event type
    means updating all three plus the SDK's `Events` builders in
-   `packages/sdk/src/events.ts` — see `CONTRIBUTING.md`.
+   `packages/sdk/src/events.ts` — see `CONTRIBUTING.md`. **The mirror is
+   currently broken:** the in-flight contracts change adds an 18th type,
+   `otel.span.unmapped`, which neither Convex copy carries yet, so that type
+   cannot be written through `sdkCreateEvents` today (see
+   [`docs/adr/007`](adr/007-otel-span-ingestion.md) C4).
 
 ---
 
@@ -142,6 +146,24 @@ Two distinct ingest paths exist, authenticated differently:
 |------|------|-------------|-------------------|
 | Clerk-session (web UI) | Clerk JWT, `getAuthContext` + `requireOrgMembership` | Convex React hooks called directly from `apps/web` | `convex/runs.ts`, `convex/events.ts`, `convex/comments.ts`, etc. |
 | SDK ingest | `x-api-key` header, hashed and matched against `convex/api_keys` | `apps/web/app/api/{runs,events,artifacts,runs/[id]/status}/route.ts` | `convex/sdk_ingest.ts`: `sdkCreateRun`, `sdkCreateEvents`, `sdkCreateArtifact`, `sdkUpdateRunStatus`, `checkIngestAuth` |
+
+**A third path — OpenTelemetry span ingestion — is in progress and NOT usable.**
+It is tracked in [`docs/adr/007-otel-span-ingestion.md`](adr/007-otel-span-ingestion.md),
+whose status is **Proposed, decision not settled**: deriving contiguous
+`sequenceNumber`s (Rule 4) and `run.started`/terminal events (Rule 5) from
+multi-batch, retried, partially-ordered OTLP delivery may not be reconcilable
+with event-log immutability (Rule 1) at all. As of `b15e921` plus the
+in-flight contracts change, what exists is **types only** —
+`packages/contracts/src/provenance.ts` (`EventProvenance`, the `sdk | otel`
+discriminator), an optional `Event.provenance`, the `otel.span.unmapped` event
+type, and the `OtelDerivedEventWrite`/`IngestOtelSpansRequest` shapes in
+`api.ts`. There is **no OTLP endpoint, no span→event mapping, no sequence
+synthesis, and no Convex-side storage**: `convex/` is entirely unchanged, so the
+`events` table still has no provenance field and `check-schema-drift.ts`
+currently fails on `"provenance" is in contracts but missing from
+convex/schema.ts`. Do not treat this path as available, and do not read the
+contract types as evidence that the ordering problem has been solved. When it
+lands, it becomes a row in the table above and this paragraph goes away.
 
 Every SDK ingest mutation calls `resolveApiKey` first, which checks existence,
 revocation (`revokedAt`), expiration (`expiresAt`), and scope (`scopes` — a key with no
