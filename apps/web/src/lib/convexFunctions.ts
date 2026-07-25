@@ -4,6 +4,8 @@
 
 import { makeFunctionReference } from 'convex/server'
 
+import type { BudgetMeter, BudgetPeriod, BudgetScope } from '@agent-flight-recorder/contracts'
+
 type Q = 'query'
 type M = 'mutation'
 type A = 'action'
@@ -23,6 +25,69 @@ type A = 'action'
 type CausalWalkArgs = {
   runId: string
   maxDepth?: number
+}
+
+/**
+ * The narrowing ids a breaker evaluation accepts, mirroring
+ * `convex/budgets.ts`'s `checkBudget` validator.
+ *
+ * Declared once and shared with {@link SdkBudgetSubjectArgs}'s body so the two
+ * evaluation doors cannot drift into asking different questions — which, for a
+ * breaker, means the web UI and the SDK disagreeing about which budgets govern
+ * a subject.
+ */
+type BudgetNarrowingArgs = {
+  projectId?: string
+  agentId?: string
+  agentVersionId?: string
+  runId?: string
+}
+
+/** Clerk-authed evaluation: the org is NAMED, and Convex re-checks membership in it. */
+type BudgetSubjectArgs = BudgetNarrowingArgs & { orgId: string }
+
+/**
+ * Key-authed evaluation: the org comes from the KEY and there is deliberately
+ * no `orgId` field to supply one. See `convex/budget_gate.ts`.
+ */
+type SdkBudgetSubjectArgs = BudgetNarrowingArgs & { apiKeyHash: string }
+
+/**
+ * Mirrors `convex/budgets.ts`'s `createBudget` validator.
+ *
+ * The vocabularies are the CONTRACT'S (`BudgetScope` / `BudgetMeter` /
+ * `BudgetPeriod`), imported rather than respelled — a locally retyped union is
+ * exactly the second source of truth CLAUDE.md's Repo Conventions -> Types
+ * forbids, and here a drifted spelling is an `ArgumentValidationError` at
+ * runtime that nothing catches at build time.
+ */
+type CreateBudgetArgs = {
+  orgId: string
+  name: string
+  scope: BudgetScope
+  scopeId: string
+  meter: BudgetMeter
+  period: BudgetPeriod
+  limitAmount: number
+  currency?: string
+  rearmOnPeriodRoll?: boolean
+  enabled?: boolean
+}
+
+/**
+ * Mirrors `convex/budgets.ts`'s `updateBudget` validator.
+ *
+ * NOTE WHAT IS NOT HERE: no way to clear a trip. `updateBudget` deliberately
+ * cannot, because raising a limit is not a decision that the earlier, proven
+ * breach did not happen — only `resetBudget` clears one, and it is behind a
+ * different (admin) gate for that reason.
+ */
+type UpdateBudgetArgs = {
+  budgetId: string
+  name?: string
+  enabled?: boolean
+  limitAmount?: number
+  rearmOnPeriodRoll?: boolean
 }
 
 export const convex = {
@@ -332,6 +397,75 @@ export const convex = {
     // (tests/unit/failure_patterns_resolve_args.test.ts).
     getPatternResolutionEvidence: makeFunctionReference<Q>(
       'failure_patterns:getPatternResolutionEvidence',
+    ),
+  },
+
+  // --- BUDGET CIRCUIT BREAKERS ---------------------------------------------
+  //
+  // EVERY REF BELOW DECLARES ITS ARGS, and none of them is bare. This is the
+  // seam whose BOTH type parameters default to `any` (see the causality block
+  // above), and it is the seam a budget call crosses — where a dropped or
+  // misspelled arg is not a rendering defect but an enforcement one. A `runId`
+  // that silently fails to narrow returns a WELL-FORMED snapshot about a
+  // DIFFERENT SUBJECT, which is "some other agent has headroom" rendered as
+  // though it were about this one.
+  //
+  // THE RETURNS ARE `unknown`, DELIBERATELY, AND NOT `BreakerSnapshot`.
+  // Declaring the contract type here would be an ASSERTION, not a check —
+  // nothing verifies a string-named reference against the function it names, so
+  // the parameter would promise a guarantee the value never had. `unknown`
+  // forces every consumer through contracts' own `breakerSnapshotRefusals` /
+  // `snapshotUnusableFields`, which is the only thing that actually establishes
+  // what arrived. A `BreakerSnapshot` annotation here would let a malformed
+  // body reach a renderer with TypeScript vouching for it.
+  budgets: {
+    listBudgets: makeFunctionReference<Q, { orgId: string }, unknown>('budgets:listBudgets'),
+    getBudget: makeFunctionReference<Q, { budgetId: string }, unknown>('budgets:getBudget'),
+    /** Clerk-authed breaker evaluation. The SDK-facing twin is `budget_gate:sdkCheckBudget`. */
+    checkBudget: makeFunctionReference<Q, BudgetSubjectArgs, unknown>('budgets:checkBudget'),
+    /**
+     * ADMIN-gated. How close this org is to the sweep's GLOBAL ceiling.
+     *
+     * Surfaced so the ceiling is observable before it bites rather than
+     * inferable afterwards — and rendered with its own caveat intact, because
+     * `sweepBatchSize` is global across every org: being well under it is not
+     * proof of safety, only evidence that this org is not a large contributor.
+     *
+     * NOTE WHAT A LAGGING SWEEP DOES NOT COST. Breaker state is computed fresh
+     * on every check and never reads the sweep's output, so a lagging sweep
+     * cannot make an answer stale or permissive. What it delays is the AUDIT of
+     * a breach nobody happened to query. Rendering it as a staleness warning
+     * would be a false alarm in the halt-a-business direction.
+     */
+    getBudgetSweepPressure: makeFunctionReference<Q, { orgId: string }, unknown>(
+      'budgets:getBudgetSweepPressure',
+    ),
+    createBudget: makeFunctionReference<M, CreateBudgetArgs, unknown>('budgets:createBudget'),
+    updateBudget: makeFunctionReference<M, UpdateBudgetArgs, unknown>('budgets:updateBudget'),
+    deleteBudget: makeFunctionReference<M, { budgetId: string }, unknown>('budgets:deleteBudget'),
+    /**
+     * MEMBER-gated, audited. Tripping WITHHOLDS — its cost is delay — so it is
+     * not behind the admin gate that `resetBudget` is behind. See
+     * `convex/budgets.ts`'s header on the asymmetry.
+     */
+    tripBudget: makeFunctionReference<M, { budgetId: string; reason: string }, unknown>(
+      'budgets:tripBudget',
+    ),
+    /** ADMIN-gated, audited. Resetting RESUMES unbounded spend; the gate is the risk's own. */
+    resetBudget: makeFunctionReference<M, { budgetId: string; reason: string }, unknown>(
+      'budgets:resetBudget',
+    ),
+  },
+  // The API-key-authed gate (convex/budget_gate.ts). Separate module because it
+  // authenticates by pre-hashed key and must never reach for Clerk — the same
+  // split, for the same reason, as sdk_ingest.ts versus runs.ts.
+  //
+  // NOTE THE ABSENT `orgId`: the caller cannot name an organization, so it
+  // cannot name someone else's. The optional ids only NARROW within the key's
+  // own org.
+  budget_gate: {
+    sdkCheckBudget: makeFunctionReference<Q, SdkBudgetSubjectArgs, unknown>(
+      'budget_gate:sdkCheckBudget',
     ),
   },
 } as const

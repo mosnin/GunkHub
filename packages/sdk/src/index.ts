@@ -45,7 +45,22 @@ export {
   PROJECTION_IDENTITY_FIELDS,
   isPatternScanComplete,
 } from './reader.js'
-export { V1ApiError, fetchV1, tryParseV1Json, messageFromV1Body } from './v1-client.js'
+export { V1ApiError, fetchV1, postV1, tryParseV1Json, messageFromV1Body } from './v1-client.js'
+
+// BUDGET CIRCUIT BREAKERS — the first thing in this SDK that does something
+// other than record, and the only thing here that can change what an agent
+// DOES. `BudgetGuard` is the in-process seam: it holds a server-evaluated
+// snapshot, answers `check()` synchronously with no I/O so a per-model-call
+// breaker is affordable, and NEVER THROWS — an exception in an enforcement path
+// is an enforcement outcome nobody chose, and inside somebody's try/catch it is
+// the permissive one.
+//
+// IT DECLINES; IT DOES NOT STOP. Nothing exported here asserts that an agent
+// halted, that spend was prevented, or that a limit was enforced — those are
+// facts about a process this library sits inside and does not control. See
+// `packages/contracts/src/budgets.ts`, invariant 1.
+export { BudgetGuard, snapshotRefusals } from './budget-guard.js'
+export type { BudgetGuardConfig, SnapshotAcceptance } from './budget-guard.js'
 
 // Generic projection primitives — shared by the MCP server's projections and
 // by anything else shaping a v1 response into a budgeted one. See
@@ -133,6 +148,8 @@ export type {
   V1FleetHealthData,
   CausalTraceParams,
   V1CausalTraceData,
+  BudgetSnapshotParams,
+  V1BudgetSnapshotData,
 } from './reader.js'
 export type { V1ApiConfig, V1FetchLike, V1ApiErrorKind, V1Envelope } from './v1-client.js'
 
@@ -288,6 +305,67 @@ export type {
   CausalClaim,
   CausalClaimContradiction,
   CausalClaimFinding,
+  // Budget circuit breakers ("may this agent spend any more?"). THREE
+  // structural separations, and all three are load-bearing:
+  //
+  //   TOLD-YES vs NOT-ASKED — `AllowedByArmedBreaker`, `AllowedWithinGrace`,
+  //   `AllowedNoBudgetGoverns` and `AllowedWithoutAnswer` are four different
+  //   ways of proceeding and they share no field. There is deliberately no
+  //   `allowed: boolean`, because it would have made "the breaker said yes" and
+  //   "we never asked and the policy says go" the same number on the same graph.
+  //
+  //   EXACT vs APPROXIMATE — `ReconciledSpend` carries `reconciledAmount` and
+  //   `ApproximateSpend` carries `estimatedAmount`; there is no `amount`, so
+  //   `spend.amount >= limit.limitAmount` does not compile and the only
+  //   comparison is `compareSpendToLimit`, which is three-valued. ADR-002's
+  //   counters are approximate and NOT billing-grade, and an approximate $99
+  //   against a $100 cap is `not_decidable`, never `provably_under`.
+  //
+  //   THE BREAKER vs THE SDK vs THE AGENT — "the breaker is tripped" and "the
+  //   SDK declined" are facts we own. "The agent halted" is not, and no type or
+  //   field below can express it; `FORBIDDEN_ENFORCEMENT_CLAIM_FIELDS` is the
+  //   vocabulary the wire gate refuses.
+  //
+  // NOT collapsed into convenience unions, for the reasons written up in
+  // `packages/contracts/src/budgets.ts`.
+  BudgetLimit,
+  BudgetScope,
+  BudgetPeriod,
+  BudgetMeter,
+  BudgetSubject,
+  SpendFigure,
+  ReconciledSpend,
+  ApproximateSpend,
+  SpendReconciliation,
+  SpendApproximationKind,
+  SpendUsability,
+  LimitComparison,
+  BreakerState,
+  BreakerTripped,
+  BreakerArmed,
+  BreakerStateUndetermined,
+  BreakerUndeterminedKind,
+  BreakerTripCause,
+  BreakerSnapshot,
+  BreakerScan,
+  BudgetDecision,
+  BudgetDecisionInput,
+  BudgetUnavailablePolicy,
+  AllowedByArmedBreaker,
+  AllowedNoBudgetGoverns,
+  AllowedWithinGrace,
+  AllowedWithoutAnswer,
+  DeclinedBreakerTripped,
+  DeclinedNoAnswer,
+  BudgetUnusableReason,
+  BudgetUnusableFieldFinding,
+  BudgetClaim,
+  BudgetClaimContradiction,
+  BudgetClaimFinding,
+  UpsertBudgetRequest,
+  ManualTripRequest,
+  ManualResetRequest,
+  BudgetMutationResult,
 } from '@agent-flight-recorder/contracts'
 
 // Divergence verdict/coverage RULES (runtime). One implementation of "is this
@@ -396,4 +474,51 @@ export {
   MAX_SUSPECTED_LINK_RUNS,
   MAX_CAUSAL_NODES,
   DEFAULT_CAUSAL_MAX_DEPTH,
+  // Budget RULES (runtime). Same single-definition posture, and here it is not
+  // a consistency nicety — two implementations of "may this agent spend more?"
+  // is two different answers to the same question in the same company, one of
+  // which lets spend past a cap.
+  //
+  // `decideBudget` is THE rule, shared by `BudgetGuard` and `afr budget check`.
+  // `mayProceed` is the boolean a control-flow site needs, backed by a TOTAL
+  // map over the decision bands so a seventh band cannot ship unclassified.
+  // `compareSpendToLimit` is the ONLY way to compare a spend to a limit, and it
+  // is three-valued because an approximate figure near a cap decides nothing.
+  decideBudget,
+  mayProceed,
+  wasDeclinedBySdk,
+  compareSpendToLimit,
+  spendUsability,
+  isBreakerSnapshotComplete,
+  breakerSnapshotRefusals,
+  breakerCadenceInvariant,
+  // "Which tripped breaker may a decision rely on?" — scoped, so a typo in a
+  // sibling field cannot erase a genuine trip's identity and reason.
+  establishedTrip,
+  // The shelf life a snapshot states, as a DURATION — the one reader, so the
+  // decision rule and the refresh scheduler cannot end up on different clocks.
+  // Prefers the explicit `shelfLifeMs`; a duration means the same thing whenever
+  // it arrives, where an absolute instant silently spends the cadence margin on
+  // network transit — fleet-wide and simultaneously, at the worst moment.
+  statedShelfLifeMs,
+  // "Do the snapshot's claims agree with the figures it ships with?" — the one
+  // a GATE calls. `armed_on_undecidable_spend` is the ADR-002 audit.
+  snapshotClaimContradictions,
+  // "Is what arrived something a comparison can be trusted with?" — asked at the
+  // boundary, BEFORE any limit check. '9900' >= 10000 is false by JS coercion,
+  // so a wrong-typed spend figure does not FAIL a limit check, it PASSES one.
+  snapshotUnusableFields,
+  // The decision sentence is COMPOSED, never transmitted — so no surface can
+  // phrase a decline as an outcome. Render this, never a string from the wire.
+  decisionStatement,
+  spendStatement,
+  FORBIDDEN_ENFORCEMENT_CLAIM_FIELDS,
+  BUDGET_SCOPES,
+  BUDGET_PERIODS,
+  BUDGET_METERS,
+  MAX_BREAKER_STATES,
+  BREAKER_EVALUATION_CADENCE_MS,
+  BREAKER_FRESHNESS_CADENCE_MULTIPLE,
+  MAX_BREAKER_ANSWER_FRESHNESS_MS,
+  MAX_BREAKER_GRACE_MS,
 } from '@agent-flight-recorder/contracts'

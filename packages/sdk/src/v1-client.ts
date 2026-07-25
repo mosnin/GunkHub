@@ -139,6 +139,61 @@ export async function fetchV1<T>(
     throw new V1ApiError('network', `Network error calling ${path}: ${err instanceof Error ? err.message : String(err)}`)
   }
 
+  return interpretV1Response<T>(res, path)
+}
+
+/**
+ * Perform a POST against a v1 route and return the parsed `data` envelope field.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY A WRITE HELPER LIVES IN A MODULE THAT SAYS "READ API" IN ITS HEADER
+ * ---------------------------------------------------------------------------
+ *
+ * The v1 surface was read-only until budget circuit breakers, which introduced
+ * the first PRIVILEGED operations an operator drives from outside the web UI:
+ * defining a budget, tripping a breaker by hand, clearing one. Those are
+ * admin-gated and audited server-side into the append-only admin audit log
+ * (CLAUDE.md Event Log Rule 6), and they are the CLI's to expose.
+ *
+ * IT SHARES THE STATUS MAPPING RATHER THAN REINVENTING IT, which is the whole
+ * reason it is here and not in the CLI: a POST that mapped 403 differently from
+ * a GET would give the same misconfiguration two different exit codes depending
+ * on which subcommand hit it.
+ *
+ * NOTE WHAT THIS DOES NOT OPEN. `packages/mcp` is a read surface by CLAUDE.md
+ * and stays one; this helper is not a licence to add a write tool there. And no
+ * ingest path moves here — events still go through `HttpTransport`.
+ *
+ * @throws {@link V1ApiError} on any auth/not-found/rate-limit/server/network/parse failure.
+ */
+export async function postV1<T>(
+  config: V1ApiConfig,
+  path: string,
+  body: unknown,
+  fetchImpl: V1FetchLike = fetch as unknown as V1FetchLike
+): Promise<T> {
+  const url = `${config.baseUrl.replace(/\/$/, '')}${path}`
+  let res: Awaited<ReturnType<V1FetchLike>>
+  try {
+    res = await fetchImpl(url, {
+      method: 'POST',
+      headers: { 'x-api-key': config.apiKey, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  } catch (err) {
+    throw new V1ApiError('network', `Network error calling ${path}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  return interpretV1Response<T>(res, path)
+}
+
+/**
+ * Map a v1 response to either its `data` payload or a {@link V1ApiError}.
+ *
+ * The ONE place HTTP status becomes a {@link V1ApiErrorKind}, shared by
+ * {@link fetchV1} and {@link postV1}. Two copies is how a 403 becomes exit 2 on
+ * a read and exit 4 on a write.
+ */
+async function interpretV1Response<T>(res: Awaited<ReturnType<V1FetchLike>>, path: string): Promise<T> {
   if (res.status === 401 || res.status === 403) {
     const body = await tryParseV1Json(res)
     const code = codeFromV1Body(body)

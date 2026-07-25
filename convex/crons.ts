@@ -1,6 +1,7 @@
 // Convex scheduled jobs for Agent Flight Recorder.
 // All jobs run on the UTC timezone defined by hourUTC/minuteUTC.
 
+import { BREAKER_EVALUATION_CADENCE_MS } from "@agent-flight-recorder/contracts";
 import { cronJobs , makeFunctionReference } from "convex/server";
 
 const crons = cronJobs();
@@ -145,6 +146,54 @@ crons.interval(
   "backfill-missing-explanations",
   { minutes: 30 },
   makeFunctionReference<"action">("run_explanations:backfillMissingExplanations"),
+  {},
+);
+
+// BUDGET CIRCUIT BREAKERS — re-evaluate the stalest enabled breakers.
+//
+// EVERY MINUTE, and the interval is load-bearing rather than a taste. A budget
+// check (`checkBudget` / `sdkCheckBudget`) reads the state THIS job wrote; a
+// state older than the breaker's `maxStalenessMs` does not decide, it withholds
+// (convex/helpers/budget.ts PART 4). The staleness floor is two minutes —
+// deliberately TWICE this interval — so one missed tick does not flip every
+// breaker in the deployment to "withhold" at once.
+//
+// THE FAILURE MODE IS INTENTIONALLY LOUD AND SAFE. If this job stops, budgets do
+// not silently become permissive; they stop answering and every cooperating
+// caller withholds. That costs honest work during an outage of ours, and it is
+// the deliberate choice — the alternative is that our own downtime is the
+// reliable way to defeat every budget in the system.
+//
+// BOUNDED: at most BUDGET_SWEEP_BATCH breakers per tick, taken oldest-evaluated
+// first from `budget_breakers.by_enabled_evaluated` with `enabled = true`, so
+// disabled breakers cost nothing and a never-evaluated breaker (which is
+// currently withholding) is picked up first.
+//
+// N5 — THE INTERVAL IS DERIVED, NOT WRITTEN DOWN A SECOND TIME.
+//
+// A `{ minutes: 1 }` literal here and `BREAKER_EVALUATION_CADENCE_MS` in the
+// contract are two spellings of one number that nothing forces to agree, and
+// `breakerCadenceInvariant()` cannot catch the drift because it only relates
+// contract constants to each other. Team D added a test that reads the schedule
+// off this export and compares it — which turns the drift red the day someone
+// edits one side.
+//
+// A test that catches drift is strictly worse than a registration that cannot
+// drift, so the coupling lives HERE: the schedule is COMPUTED from the contract
+// constant. There is now no second literal to get wrong, and Team D's check
+// becomes a belt-and-braces confirmation of an equality that holds by
+// construction. The assertion below fires at module load rather than letting a
+// fractional interval reach the scheduler silently.
+const BREAKER_SWEEP_SECONDS = BREAKER_EVALUATION_CADENCE_MS / 1000;
+if (!Number.isInteger(BREAKER_SWEEP_SECONDS) || BREAKER_SWEEP_SECONDS <= 0) {
+  throw new Error(
+    `BREAKER_EVALUATION_CADENCE_MS (${BREAKER_EVALUATION_CADENCE_MS}) must be a positive whole number of seconds to be registrable as a cron interval.`,
+  );
+}
+crons.interval(
+  "evaluate-budget-breakers",
+  { seconds: BREAKER_SWEEP_SECONDS },
+  makeFunctionReference<"action">("budgets:sweepBudgetBreakers"),
   {},
 );
 

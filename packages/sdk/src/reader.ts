@@ -21,6 +21,8 @@
  */
 import {
   causalTraversalVerdict,
+  snapshotClaimContradictions,
+  snapshotUnusableFields,
   divergenceReportVerdict,
   fleetDivergenceVerdict,
   SHARED_ATTRIBUTE_HYPOTHESIS_KINDS,
@@ -38,6 +40,7 @@ import { fetchV1, V1ApiError } from './v1-client.js'
 
 import type { V1ApiConfig, V1FetchLike } from './v1-client.js'
 import type {
+  BreakerSnapshot,
   CausalDirection,
   CausalTraversal,
   DivergenceReport,
@@ -2465,6 +2468,219 @@ export class FlightReader {
     )
     assertCausalTraversalTrustworthy(data.traversal as CausalTraversal, params)
     return data
+  }
+
+  /**
+   * Read every budget circuit breaker governing a subject, in ONE call.
+   *
+   * Breaker types are contracts' — see `packages/contracts/src/budgets.ts`. The
+   * enforcement seam is `BudgetGuard` (`./budget-guard.ts`); this method is only
+   * how a snapshot is obtained.
+   *
+   * **THE ANSWER HAS A SERVER-STATED SHELF LIFE.** `snapshot.freshUntil` is the
+   * server's judgement about how long its answer stays good — only the server
+   * knows the spend rate and the distance to the cap. Hand the snapshot to a
+   * `BudgetGuard` and let it answer `check()` locally until then; that is what
+   * makes a per-model-call breaker affordable. The client caps the shelf life at
+   * `MAX_BREAKER_ANSWER_FRESHNESS_MS` whatever the server says, because an
+   * unbounded shelf life is a bypass.
+   *
+   * **AN EMPTY SNAPSHOT IS NOT AN ALL-CLEAR.** `scan.budgetsInScope === 0` means
+   * no budget governs this subject, which is also what a deleted or mis-scoped
+   * budget looks like. `decideBudget` gives it its own decision band rather than
+   * counting it as headroom.
+   *
+   * SERVER SUPPORT: the route does not exist yet at the time of writing — it is
+   * Team A's (`convex/`) and the web layer's (`apps/web`) to build. This method
+   * is written against the exact contract shape, so wiring the route should
+   * require no SDK change. Until then, calling it surfaces a `V1ApiError` with
+   * `kind: 'not_found'`, and a `BudgetGuard` on a `deny` policy will decline —
+   * which is the correct behaviour for a breaker whose server is not there.
+   *
+   * @param params - the subject to evaluate breakers for. At least one of
+   *   `runId`/`agentId`/`projectId` must be set; the key's org is implied.
+   * @returns `{ snapshot }` — hand it straight to `BudgetGuard.absorbSnapshot`.
+   * @throws {@link V1ApiError} on any auth/not-found/rate-limit/server/network failure.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if the snapshot
+   *   cannot be trusted — see {@link assertBreakerSnapshotTrustworthy}.
+   * @throws {RangeError} if no subject was named — a caller bug, before any request.
+   */
+  async getBudgetSnapshot(params: BudgetSnapshotParams): Promise<V1BudgetSnapshotData> {
+    const named = [params?.runId, params?.agentId, params?.projectId].filter(
+      (value) => typeof value === 'string' && value.length > 0
+    )
+    if (named.length === 0) {
+      throw new RangeError(
+        `getBudgetSnapshot: name a subject (runId, agentId or projectId). There is deliberately no "everything in ` +
+          `the org" default: a breaker check whose subject is implicit silently changes meaning the day someone ` +
+          `adds an org-wide budget, and it changes it in the direction that stops agents.`
+      )
+    }
+
+    const data = await fetchV1<V1BudgetSnapshotData>(
+      this.config,
+      '/api/v1/budgets/snapshot',
+      {
+        ...(params.runId !== undefined && { runId: params.runId }),
+        ...(params.agentId !== undefined && { agentId: params.agentId }),
+        ...(params.projectId !== undefined && { projectId: params.projectId }),
+      },
+      this.fetchImpl
+    )
+    assertBreakerSnapshotTrustworthy(data.snapshot, params)
+    return data
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/budgets/snapshot
+//
+// "May this agent spend any more?" — the enforcement altitude. Breaker types
+// are contracts' (`packages/contracts/src/budgets.ts`); the engine is Team A's.
+// ---------------------------------------------------------------------------
+
+/** Parameters for {@link FlightReader.getBudgetSnapshot}. At least one subject field is required. */
+export interface BudgetSnapshotParams {
+  /** Evaluate breakers governing this run (and everything above it in the hierarchy). */
+  runId?: string
+  /** Evaluate breakers governing this agent. */
+  agentId?: string
+  /** Evaluate breakers governing this project. */
+  projectId?: string
+}
+
+/** Response shape for `GET /api/v1/budgets/snapshot`. */
+export interface V1BudgetSnapshotData {
+  snapshot: BreakerSnapshot
+}
+
+/**
+ * Refuse a breaker snapshot that cannot be enforced on.
+ *
+ * SAME POSTURE AS {@link assertCausalTraversalTrustworthy}, applied to the one
+ * surface in this SDK whose output changes what an agent DOES rather than what
+ * an operator reads. The failure modes are correspondingly worse in both
+ * directions: a snapshot that wrongly says `armed` lets spend run past a cap,
+ * and one that wrongly says `tripped` stops a company's agents.
+ *
+ * FIVE GROUNDS. Two of them are new to this feature, and both exist because of
+ * invariants the type system enforces in OUR code and cannot enforce on a JSON
+ * body.
+ *
+ * 1. IGNORED PARAMETERS. The subject is echoed on `scan.subject`, and a
+ *    deployment that evaluated a different subject returned a well-formed
+ *    answer to a question nobody asked — here, "some other agent has headroom",
+ *    rendered as though it were about this one.
+ *
+ * 2. CONTENTS THAT ARE NOT USABLE AT ALL. Checked before any comparison, for
+ *    the reason written up in contracts: `'9900' >= 10000` is `false` by JS
+ *    coercion and `NaN >= 10000` is `false` too, so a wrong-typed spend figure
+ *    does not fail a limit check — IT PASSES ONE.
+ *
+ * 3. A CLAIM THE SNAPSHOT'S OWN FIGURES REFUTE. NEW, AND IT IS THE ADR-002
+ *    GROUND. `usage_counters` is explicitly approximate and explicitly not
+ *    billing-grade, so a breaker reported as `armed` on an estimate that
+ *    straddles its cap has established nothing — it is "we could not tell"
+ *    rendered as "there is room", which is the failure this whole feature
+ *    exists to prevent, and it is decidable from the figures already in hand
+ *    because every state carries the limit it is about. Contracts'
+ *    `snapshotClaimContradictions` is the single enumeration, driven by a total
+ *    table so a new self-claim cannot ship unaudited.
+ *
+ * 4. A BODY THAT CLAIMS THE AGENT WAS STOPPED. NEW, AND THE CENTRAL ONE FOR
+ *    THIS FEATURE'S FIRST INVARIANT. We record and we decline; we do not stop a
+ *    process, and we cannot observe whether one stopped. Contracts gives no
+ *    type a field named `enforced`, `halted`, `blocked` or `prevented`, so the
+ *    claim is unspellable in our code — but a JSON body can add one back, and
+ *    every surface that spreads a state object would then render it. The
+ *    absence is therefore re-checked here, at the one layer every consumer
+ *    passes through. Reported by `snapshotUnusableFields` as
+ *    `forbidden_enforcement_claim`.
+ *
+ * 5. A SHELF LIFE THAT IS NOT ONE. `freshUntil <= evaluatedAt` is an answer born
+ *    stale; a `freshUntil` far in the future is a bypass. The first is refused
+ *    here; the second is CAPPED rather than refused, by `decideBudget`, because
+ *    an over-generous shelf life on an otherwise sound answer should degrade to
+ *    a shorter one rather than to no answer at all.
+ *
+ * NOT CHECKED, deliberately: `evaluationTruncated`, and an `undetermined`
+ * state. Those are the server TELLING THE TRUTH in a field, and the correct
+ * response is a `declined_no_answer` decision under the caller's own policy —
+ * which `decideBudget` already produces. Throwing them away here would replace
+ * a decision the caller configured with an exception they did not.
+ */
+function assertBreakerSnapshotTrustworthy(snapshot: BreakerSnapshot, params: BudgetSnapshotParams): void {
+  const context = 'getBudgetSnapshot'
+
+  const scan = (snapshot as { scan?: unknown })?.scan
+  if (scan === null || typeof scan !== 'object' || Array.isArray(scan)) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the snapshot carried no usable \`scan\`. Without it there is no way to tell a subject that is ` +
+        `governed by no budget from one whose budgets were never read, and "no breakers found" would read as "no ` +
+        `budget applies". Refusing to report an unevaluated subject as an unbudgeted one.`
+    )
+  }
+
+  const subject = (scan as { subject?: unknown }).subject
+  if (subject === null || typeof subject !== 'object' || Array.isArray(subject)) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the scan carried no \`subject\`, so there is no way to check that this snapshot is about the ` +
+        `subject that was asked about. Refusing.`
+    )
+  }
+  const echoed = subject as Record<string, unknown>
+  for (const field of ['runId', 'agentId', 'projectId'] as const) {
+    const requested = params[field]
+    if (requested === undefined) continue
+    if (echoed[field] !== requested) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: asked about ${field}=${JSON.stringify(requested)} but the scan reports ` +
+          `${JSON.stringify(echoed[field] ?? null)}. This deployment ignored the parameter, so these breakers ` +
+          `govern something else — a well-formed statement that SOME OTHER subject has headroom, rendered as ` +
+          `though it were about this one. Refusing.`
+      )
+    }
+  }
+
+  // Grounds 2, 4 and 5, in one sweep. `snapshotUnusableFields` reports the
+  // forbidden-claim fields and the non-positive shelf life alongside the
+  // ordinary type failures, so no gate can cover four of five.
+  const unusable = snapshotUnusableFields(snapshot)
+  if (unusable.length > 0) {
+    const claims = unusable.filter((f) => f.reason === 'forbidden_enforcement_claim')
+    if (claims.length > 0) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: the response asserts something this system cannot know — ` +
+          `[${claims.map((f) => f.path).join(', ')}]. This SDK records, and it DECLINES; it does not stop a ` +
+          `process and cannot observe whether one stopped. A field named "enforced" or "halted" becomes a line in ` +
+          `an incident review and eventually a compliance claim that nobody can support. Refusing to carry it.`
+      )
+    }
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: ${unusable.length} field(s) in the snapshot cannot be used — ` +
+        `[${unusable.map((f) => `${f.path}: ${f.reason}`).join(', ')}]. Every limit check is a comparison, and a ` +
+        `comparison against a wrong-typed value does not fail, it TAKES A BRANCH: '9900' >= 10000 is false by JS ` +
+        `coercion, and so is NaN >= 10000. A malformed spend figure would not fail a limit check, it would pass ` +
+        `one. Refusing.`
+    )
+  }
+
+  // Ground 3.
+  const contradictions = snapshotClaimContradictions(snapshot)
+  if (contradictions.length > 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: ${contradictions.length} claim(s) in this snapshot are contradicted by the spend figures it ` +
+        `ships with — [${contradictions.map((f) => `${f.at}: ${f.contradiction}`).join(', ')}]. The one to look at ` +
+        `first is \`armed_on_undecidable_spend\`: ADR-002's usage counters are approximate and explicitly not ` +
+        `billing-grade, so an estimate that straddles its own cap establishes NOTHING, and a breaker armed on it ` +
+        `is "we could not tell" rendered as "there is room". Refusing.`
+    )
   }
 }
 

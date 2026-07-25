@@ -13,10 +13,15 @@
  * `afr` process exit-code convention (0 ok, 1 usage, 2 auth, 3 not-found,
  * 4 network/server/other) — computed from the shared `V1ApiError.kind`.
  */
-import { FlightReader, V1ApiError } from '@agent-flight-recorder/sdk'
+import { FlightReader, postV1, V1ApiError } from '@agent-flight-recorder/sdk'
 
 import type {
   AgentDivergenceParams,
+  BudgetMutationResult,
+  BudgetSnapshotParams,
+  ManualResetRequest,
+  ManualTripRequest,
+  V1BudgetSnapshotData,
   CausalDirection,
   CausalTraceParams,
   FleetHealthParams,
@@ -280,6 +285,64 @@ export async function getCausalTrace<D extends CausalDirection>(
 ): Promise<V1CausalTraceData<D>> {
   try {
     return await new FlightReader(config, fetchImpl).getCausalTrace(params)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/**
+ * Read every budget circuit breaker governing a subject, in ONE call.
+ *
+ * Routes through `FlightReader`, so every refusal in that gate reaches the CLI
+ * as an `ApiClientError` rather than as a plausible-looking snapshot. The one
+ * to know about: a breaker reported ARMED on an approximate spend figure that
+ * straddles its own cap is refused, not rendered — "we could not tell" shown as
+ * "there is room" is the failure the whole feature exists against.
+ */
+export async function getBudgetSnapshot(
+  config: ApiClientConfig,
+  params: BudgetSnapshotParams,
+  fetchImpl?: ApiFetchLike
+): Promise<V1BudgetSnapshotData> {
+  try {
+    return await new FlightReader(config, fetchImpl).getBudgetSnapshot(params)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/**
+ * Trip a breaker by hand. PRIVILEGED — admin-gated and audited server-side into
+ * the append-only admin audit log (CLAUDE.md Event Log Rule 6).
+ *
+ * The `reason` is not optional and is not defaulted anywhere in this path: a
+ * manual trip has no meter reading behind it, so the audit entry's only content
+ * is the sentence an operator wrote.
+ *
+ * SERVER SUPPORT: the route is Team A's / the web layer's to build. Until it
+ * exists this surfaces `not_found` (exit 3), which is the honest outcome — a
+ * privileged mutation that silently no-ops would be far worse.
+ */
+export async function tripBudget(
+  config: ApiClientConfig,
+  request: ManualTripRequest,
+  fetchImpl?: ApiFetchLike
+): Promise<BudgetMutationResult> {
+  try {
+    return await postV1<BudgetMutationResult>(config, '/api/v1/budgets/trip', request, fetchImpl)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/** Clear a tripped breaker. PRIVILEGED and audited — see {@link tripBudget}. */
+export async function resetBudget(
+  config: ApiClientConfig,
+  request: ManualResetRequest,
+  fetchImpl?: ApiFetchLike
+): Promise<BudgetMutationResult> {
+  try {
+    return await postV1<BudgetMutationResult>(config, '/api/v1/budgets/reset', request, fetchImpl)
   } catch (err) {
     toApiClientError(err)
   }

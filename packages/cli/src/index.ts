@@ -10,6 +10,15 @@
  * `explain` talk to the public v1 read API (`GET /api/v1/runs...`, see
  * `src/apiClient.ts`) via `x-api-key` auth.
  */
+import {
+  BUDGET_HELP,
+  exitCodeForBudget,
+  parseBudgetArgs,
+  printBudget,
+  printBudgetMutation,
+  runBudgetCheck,
+  runBudgetMutation,
+} from './commands/budget.js'
 import { CAUSE_HELP, exitCodeForCause, parseCauseArgs, printCause, runCause } from './commands/cause.js'
 import { COMPAT_HELP, exitCodeForCompat, parseCompatArgs, printCompat, runCompat } from './commands/compat.js'
 import { printConfigCheck, runConfigCheck } from './commands/config-check.js'
@@ -75,6 +84,28 @@ export {
   DEFAULT_BURST_WINDOW_MINUTES,
 } from './commands/fleet.js'
 export type { FleetArgs, FleetCommandResult, FleetResult, FleetFailOn } from './commands/fleet.js'
+export {
+  parseBudgetArgs,
+  runBudgetCheck,
+  runBudgetMutation,
+  printBudget,
+  printBudgetMutation,
+  exitCodeForBudget,
+  validatePrivilegedArgs,
+  BUDGET_EXIT_TRIPPED,
+  BUDGET_EXIT_INDETERMINATE,
+  DEFAULT_UNAVAILABLE_MODE,
+  DEFAULT_GRACE_MS,
+  BUDGET_HELP,
+} from './commands/budget.js'
+export type {
+  BudgetArgs,
+  BudgetCheckResult,
+  BudgetCommandResult,
+  BudgetUnavailableMode,
+  BudgetMutationCommandResult,
+  BudgetPrivilegedResult,
+} from './commands/budget.js'
 export { runConfigCheck, printConfigCheck } from './commands/config-check.js'
 export type { ConfigCheck, ConfigCheckResult, FetchLike } from './commands/config-check.js'
 export { runRecordDemo, printRecordDemo } from './commands/record-demo.js'
@@ -120,6 +151,12 @@ Usage:
   afr <command> [subcommand] [args]
 
 Commands:
+  afr budget check --agent <id> | --run <id>
+                                May this agent spend any more? Asks the recorded
+                                budget circuit breakers. FAILS CLOSED by default:
+                                if the breaker cannot be consulted, this does not
+                                pass. Exit 10 tripped, 11 cannot establish.
+                                'afr budget list|trip|reset' for the rest.
   afr triage                    START HERE: what is wrong right now, and what to look at first
   afr cause <runId> --direction up|down|both
                                 What caused this run, and what did it break? Walks the
@@ -206,6 +243,34 @@ export async function main(argv: string[], log: (line: string) => void = console
       const result = await runInit(args)
       printInit(result, log)
       return result.exitCode
+    }
+
+    case 'budget': {
+      const args = parseBudgetArgs(afterCommand)
+      if (args.help === true || args.subcommand === undefined) {
+        log(BUDGET_HELP)
+        // Bare `afr budget` is a usage error (1); `--help` is not (0). A deploy
+        // gate that typos the subcommand must not exit 0.
+        return args.help === true ? 0 : 1
+      }
+      if (args.subcommand === 'trip' || args.subcommand === 'reset') {
+        const mutation = await runBudgetMutation(args, args.subcommand)
+        printBudgetMutation(mutation, log)
+        return mutation.ok ? 0 : mutation.exitCode
+      }
+      if (args.subcommand !== 'check' && args.subcommand !== 'list') {
+        log(`Unknown 'budget' subcommand: ${args.subcommand}. Try check, list, trip or reset.`)
+        return 1
+      }
+      const result = await runBudgetCheck(args)
+      printBudget(args, result, log)
+      // Transport/usage failures that are MISCONFIGURATION (bad key, unknown
+      // subject) keep the shared 0-4 convention; an outage does not, because
+      // `runBudgetCheck` feeds it to the policy instead. A SUCCESSFUL read maps
+      // its decision to 0/10/11. Exit 0 is unreachable unless a breaker was
+      // consulted, no budget governs the subject, or an expired yes was
+      // honoured inside an explicitly configured grace.
+      return result.ok ? exitCodeForBudget(result) : result.exitCode
     }
 
     case 'triage': {

@@ -22,7 +22,23 @@ import {
  * future read-only, API-key-authenticated surface (no such surface is wired
  * up yet).
  */
-export const API_KEY_SCOPES = ["ingest:write", "ingest:read", "read"] as const;
+export const API_KEY_SCOPES = [
+  "ingest:write",
+  "ingest:read",
+  "read",
+  // PRIVILEGED BUDGET SCOPES. Unlike every scope above, these are NEVER granted
+  // by the `scopes: undefined` back-compat path — see requirePrivilegedScope in
+  // convex/budget_gate.ts. They must be listed explicitly on a key, and they are
+  // only half of the check: the key's CREATOR must also still hold the matching
+  // org role. See that file's header for why both are required.
+  //
+  // Two scopes rather than one, because collapsing them would undo the
+  // permission asymmetry: tripping WITHHOLDS and costs delay, resetting RESUMES
+  // unbounded spend. A single "budget:write" scope would let anything that can
+  // pull the cord also clear a proven breach.
+  "budget:trip",
+  "budget:reset",
+] as const;
 
 /**
  * Create a new API key record for an organization.

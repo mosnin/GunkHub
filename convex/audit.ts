@@ -55,6 +55,30 @@ export const AUDIT_ACTIONS = [
   // makes the lifecycle transition history reconstructible end-to-end from
   // the append-only audit log alone — no mutable per-pattern history table.
   "failure_pattern.regressed",
+  // BUDGET CIRCUIT BREAKERS (convex/budgets.ts, convex/helpers/budget.ts).
+  //
+  // Every one of these is a privileged mutation of a control that governs
+  // whether an autonomous agent's caller proceeds, so all six are audited per
+  // Event Log Rule 6. Note the deliberate split between the two trip actions:
+  //
+  //   budget.tripped        a HUMAN decided, recorded with their Clerk user id.
+  //   budget.auto_tripped   an EVALUATION crossed the limit, recorded with
+  //                         SYSTEM_ACTOR. Written by evaluateBreaker.
+  //
+  // Keeping them apart is what makes the whole trip/reset history
+  // reconstructible from the append-only audit log alone — the same reasoning
+  // as ADR-006's "failure_pattern.reopened" vs "failure_pattern.regressed"
+  // above, and the reason there is no mutable per-breaker history table.
+  //
+  // NONE of these action names says anything about an agent being stopped.
+  // They name what the BREAKER did, which is the only thing this product
+  // observed. See convex/helpers/budget.ts PART 3.
+  "budget.created",
+  "budget.updated",
+  "budget.deleted",
+  "budget.tripped",
+  "budget.auto_tripped",
+  "budget.reset",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -77,6 +101,16 @@ export const SYSTEM_ACTOR = "system";
  * Append one audit row. Called from privileged mutations AFTER their own auth
  * checks have passed — this helper performs no authorization of its own.
  * Insert-only by construction: there is no corresponding update/delete.
+ *
+ * RETURNS THE INSERTED ROW ID — THE RECEIPT. The contract's
+ * `BudgetMutationResult` requires `auditLogId`, and without this the audit row
+ * existed but nothing could point at it: an operator who tripped a budget
+ * mid-incident had no id to cite in a ticket or a postmortem, and the only way
+ * to find their own entry was to scan the org's log and guess by timestamp. For
+ * a privileged, audited write, "it was recorded, and here is the id" is most of
+ * the value of having recorded it.
+ *
+ * Additive: every existing call site ignores the return.
  */
 export async function recordAuditEvent(
   ctx: MutationCtx,
@@ -88,13 +122,13 @@ export async function recordAuditEvent(
     targetId: string;
     metadata?: Record<string, unknown>;
   },
-): Promise<void> {
+): Promise<Id<"audit_log">> {
   // Defense in depth: the closed set is enforced at runtime too, so a future
   // call site cannot invent an unvocabularied action string via a cast.
   if (!AUDIT_ACTION_SET.has(entry.action)) {
     throw afrError("INVALID_ARGUMENT", `Unknown audit action "${entry.action}"`);
   }
-  await ctx.db.insert("audit_log", {
+  return await ctx.db.insert("audit_log", {
     orgId: entry.orgId,
     actorClerkUserId: entry.actorClerkUserId,
     action: entry.action,

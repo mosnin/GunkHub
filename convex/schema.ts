@@ -1212,4 +1212,118 @@ export default defineSchema({
     // return the existing row rather than insert a duplicate, which would
     // otherwise inflate every fan-out count in the graph.
     .index("by_org_triple", ["orgId", "producerRunId", "consumerRunId", "kind"]),
+
+  // ---------------------------------------------------------------------------
+  // BUDGET CIRCUIT BREAKERS.
+  //
+  // "This agent may not spend more than X" as a stored, evaluated, audited fact.
+  // The full reasoning — why the substrate is `runs.tokensIn/tokensOut` and NOT
+  // `usage_counters`, why recorded spend is a FLOOR that can prove a breach but
+  // never prove compliance, why nothing here may claim an agent was stopped, and
+  // why an unevaluable breaker withholds — is in convex/helpers/budget.ts. Read
+  // it before changing any field below.
+  //
+  // ADDITIVE: net-new table, no existing document is affected, no migration.
+  //
+  // THE APPEND-ONLY LOG IS UNTOUCHED BY THIS FEATURE. Evaluating, tripping,
+  // re-arming and resetting a breaker write to THIS table and to `audit_log`,
+  // and to nothing else. No event is appended, no run is patched, `runs.status`
+  // is never set. A budget cannot corrupt a run in flight because it never
+  // writes to one — asserted in convex/budgets.test.ts across a window roll.
+  // ---------------------------------------------------------------------------
+  budget_breakers: defineTable({
+    orgId: v.id("organizations"),
+
+    // -- THE DEFINITION. Vocabulary is the CONTRACT'S, not this file's. -----
+    // `scope`, `meter` and `period` are the frozen vocabularies from
+    // packages/contracts/src/budgets.ts (BUDGET_SCOPES / BUDGET_METERS /
+    // BUDGET_PERIODS). They are spelled out as v.literal unions here because
+    // Convex's validator DSL cannot be built from a runtime array, and
+    // convex/budgets.ts asserts at module load that the two agree — so a
+    // vocabulary change in the contract fails loudly here instead of drifting.
+    scope: v.union(
+      v.literal("org"),
+      v.literal("project"),
+      v.literal("agent"),
+      v.literal("agent_version"),
+      v.literal("run"),
+    ),
+    /** The governed entity's id. For scope "org", the org's own id. */
+    scopeId: v.string(),
+    meter: v.union(
+      v.literal("cost_minor_units"),
+      v.literal("tokens_in"),
+      v.literal("tokens_out"),
+      v.literal("runs_started"),
+      v.literal("events_ingested"),
+    ),
+    period: v.union(
+      v.literal("run"),
+      v.literal("hour"),
+      v.literal("day"),
+      v.literal("month"),
+      v.literal("lifetime"),
+    ),
+    /** Integer, in the meter's own unit. >= BUDGET_MIN_LIMIT_AMOUNT: a limit of 0 is breached by an empty window. */
+    limitAmount: v.number(),
+    /** ISO 4217 for cost meters. Stored for display only — this backend refuses to produce cost figures at all. */
+    currency: v.optional(v.string()),
+    name: v.string(),
+    enabled: v.boolean(),
+    /** Re-arm when the accounting period rolls past the trip, rather than only on an operator reset. */
+    rearmOnPeriodRoll: v.boolean(),
+
+    // -- TRIP FACTS. The ONLY evaluated thing persisted, and deliberately. ---
+    //
+    // NOTE WHAT IS NOT HERE: no `state`, no `evaluatedAt`, no cached
+    // observation. An earlier draft of this table stored all three, which was a
+    // stored projection over the log — the thing CLAUDE.md Event Log Rule 2 and
+    // the contract's BreakerSnapshot header both forbid ("DERIVED, NEVER SOURCE
+    // OF TRUTH ... recompute it; do not store it back"). Breaker state is now
+    // computed at query time in convex/budgets.ts, so it cannot go stale and
+    // there is no cache to disagree with the runs it was derived from.
+    //
+    // A TRIP IS DIFFERENT AND IS PERSISTED, because it is not a projection: it
+    // is a recorded FACT with an audit row behind it, and for a manual trip it
+    // is a human decision that no recomputation could ever rediscover. A trip
+    // persists until an operator resets it (or, opt-in, until the period rolls
+    // past it) — spend falling back under the limit does not clear it.
+    trippedAt: v.optional(v.number()),
+    trippedBy: v.optional(v.union(v.literal("limit_reached"), v.literal("manual_trip"))),
+    /**
+     * The system's own past-tense account of the trip. Composed through
+     * assertNoExecutionClaim, so it names the BREAKER and the recorded total and
+     * never claims an agent stopped — see convex/helpers/budget.ts PART 3.
+     */
+    trippedBecause: v.optional(v.string()),
+    /** Clerk user id for a manual trip; the system actor for an automatic one. */
+    trippedByUser: v.optional(v.string()),
+    /**
+     * Operator free text from a manual trip or reset, stored VERBATIM and never
+     * composed into a system statement. The execution-claim guard applies to our
+     * voice, not to a human's account of what they did.
+     */
+    operatorNote: v.optional(v.string()),
+
+    /**
+     * Last operator reset. Advances the accounting window start for EVERY
+     * period, so a reset means "begin a new accounting period now" rather than a
+     * button that re-trips on the next evaluation.
+     */
+    resetAt: v.optional(v.number()),
+    resetBy: v.optional(v.string()),
+
+    createdAt: v.number(),
+    createdBy: v.string(),
+  })
+    // Every read of this table is org-scoped; this is the listing index.
+    .index("by_org", ["orgId"])
+    // The gate asks "which budgets govern THIS subject?" and needs one range per
+    // scope level: (org, "org", orgId), (org, "agent", agentId), and so on.
+    // Justified by a caller shipping in this change — without it every check
+    // scans all of the org's budgets.
+    .index("by_org_scope", ["orgId", "scope", "scopeId"])
+    // The trip-recording sweep walks enabled budgets across all orgs. Ranging on
+    // `enabled` keeps a deployment full of disabled budgets off the sweep.
+    .index("by_enabled", ["enabled"]),
 });
