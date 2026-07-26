@@ -1,48 +1,15 @@
-import { query, mutation } from "convex/server";
 import { v } from "convex/values";
-import { requireOrgMembership } from "./auth.js";
 
-/**
- * Return the distinct agents that have at least one run in the given org.
- * Used to populate the agent filter dropdown on the runs list page.
- */
-export const listDistinctAgents = query({
-  args: {
-    orgId: v.id("organizations"),
-  },
-  handler: async (ctx, args) => {
-    await requireOrgMembership(ctx, args.orgId);
-
-    // Collect all runs for the org, then derive the distinct agent IDs.
-    // This approach avoids a separate cross-table join and is acceptable
-    // at v1 scale (orgId-scoped index keeps the scan bounded).
-    const runs = await ctx.db
-      .query("runs")
-      .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
-      .collect();
-
-    const seenAgentIds = new Set<string>();
-    const agentIds: string[] = [];
-    for (const run of runs) {
-      const id = run.agentId as string;
-      if (!seenAgentIds.has(id)) {
-        seenAgentIds.add(id);
-        agentIds.push(id);
-      }
-    }
-
-    // Fetch the agent records for each distinct agentId.
-    const agents = await Promise.all(
-      agentIds.map((id) => ctx.db.get(id as Parameters<typeof ctx.db.get>[0])),
-    );
-
-    // Filter out any stale IDs where the agent record no longer exists.
-    return agents.filter(Boolean);
-  },
-});
+import { query, mutation } from "./_generated/server.js";
+import { recordAuditEvent } from "./audit.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 /**
  * List all agents belonging to an organization (not filtered by project).
+ * Returns full agent docs (id + name + slug + ...), which is a superset of what
+ * the runs-page agent filter dropdown needs. Replaces the deleted
+ * listDistinctAgents, which did a full runs-table scan + N+1 agent fetch.
  */
 export const listAgentsByOrg = query({
   args: {
@@ -51,10 +18,11 @@ export const listAgentsByOrg = query({
   handler: async (ctx, args) => {
     await requireOrgMembership(ctx, args.orgId);
 
+    // Bounded: at most MAX_PAGE_SIZE agents returned (no unbounded .collect()).
     const agents = await ctx.db
       .query("agents")
       .withIndex("by_org", (q) => q.eq("orgId", args.orgId))
-      .collect();
+      .take(MAX_PAGE_SIZE);
 
     return agents;
   },
@@ -68,18 +36,26 @@ export const listAgents = query({
     projectId: v.id("projects"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the project is observed only afterwards, so a project in another org and
+    // a project that does not exist are indistinguishable.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
     const project = await ctx.db.get(args.projectId);
-    if (!project) {
+    if (!project || project.orgId !== orgId) {
       throw new Error("Project not found");
     }
-    await requireOrgMembership(ctx, project.orgId);
 
+    // Bounded: at most MAX_PAGE_SIZE agents returned (no unbounded .collect()).
     const agents = await ctx.db
       .query("agents")
       .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
-      .collect();
+      .take(MAX_PAGE_SIZE);
 
-    return agents;
+    // Defence in depth: an agent stamped with a different org than its project
+    // is a data defect, not something to hand back across the boundary.
+    return agents.filter((a) => a.orgId === orgId);
   },
 });
 
@@ -91,11 +67,15 @@ export const getAgent = query({
     agentId: v.id("agents"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the agent is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
     const agent = await ctx.db.get(args.agentId);
-    if (!agent) {
+    if (!agent || agent.orgId !== orgId) {
       throw new Error("Agent not found");
     }
-    await requireOrgMembership(ctx, agent.orgId);
     return agent;
   },
 });
@@ -111,11 +91,21 @@ export const createAgent = mutation({
     description: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.projectId — this is a WRITE path.
+    //
+    // P0 authorization gate: creating an agent is a structural change, gated to
+    // "admin" like createProject (above it in the hierarchy) and
+    // createAgentVersion (below it). The gate is applied to the caller's OWN
+    // org, so its "Forbidden" is projectId-independent.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
+
+    // Cross-org project and nonexistent project collapse to one outcome.
     const project = await ctx.db.get(args.projectId);
-    if (!project) {
+    if (!project || project.orgId !== orgId) {
       throw new Error("Project not found");
     }
-    await requireOrgMembership(ctx, project.orgId);
 
     const now = Date.now();
     const agentId = await ctx.db.insert("agents", {
@@ -130,6 +120,16 @@ export const createAgent = mutation({
 
     const agent = await ctx.db.get(agentId);
     if (!agent) throw new Error("Failed to create agent");
+
+    await recordAuditEvent(ctx, {
+      orgId: project.orgId,
+      actorClerkUserId: userId,
+      action: "agent.created",
+      targetType: "agent",
+      targetId: String(agentId),
+      metadata: { name: args.name, slug: args.slug, projectId: String(args.projectId) },
+    });
+
     return agent;
   },
 });

@@ -17,7 +17,7 @@ export function IntegrityBadge({ status }: IntegrityBadgeProps) {
   if (!status.verified) {
     return (
       <span
-        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-neutral-600 border border-neutral-800"
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-pewter border border-neutral-800"
         title="Projection integrity not yet verified"
       >
         <span className="w-1.5 h-1.5 rounded-full bg-neutral-700" aria-hidden="true" />
@@ -32,10 +32,10 @@ export function IntegrityBadge({ status }: IntegrityBadgeProps) {
   if (!status.isValid) {
     return (
       <span
-        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-red-500 border border-red-900"
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-destructive-500 border border-destructive-700"
         title={`Integrity check failed ${when}: ${title}`}
       >
-        <span className="w-1.5 h-1.5 rounded-full bg-red-600" aria-hidden="true" />
+        <span className="w-1.5 h-1.5 rounded-full bg-destructive-500" aria-hidden="true" />
         failed
       </span>
     )
@@ -45,10 +45,10 @@ export function IntegrityBadge({ status }: IntegrityBadgeProps) {
   if (status.checksRan.includes('replay')) {
     return (
       <span
-        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-emerald-700 border border-emerald-900"
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-neon-glow border border-primary-800"
         title={`Full derivation verified ${when}: ${title}`}
       >
-        <span className="w-1.5 h-1.5 rounded-full bg-emerald-600" aria-hidden="true" />
+        <span className="w-1.5 h-1.5 rounded-full bg-neon-glow" aria-hidden="true" />
         verified
       </span>
     )
@@ -57,10 +57,10 @@ export function IntegrityBadge({ status }: IntegrityBadgeProps) {
   // Partial: sequence-only — either pre-Prompt 21 record or graceful degradation
   return (
     <span
-      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-sky-700 border border-sky-900"
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono text-pewter border border-graphite-light"
       title={`Sequence-only verified ${when} (partial — full derivation not run): ${title}`}
     >
-      <span className="w-1.5 h-1.5 rounded-full bg-sky-700" aria-hidden="true" />
+      <span className="w-1.5 h-1.5 rounded-full bg-pewter" aria-hidden="true" />
       partial
     </span>
   )

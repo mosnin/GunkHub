@@ -1,10 +1,13 @@
 'use client'
 
+import { analyzeRunOrdering, readEventTiming } from '@agent-flight-recorder/contracts'
 import { useRouter } from 'next/navigation'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 
-import type { DiffKind, EventDiff, FieldChange, RunDiff } from '@agent-flight-recorder/contracts'
 
+import type { DiffKind, Event, EventDiff, FieldChange, RunDiff } from '@agent-flight-recorder/contracts'
+
+import { OrderingBasisNote } from '@/components/runs/TemporalOrderNote'
 import { EmptyState } from '@/components/ui/EmptyState'
 
 interface DiffViewerProps {
@@ -14,26 +17,31 @@ interface DiffViewerProps {
   loading?: boolean
 }
 
-// Event type → color class consistent with Timeline
+// Windowed rendering (parity with Timeline/EventInspector): only this many diff
+// rows are mounted at once; "earlier / later" expanders shift the window. Keeps
+// the DOM bounded even for 10k-event diffs.
+const WINDOW_SIZE = 100
+
+// Event type text treatment. design.md restricts colour to Neon Glow, the red
+// alert, and greys — event types are read from the mono label itself, so only
+// run lifecycle gets the single Neon accent; every other type is neutral.
 function typeColorClass(type: string | undefined): string {
   if (!type) return 'text-neutral-500'
-  if (type.startsWith('llm.') || type.startsWith('LLM_')) return 'text-violet-400'
-  if (type.startsWith('tool.') || type.startsWith('TOOL_')) return 'text-amber-400'
-  if (type.startsWith('http.') || type.startsWith('HTTP_')) return 'text-sky-400'
-  if (type.startsWith('run.') || type.startsWith('RUN_')) return 'text-emerald-400'
-  if (type.startsWith('memory.') || type.startsWith('MEMORY_')) return 'text-pink-400'
-  if (type.startsWith('retrieval.') || type.startsWith('RETRIEVAL_')) return 'text-cyan-400'
-  return 'text-neutral-400'
+  if (type.startsWith('run.') || type.startsWith('RUN_')) return 'text-neon-glow'
+  return 'text-neutral-300'
 }
 
+// Diff kinds map to the git-style +/-/~/= glyphs. added/removed keep the two
+// sanctioned accents (Neon Glow green add, red-alert remove); `changed` and
+// `same` are differentiated by the glyph + weight/opacity, not an off-palette hue.
 const kindConfig: Record<
   DiffKind,
   { prefix: string; border: string; bg: string; text: string }
 > = {
-  same:    { prefix: ' ', border: 'border-l-neutral-700', bg: '',                  text: 'text-neutral-500' },
-  added:   { prefix: '+', border: 'border-l-emerald-600', bg: 'bg-emerald-950/20', text: 'text-emerald-400' },
-  removed: { prefix: '-', border: 'border-l-red-600',     bg: 'bg-red-950/20',     text: 'text-red-400'    },
-  changed: { prefix: '~', border: 'border-l-amber-600',   bg: 'bg-amber-950/20',   text: 'text-amber-400'  },
+  same:    { prefix: ' ', border: 'border-l-neutral-700',    bg: '',                      text: 'text-neutral-500' },
+  added:   { prefix: '+', border: 'border-l-primary-700',    bg: 'bg-primary-900/20',     text: 'text-neon-glow'   },
+  removed: { prefix: '-', border: 'border-l-destructive-600', bg: 'bg-destructive-900/20', text: 'text-destructive-400' },
+  changed: { prefix: '~', border: 'border-l-neutral-500',    bg: 'bg-neutral-800/40',     text: 'text-neutral-200 font-semibold' },
 }
 
 interface FieldChangesTableProps {
@@ -44,20 +52,20 @@ function FieldChangesTable({ changes }: FieldChangesTableProps) {
   return (
     <table className="w-full text-xs font-mono mt-2 border-collapse">
       <thead>
-        <tr className="text-neutral-600">
+        <tr className="text-pewter">
           <th className="text-left px-2 py-1 w-1/3 font-medium">field</th>
-          <th className="text-left px-2 py-1 w-1/3 font-medium text-red-600">left</th>
-          <th className="text-left px-2 py-1 w-1/3 font-medium text-emerald-600">right</th>
+          <th className="text-left px-2 py-1 w-1/3 font-medium text-destructive-500">left</th>
+          <th className="text-left px-2 py-1 w-1/3 font-medium text-neon-glow">right</th>
         </tr>
       </thead>
       <tbody>
         {changes.map((change, i) => (
           <tr key={i} className="border-t border-neutral-800">
             <td className="px-2 py-1 text-neutral-400 truncate max-w-0 w-1/3">{change.path}</td>
-            <td className="px-2 py-1 text-red-400/80 truncate max-w-0 w-1/3">
+            <td className="px-2 py-1 text-destructive-400/90 truncate max-w-0 w-1/3">
               {JSON.stringify(change.left)}
             </td>
-            <td className="px-2 py-1 text-emerald-400/80 truncate max-w-0 w-1/3">
+            <td className="px-2 py-1 text-neon-glow/80 truncate max-w-0 w-1/3">
               {JSON.stringify(change.right)}
             </td>
           </tr>
@@ -70,44 +78,76 @@ function FieldChangesTable({ changes }: FieldChangesTableProps) {
 interface EventDiffRowProps {
   entry: EventDiff
   isFirstDivergence: boolean
+  expanded: boolean
+  onToggleExpanded: () => void
 }
 
-function EventDiffRow({ entry, isFirstDivergence }: EventDiffRowProps) {
-  const [expanded, setExpanded] = useState(false)
+// Expand state is lifted to DiffResult (keyed by sequence number) so it survives
+// the row unmounting when the window shifts.
+function EventDiffRow({ entry, isFirstDivergence, expanded, onToggleExpanded }: EventDiffRowProps) {
   const cfg = kindConfig[entry.kind]
   const type = entry.leftEvent?.type ?? entry.rightEvent?.type
   const changes = entry.changes ?? []
   const hasChanges = entry.kind === 'changed' && changes.length > 0
 
+  // True when EITHER side's instant was inferred rather than measured. A
+  // position aligning an inferred timing against a measured one is a weaker
+  // comparison than one aligning two measured timings, and the row says so.
+  const inferred =
+    (entry.leftEvent !== undefined && !readEventTiming(entry.leftEvent).measured) ||
+    (entry.rightEvent !== undefined && !readEventTiming(entry.rightEvent).measured)
+
   return (
     <div>
       {isFirstDivergence && (
-        <div className="flex items-center gap-2 px-3 py-1 text-xs text-amber-400 font-mono border-t border-amber-900/40 bg-amber-950/10">
+        <div className="flex items-center gap-2 px-3 py-1 text-xs text-neon-glow font-mono border-t border-neon-muted/40 bg-primary-900/10">
           <span aria-hidden="true">↑</span>
           First divergence
         </div>
       )}
       <div
-        className={[
-          'border-l-2 px-3 py-2',
-          cfg.border,
-          cfg.bg,
-          entry.kind === 'same' ? 'opacity-50' : '',
-        ].join(' ')}
+        className={['border-l-2 px-3 py-2', cfg.border, cfg.bg].join(' ')}
       >
         <div className="flex items-center gap-2">
-          <span className={['font-mono text-xs w-4 shrink-0 select-none', cfg.text].join(' ')}>
+          {/* De-emphasis for `same` rows is applied to the glyph/seq only — the
+              type label stays fully legible (contrast requirement). */}
+          <span
+            className={[
+              'font-mono text-xs w-4 shrink-0 select-none',
+              cfg.text,
+              entry.kind === 'same' ? 'opacity-60' : '',
+            ].join(' ')}
+          >
             {cfg.prefix}
           </span>
-          <span className="font-mono text-xs text-neutral-600 w-8 shrink-0">
+          <span
+            className={[
+              'font-mono text-xs text-pewter w-8 shrink-0',
+              entry.kind === 'same' ? 'opacity-60' : '',
+            ].join(' ')}
+          >
             #{entry.sequenceNumber}
           </span>
-          <span className={['font-mono text-xs flex-1 truncate', typeColorClass(type)].join(' ')}>
+          <span
+            className={[
+              'font-mono text-xs flex-1 truncate',
+              entry.kind === 'same' ? 'text-neutral-400' : typeColorClass(type),
+            ].join(' ')}
+          >
             {type ?? '(no event)'}
           </span>
+          {inferred && (
+            <span
+              className="shrink-0 font-mono text-xs text-pewter"
+              title="Inferred timing on at least one side — clamped or rounded at ingest, not measured."
+              aria-label="Inferred timing"
+            >
+              ~
+            </span>
+          )}
           {hasChanges && (
             <button
-              onClick={() => setExpanded((v) => !v)}
+              onClick={onToggleExpanded}
               className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors duration-75 flex items-center gap-1"
             >
               {expanded ? 'hide' : `${changes.length} changes`}
@@ -151,7 +191,7 @@ function RunSelector() {
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="flex flex-col gap-1.5">
           <label htmlFor="diff-left" className="text-xs font-medium text-neutral-500 uppercase tracking-wider">
             Run A (left)
@@ -162,7 +202,7 @@ function RunSelector() {
             value={left}
             onChange={(e) => setLeft(e.target.value)}
             placeholder="Paste run ID..."
-            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-600 font-mono outline-none focus:border-neutral-600 transition-colors duration-75"
+            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-500 font-mono outline-none focus:ring-1 focus:ring-neon-glow focus:border-neon-muted transition-colors duration-75"
           />
         </div>
         <div className="flex flex-col gap-1.5">
@@ -175,7 +215,7 @@ function RunSelector() {
             value={right}
             onChange={(e) => setRight(e.target.value)}
             placeholder="Paste run ID..."
-            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-600 font-mono outline-none focus:border-neutral-600 transition-colors duration-75"
+            className="h-9 px-3 rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 placeholder-neutral-500 font-mono outline-none focus:ring-1 focus:ring-neon-glow focus:border-neon-muted transition-colors duration-75"
           />
         </div>
       </div>
@@ -192,6 +232,10 @@ function RunSelector() {
   )
 }
 
+function isEvent(e: Event | undefined): e is Event {
+  return e !== undefined
+}
+
 interface DiffResultProps {
   diff: RunDiff
   incomparable?: boolean
@@ -202,11 +246,49 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
   const { summary, leftRunId, rightRunId, eventDiffs } = diff
   const firstDivergenceIndex = eventDiffs.findIndex((e) => e.kind !== 'same')
 
+  // Each side's ordering basis, reconstructed from the events the diff carries.
+  // Reported SEPARATELY rather than merged: a comparison where one run is
+  // temporally ordered and the other is only in arrival order is aligning
+  // positions that mean different things on each side, and collapsing that into
+  // a single badge would hide exactly the asymmetry an engineer needs to see.
+  const leftOrdering = useMemo(
+    () => analyzeRunOrdering(eventDiffs.map((e) => e.leftEvent).filter(isEvent)),
+    [eventDiffs]
+  )
+  const rightOrdering = useMemo(
+    () => analyzeRunOrdering(eventDiffs.map((e) => e.rightEvent).filter(isEvent)),
+    [eventDiffs]
+  )
+
+  // Windowed rendering — center the initial window on the first divergence (the
+  // row engineers care about) when one exists, else start at the top.
+  const [windowStart, setWindowStart] = useState(() =>
+    firstDivergenceIndex > 0
+      ? Math.max(0, Math.min(firstDivergenceIndex - Math.floor(WINDOW_SIZE / 2), eventDiffs.length - WINDOW_SIZE))
+      : 0
+  )
+  // Per-row "changes" expansion, keyed by sequence number so it survives window shifts.
+  const [expandedSeqs, setExpandedSeqs] = useState<ReadonlySet<number>>(new Set<number>())
+
+  function toggleExpanded(seq: number) {
+    setExpandedSeqs((prev) => {
+      const next = new Set(prev)
+      if (next.has(seq)) next.delete(seq)
+      else next.add(seq)
+      return next
+    })
+  }
+
+  const windowEnd = Math.min(eventDiffs.length, windowStart + WINDOW_SIZE)
+  const visibleDiffs = eventDiffs.slice(windowStart, windowEnd)
+  const earlierCount = windowStart
+  const laterCount = eventDiffs.length - windowEnd
+
   return (
     <div className="flex flex-col gap-4">
       {/* Header — run IDs + summary badges */}
       <div className="flex flex-col gap-3">
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="flex flex-col gap-1">
             <span className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Run A</span>
             <span className="h-9 px-3 flex items-center rounded-md bg-neutral-900 border border-neutral-800 text-sm text-neutral-300 font-mono truncate">
@@ -223,36 +305,58 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
 
         {/* Summary badges */}
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-950/40 border border-emerald-900/50 text-xs font-mono font-medium text-emerald-400">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-primary-900/40 border border-primary-800/50 text-xs font-mono font-medium text-neon-glow">
             +{summary.added} added
           </span>
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-red-950/40 border border-red-900/50 text-xs font-mono font-medium text-red-400">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-destructive-900/40 border border-destructive-700/50 text-xs font-mono font-medium text-destructive-400">
             -{summary.removed} removed
           </span>
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-950/40 border border-amber-900/50 text-xs font-mono font-medium text-amber-400">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-neutral-800 border border-neutral-600 text-xs font-mono font-semibold text-neutral-200">
             ~{summary.changed} changed
           </span>
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-neutral-800 border border-neutral-700 text-xs font-mono font-medium text-neutral-500">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-neutral-800 border border-neutral-700 text-xs font-mono font-medium text-neutral-400">
             ={summary.same} same
           </span>
           {summary.statusChanged && (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-950/40 border border-amber-900/50 text-xs font-mono font-medium text-amber-400">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-destructive-900/40 border border-destructive-700/50 text-xs font-mono font-medium text-destructive-400">
               status changed
             </span>
           )}
         </div>
       </div>
 
+      {/* Ordering basis, per side. Silent when both runs are natively recorded. */}
+      {(leftOrdering.basis !== 'sequence-native' || rightOrdering.basis !== 'sequence-native') && (
+        <div className="flex flex-col gap-2">
+          {leftOrdering.basis !== 'sequence-native' && (
+            <div>
+              <div className="text-xs font-medium text-ash uppercase tracking-wider mb-1">
+                Run A ordering
+              </div>
+              <OrderingBasisNote ordering={leftOrdering} subject="comparison" />
+            </div>
+          )}
+          {rightOrdering.basis !== 'sequence-native' && (
+            <div>
+              <div className="text-xs font-medium text-ash uppercase tracking-wider mb-1">
+                Run B ordering
+              </div>
+              <OrderingBasisNote ordering={rightOrdering} subject="comparison" />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Truncation warning */}
       {diff.truncated && (
-        <div className="px-4 py-2 bg-orange-950/40 border border-orange-900/50 rounded-md text-xs text-orange-400 font-medium">
+        <div className="px-4 py-2 bg-graphite border border-graphite-light rounded-[4px] text-xs text-pewter font-medium">
           This comparison is partial. Each run was capped at 10,000 events — the displayed diff may not represent the full difference.
         </div>
       )}
 
       {/* Incomparable notice */}
       {incomparable && (
-        <div className="rounded-md bg-amber-950/30 border border-amber-900/60 px-4 py-3 text-sm text-amber-300">
+        <div className="rounded-[4px] bg-destructive-900/30 border border-destructive-700/60 px-4 py-3 text-sm text-destructive-400">
           <span className="font-semibold">Cannot compare: </span>
           {incomparableReason ?? 'These runs cannot be fairly compared.'}
         </div>
@@ -267,13 +371,39 @@ function DiffResult({ diff, incomparable, incomparableReason }: DiffResultProps)
           />
         ) : (
           <div className="divide-y divide-neutral-800/50">
-            {eventDiffs.map((entry, i) => (
+            {/* Earlier rows expander */}
+            {earlierCount > 0 && (
+              <div className="flex justify-center py-1.5">
+                <button
+                  onClick={() => setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))}
+                  className="px-4 py-1.5 text-xs font-mono rounded border border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600 transition-colors duration-100"
+                >
+                  ↑ {earlierCount} earlier
+                </button>
+              </div>
+            )}
+
+            {visibleDiffs.map((entry, i) => (
               <EventDiffRow
                 key={`${entry.sequenceNumber}-${entry.kind}`}
                 entry={entry}
-                isFirstDivergence={i === firstDivergenceIndex && firstDivergenceIndex !== -1}
+                isFirstDivergence={windowStart + i === firstDivergenceIndex && firstDivergenceIndex !== -1}
+                expanded={expandedSeqs.has(entry.sequenceNumber)}
+                onToggleExpanded={() => toggleExpanded(entry.sequenceNumber)}
               />
             ))}
+
+            {/* Later rows expander */}
+            {laterCount > 0 && (
+              <div className="flex justify-center py-1.5">
+                <button
+                  onClick={() => setWindowStart(windowStart + WINDOW_SIZE)}
+                  className="px-4 py-1.5 text-xs font-mono rounded border border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600 transition-colors duration-100"
+                >
+                  ↓ {laterCount} later
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -286,7 +416,7 @@ export function DiffViewer({ diff, incomparable, incomparableReason, loading }: 
   if (loading) {
     return (
       <div className="flex flex-col gap-4">
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="h-9 rounded-md bg-neutral-900 border border-neutral-800 animate-pulse" />
           <div className="h-9 rounded-md bg-neutral-900 border border-neutral-800 animate-pulse" />
         </div>
@@ -314,6 +444,10 @@ export function DiffViewer({ diff, incomparable, incomparableReason, loading }: 
 
   return (
     <DiffResult
+      // Key by run pair so window position and expanded rows reset when the
+      // compared pair changes (stale-state bug: React reuses component state
+      // across different diffs otherwise).
+      key={`${diff.leftRunId}:${diff.rightRunId}`}
       diff={diff}
       incomparable={incomparable}
       incomparableReason={incomparableReason}

@@ -1,4 +1,8 @@
+import { unavailableEmpty, unavailableError } from './serviceResult'
+
+import type { ServiceResult } from './serviceResult'
 import type { Artifact } from '@agent-flight-recorder/contracts'
+
 
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient } from '@/lib/convexServer'
@@ -34,14 +38,44 @@ export async function listArtifacts(runId: string): Promise<{ artifacts: Artifac
 
 /**
  * Resolve a storage key to a fetchable URL.
- * Returns an empty string when the blob storage adapter cannot locate the key
- * (e.g. in stub mode when no artifact has been uploaded).
+ *
+ * This used to return `Promise<string>` and `catch { return '' }`, which
+ * collapsed two adapter rejections that mean opposite things:
+ *
+ *   - StubBlobStorage rejects with "key not found" — the artifact was never
+ *     uploaded. Benign, expected in stub mode, genuinely nothing to fetch.
+ *   - VercelBlobStorage rejects with "BLOB_STORE_URL is not configured" — the
+ *     entire blob store is misconfigured, so EVERY artifact in the product is
+ *     unreachable.
+ *
+ * Both produced `''`, so a total storage outage was indistinguishable from a
+ * run that happens to have no artifact bodies. That is the same defect as the
+ * verification widget, one artifact at a time.
+ *
+ * Note the stub's rejection message embeds the storage key, which is exactly
+ * the sort of internal detail `unavailableError` keeps out of `message` — the
+ * key goes to the structured log, not to the page.
+ *
+ * `status: 'empty'` is not reachable here: the adapter contract is
+ * resolve-with-a-URL or reject, so there is no "succeeded with no URL" case.
+ * A caller that gets a non-'ok' result is always looking at a failure, and the
+ * distinction it must draw is which one — hence the message.
  */
-export async function getArtifactUrl(storageKey: string): Promise<string> {
+export async function getArtifactUrl(storageKey: string): Promise<ServiceResult<{ url: string }>> {
   const adapter = getStorageAdapter()
   try {
-    return await adapter.getUrl(storageKey)
-  } catch {
-    return ''
+    const url = await adapter.getUrl(storageKey)
+    if (!url) {
+      // Defensive: an adapter that resolves with an empty string has told us
+      // nothing is stored there, which is a real (if unexpected) empty.
+      return unavailableEmpty('This artifact has no stored content.')
+    }
+    return { status: 'ok', url }
+  } catch (err) {
+    return unavailableError('this artifact', err, {
+      service: 'artifacts',
+      fn: 'getArtifactUrl',
+      storageKey,
+    })
   }
 }

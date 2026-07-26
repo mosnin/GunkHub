@@ -1,18 +1,34 @@
-import { query, mutation } from "convex/server";
 import { v } from "convex/values";
+
+import { query, mutation } from "./_generated/server.js";
 import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { afrError } from "./helpers/errors.js";
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_COMMENTS_PER_TARGET,
+  MAX_PAGE_SIZE,
+} from "./helpers/pagination.js";
+
+import type { Id } from "./_generated/dataModel.js";
 
 /**
- * List all comments on a given target (run or event).
+ * List comments on a given target (run or event), bounded by `limit` (default
+ * DEFAULT_PAGE_SIZE, capped at MAX_PAGE_SIZE). Return shape is unchanged — a plain
+ * array of comment docs — so existing consumers do not need to adapt; the only
+ * behavioral change is that at most MAX_PAGE_SIZE rows are returned instead of an
+ * unbounded `.collect()`.
  */
 export const listComments = query({
   args: {
     orgId: v.id("organizations"),
     targetId: v.string(),
     targetType: v.union(v.literal("run"), v.literal("event")),
+    limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     await requireOrgMembership(ctx, args.orgId);
+
+    const limit = Math.min(args.limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
 
     const comments = await ctx.db
       .query("comments")
@@ -20,7 +36,7 @@ export const listComments = query({
         q.eq("targetId", args.targetId).eq("targetType", args.targetType),
       )
       .filter((q) => q.eq(q.field("orgId"), args.orgId))
-      .collect();
+      .take(limit);
 
     return comments;
   },
@@ -39,7 +55,40 @@ export const createComment = mutation({
   },
   handler: async (ctx, args) => {
     const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, args.orgId);
+    // Authoring a comment is a write; a read-only viewer must not be able to do it.
+    await requireOrgMembership(ctx, args.orgId, { minimumRole: "member" });
+
+    // TENANCY: confirm the comment target (run/event) actually belongs to the
+    // caller's org. Without this, a member could stamp a comment with their own
+    // orgId that references another org's run/event id, weakening referential
+    // tenancy integrity (mirrors the ownership checks in createRun/sdkCreateArtifact).
+    if (args.targetType === "run") {
+      const run = await ctx.db.get(args.targetId as Id<"runs">);
+      if (!run || run.orgId !== args.orgId) {
+        throw new Error("Comment target run not found in this organization");
+      }
+    } else {
+      const event = await ctx.db.get(args.targetId as Id<"events">);
+      if (!event || event.orgId !== args.orgId) {
+        throw new Error("Comment target event not found in this organization");
+      }
+    }
+
+    // Write ceiling: bounded count on the by_target index (cheap at this cap
+    // size). Stops a runaway client from growing one target's comment thread
+    // without bound.
+    const existingForTarget = await ctx.db
+      .query("comments")
+      .withIndex("by_target", (q) =>
+        q.eq("targetId", args.targetId).eq("targetType", args.targetType),
+      )
+      .take(MAX_COMMENTS_PER_TARGET);
+    if (existingForTarget.length >= MAX_COMMENTS_PER_TARGET) {
+      throw afrError(
+        "COMMENT_LIMIT_EXCEEDED",
+        `Target ${args.targetType} has reached the maximum of ${MAX_COMMENTS_PER_TARGET} comments`,
+      );
+    }
 
     const now = Date.now();
     const commentId = await ctx.db.insert("comments", {
@@ -69,13 +118,20 @@ export const resolveComment = mutation({
     commentId: v.id("comments"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.commentId. Resolving a comment mutates it; a
+    // read-only viewer must not be able to do it, and that role gate is applied
+    // to the caller's OWN org so its "Forbidden" is commentId-independent.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "member" });
+
+    // Cross-org comment and nonexistent comment collapse to one outcome. The
+    // "already resolved" check below is reachable only for a comment the caller
+    // can see, so it cannot leak another org's comment state either.
     const comment = await ctx.db.get(args.commentId);
-    if (!comment) {
+    if (!comment || comment.orgId !== orgId) {
       throw new Error("Comment not found");
     }
-
-    const { userId } = await getAuthContext(ctx);
-    await requireOrgMembership(ctx, comment.orgId);
 
     if (comment.resolvedAt !== undefined) {
       throw new Error("Comment is already resolved");

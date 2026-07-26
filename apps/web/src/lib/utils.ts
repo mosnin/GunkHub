@@ -22,6 +22,29 @@ export function formatDuration(ms: number): string {
 }
 
 /**
+ * Format a SPAN of milliseconds at day/week granularity — for durations
+ * measured in soak time rather than run latency. `formatDuration` above tops
+ * out at minutes, which is right for a run and useless for "how long has this
+ * fix been soaking"; this is its coarse counterpart.
+ *
+ * Deliberately floors rather than rounds: a fix that has soaked for 6.9 days
+ * has NOT soaked for a week, and rounding up would overstate the evidence in
+ * exactly the direction this feature exists to prevent.
+ *
+ * Examples: "under an hour" | "3 hours" | "1 day" | "2 weeks"
+ */
+export function formatCoarseDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return 'no time'
+  const hours = Math.floor(ms / 3_600_000)
+  if (hours < 1) return 'under an hour'
+  if (hours < 24) return hours === 1 ? '1 hour' : `${hours} hours`
+  const days = Math.floor(hours / 24)
+  if (days < 14) return days === 1 ? '1 day' : `${days} days`
+  const weeks = Math.floor(days / 7)
+  return `${weeks} weeks`
+}
+
+/**
  * Format a Unix timestamp (ms) as a relative time string.
  * Examples: "just now" | "2 minutes ago" | "3 hours ago"
  */
@@ -53,4 +76,39 @@ export function formatRelativeTime(timestamp: number): string {
 export function truncateId(id: string, length = 8): string {
   if (id.length <= length) return id
   return id.slice(0, length)
+}
+
+/**
+ * Parses `value` as a URL ONLY if it is `http:`/`https:` — used to decide
+ * whether a free-form, human-entered reference string (e.g.
+ * `FailurePattern.resolutionRef`, see docs/adr/006-failure-resolution.md) may
+ * be rendered as an external `<a>` link. Anything else (a bare agentVersionId,
+ * a `javascript:`/`data:`/`file:` URI, plain prose) returns `null` and must be
+ * rendered as plain text — this is the ONLY gate between untrusted free text
+ * and an anchor's `href`, so it fails closed on anything that doesn't parse
+ * cleanly as http(s).
+ */
+export function parseSafeHttpUrl(value: string): URL | null {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Format a byte count as a human-readable size string.
+ * Examples: 512B | 3.4KB | 12.1MB | 2.0GB
+ */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value.toFixed(1)}${units[unitIndex]}`
 }

@@ -7,6 +7,13 @@ import type { Event, ListEventsResponse } from '@agent-flight-recorder/contracts
 import { CodeBlock } from '@/components/ui/CodeBlock'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { LoadingState } from '@/components/ui/LoadingState'
+import {
+  isNavDownKey,
+  isNavFirstKey,
+  isNavLastKey,
+  isNavUpKey,
+  isPrimaryActionKey,
+} from '@/lib/hooks/useKeyScope'
 
 const WINDOW_SIZE = 100
 
@@ -45,7 +52,7 @@ function ExternalizedPayloadView({ payload }: { payload: {
     <div className="p-4 flex flex-col gap-3">
       {/* Header */}
       <div className="flex items-center gap-2">
-        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium border bg-amber-900/40 text-amber-400 border-amber-700/60">
+        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium border bg-neutral-800 text-neutral-300 border-neutral-600">
           externalized
         </span>
         <span className="text-xs text-neutral-500">
@@ -57,19 +64,19 @@ function ExternalizedPayloadView({ payload }: { payload: {
       {/* Artifact metadata */}
       <dl className="flex flex-col gap-2 text-xs">
         <div className="flex items-start justify-between gap-4">
-          <dt className="text-neutral-600 shrink-0 w-24">Artifact ID</dt>
+          <dt className="text-pewter shrink-0 w-24">Artifact ID</dt>
           <dd className="font-mono text-neutral-400 truncate text-right">{_artifact.artifactId}</dd>
         </div>
         <div className="flex items-start justify-between gap-4">
-          <dt className="text-neutral-600 shrink-0 w-24">Storage key</dt>
+          <dt className="text-pewter shrink-0 w-24">Storage key</dt>
           <dd className="font-mono text-neutral-500 text-right">{keyPreview}</dd>
         </div>
         <div className="flex items-start justify-between gap-4">
-          <dt className="text-neutral-600 shrink-0 w-24">Size</dt>
+          <dt className="text-pewter shrink-0 w-24">Size</dt>
           <dd className="font-mono text-neutral-400">{sizeKb} KB</dd>
         </div>
         <div className="flex items-start justify-between gap-4">
-          <dt className="text-neutral-600 shrink-0 w-24">Checksum</dt>
+          <dt className="text-pewter shrink-0 w-24">Checksum</dt>
           <dd className="font-mono text-neutral-500 text-right" title={_artifact.checksum}>
             {_artifact.checksum.slice(0, 16)}…
           </dd>
@@ -77,7 +84,7 @@ function ExternalizedPayloadView({ payload }: { payload: {
       </dl>
 
       {/* Note */}
-      <p className="text-xs text-neutral-600 border-t border-neutral-800 pt-3 mt-1">
+      <p className="text-xs text-pewter border-t border-neutral-800 pt-3 mt-1">
         Full payload stored as artifact. View it in the{' '}
         <span className="text-neutral-500">Artifacts</span> tab.
       </p>
@@ -101,6 +108,9 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
   const [seekState, setSeekState] = useState<SeekState>('idle')
   const [followTail, setFollowTail] = useState(isLive)
   const [unseenCount, setUnseenCount] = useState(0)
+  // True when the most recent live poll failed — drives the "reconnecting…"
+  // stale indicator; cleared on the next successful poll.
+  const [pollFailed, setPollFailed] = useState(false)
 
   // Keep a stable ref to followTail for use inside polling effect closures
   const followTailRef = useRef(isLive)
@@ -110,54 +120,104 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
 
   const allEvents = [...(events ?? []), ...extraEvents]
 
+  // Always-current set of known event IDs, for dedup inside polling closures.
+  // The interval closure captures state at effect-setup time, so deduping against
+  // the `allEvents` array (stale) re-classifies already-appended events as new and
+  // appends them again every tick. A ref is read live, so dedup stays correct.
+  const knownIdsRef = useRef<Set<string>>(new Set())
+  // Highest known sequence number, for tail polling (fetch events after it).
+  const maxSeqRef = useRef<number>(0)
+  useEffect(() => {
+    const ids = new Set<string>()
+    let maxSeq = 0
+    for (const e of allEvents) {
+      ids.add(e.id)
+      if (e.sequenceNumber > maxSeq) maxSeq = e.sequenceNumber
+    }
+    knownIdsRef.current = ids
+    maxSeqRef.current = maxSeq
+  }, [events, extraEvents])
+
+  // Guards against overlapping fetches without depending on the stale `isPending`
+  // captured by the interval closure.
+  const inFlightRef = useRef(false)
+
   function handleLoadMore() {
     if (!cursor) return
     setLoadError(null)
-    const prevTotal = (events?.length ?? 0) + extraEvents.length
     startTransition(async () => {
       try {
         const params = new URLSearchParams({ cursor, limit: '200' })
         const res = await fetch(`/api/runs/${runId}/events?${params.toString()}`)
         if (!res.ok) throw new Error(`Failed to load events (${res.status})`)
         const data = (await res.json()) as ListEventsResponse
-        const newTotal = prevTotal + data.events.length
-        setExtraEvents((prev) => [...prev, ...data.events])
+        setPollFailed(false)
+        // Dedup against the live id set so a re-fetched page cannot append
+        // duplicates (same defence Timeline has).
+        const known = knownIdsRef.current
+        const fresh = data.events.filter((e) => !known.has(e.id))
+        const prevTotal = (events?.length ?? 0) + extraEvents.length
+        const newTotal = prevTotal + fresh.length
+        if (fresh.length > 0) setExtraEvents((prev) => [...prev, ...fresh])
         setCursor(data.nextCursor)
         // Auto-advance only when following tail; otherwise accumulate unseen count
-        if (data.events.length > 0) {
+        if (fresh.length > 0) {
           if (followTailRef.current) {
             setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
           } else {
-            setUnseenCount((prev) => prev + data.events.length)
+            setUnseenCount((prev) => prev + fresh.length)
           }
         }
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load more events')
+        // When live-polling via the cursor path, a failure must also surface as
+        // the stale/reconnecting indicator, not just an inline load error.
+        if (isLive) setPollFailed(true)
       }
     })
   }
 
   async function pollFromStart() {
     try {
-      const res = await fetch(`/api/runs/${runId}/events?limit=200`)
-      if (!res.ok) return
+      // Tail from the highest known sequence number so new events are found
+      // regardless of run size. Re-fetching page 1 would only ever return the
+      // earliest events and never the newly-appended tail on runs > one page.
+      const maxSeq = maxSeqRef.current
+      const res = await fetch(`/api/runs/${runId}/events?limit=200&afterSeq=${maxSeq}`)
+      if (!res.ok) {
+        setPollFailed(true)
+        return
+      }
       const data = (await res.json()) as ListEventsResponse
-      const existingIds = new Set(allEvents.map((e) => e.id))
-      const brandNew = data.events.filter((e) => !existingIds.has(e.id))
+      setPollFailed(false)
+      // Dedup against the LIVE id set (ref), not the stale closure array.
+      const known = knownIdsRef.current
+      const brandNew = data.events.filter((e) => !known.has(e.id))
       if (brandNew.length > 0) {
-        const newTotal = allEvents.length + brandNew.length
-        setExtraEvents((prev) => [...prev, ...brandNew])
-        if (followTailRef.current) {
-          setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
-        } else {
-          setUnseenCount((prev) => prev + brandNew.length)
+        // Add immediately so a rapid follow-up poll (before re-render) won't
+        // re-append the same events, and advance the tail cursor.
+        for (const e of brandNew) {
+          known.add(e.id)
+          if (e.sequenceNumber > maxSeqRef.current) maxSeqRef.current = e.sequenceNumber
         }
+        setExtraEvents((prev) => {
+          const next = [...prev, ...brandNew]
+          const newTotal = (events?.length ?? 0) + next.length
+          if (followTailRef.current) {
+            setWindowStart(Math.max(0, newTotal - WINDOW_SIZE))
+          } else {
+            setUnseenCount((u) => u + brandNew.length)
+          }
+          return next
+        })
       }
-      if (data.nextCursor && !cursor) {
-        setCursor(data.nextCursor)
-      }
+      // NOTE: intentionally do NOT reset `cursor` here. When cursor is undefined
+      // all pages are loaded and we are tailing; re-seeding it from page 1's cursor
+      // restarts pagination and re-appends already-loaded pages every tick.
     } catch {
-      // Non-fatal: ignore failed polls
+      // Non-fatal, but surfaced: mark the stream stale so the UI can show a
+      // "reconnecting…" indicator instead of silently freezing.
+      setPollFailed(true)
     }
   }
 
@@ -206,12 +266,19 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
     if (!isLive) return
     const POLL_MS = 5000
     const timer = setInterval(() => {
-      if (isPending) return // skip if a load is in flight
-      if (cursor) {
-        handleLoadMore()
-      } else {
-        void pollFromStart()
-      }
+      if (inFlightRef.current) return // skip if a fetch is already in flight
+      inFlightRef.current = true
+      void (async () => {
+        try {
+          if (cursor) {
+            handleLoadMore()
+          } else {
+            await pollFromStart()
+          }
+        } finally {
+          inFlightRef.current = false
+        }
+      })()
     }, POLL_MS)
     return () => clearInterval(timer)
   }, [isLive, cursor, runId])
@@ -244,9 +311,13 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
     }
   }
 
-  function handleListKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+  // Unified list-navigation model (shared with Timeline/ReplayViewer): arrows
+  // and j/k both move the roving focus, g/Home and G/End jump to the ends of
+  // the list, and Enter (or Space) runs the primary action — here, selecting
+  // the focused event into the payload panel. See src/lib/hooks/useKeyScope.ts.
+  function handleListKeyDown(e: React.KeyboardEvent<HTMLElement>) {
     if (allEvents.length === 0) return
-    if (e.key === 'ArrowDown') {
+    if (isNavDownKey(e)) {
       e.preventDefault()
       setFollowTail(false)
       const next = Math.min(allEvents.length - 1, focusedIdx < 0 ? windowStart : focusedIdx + 1)
@@ -255,7 +326,7 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       if (next >= windowStart + WINDOW_SIZE) {
         setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, next))
       }
-    } else if (e.key === 'ArrowUp') {
+    } else if (isNavUpKey(e)) {
       e.preventDefault()
       setFollowTail(false)
       const prev = Math.max(0, focusedIdx < 0 ? windowStart : focusedIdx - 1)
@@ -263,6 +334,29 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       setSelectedId(allEvents[prev]?.id ?? null)
       if (prev < windowStart) {
         setWindowStart(Math.max(0, prev))
+      }
+    } else if (isNavFirstKey(e)) {
+      e.preventDefault()
+      setFollowTail(false)
+      setFocusedIdx(0)
+      setSelectedId(allEvents[0]?.id ?? null)
+      setWindowStart(0)
+    } else if (isNavLastKey(e)) {
+      e.preventDefault()
+      setFollowTail(false)
+      const lastIdx = allEvents.length - 1
+      setFocusedIdx(lastIdx)
+      setSelectedId(allEvents[lastIdx]?.id ?? null)
+      setWindowStart(Math.max(0, allEvents.length - WINDOW_SIZE))
+    } else if (isPrimaryActionKey(e) || e.key === ' ') {
+      // Options are not individually focusable (listbox pattern) — activation
+      // of the focused option happens here on the container.
+      e.preventDefault()
+      const focused = allEvents[focusedIdx]
+      if (focused) {
+        setFollowTail(false)
+        setSelectedId(focused.id)
+        ensureSelectedVisible(focusedIdx)
       }
     }
   }
@@ -289,6 +383,7 @@ export function EventInspector({ runId, events, initialNextCursor, loading, init
       followTail={followTail}
       unseenCount={unseenCount}
       onResume={handleResume}
+      pollFailed={pollFailed}
     />
   )
 }
@@ -303,7 +398,7 @@ interface EventInspectorInnerProps {
   windowStart: number
   setWindowStart: (start: number) => void
   ensureSelectedVisible: (absIdx: number) => void
-  handleListKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void
+  handleListKeyDown: (e: React.KeyboardEvent<HTMLElement>) => void
   cursor: string | undefined
   loadError: string | null
   isPending: boolean
@@ -314,6 +409,7 @@ interface EventInspectorInnerProps {
   followTail?: boolean
   unseenCount?: number
   onResume?: () => void
+  pollFailed?: boolean
 }
 
 function EventInspectorInner({
@@ -337,7 +433,11 @@ function EventInspectorInner({
   followTail = false,
   unseenCount = 0,
   onResume,
+  pollFailed = false,
 }: EventInspectorInnerProps) {
+  // Copied feedback for the "Copy link" action
+  const [linkCopied, setLinkCopied] = useState(false)
+
   // Sync ?event=<sequenceNumber> into the URL without navigation
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -358,11 +458,19 @@ function EventInspectorInner({
         <div className="px-3 py-2 border-b border-neutral-800 flex items-center justify-between">
           <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Events</p>
           {isLive && (
-            <div className="flex items-center gap-2">
+            /* Polite live region so screen readers are told about newly streamed
+               events (the count, not every event). */
+            <div role="status" aria-live="polite" className="flex items-center gap-2">
+              {pollFailed && (
+                <span className="flex items-center gap-1.5 text-xs font-mono text-pewter">
+                  <span className="w-1.5 h-1.5 rounded-full bg-destructive-500 shrink-0" aria-hidden="true" />
+                  reconnecting…
+                </span>
+              )}
               {!followTail && unseenCount > 0 && onResume && (
                 <button
                   onClick={onResume}
-                  className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono bg-emerald-950 border border-emerald-800 text-emerald-400 hover:text-emerald-300 hover:border-emerald-700 transition-colors duration-100"
+                  className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono bg-primary-900 border border-primary-800 text-neon-glow hover:text-primary-300 hover:border-primary-700 transition-colors duration-100"
                 >
                   ↓ {unseenCount} new — resume
                 </button>
@@ -371,12 +479,12 @@ function EventInspectorInner({
                 onClick={followTail ? () => setFollowTail(false) : onResume}
                 className={[
                   'flex items-center gap-1 text-xs font-mono transition-colors duration-100',
-                  followTail ? 'text-neutral-600 hover:text-neutral-400' : 'text-neutral-600 hover:text-neutral-400',
+                  followTail ? 'text-pewter hover:text-cloud' : 'text-pewter hover:text-cloud',
                 ].join(' ')}
                 title={followTail ? 'Following tail — click to pause' : 'Tail paused — click to resume'}
               >
                 {followTail && (
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" aria-hidden="true" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-neon-glow animate-neon-pulse" aria-hidden="true" />
                 )}
                 <span>{followTail ? 'live' : 'paused'}</span>
               </button>
@@ -391,7 +499,7 @@ function EventInspectorInner({
           </p>
         )}
         {seekState === 'not-found' && (
-          <p className="px-3 py-1.5 text-xs font-mono text-amber-600 border-b border-neutral-800">
+          <p className="px-3 py-1.5 text-xs font-mono text-destructive-400 border-b border-neutral-800">
             Event #{initialEventSeq} not found in this run.
           </p>
         )}
@@ -403,54 +511,68 @@ function EventInspectorInner({
               setFollowTail(false)
               setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))
             }}
-            className="text-xs font-mono text-neutral-600 hover:text-neutral-400 px-3 py-1.5 border-b border-neutral-800 w-full text-left"
+            className="text-xs font-mono text-pewter hover:text-cloud px-3 py-1.5 border-b border-neutral-800 w-full text-left"
           >
             ↑ {aboveCount} above
           </button>
         )}
 
-        <div
+        {/* Listbox pattern: the container holds focus (tabIndex 0) and exposes
+            the roving focus via aria-activedescendant; options are not
+            individually focusable. */}
+        <ul
+          role="listbox"
+          aria-label="Events"
           tabIndex={0}
-          className="outline-none"
+          aria-activedescendant={
+            focusedIdx >= windowStart &&
+            focusedIdx < windowStart + WINDOW_SIZE &&
+            allEvents[focusedIdx]
+              ? `evtopt-${allEvents[focusedIdx].id}`
+              : undefined
+          }
+          className="divide-y divide-neutral-800/60 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-neon-glow"
           onFocus={() => { if (focusedIdx === -1) setFocusedIdx(0) }}
           onKeyDown={handleListKeyDown}
         >
-          <ul className="divide-y divide-neutral-800/60">
-            {windowedEvents.map((evt, relIdx) => {
-              const absIdx = windowStart + relIdx
-              return (
-                <li
-                  key={evt.id}
-                  onClick={() => {
-                    setFollowTail(false)
-                    setSelectedId(evt.id)
-                    setFocusedIdx(absIdx)
-                    ensureSelectedVisible(absIdx)
-                  }}
-                  className={[
-                    'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75',
-                    selectedEvent?.id === evt.id
-                      ? 'bg-neutral-900 text-neutral-200'
-                      : 'hover:bg-neutral-900/60 text-neutral-400',
-                    focusedIdx === absIdx ? 'ring-1 ring-inset ring-neutral-600' : '',
-                  ].join(' ')}
-                >
-                  <span className="text-xs font-mono">{evt.type}</span>
-                  {(evt.payload as { type: string }).type === '_externalized' && (
-                    <span className="text-amber-700 text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
-                  )}
-                  <span className="text-xs font-mono text-neutral-600">#{evt.sequenceNumber}</span>
-                </li>
-              )
-            })}
-          </ul>
-        </div>
+          {windowedEvents.map((evt, relIdx) => {
+            const absIdx = windowStart + relIdx
+            return (
+              <li
+                key={evt.id}
+                id={`evtopt-${evt.id}`}
+                role="option"
+                tabIndex={-1}
+                aria-selected={selectedEvent?.id === evt.id}
+                onClick={() => {
+                  setFollowTail(false)
+                  setSelectedId(evt.id)
+                  setFocusedIdx(absIdx)
+                  ensureSelectedVisible(absIdx)
+                }}
+                className={[
+                  'px-3 py-2.5 flex items-center justify-between cursor-pointer transition-colors duration-75',
+                  selectedEvent?.id === evt.id
+                    ? 'bg-neutral-900 text-neutral-200'
+                    : 'hover:bg-neutral-900/60 text-neutral-400',
+                  focusedIdx === absIdx ? 'ring-1 ring-inset ring-neon-glow' : '',
+                ].join(' ')}
+              >
+                <span className="text-xs font-mono">{evt.type}</span>
+                {(evt.payload as { type: string }).type === '_externalized' && (
+                  <span className="text-pewter text-[10px] font-mono ml-1" title="Payload externalized">↗</span>
+                )}
+                <span className="text-xs font-mono text-pewter">#{evt.sequenceNumber}</span>
+              </li>
+            )
+          })}
+        </ul>
 
         {/* Window navigation — below */}
         {belowCount > 0 && (
           <button
             onClick={() => setWindowStart(Math.min(allEvents.length - WINDOW_SIZE, windowStart + WINDOW_SIZE))}
-            className="text-xs font-mono text-neutral-600 hover:text-neutral-400 px-3 py-1.5 border-b border-neutral-800 w-full text-left"
+            className="text-xs font-mono text-pewter hover:text-cloud px-3 py-1.5 border-b border-neutral-800 w-full text-left"
           >
             ↓ {belowCount} below
           </button>
@@ -460,7 +582,7 @@ function EventInspectorInner({
         {(cursor !== undefined || loadError !== null) && (
           <div className="px-3 py-2 border-t border-neutral-800 flex flex-col gap-1">
             {loadError && (
-              <p className="text-xs text-red-400">{loadError}</p>
+              <p className="text-xs text-destructive-400">{loadError}</p>
             )}
             {cursor && (
               <button
@@ -482,12 +604,19 @@ function EventInspectorInner({
           {selectedEvent && (
             <button
               onClick={() => {
-                void navigator.clipboard.writeText(window.location.href)
+                void navigator.clipboard.writeText(window.location.href).then(() => {
+                  setLinkCopied(true)
+                  setTimeout(() => setLinkCopied(false), 1500)
+                })
               }}
               title="Copy link to this event"
-              className="text-xs font-mono text-neutral-600 hover:text-neutral-300 transition-colors duration-75 px-2 py-0.5 rounded hover:bg-neutral-800"
+              aria-label="Copy link to this event"
+              className={[
+                'text-xs font-mono transition-colors duration-75 px-2 py-0.5 rounded hover:bg-neutral-800',
+                linkCopied ? 'text-neon-glow' : 'text-pewter hover:text-neutral-300',
+              ].join(' ')}
             >
-              Copy link
+              {linkCopied ? 'Copied ✓' : 'Copy link'}
             </button>
           )}
         </div>

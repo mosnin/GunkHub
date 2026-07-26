@@ -2,8 +2,14 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "lib": ["ES2022", "DOM"],
+    "rootDir": "src",
+    "outDir": "dist",
+    "noEmit": false,
     "incremental": false,
     "declarationMap": false,
     "sourceMap": false
-  }
+  },
+  // Build (tsup) must ship src/ only — examples/ are dev-time documentation,
+  // typechecked via tsconfig.json's `include`, never bundled into dist/.
+  "include": ["src"]
 }

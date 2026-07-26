@@ -3,6 +3,7 @@ import type { Metadata } from 'next'
 
 import { PageHeader } from '@/components/layout/PageHeader'
 import { DiffViewer } from '@/components/runs/DiffViewer'
+import { ErrorState } from '@/components/ui/ErrorState'
 import { getRunDiff } from '@/lib/services/diff'
 
 export const metadata: Metadata = { title: 'Compare Runs' }
@@ -36,10 +37,7 @@ export default async function DiffPage({ searchParams }: DiffPageProps) {
       />
       <div className="mt-6">
         {fetchError ? (
-          <div className="rounded-md bg-red-950/30 border border-red-900/60 px-4 py-3 text-sm text-red-300">
-            <span className="font-semibold">Failed to load diff: </span>
-            {fetchError}
-          </div>
+          <ErrorState title="Failed to load diff" message={fetchError} />
         ) : (
           <DiffViewer
             diff={diffData?.diff}

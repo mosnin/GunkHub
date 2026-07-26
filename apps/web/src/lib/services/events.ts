@@ -26,7 +26,9 @@ function mapEvent(doc: Record<string, unknown>): Event {
  * List events for a run in sequence order.
  * Requires Clerk session with org membership on the run's org.
  */
-export async function listEvents(params: ListEventsRequest): Promise<ListEventsResponse> {
+export async function listEvents(
+  params: ListEventsRequest & { afterSeq?: number },
+): Promise<ListEventsResponse> {
   const client = await getAuthedClient()
 
   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -35,6 +37,7 @@ export async function listEvents(params: ListEventsRequest): Promise<ListEventsR
     ...(params.limit !== undefined && { limit: params.limit }),
     ...(params.cursor !== undefined && { cursor: params.cursor }),
     ...(params.types !== undefined && { types: params.types }),
+    ...(params.afterSeq !== undefined && { afterSeq: params.afterSeq }),
   })
 
   const res = result as { events: Record<string, unknown>[]; nextCursor?: string }

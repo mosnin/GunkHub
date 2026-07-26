@@ -3,6 +3,48 @@
 This runbook covers common operational issues and their resolutions. Each section
 describes a symptom, the likely cause, and the steps to diagnose and fix it.
 
+> ## :warning: Verification status of this runbook
+>
+> **No Convex deployment has ever existed for this project, and this application
+> has never been deployed to any environment.** Every procedure below was written
+> against the code, not against a running system. None of it has been executed
+> end-to-end.
+>
+> Treat each procedure as a *plausible* first attempt, not a proven one. In
+> particular, the following are **unverified**:
+>
+> - Every `npx convex deploy` / `npx convex export` / `npx convex env set`
+>   invocation. The commands and flags are correct per the Convex 1.42 CLI, but
+>   have not been run against a real deployment of this project.
+> - Every expected `GET /api/health` response body. The shapes come from reading
+>   `apps/web/src/lib/health.ts`, not from a live response.
+> - Every Convex-dashboard navigation path (table names, Settings → Backup/Export,
+>   the Logs tab) — Convex's dashboard UI may have moved since these were written.
+> - Every log-line format quoted below (artifact GC, stale-run expiry). These are
+>   transcribed from the source that emits them, but have never been observed in
+>   real deployment logs.
+> - The **Secret rotation** procedure, which involves a live Vercel deploy and a
+>   live Convex deployment in a specific interleaving. Its safety argument is
+>   sound on paper; the sequencing has never been exercised.
+>
+> Before the first production incident, walk this runbook against a staging
+> deployment and correct what does not match. See the **First-time bootstrap**
+> section of `docs/deployment_checklist.md` for standing up the first deployment,
+> including known issues (`node:` builtin imports in `convex/` with no
+> `"use node"` directive) that are expected to surface at first deploy.
+
+**Related ops docs:**
+- [`docs/ops/observability.md`](ops/observability.md) — the logging contract, where
+  logs go on Vercel, request-ID correlation, health endpoint semantics, the CSP
+  report sink, and rate-limit classes.
+- [`docs/ops/incident_response.md`](ops/incident_response.md) — triage playbooks for
+  the four most likely incidents: Convex unreachable, ingestion rejections spiking,
+  Clerk webhook/org-sync failures (including the erasure-obligation step), and bad
+  deploys.
+- [`docs/ops/dr_drill.md`](ops/dr_drill.md) — Convex export/restore mechanics, blob-
+  store considerations, the quarterly restore-drill procedure, and recommended
+  RPO/RTO targets.
+
 ---
 
 ## Storage health check
@@ -157,6 +199,12 @@ Stale run expiry: batch=N expired=E errors=X
 
 ## Convex deployment issues
 
+> **Before the first deploy:** `npx convex deploy` assumes a Convex project
+> already exists and that `convex/_generated` holds real codegen output. Neither
+> is true yet — see **First-time bootstrap** in `docs/deployment_checklist.md`.
+> Running `convex deploy` against a project that has never been created will fail
+> at authentication (`401 MissingAccessToken`), not at the schema step.
+
 **Push schema and functions:**
 ```
 npx convex deploy
@@ -284,3 +332,103 @@ Convex `organizations` table.
 
 **Fix:** Generate a new API key from the settings page (or directly in Convex if the
 settings UI is not available), update the SDK configuration, and retry.
+
+---
+
+## Secret rotation: CONVEX_WEBHOOK_SECRET / INTERNAL_VERIFY_SECRET
+
+Both are shared secrets that must match on TWO deployments at once:
+
+- `CONVEX_WEBHOOK_SECRET` — set on the Vercel project (used by
+  `/api/webhooks/clerk` when calling the webhook-only Convex lifecycle
+  mutations) AND on the Convex deployment (which validates it).
+- `INTERNAL_VERIFY_SECRET` — set on the Vercel project (validated by
+  `/api/internal/verify-derivation`) AND on the Convex deployment (sent by the
+  `verifyRecentRuns` action).
+
+**Dual-accept format:** both vars support a comma-separated value —
+`current,previous` (entries trimmed, empty entries dropped) — parsed by
+`getAcceptedSecrets()` in `apps/web/src/lib/env.ts`. This lets the Vercel
+side and the Convex side be updated in either order with no window where
+calls fail closed. Convex itself only ever holds ONE value per var (it does
+not parse comma lists) — the dual-accept logic lives entirely in the web
+tier:
+
+- `CONVEX_WEBHOOK_SECRET`: the webhook route
+  (`apps/web/app/api/webhooks/clerk/route.ts`) forwards the FIRST (current)
+  value to Convex on every lifecycle mutation call. If Convex rejects it as
+  `Unauthorized` (because Convex's single stored value is still the old
+  secret), the route retries once with the SECOND (previous) value and logs
+  a structured warning that rotation is in progress.
+- `INTERNAL_VERIFY_SECRET`: `/api/internal/verify-derivation` accepts the
+  incoming `x-internal-secret` header if it matches ANY entry in the list —
+  so it validates whichever single value Convex's `verifyRecentRuns` action
+  currently has configured, old or new.
+
+**Procedure (add new secret as `new,old` → deploy → update Convex → drop old):**
+
+1. Generate a new high-entropy secret: `openssl rand -hex 32`.
+2. On Vercel (Project → Settings → Environment Variables → Production), set
+   the var to `<new>,<old>` — new value first, old value second — for
+   whichever secret you are rotating. Redeploy.
+   - `CONVEX_WEBHOOK_SECRET=<new>,<old>`, or
+   - `INTERNAL_VERIFY_SECRET=<new>,<old>`.
+   At this point Convex still has the OLD single value configured, but
+   nothing fails closed:
+   - Webhook calls try `<new>` first, get rejected, retry with `<old>`
+     (which Convex still recognizes) — check the Vercel function logs for
+     the `"secret rotation appears in progress"` warning to confirm this is
+     happening rather than silently failing.
+   - Verify-derivation accepts Convex's `<old>` value because it's the
+     second entry in the accepted list.
+3. Update the SAME var on the Convex deployment to the single new value
+   (Dashboard → Deployment → Settings → Environment Variables):
+   `npx convex env set CONVEX_WEBHOOK_SECRET <new>` or
+   `npx convex env set INTERNAL_VERIFY_SECRET <new>`.
+   Convex env changes apply to new function executions automatically — no
+   Convex redeploy needed.
+4. Verify:
+   - `CONVEX_WEBHOOK_SECRET`: create a throwaway Clerk org (or use Clerk's
+     webhook "Resend") and confirm the org record appears in Convex, and
+     that the Vercel logs show no more rotation-retry warnings (the first,
+     current value is now succeeding directly).
+   - `INTERNAL_VERIFY_SECRET`: wait for (or manually trigger) the next
+     `verifyRecentRuns` cycle and confirm runs get verification results, not
+     401s, in the Vercel function logs for `/api/internal/verify-derivation`.
+5. Once step 4 confirms the new value works end-to-end, drop the old value:
+   set the Vercel var back to a single value (`<new>`, no comma) and
+   redeploy. Leaving the old value in the list longer than necessary widens
+   the window in which a leaked old secret remains accepted.
+
+**Why this is safe to leave mid-rotation:** both accepted values are
+high-entropy secrets known only to the operator performing the rotation —
+holding two valid values briefly is materially the same risk as holding one,
+and is strictly safer than the old fail-closed window where webhooks/verify
+calls were rejected outright.
+
+---
+
+## Backup and disaster recovery
+
+**Data of record:** all product data (orgs, projects, agents, runs, events,
+artifacts metadata, comments) lives in Convex. Artifact payload BLOBS live in
+Vercel Blob storage; event records store only pointers + SHA-256 checksums.
+
+**Backup capability:**
+
+- Convex supports full-deployment snapshot export (Dashboard → Settings →
+  Backup/Export, or `npx convex export`) producing a ZIP of all tables, and
+  point-in-time restore via snapshot import on paid plans.
+- Vercel Blob objects are durable managed storage; blobs are content-addressed
+  by checksum in our storage keys, so a Convex restore never points at
+  ambiguous blob content. Blobs themselves are not separately backed up today.
+
+**Targets:** RPO and RTO are TBD by the operator — no formal targets have been
+committed for v1. Until they are set, the working assumption is: RPO = age of
+the most recent Convex snapshot export (run exports at least weekly), RTO =
+time to import the snapshot into a fresh deployment plus a Vercel redeploy
+(order of hours).
+
+**Restore drill (recommended before GA):** export a snapshot, import it into a
+scratch Convex deployment, point a preview Vercel deployment at it, and confirm
+runs, events, and artifact downloads all resolve.

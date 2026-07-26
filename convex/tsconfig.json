@@ -1,0 +1,20 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "noEmit": true,
+    // Convex's generated document types make optional fields `field?: T` (never
+    // `T | undefined`), while Convex's own runtime + insert()/patch() accept an
+    // explicit `undefined` for those fields. exactOptionalPropertyTypes flags that
+    // idiom as an error on every insert. Convex's own generated tsconfig does not
+    // enable this flag; we disable it here (and only here) so the backend keeps
+    // every other strict check from tsconfig.base.json. See docs/roadmap.
+    "exactOptionalPropertyTypes": false
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules", "_generated/**/*.js", "**/*.test.ts", "vitest.config.ts"]
+}

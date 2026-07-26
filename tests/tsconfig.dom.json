@@ -1,0 +1,65 @@
+{
+  // Typecheck project for tests that RENDER apps/web React components.
+  //
+  // WHY THIS FILE EXISTS
+  // Exactly the same divergence `tests/tsconfig.convex-seam.json` documents
+  // for `convex/`, one boundary over. `apps/web/tsconfig.json` deliberately
+  // sets `exactOptionalPropertyTypes: false`; `tests/tsconfig.json` inherits
+  // `true` from `tsconfig.base.json`. A test that IMPORTS a web component
+  // therefore drags legitimately-written `apps/web` source into a stricter
+  // project and fails typecheck on code that is correct under its own config
+  // and that `pnpm --filter @agent-flight-recorder/web typecheck` passes
+  // cleanly today. (Concretely: `<MutedBadge mutedAt={pattern.mutedAt} />` in
+  // PatternRow.tsx and TopFailurePatternsCard.tsx, where `mutedAt?: number`
+  // meets `number | undefined` — idiomatic React prop forwarding that only
+  // the strict flag rejects.)
+  //
+  // The fix is NOT to relax the flag in `tests/tsconfig.json`. That strictness
+  // is what makes fixture drift fail CI, and it stays on for every other test
+  // — see that file's own note. Instead this project compiles the DOM test
+  // under the WEB APP's config, by extending `apps/web/tsconfig.json` directly
+  // rather than restating its flags. If Team B ever turns
+  // `exactOptionalPropertyTypes` back on in `apps/web`, this project follows
+  // automatically with no edit here.
+  //
+  // KEEP THIS FILE'S `include` NARROW, for the same reason the convex-seam
+  // project keeps its own narrow. Every file listed here trades
+  // `exactOptionalPropertyTypes` for the ability to import React components.
+  // That is the right trade only for files that render them. Ordinary tests
+  // belong in `tests/tsconfig.json`.
+  //
+  // Run by `pnpm --filter @agent-flight-recorder/tests typecheck`, which runs
+  // all three projects. See CONTRIBUTING.md § Verification gates.
+  "extends": "../apps/web/tsconfig.json",
+  "compilerOptions": {
+    // vitest transforms with esbuild's automatic JSX runtime (see
+    // `esbuild.jsx` in tests/vitest.config.ts). apps/web uses `preserve`
+    // because Next does its own transform; here the test must typecheck the
+    // way it actually runs.
+    "jsx": "react-jsx",
+    "types": ["node", "vitest/globals", "@testing-library/jest-dom/vitest"],
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    // Own buildinfo so this project's incremental state does not collide with
+    // the other two.
+    "tsBuildInfoFile": "./tsconfig.dom.tsbuildinfo",
+    // Same relaxations tests/tsconfig.json makes for test code (positional
+    // array access, record indexing).
+    "noUncheckedIndexedAccess": false,
+    "noPropertyAccessFromIndexSignature": false,
+    // Restated relative to THIS file. `apps/web/tsconfig.json` declares
+    // `@/*` relative to itself, which is still correct when extended, but
+    // `@app/*` (Next route files — see tests/vitest.config.ts) is this
+    // package's alias and has to be declared here.
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["../apps/web/src/*"],
+      "@app/*": ["../apps/web/app/*"]
+    }
+  },
+  // DOM tests and the stubs they resolve through, only.
+  "include": ["unit/patterns_a11y.test.tsx", "stubs/next-link.tsx", "setup/dom.ts"],
+  "exclude": ["node_modules"]
+}

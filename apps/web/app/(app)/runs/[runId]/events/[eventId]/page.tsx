@@ -1,3 +1,4 @@
+import Link from 'next/link'
 import { notFound } from 'next/navigation'
 
 import type { Metadata } from 'next'
@@ -19,12 +20,18 @@ export default async function EventDetailPage({ params }: EventDetailPageProps) 
 
   try {
     event = await getEvent(eventId)
-    if (!event || event.runId !== runId) notFound()
   } catch (err) {
+    // notFound() throws a NEXT_NOT_FOUND digest — if that were caught here it
+    // would leak into the ErrorState below. Keep it out of the try entirely and
+    // only translate genuine "not found" fetch errors into a 404.
     const msg = err instanceof Error ? err.message : 'Unknown error'
     if (msg.toLowerCase().includes('not found')) notFound()
     fetchError = msg
   }
+
+  // Outside the try: a valid event under the wrong run URL (or a missing event)
+  // must 404, and notFound()'s thrown digest must propagate, not be swallowed.
+  if (!fetchError && (!event || event.runId !== runId)) notFound()
 
   if (fetchError) {
     return (
@@ -42,13 +49,13 @@ export default async function EventDetailPage({ params }: EventDetailPageProps) 
     <div className="p-6 max-w-4xl">
       {/* Breadcrumb */}
       <nav className="mb-4 flex items-center gap-2 text-xs text-neutral-500">
-        <a href={`/runs/${runId}`} className="hover:text-neutral-300 transition-colors">
+        <Link href={`/runs/${runId}`} className="hover:text-neutral-300 transition-colors">
           Run
-        </a>
+        </Link>
         <span>/</span>
-        <a href={`/runs/${runId}?tab=events`} className="hover:text-neutral-300 transition-colors">
+        <Link href={`/runs/${runId}?tab=events`} className="hover:text-neutral-300 transition-colors">
           Events
-        </a>
+        </Link>
         <span>/</span>
         <span className="font-mono text-neutral-400">{eventId.slice(-8)}</span>
       </nav>
@@ -62,19 +69,19 @@ export default async function EventDetailPage({ params }: EventDetailPageProps) 
           <span className="text-xs text-neutral-500">
             seq #{event.sequenceNumber}
           </span>
-          <span className="text-xs text-neutral-600 tabular-nums">
+          <span className="text-xs text-pewter tabular-nums">
             {new Date(event.timestamp).toISOString()}
           </span>
         </div>
         {event.parentEventId && (
           <div className="text-xs text-neutral-500">
             Parent:{' '}
-            <a
+            <Link
               href={`/runs/${runId}/events/${event.parentEventId}`}
               className="font-mono text-primary-400 hover:text-primary-300 transition-colors"
             >
               {event.parentEventId.slice(-8)}
-            </a>
+            </Link>
           </div>
         )}
       </div>

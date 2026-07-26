@@ -1,6 +1,7 @@
 import { auth } from '@clerk/nextjs/server'
 import { redirect } from 'next/navigation'
 
+import { KeyboardLayer } from '@/components/keyboard/KeyboardLayer'
 import { AppShell } from '@/components/layout/AppShell'
 
 export default function AppLayout({
@@ -14,5 +15,10 @@ export default function AppLayout({
     redirect('/sign-in')
   }
 
-  return <AppShell>{children}</AppShell>
+  return (
+    <>
+      <AppShell>{children}</AppShell>
+      <KeyboardLayer />
+    </>
+  )
 }

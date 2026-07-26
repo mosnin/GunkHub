@@ -28,8 +28,28 @@ export const Events = {
   runCompleted(runId: string, output: unknown, duration_ms: number) {
     return { type: 'run.completed' as const, payload: { type: 'run.completed' as const, output, duration_ms } }
   },
-  runFailed(runId: string, error: { message: string; code?: string; stack?: string }, duration_ms: number) {
-    return { type: 'run.failed' as const, payload: { type: 'run.failed' as const, error, duration_ms } }
+  /**
+   * @param errorSummary - Optional short, bounded, already-redacted error
+   *   summary (see `buildErrorSummary` in `error-summary.ts`). Carried as a
+   *   sibling field on the payload — NOT nested under `error` — so it can be
+   *   carved out and preserved when the payload is externalized (M4: see
+   *   `externalize.ts`).
+   */
+  runFailed(
+    runId: string,
+    error: { message: string; code?: string; stack?: string },
+    duration_ms: number,
+    errorSummary?: string
+  ) {
+    return {
+      type: 'run.failed' as const,
+      payload: {
+        type: 'run.failed' as const,
+        error,
+        duration_ms,
+        ...(errorSummary !== undefined && { errorSummary }),
+      },
+    }
   },
   llmRequest(model: string, messages: Array<{ role: string; content: string }>, options?: { temperature?: number; max_tokens?: number }) {
     return {

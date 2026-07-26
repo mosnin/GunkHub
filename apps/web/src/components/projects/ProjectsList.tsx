@@ -72,7 +72,7 @@ export function ProjectsList({ projects }: ProjectsListProps) {
                   <td className="px-4 py-3 text-sm text-neutral-200 font-medium">
                     {p.name}
                     {p.description && (
-                      <span className="ml-2 text-xs text-neutral-600 font-normal">{p.description}</span>
+                      <span className="ml-2 text-xs text-pewter font-normal">{p.description}</span>
                     )}
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-neutral-400">{p.slug}</td>

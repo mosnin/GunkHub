@@ -1,27 +1,34 @@
+import Link from 'next/link'
 import { notFound } from 'next/navigation'
-import { Suspense } from 'react'
 
 import type { Artifact, Comment, FailureSummary } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
 import { ArtifactList } from '@/components/runs/ArtifactList'
 import { CommentThread } from '@/components/runs/CommentThread'
+import { EvalsPanel } from '@/components/runs/EvalsPanel'
 import { EventInspector } from '@/components/runs/EventInspector'
+import { ExplanationPanel } from '@/components/runs/ExplanationPanel'
 import { FailureSummary as FailureSummaryPanel } from '@/components/runs/FailureSummary'
 import { RunBreadcrumb } from '@/components/runs/RunBreadcrumb'
 import { RunHeader } from '@/components/runs/RunHeader'
+import { RunHierarchyPanel } from '@/components/runs/RunHierarchyPanel'
 import { Timeline } from '@/components/runs/Timeline'
+import { TriageControl } from '@/components/runs/TriageControl'
 import { VerificationPanel } from '@/components/runs/VerificationPanel'
 import { ErrorState } from '@/components/ui/ErrorState'
-import { LoadingState } from '@/components/ui/LoadingState'
+import { InlineError } from '@/components/ui/InlineError'
+import { getCurrentAuth } from '@/lib/auth'
 import { getAgent } from '@/lib/services/agents'
 import { listArtifacts } from '@/lib/services/artifacts'
 import { listComments } from '@/lib/services/comments'
+import { getRunEvalSummary, listEvalsForRun, type RunEvalSummary } from '@/lib/services/evals'
 import { listEvents } from '@/lib/services/events'
+import { getRunExplanation, type RunExplanation } from '@/lib/services/explanations'
 import { getRunVerificationStatus, type VerificationStatus } from '@/lib/services/projection_verify'
 import { getProject } from '@/lib/services/projects'
 import { getReplayProjection } from '@/lib/services/replay'
-import { getRun } from '@/lib/services/runs'
+import { getRun, listChildRuns } from '@/lib/services/runs'
 
 export const metadata: Metadata = { title: 'Run Detail' }
 
@@ -29,6 +36,7 @@ const TABS = [
   { id: 'timeline', label: 'Timeline' },
   { id: 'events', label: 'Events' },
   { id: 'artifacts', label: 'Artifacts' },
+  { id: 'evals', label: 'Evals' },
   { id: 'comments', label: 'Comments' },
   { id: 'replay', label: 'Replay' },
 ] as const
@@ -59,77 +67,96 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   let failureSummary: FailureSummary | null = null
   let artifactsData: { artifacts: Artifact[] } = { artifacts: [] }
   let commentsData: Comment[] = []
+  let childRuns: Awaited<ReturnType<typeof listChildRuns>> = []
+  let evalsData: Awaited<ReturnType<typeof listEvalsForRun>> = []
+  let evalSummary: RunEvalSummary | undefined
+  let explanation: RunExplanation | null = null
 
-  try {
-    runData = await getRun(runId)
-    eventsData = await listEvents({ runId, limit: 200 })
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error'
+  // Phase 1 — fetch everything that only depends on runId in parallel instead of
+  // serially. run + events are the fatal group (drive notFound / ErrorState);
+  // replay, artifacts, comments, child runs, evals, and the failure explanation
+  // are additive (non-fatal). allSettled lets one failure not reject the others.
+  const [
+    runSettled,
+    eventsSettled,
+    replaySettled,
+    artifactsSettled,
+    commentsSettled,
+    childRunsSettled,
+    evalsSettled,
+    evalSummarySettled,
+    explanationSettled,
+  ] = await Promise.allSettled([
+    getRun(runId),
+    listEvents({ runId, limit: 200 }),
+    getReplayProjection(runId),
+    listArtifacts(runId),
+    listComments(runId, 'run'),
+    listChildRuns(runId),
+    listEvalsForRun(runId),
+    getRunEvalSummary(runId),
+    getRunExplanation(runId),
+  ])
+
+  if (runSettled.status === 'fulfilled') runData = runSettled.value
+  if (eventsSettled.status === 'fulfilled') eventsData = eventsSettled.value
+  if (childRunsSettled.status === 'fulfilled') childRuns = childRunsSettled.value
+  if (evalsSettled.status === 'fulfilled') evalsData = evalsSettled.value
+  if (evalSummarySettled.status === 'fulfilled') evalSummary = evalSummarySettled.value
+  if (explanationSettled.status === 'fulfilled') explanation = explanationSettled.value
+  const evalsFailed = evalsSettled.status === 'rejected'
+  const explanationFailed = explanationSettled.status === 'rejected'
+
+  // Fatal group error handling — preserve notFound() on "not found", else surface.
+  const fatalRejection: unknown =
+    runSettled.status === 'rejected'
+      ? runSettled.reason
+      : eventsSettled.status === 'rejected'
+        ? eventsSettled.reason
+        : null
+  if (fatalRejection) {
+    const msg = fatalRejection instanceof Error ? fatalRejection.message : 'Unknown error'
     if (msg.toLowerCase().includes('not found')) notFound()
     fetchError = msg
   }
 
-  // Resolve agent version label for display in RunHeader
-  let agentVersionLabel: string | undefined
-  if (runData?.run.agentVersionId) {
-    try {
-      const { getAgentVersion } = await import('@/lib/services/agent_versions')
-      const v = await getAgentVersion(runData.run.agentVersionId)
-      agentVersionLabel = v?.version
-    } catch {
-      // Non-fatal
-    }
-  }
+  // Additive results — non-fatal, defaults retained on rejection, but track
+  // per-section failure so the UI shows an inline error instead of a
+  // misleading empty state.
+  const replayFailed = replaySettled.status === 'rejected'
+  const artifactsFailed = artifactsSettled.status === 'rejected'
+  const commentsFailed = commentsSettled.status === 'rejected'
+  if (replaySettled.status === 'fulfilled') failureSummary = replaySettled.value.failureSummary
+  if (artifactsSettled.status === 'fulfilled') artifactsData = artifactsSettled.value
+  if (commentsSettled.status === 'fulfilled') commentsData = commentsSettled.value
 
-  // Failure summary is additive — a failed fetch does not block the rest of the page.
-  try {
-    const replayData = await getReplayProjection(runId)
-    failureSummary = replayData.failureSummary
-  } catch {
-    // Non-fatal: skip the failure panel if the projection cannot be built.
-  }
-
-  try {
-    artifactsData = await listArtifacts(runId)
-  } catch {
-    // Non-fatal: show empty artifact list if fetch fails
-  }
-
-  try {
-    commentsData = await listComments(runId, 'run')
-  } catch {
-    // Non-fatal: show empty comment thread if fetch fails
-  }
-
-  // Only fetch verification status for terminal runs — running runs won't have results yet
-  let verificationStatus: VerificationStatus | null = null
   const TERMINAL = ['completed', 'failed', 'cancelled', 'timed_out'] as const
-  if (runData && TERMINAL.includes(runData.run.status as typeof TERMINAL[number])) {
-    try {
-      verificationStatus = await getRunVerificationStatus(runId)
-    } catch {
-      // Non-fatal: show "unverified" if status cannot be fetched
-    }
-  }
 
-  // Resolve parent context for breadcrumb — non-fatal if either fails
+  // Phase 2 — fetches that depend on runData, run in parallel with one another.
+  let agentVersionLabel: string | undefined
+  let verificationStatus: VerificationStatus | null = null
   let breadcrumbProjectName: string | undefined
   let breadcrumbAgentName: string | undefined
 
   if (runData) {
-    try {
-      const project = await getProject(runData.run.projectId)
-      breadcrumbProjectName = project.name
-    } catch {
-      // Non-fatal: fall back to showing project ID in breadcrumb
-    }
+    const run = runData.run
+    const isTerminal = TERMINAL.includes(run.status as typeof TERMINAL[number])
+    const { getAgentVersion } = await import('@/lib/services/agent_versions')
 
-    try {
-      const agent = await getAgent(runData.run.agentId)
-      breadcrumbAgentName = agent?.name
-    } catch {
-      // Non-fatal: fall back to showing agent ID in breadcrumb
-    }
+    const [versionRes, verifyRes, projectRes, agentRes] = await Promise.all([
+      run.agentVersionId
+        ? getAgentVersion(run.agentVersionId).catch(() => null)
+        : Promise.resolve(null),
+      // Only terminal runs have verification results yet.
+      isTerminal ? getRunVerificationStatus(runId).catch(() => null) : Promise.resolve(null),
+      getProject(run.projectId).catch(() => null),
+      getAgent(run.agentId).catch(() => null),
+    ])
+
+    agentVersionLabel = versionRes?.version
+    verificationStatus = verifyRes
+    breadcrumbProjectName = projectRes?.name
+    breadcrumbAgentName = agentRes?.name
   }
 
   if (fetchError) {
@@ -145,6 +172,8 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
   const { run } = runData
   const events = eventsData?.events ?? []
   const initialNextCursor = eventsData?.nextCursor
+  const isAdmin = getCurrentAuth().orgRole === 'admin'
+  const showExplanation = run.status === 'failed' || run.status === 'timed_out'
 
   return (
     <div className="flex flex-col h-full">
@@ -161,7 +190,7 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
       <RunHeader
         runId={runId}
         status={run.status}
-        agentName={run.agentId}
+        agentName={breadcrumbAgentName ?? run.agentId}
         agentVersionLabel={agentVersionLabel}
         startedAt={run.startedAt}
         endedAt={run.endedAt}
@@ -170,11 +199,62 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         metadata={run.metadata}
         isLive={run.status === 'running'}
         verificationStatus={verificationStatus}
+        environment={run.environment}
       />
 
+      {/* Triage + labels — only rendered when there's something to show:
+          eligible (failed/timed_out) runs always get the control; any run
+          that already has a triage state or labels shows them read-only. */}
+      {(run.status === 'failed' || run.status === 'timed_out' || run.triageState !== undefined || (run.labels?.length ?? 0) > 0) && (
+        <div className="px-6 py-3 border-b border-neutral-800">
+          <TriageControl
+            runId={runId}
+            triageState={run.triageState ?? 'open'}
+            labels={run.labels ?? []}
+            eligible={run.status === 'failed' || run.status === 'timed_out'}
+          />
+        </div>
+      )}
+
+      {/* Trace hierarchy — parent link, child runs, session link, and the
+          causal walk.
+
+          NO LONGER HIDDEN when the run has none of parent/session/children.
+          That condition was the defect this feature exists to fix: a run with
+          no recorded parent showed no trace panel at all, and an absent panel
+          reads as "this run has no lineage" — which is a conclusion the data
+          does not support. Absence of a recorded edge is absence of a record,
+          not a record of absence. The causal link is always offered, and the
+          walk itself is what says whether the chain ENDED or the trail was
+          LOST. */}
+      <RunHierarchyPanel
+        runId={run.id}
+        parentRunId={run.parentRunId}
+        sessionId={run.sessionId}
+        children={childRuns}
+      />
+
+      {/* "Why did this fail?" — the flagship explainability panel. Only for
+          failed/timed_out runs; completed runs never render an empty card.
+          Sits above the failure-summary heuristics and the timeline so it is
+          the first thing the engineer sees. */}
+      {showExplanation && (
+        <ExplanationPanel
+          runId={runId}
+          explanation={explanation}
+          loadFailed={explanationFailed}
+          isAdmin={isAdmin}
+          runEndedAt={run.endedAt}
+        />
+      )}
+
       {/* Failure summary panel — additive, shown only when there is a failure or incomplete run */}
-      {failureSummary && (
-        <FailureSummaryPanel summary={failureSummary} />
+      {replayFailed ? (
+        <div className="px-6 pt-3">
+          <InlineError message="Couldn't load the failure analysis for this run — refresh to retry." />
+        </div>
+      ) : (
+        failureSummary && <FailureSummaryPanel summary={failureSummary} />
       )}
 
       {/* Verification panel — shown only for terminal runs */}
@@ -186,9 +266,11 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
         />
       )}
 
-      {/* Tab bar */}
+      {/* Section navigation — these are links that change the URL, not a
+          client-side tab switcher, so they carry nav/aria-current semantics
+          rather than tablist/tab roles. */}
       <div className="border-b border-neutral-800 px-6 mt-3">
-        <nav className="-mb-px flex gap-6" role="tablist">
+        <nav aria-label="Run sections" className="-mb-px flex gap-6 overflow-x-auto">
           {TABS.map((tab) => {
             const isActive = tab.id === activeTab
             // Replay tab links to the dedicated replay page instead of a tab panel
@@ -197,11 +279,10 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
                 ? `/runs/${runId}/replay`
                 : `/runs/${runId}?tab=${tab.id}`
             return (
-              <a
+              <Link
                 key={tab.id}
                 href={href}
-                role="tab"
-                aria-selected={isActive}
+                aria-current={isActive ? 'page' : undefined}
                 className={[
                   'pb-3 text-sm font-medium border-b-2 transition-colors duration-100 whitespace-nowrap',
                   isActive
@@ -210,33 +291,54 @@ export default async function RunDetailPage({ params, searchParams }: RunDetailP
                 ].join(' ')}
               >
                 {tab.label}
-              </a>
+              </Link>
             )
           })}
         </nav>
       </div>
 
-      {/* Tab content */}
-      <div className="flex-1 overflow-y-auto">
+      {/* Tab content — data is already fetched above, so these render
+          synchronously (no Suspense boundary needed). */}
+      <div className="flex-1 min-w-0 overflow-y-auto">
         {activeTab === 'timeline' && (
-          <Suspense fallback={<LoadingState message="Loading timeline..." />}>
-            <Timeline runId={runId} events={events} initialNextCursor={initialNextCursor} isLive={run.status === 'running'} />
-          </Suspense>
+          <Timeline
+            runId={runId}
+            events={events}
+            initialNextCursor={initialNextCursor}
+            isLive={run.status === 'running'}
+            citedSequenceNumbers={explanation?.citedSequenceNumbers}
+            focusEventSeq={initialEventSeq}
+          />
         )}
         {activeTab === 'events' && (
-          <Suspense fallback={<LoadingState message="Loading events..." />}>
-            <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} initialEventSeq={initialEventSeq} isLive={run.status === 'running'} />
-          </Suspense>
+          <EventInspector runId={runId} events={events} initialNextCursor={initialNextCursor} initialEventSeq={initialEventSeq} isLive={run.status === 'running'} />
         )}
         {activeTab === 'artifacts' && (
-          <Suspense fallback={<LoadingState message="Loading artifacts..." />}>
+          artifactsFailed ? (
+            <div className="p-6">
+              <InlineError message="Couldn't load artifacts — refresh to retry." />
+            </div>
+          ) : (
             <ArtifactList artifacts={artifactsData.artifacts} />
-          </Suspense>
+          )
+        )}
+        {activeTab === 'evals' && (
+          evalsFailed ? (
+            <div className="p-6">
+              <InlineError message="Couldn't load evals — refresh to retry." />
+            </div>
+          ) : (
+            <EvalsPanel evals={evalsData} summary={evalSummary} />
+          )
         )}
         {activeTab === 'comments' && (
-          <Suspense fallback={<LoadingState message="Loading comments..." />}>
+          commentsFailed ? (
+            <div className="p-6">
+              <InlineError message="Couldn't load comments — refresh to retry." />
+            </div>
+          ) : (
             <CommentThread targetId={runId} targetType="run" initialComments={commentsData} />
-          </Suspense>
+          )
         )}
       </div>
     </div>

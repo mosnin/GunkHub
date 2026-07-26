@@ -5,12 +5,19 @@
 import { randomBytes } from 'node:crypto'
 
 import { auth } from '@clerk/nextjs/server'
-import { NextResponse } from 'next/server'
+import { type NextRequest, NextResponse } from 'next/server'
 
 import type { ApiError } from '@agent-flight-recorder/contracts'
 
+import { withApiHandler } from '@/lib/apiHandler'
+import { resolveRequestedScopes } from '@/lib/apiKeyScopes'
 import { convex } from '@/lib/convexFunctions'
-import { getAuthedClient, hashApiKey, resolveConvexOrgId } from '@/lib/convexServer'
+import {
+  getAuthedClient,
+  hashApiKey,
+  resolveConvexOrgId,
+  withConvexTimeout,
+} from '@/lib/convexServer'
 
 // Convex returns untyped documents; we cast through unknown to avoid unsafe-any
 // while still accessing the fields we know are present on the api_keys table.
@@ -19,6 +26,8 @@ interface ApiKeyDoc {
   name: string
   createdAt: number
   lastUsedAt?: number
+  expiresAt?: number
+  scopes?: string[]
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -48,7 +57,7 @@ async function convexQuery(
 // POST /api/api-keys — generate a new API key for the authenticated org
 // ---------------------------------------------------------------------------
 
-export async function POST(req: Request) {
+export const POST = withApiHandler('/api/api-keys', async (req: NextRequest, ctx) => {
   const { userId, orgId: clerkOrgId } = auth()
   if (!userId || !clerkOrgId) {
     return NextResponse.json<ApiError>(
@@ -56,6 +65,7 @@ export async function POST(req: Request) {
       { status: 401 },
     )
   }
+  ctx.setOrgId(clerkOrgId)
 
   let body: Record<string, unknown>
   try {
@@ -76,39 +86,82 @@ export async function POST(req: Request) {
     )
   }
 
-  try {
-    const convexOrgId = await resolveConvexOrgId(clerkOrgId)
-    const rawKey = randomBytes(32).toString('hex')
-    const keyHash = hashApiKey(rawKey)
-
-    const client = await getAuthedClient()
-    const keyDoc = (await convexMutation(client, convex.api_keys.createApiKey, {
-      orgId: convexOrgId,
-      name: name.trim(),
-      keyHash,
-    })) as ApiKeyDoc
-
-    // The raw key is returned ONCE and never stored — caller must persist it securely.
-    return NextResponse.json(
-      {
-        id: keyDoc._id,
-        name: keyDoc.name,
-        createdAt: keyDoc.createdAt,
-        key: rawKey,
-      },
-      { status: 201 },
-    )
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Internal error'
-    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
+  // Optional expiration: accept either an absolute epoch-ms `expiresAt` or a
+  // convenience `expiresInDays`.
+  let expiresAt: number | undefined
+  const rawExpiresAt = body['expiresAt']
+  const rawExpiresInDays = body['expiresInDays']
+  if (typeof rawExpiresAt === 'number') {
+    expiresAt = rawExpiresAt
+  } else if (typeof rawExpiresInDays === 'number' && rawExpiresInDays > 0) {
+    expiresAt = Date.now() + rawExpiresInDays * 24 * 60 * 60 * 1000
   }
-}
+  if (expiresAt !== undefined && expiresAt <= Date.now()) {
+    return NextResponse.json<ApiError>(
+      { code: 'VALIDATION_ERROR', message: 'expiration must be in the future' },
+      { status: 422 },
+    )
+  }
+
+  // Optional per-key ingest rate limit (events/min).
+  let rateLimitPerMin: number | undefined
+  const rawRate = body['rateLimitPerMin']
+  if (typeof rawRate === 'number') {
+    if (rawRate <= 0 || !Number.isFinite(rawRate)) {
+      return NextResponse.json<ApiError>(
+        { code: 'VALIDATION_ERROR', message: 'rateLimitPerMin must be a positive number' },
+        { status: 422 },
+      )
+    }
+    rateLimitPerMin = rawRate
+  }
+
+  // Scopes: validate against the allowed set (subset check), defaulting to
+  // ["ingest:write"] when omitted — see resolveRequestedScopes for the full
+  // contract (includes "read", minted for the v1 read API / CLI as of this
+  // cycle).
+  const scopesResult = resolveRequestedScopes(body['scopes'])
+  if (!scopesResult.ok) {
+    return NextResponse.json<ApiError>(
+      { code: 'VALIDATION_ERROR', message: scopesResult.error },
+      { status: 422 },
+    )
+  }
+  const scopes = scopesResult.scopes
+
+  const convexOrgId = await resolveConvexOrgId(clerkOrgId)
+  const rawKey = randomBytes(32).toString('hex')
+  const keyHash = hashApiKey(rawKey)
+
+  const client = await getAuthedClient()
+  const keyDoc = (await withConvexTimeout(convexMutation(client, convex.api_keys.createApiKey, {
+    orgId: convexOrgId,
+    name: name.trim(),
+    keyHash,
+    ...(expiresAt !== undefined && { expiresAt }),
+    scopes,
+    ...(rateLimitPerMin !== undefined && { rateLimitPerMin }),
+  }))) as ApiKeyDoc
+
+  // The raw key is returned ONCE and never stored — caller must persist it securely.
+  return NextResponse.json(
+    {
+      id: keyDoc._id,
+      name: keyDoc.name,
+      createdAt: keyDoc.createdAt,
+      expiresAt: keyDoc.expiresAt,
+      scopes: keyDoc.scopes,
+      key: rawKey,
+    },
+    { status: 201 },
+  )
+})
 
 // ---------------------------------------------------------------------------
 // GET /api/api-keys — list API keys for the authenticated org
 // ---------------------------------------------------------------------------
 
-export async function GET() {
+export const GET = withApiHandler('/api/api-keys', async (_req: NextRequest, ctx) => {
   const { userId, orgId: clerkOrgId } = auth()
   if (!userId || !clerkOrgId) {
     return NextResponse.json<ApiError>(
@@ -116,25 +169,25 @@ export async function GET() {
       { status: 401 },
     )
   }
+  ctx.setOrgId(clerkOrgId)
 
-  try {
-    const convexOrgId = await resolveConvexOrgId(clerkOrgId)
-    const client = await getAuthedClient()
-    const keys = (await convexQuery(client, convex.api_keys.listApiKeys, {
-      orgId: convexOrgId,
-    })) as ApiKeyDoc[]
+  const convexOrgId = await resolveConvexOrgId(clerkOrgId)
+  const client = await getAuthedClient()
+  const keys = (await withConvexTimeout(convexQuery(client, convex.api_keys.listApiKeys, {
+    orgId: convexOrgId,
+  }))) as ApiKeyDoc[]
 
-    // Return only safe fields — never the raw key or hash
-    const safeKeys = keys.map((k) => ({
-      id: k._id,
-      name: k.name,
-      createdAt: k.createdAt,
-      lastUsedAt: k.lastUsedAt,
-    }))
+  // Return only safe fields — never the raw key or hash
+  const now = Date.now()
+  const safeKeys = keys.map((k) => ({
+    id: k._id,
+    name: k.name,
+    createdAt: k.createdAt,
+    lastUsedAt: k.lastUsedAt,
+    expiresAt: k.expiresAt,
+    scopes: k.scopes,
+    expired: k.expiresAt !== undefined && k.expiresAt <= now,
+  }))
 
-    return NextResponse.json({ keys: safeKeys })
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Internal error'
-    return NextResponse.json<ApiError>({ code: 'INTERNAL_ERROR', message }, { status: 500 })
-  }
-}
+  return NextResponse.json({ keys: safeKeys })
+})

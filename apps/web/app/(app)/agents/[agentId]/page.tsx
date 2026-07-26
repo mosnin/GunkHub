@@ -4,10 +4,17 @@ import { notFound } from 'next/navigation'
 import type { Agent, AgentVersion } from '@agent-flight-recorder/contracts'
 import type { Metadata } from 'next'
 
+import { CostStats } from '@/components/agents/CostStats'
+import { EvalVersionPanel } from '@/components/agents/EvalVersionPanel'
+import { VersionCompare } from '@/components/agents/VersionCompare'
 import { VersionSection } from '@/components/agents/VersionSection'
 import { Card } from '@/components/ui/Card'
 import { CodeBlock } from '@/components/ui/CodeBlock'
+import { getAgentVersionEvalRules } from '@/lib/services/agent_versions'
+import { getAgentCostStats } from '@/lib/services/cost'
+import { getEvalRollupForVersion } from '@/lib/services/evals'
 import { getProject } from '@/lib/services/projects'
+import { unavailableEmpty } from '@/lib/services/serviceResult'
 
 export const metadata: Metadata = { title: 'Agent' }
 
@@ -88,6 +95,28 @@ export default async function AgentPage({ params }: Props) {
 
   const sdkSnippet = buildSdkSnippet(agent.id, versions[0]?.id)
 
+  // Cost + eval-rollup panels are additive — a failure here must not blank the
+  // whole agent page, so both return an explained ServiceResult rather than
+  // throwing, and each panel renders 'empty' and 'error' differently.
+  const costStats = await getAgentCostStats(agent.id, '7d')
+
+  const latestVersion = versions[0]
+  let evalRules: Record<string, unknown>[] = []
+  // No version means there is genuinely nothing to roll up — a real 'empty',
+  // not a fabricated absence. (The panel below only renders when a version
+  // exists, so this is belt-and-braces, but it must still be honest: the old
+  // `{ available: false }` literal claimed "no data" without asking anyone.)
+  const evalRollup = latestVersion
+    ? await getEvalRollupForVersion(latestVersion.id, '7d')
+    : unavailableEmpty('This agent has no versions yet, so there is no eval rollup to show.')
+  if (latestVersion) {
+    try {
+      evalRules = await getAgentVersionEvalRules(latestVersion.id)
+    } catch {
+      // Non-fatal: eval rules list stays empty
+    }
+  }
+
   return (
     <div className="p-6 max-w-4xl mx-auto">
       {/* Breadcrumb */}
@@ -138,17 +167,34 @@ export default async function AgentPage({ params }: Props) {
         <VersionSection agentId={agent.id} versions={versions} nextCursor={versionsNextCursor} />
       </section>
 
+      {/* Cost — estimated token cost by model */}
+      <section className="mb-8">
+        <CostStats stats={costStats} />
+      </section>
+
+      {/* Evals — configured rules + pass-rate rollup for the latest version */}
+      {latestVersion && (
+        <section className="mb-8">
+          <EvalVersionPanel version={latestVersion.version} evalRules={evalRules} rollup={evalRollup} />
+        </section>
+      )}
+
+      {/* Version comparison — pick two versions, see the cohort comparison */}
+      <section className="mb-8">
+        <VersionCompare versions={versions} />
+      </section>
+
       {/* SDK Setup */}
       <Card>
         <div className="px-5 py-4 border-b border-neutral-800">
           <h2 className="text-sm font-semibold text-neutral-200">SDK Setup</h2>
-          <p className="mt-0.5 text-xs text-neutral-500">
+          <p className="mt-0.5 text-xs text-pewter">
             Use this snippet to record runs for this agent.
           </p>
         </div>
         <div className="px-5 py-4">
           <CodeBlock content={sdkSnippet} language="typescript" maxHeight="300px" />
-          <p className="mt-3 text-xs text-neutral-600">
+          <p className="mt-3 text-xs text-pewter">
             Need an API key?{' '}
             <Link
               href="/settings"

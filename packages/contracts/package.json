@@ -1,26 +1,29 @@
 {
   "name": "@agent-flight-recorder/contracts",
-  "version": "0.6.1",
+  "version": "0.26.0",
   "private": true,
-  "main": "./dist/index.cjs",
+  "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm,cjs --dts --tsconfig tsconfig.build.json",
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean --tsconfig tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "dev": "tsup src/index.ts --format esm,cjs --dts --watch --tsconfig tsconfig.build.json"
+    "dev": "tsup src/index.ts --format esm,cjs --dts --watch --tsconfig tsconfig.build.json",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
   },
   "devDependencies": {
     "tsup": "^8.0.0",
     "typescript": "^5.4.0"
-  },
-  "dependencies": {
-    "zod": "^3.23.0"
   }
 }

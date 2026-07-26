@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+
 import { STALE_RUN_TIMEOUT_MS, STALE_RUN_BATCH_SIZE } from '../../convex/helpers/pagination.js'
 
 describe('Stale run timeout configuration', () => {
@@ -48,7 +49,7 @@ describe('markRunTimedOut safety invariants', () => {
 
   it('expiry is idempotent: already-timed_out runs are not re-patched', () => {
     // A run with status "timed_out" returns early from markRunTimedOut
-    const runStatus = 'timed_out'
+    const runStatus: string = 'timed_out'
     const wouldPatch = runStatus === 'running'
     expect(wouldPatch).toBe(false)
   })

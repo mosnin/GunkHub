@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+
 import { buildReplayProjection } from '../../apps/web/src/lib/replay/projection.js'
 import {
   successfulRun,
@@ -10,6 +11,7 @@ import {
   nestedRun,
   nestedRunEvents,
 } from '../fixtures/events.js'
+
 import type { Event, Run } from '@agent-flight-recorder/contracts'
 
 // ---------------------------------------------------------------------------

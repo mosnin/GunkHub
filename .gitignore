@@ -24,7 +24,10 @@ out/
 
 # Convex
 .convex/
-convex/_generated/
+# NOTE: convex/_generated is intentionally TRACKED (not ignored). This repo's CI
+# has no live Convex deployment to run `convex codegen`, so the generated files are
+# hand-authored to mirror codegen output and committed so `pnpm typecheck` covers
+# the backend on a fresh checkout. A local `convex dev` will regenerate them.
 
 # Turbo
 .turbo/
@@ -32,6 +35,12 @@ convex/_generated/
 # Test coverage
 coverage/
 .nyc_output/
+
+# Playwright (playwright.config.ts lives at repo root, so output lands here
+# rather than under tests/)
+/test-results/
+/playwright-report/
+/blob-report/
 
 # Editor directories and files
 .vscode/

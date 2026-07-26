@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach } from 'vitest'
+
 import {
   PAYLOAD_EXTERNALIZATION_THRESHOLD,
   sha256Hex,
 } from '../../apps/web/src/lib/storage/adapter.js'
-import { StubBlobStorageAdapter } from '../../apps/web/src/lib/storage/stub.js'
 import { getStorageAdapter } from '../../apps/web/src/lib/storage/index.js'
+import { StubBlobStorageAdapter } from '../../apps/web/src/lib/storage/stub.js'
 
 // ---------------------------------------------------------------------------
 // PAYLOAD_EXTERNALIZATION_THRESHOLD

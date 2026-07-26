@@ -124,7 +124,7 @@ export function ProjectDetail({ project, agents }: ProjectDetailProps) {
                     <td className="px-4 py-3 text-sm text-neutral-200 font-medium">
                       {a.name}
                       {a.description && (
-                        <span className="ml-2 text-xs text-neutral-600 font-normal">
+                        <span className="ml-2 text-xs text-pewter font-normal">
                           {a.description}
                         </span>
                       )}
@@ -151,7 +151,7 @@ export function ProjectDetail({ project, agents }: ProjectDetailProps) {
         <Card>
           <div className="px-5 py-4 border-b border-neutral-800">
             <p className="text-sm font-medium text-neutral-200">Record runs for this project</p>
-            <p className="mt-0.5 text-xs text-neutral-500">
+            <p className="mt-0.5 text-xs text-pewter">
               {firstAgent != null
                 ? `Using agent: ${firstAgent.name}`
                 : 'Create an agent above to get the agent ID for this snippet.'}
@@ -159,7 +159,7 @@ export function ProjectDetail({ project, agents }: ProjectDetailProps) {
           </div>
           <div className="px-5 py-4">
             <CodeBlock content={sdkSnippet} language="typescript" maxHeight="300px" />
-            <p className="mt-3 text-xs text-neutral-600">
+            <p className="mt-3 text-xs text-pewter">
               Need an API key?{' '}
               <Link
                 href="/settings"

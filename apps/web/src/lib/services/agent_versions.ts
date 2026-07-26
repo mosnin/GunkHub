@@ -1,7 +1,14 @@
+import { unavailableEmpty, unavailableError } from './serviceResult'
+
+import type { ServiceResult } from './serviceResult'
+import type { VersionNarrativeResult as VersionCompareNarrative } from '@/lib/versionNarrative'
 import type { AgentVersion } from '@agent-flight-recorder/contracts'
+
 
 import { convex } from '@/lib/convexFunctions'
 import { getAuthedClient } from '@/lib/convexServer'
+
+const COMPARE_SUBJECT = 'the version comparison'
 
 function mapAgentVersion(doc: Record<string, unknown>): AgentVersion {
   return {
@@ -75,6 +82,11 @@ export async function createAgentVersion(input: {
   version: string
   changelog?: string
   configSnapshot?: Record<string, unknown>
+  /** Optional eval-auto-run rules (see convex/helpers/evals.ts `EvalRule`),
+      authored via the JSON editor in CreateVersionModal.tsx. Validated
+      client-side (lib/evalRulesValidation.ts) before reaching here; Convex
+      re-validates on write against the same shape. */
+  evalRules?: Record<string, unknown>[]
 }): Promise<AgentVersion> {
   const client = await getAuthedClient()
 
@@ -84,7 +96,147 @@ export async function createAgentVersion(input: {
     version: input.version.trim(),
     ...(input.changelog !== undefined && { changelog: input.changelog }),
     ...(input.configSnapshot !== undefined && { configSnapshot: input.configSnapshot }),
+    ...(input.evalRules !== undefined && input.evalRules.length > 0 && { evalRules: input.evalRules }),
   })
 
   return mapAgentVersion(doc as Record<string, unknown>)
+}
+
+/**
+ * A version's configured eval-auto-run rule set (schema.ts `agent_versions.evalRules`,
+ * validated at write time by convex/helpers/agent_version_fields.ts against the
+ * `EvalRule` discriminated union in convex/helpers/evals.ts). Not part of the
+ * shared `AgentVersion` contract type — read here as a loosely-typed array of
+ * records for read-only display (this cycle's requirement); each rule's
+ * `kind` field plus its remaining fields are rendered generically rather than
+ * importing the convex-internal union type into apps/web.
+ */
+export async function getAgentVersionEvalRules(versionId: string): Promise<Record<string, unknown>[]> {
+  const client = await getAuthedClient()
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const doc = await client.query(convex.agent_versions.getAgentVersion, { versionId })
+  if (!doc) return []
+  const rules = (doc as Record<string, unknown>).evalRules
+  return Array.isArray(rules) ? (rules as Record<string, unknown>[]) : []
+}
+
+// ---------------------------------------------------------------------------
+// Version comparison (cohort A/B) — Team B's convex/insights.ts `compareVersions`.
+// ---------------------------------------------------------------------------
+//
+// Real request:  { orgId, agentVersionIdA, agentVersionIdB }
+// Real response: {
+//   agentId,
+//   versionA: { id, version, sampleSize, scanned, truncated, countsByStatus },
+//   versionB: { id, version, sampleSize, scanned, truncated, countsByStatus },
+//   comparison: CohortComparison,  // includes the significance verdict
+// }
+//
+// `comparison.verdict` is one of likely_regression / likely_improvement /
+// inconclusive / insufficient_data. `truncated: true` on either cohort means
+// the underlying scan was capped — surfaced in the UI as "sampled" rather
+// than a full-population comparison.
+
+export interface VersionCohortStats {
+  id: string
+  version: string
+  sampleSize: number
+  scanned: number
+  truncated: boolean
+  countsByStatus: Record<string, number>
+}
+
+export type VersionCompareVerdict =
+  | 'likely_regression'
+  | 'likely_improvement'
+  | 'inconclusive'
+  | 'insufficient_data'
+
+export interface CohortComparison {
+  verdict: VersionCompareVerdict
+  /** Remaining fields (failure-rate deltas, statistical detail, etc.) — shape
+      is owned by insights.ts and rendered generically where not explicitly typed. */
+  [key: string]: unknown
+}
+
+export interface VersionCompareResultData {
+  agentId: string
+  versionA: VersionCohortStats
+  versionB: VersionCohortStats
+  comparison: CohortComparison
+  /** "What changed" narrative — Team C's `versionNarrative.ts` / the
+      `?explain=1` route. Absent/null is a normal, honest state (fetch
+      failed, or narrative generation itself is not yet wired up here) —
+      never rendered as an error. */
+  narrative?: VersionCompareNarrative | null
+}
+
+export type VersionCompareResult = ServiceResult<VersionCompareResultData>
+
+export async function compareVersions(
+  orgId: string,
+  agentVersionIdA: string,
+  agentVersionIdB: string,
+): Promise<VersionCompareResult> {
+  try {
+    const client = await getAuthedClient()
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const result = await client.query(convex.insights.compareVersions, {
+      orgId,
+      agentVersionIdA,
+      agentVersionIdB,
+    })
+    // Query succeeded with no comparison: these two versions have no
+    // overlapping run cohorts to compare yet.
+    if (!result) {
+      return unavailableEmpty('Not enough recorded runs on these two versions to compare them yet.')
+    }
+    const r = result as VersionCompareResultData
+    return { status: 'ok', ...r }
+  } catch (err) {
+    return unavailableError(COMPARE_SUBJECT, err, {
+      service: 'agent_versions',
+      fn: 'compareVersions',
+      agentVersionIdA,
+      agentVersionIdB,
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Version "what changed" narrative — Explainability Layer, cycle 2.
+//
+// Team C shipped this cycle: `GET /api/agents/[agentId]/versions/compare?
+// a=&b=&explain=1` (apps/web/app/api/agents/[agentId]/versions/compare/
+// route.ts), backed by the pure `@/lib/versionNarrative` narrative builder
+// plus the Convex I/O in `@/lib/services/versionCompareNarrative`
+// (`fetchVersionComparisonRaw` / `narrateVersionComparison`). Rather than
+// round-tripping this server action back through its own HTTP route, this
+// calls those same underlying functions directly — same code path the route
+// itself uses, no network hop, no cookie-forwarding needed.
+// ---------------------------------------------------------------------------
+
+export type { VersionCompareNarrative }
+
+/**
+ * Fetch the "what changed" narrative for a version comparison, using the same
+ * `fetchVersionComparisonRaw` + `narrateVersionComparison` pipeline as the
+ * `?explain=1` route. Non-fatal: any failure (auth, network, a version pair
+ * that doesn't resolve) returns `null` rather than throwing, so a narrative
+ * failure never blocks the cohort comparison itself.
+ */
+export async function getVersionCompareNarrative(
+  convexOrgId: string,
+  agentVersionIdA: string,
+  agentVersionIdB: string,
+) {
+  try {
+    const { fetchVersionComparisonRaw, narrateVersionComparison } = await import(
+      '@/lib/services/versionCompareNarrative'
+    )
+    const raw = await fetchVersionComparisonRaw(convexOrgId, agentVersionIdA, agentVersionIdB)
+    return narrateVersionComparison(raw)
+  } catch {
+    return null
+  }
 }

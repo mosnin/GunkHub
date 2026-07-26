@@ -5,7 +5,10 @@
 #   ./scripts/validate.sh           # run all checks
 #   ./scripts/validate.sh typecheck # run only typecheck
 #   ./scripts/validate.sh build     # run only build
+#   ./scripts/validate.sh build-integrity # run only the stale/partial artifact check
 #   ./scripts/validate.sh lint      # run only lint
+#   ./scripts/validate.sh convex-refs # run only the convex ref/call-site check
+#   ./scripts/validate.sh design-tokens # run only the design.md conformance check
 
 set -euo pipefail
 
@@ -63,7 +66,7 @@ print_summary() {
   log_header "Validation Summary"
   echo ""
 
-  for check in typecheck build lint schema-drift; do
+  for check in typecheck build build-integrity lint schema-drift convex-refs design-tokens; do
     if [[ -v RESULTS[$check] ]]; then
       local result="${RESULTS[$check]}"
       if [[ "$result" == "PASS" ]]; then
@@ -105,7 +108,7 @@ fi
 
 # ─── Determine which checks to run ───────────────────────────────────────────
 
-CHECKS_TO_RUN=("typecheck" "build" "lint" "schema-drift")
+CHECKS_TO_RUN=("typecheck" "build" "build-integrity" "lint" "schema-drift" "convex-refs" "design-tokens")
 
 if [[ $# -gt 0 ]]; then
   CHECKS_TO_RUN=("$@")
@@ -121,14 +124,39 @@ for check in "${CHECKS_TO_RUN[@]}"; do
     build)
       run_check "build" "pnpm build"
       ;;
+    build-integrity)
+      # MUST run after `build`. Detects dist/ artifacts left behind by a build
+      # that RAN AND PARTIALLY FAILED — the case a cold `rm -rf packages/*/dist`
+      # cannot reach, because the stale file was written by a real build, not
+      # left by a missing one. Specifically: a `tsup` run whose DTS step fails
+      # leaves the PREVIOUS index.d.ts on disk (contracts and sdk build without
+      # --clean), and every `tsc` in the repo then typechecks against types that
+      # no longer describe the source, at exit 0. See the script header.
+      run_check "build-integrity" "pnpm tsx scripts/check-build-integrity.ts"
+      ;;
     lint)
       run_check "lint" "pnpm lint"
       ;;
     schema-drift)
       run_check "schema-drift" "pnpm tsx scripts/check-schema-drift.ts"
       ;;
+    convex-refs)
+      # Cross-checks the hand-maintained makeFunctionReference string refs in
+      # apps/web/src/lib/convexFunctions.ts against the real convex/*.ts
+      # registrations. TypeScript cannot see this seam; see the script header.
+      run_check "convex-refs" "pnpm tsx scripts/check-convex-refs.ts"
+      ;;
+    design-tokens)
+      # Enforces design.md ("Neon"), which CLAUDE.md declares authoritative for
+      # the visual system. Nothing else in the repo does: not eslint, not the
+      # type system, not the build. The script parses design.md's own token
+      # tables and WCAG matrix at run time and resolves every Tailwind class
+      # back to a token by VALUE, so `text-neutral-500` is caught as the Ash it
+      # actually is. See the script header.
+      run_check "design-tokens" "pnpm tsx scripts/check-design-tokens.ts"
+      ;;
     *)
-      echo -e "${RED}Unknown check: ${check}. Valid options: typecheck, build, lint, schema-drift${RESET}"
+      echo -e "${RED}Unknown check: ${check}. Valid options: typecheck, build, build-integrity, lint, schema-drift, convex-refs, design-tokens${RESET}"
       exit 1
       ;;
   esac

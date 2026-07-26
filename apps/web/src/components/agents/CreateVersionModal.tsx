@@ -4,6 +4,8 @@ import { useEffect, useRef, useState, useTransition } from 'react'
 
 import { Button } from '@/components/ui/Button'
 import { createAgentVersionAction } from '@/lib/actions/agent_versions'
+import { EVAL_RULE_REFERENCE, parseEvalRulesInput } from '@/lib/evalRulesValidation'
+import { useFocusTrap } from '@/lib/hooks/useFocusTrap'
 
 interface CreateVersionModalProps {
   isOpen: boolean
@@ -21,9 +23,12 @@ export function CreateVersionModal({
   const [version, setVersion] = useState('')
   const [changelog, setChangelog] = useState('')
   const [configSnapshotRaw, setConfigSnapshotRaw] = useState('')
+  const [evalRulesRaw, setEvalRulesRaw] = useState('')
+  const [showRulesReference, setShowRulesReference] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
   const versionRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useFocusTrap<HTMLDivElement>(isOpen)
 
   // Reset state when modal opens
   useEffect(() => {
@@ -31,8 +36,9 @@ export function CreateVersionModal({
       setVersion('')
       setChangelog('')
       setConfigSnapshotRaw('')
+      setEvalRulesRaw('')
+      setShowRulesReference(false)
       setError(null)
-      setTimeout(() => versionRef.current?.focus(), 50)
     }
   }, [isOpen])
 
@@ -63,12 +69,19 @@ export function CreateVersionModal({
       }
     }
 
+    const evalRulesResult = parseEvalRulesInput(evalRulesRaw)
+    if (evalRulesResult.error) {
+      setError(evalRulesResult.error)
+      return
+    }
+
     startTransition(async () => {
       const result = await createAgentVersionAction(
         agentId,
         version,
         changelog || undefined,
         parsedConfig,
+        evalRulesResult.rules,
       )
       if ('error' in result) {
         setError(result.error)
@@ -85,10 +98,17 @@ export function CreateVersionModal({
         if (e.target === e.currentTarget) onClose()
       }}
     >
-      <div className="w-full max-w-lg mx-4 rounded-xl border border-neutral-800 bg-neutral-900 shadow-2xl">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-version-title"
+        tabIndex={-1}
+        className="w-full max-w-lg mx-4 rounded-[4px] border border-graphite-light bg-graphite-deep shadow-lg outline-none"
+      >
         {/* Header */}
         <div className="px-5 py-4 border-b border-neutral-800">
-          <h2 className="text-sm font-semibold text-neutral-100">New Version</h2>
+          <h2 id="create-version-title" className="text-sm font-semibold text-neutral-100">New Version</h2>
         </div>
 
         {/* Form */}
@@ -100,7 +120,7 @@ export function CreateVersionModal({
                 htmlFor="version-version"
                 className="block text-xs font-medium text-neutral-400 mb-1.5"
               >
-                Version <span className="text-red-500">*</span>
+                Version <span className="text-destructive-400">*</span>
               </label>
               <input
                 ref={versionRef}
@@ -111,7 +131,9 @@ export function CreateVersionModal({
                 onChange={(e) => setVersion(e.target.value)}
                 maxLength={64}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? 'create-version-error' : undefined}
+                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
               />
             </div>
 
@@ -121,7 +143,7 @@ export function CreateVersionModal({
                 htmlFor="version-changelog"
                 className="block text-xs font-medium text-neutral-400 mb-1.5"
               >
-                Changelog <span className="text-neutral-600">(optional)</span>
+                Changelog <span className="text-pewter">(optional)</span>
               </label>
               <textarea
                 id="version-changelog"
@@ -130,7 +152,7 @@ export function CreateVersionModal({
                 value={changelog}
                 onChange={(e) => setChangelog(e.target.value)}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
+                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
               />
             </div>
 
@@ -140,7 +162,7 @@ export function CreateVersionModal({
                 htmlFor="version-config"
                 className="block text-xs font-medium text-neutral-400 mb-1.5"
               >
-                Config snapshot (JSON) <span className="text-neutral-600">(optional)</span>
+                Config snapshot (JSON) <span className="text-pewter">(optional)</span>
               </label>
               <textarea
                 id="version-config"
@@ -149,12 +171,68 @@ export function CreateVersionModal({
                 value={configSnapshotRaw}
                 onChange={(e) => setConfigSnapshotRaw(e.target.value)}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm font-mono bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? 'create-version-error' : undefined}
+                className="w-full px-3 py-2 text-sm font-mono bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
               />
             </div>
 
+            {/* Eval rules (JSON editor) */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label
+                  htmlFor="version-eval-rules"
+                  className="block text-xs font-medium text-neutral-400"
+                >
+                  Eval rules (JSON) <span className="text-pewter">(optional)</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setShowRulesReference((v) => !v)}
+                  className="text-xs text-neon-glow hover:text-whiteout transition-colors duration-100"
+                  aria-expanded={showRulesReference}
+                  aria-controls="eval-rules-reference"
+                >
+                  {showRulesReference ? 'Hide reference' : 'Rules reference'}
+                </button>
+              </div>
+              {showRulesReference && (
+                <div
+                  id="eval-rules-reference"
+                  className="mb-2 flex flex-col gap-1.5 rounded-[4px] border border-graphite-light bg-graphite px-3 py-2.5 max-h-40 overflow-y-auto"
+                >
+                  {EVAL_RULE_REFERENCE.map((r) => (
+                    <div key={r.kind} className="text-xs">
+                      <span className="font-mono text-whiteout font-medium">{r.kind}</span>
+                      <span className="text-pewter"> — {r.description}</span>
+                      <div className="font-mono text-xs text-pewter break-all">{r.example}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <textarea
+                id="version-eval-rules"
+                rows={4}
+                placeholder='[{ "kind": "terminal_status", "expect": ["completed"] }]'
+                value={evalRulesRaw}
+                onChange={(e) => setEvalRulesRaw(e.target.value)}
+                disabled={isPending}
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? 'create-version-error' : undefined}
+                className="w-full px-3 py-2 text-sm font-mono bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
+              />
+              <p className="mt-1 text-xs text-pewter">
+                A structured rule builder is planned for a future cycle — this JSON editor is
+                validated against the 6 supported rule kinds before submit.
+              </p>
+            </div>
+
             {/* Error */}
-            {error && <p className="text-sm text-red-400 mt-2">{error}</p>}
+            {error && (
+              <p id="create-version-error" role="alert" className="text-sm text-destructive-400 mt-2">
+                {error}
+              </p>
+            )}
           </div>
 
           {/* Actions */}

@@ -31,3 +31,257 @@ export const STALE_RUN_TIMEOUT_MS = 24 * 60 * 60 * 1000;
  * Mirrors GC_CANDIDATE_PAGE_SIZE for consistency.
  */
 export const STALE_RUN_BATCH_SIZE = 100;
+
+/**
+ * Write ceiling: maximum events per run. Sequence numbers are contiguous from 1,
+ * so `sequenceNumber > MAX_EVENTS_PER_RUN` is an exact, O(1) "run is full" check
+ * enforced in both createEvent and sdkCreateEvents. A run at this size is far
+ * beyond what the UI can usefully render (MAX_EVENTS_PER_REPLAY is 10k) — the cap
+ * exists to stop a runaway agent from growing one run without bound.
+ */
+export const MAX_EVENTS_PER_RUN = 50_000;
+
+/**
+ * Write ceiling: maximum artifact records per run. Checked with a bounded
+ * `.take(MAX_ARTIFACTS_PER_RUN)` count on the by_run index — cheap at this size
+ * and requires no denormalized counter on the run document.
+ */
+export const MAX_ARTIFACTS_PER_RUN = 1_000;
+
+/**
+ * Default ingest rate limit (events/min) applied to newly created API keys when
+ * the caller does not specify one. Explicit values override; pre-existing keys
+ * with rateLimitPerMin unset remain unlimited (back-compat).
+ */
+export const DEFAULT_RATE_LIMIT_PER_MIN = 600;
+
+/**
+ * Maximum documents deleted per purge/retention internal-mutation batch
+ * (ADR 001). Small enough to stay well inside Convex transaction limits.
+ */
+export const PURGE_BATCH_SIZE = 100;
+
+/**
+ * Write ceiling: maximum comments per target (run or event). Enforced in
+ * createComment with a COMMENT_LIMIT_EXCEEDED typed error. Checked with a
+ * bounded `.take(MAX_COMMENTS_PER_TARGET)` count on the by_target index.
+ */
+export const MAX_COMMENTS_PER_TARGET = 500;
+
+/**
+ * ADR-007 write ceiling: maximum SPANS accepted in one otelIngestSpans call.
+ *
+ * An OTLP ExportTraceServiceRequest is caller-controlled and unbounded — the
+ * protocol names no limit, and a misconfigured BatchSpanProcessor with a large
+ * `maxExportBatchSize` will happily post tens of thousands. Three separate
+ * ceilings are at stake and this one bounds all of them: the per-span index
+ * probes the dedupe pass performs, the O(n log n) ordering the mapper runs, and
+ * the Convex transaction's own read/write budget.
+ *
+ * 1000 spans is roughly 2000 derived events — well inside a Convex transaction
+ * and still an order of magnitude above the OTel SDK default batch size (512).
+ *
+ * An over-sized batch is REJECTED with BATCH_TOO_LARGE, never truncated. A
+ * truncating ingest returns success to an exporter that then drops the spans it
+ * believes were recorded, and the resulting run is missing events that nothing
+ * in the system knows are missing — the exact failure the loss accounting in
+ * convex/helpers/otel_mapping.ts exists to prevent.
+ */
+export const MAX_OTEL_SPANS_PER_BATCH = 1_000;
+
+/**
+ * ADR-007: how long a trace must go with NO new spans before its run is closed.
+ *
+ * OTel defines no trace-completion signal. "Every span in the batch is closed"
+ * is a fact about a BATCH and says nothing about the TRACE, so terminality
+ * cannot be decided per batch — doing so meant `{A}` then `{B}` closed the run
+ * on batch 1 and lost B forever, while `{A,B}` kept both. Completion is
+ * therefore a TIMEOUT, and this is it.
+ *
+ * 5 minutes: comfortably above any reasonable BatchSpanProcessor delay
+ * (`scheduledDelayMillis` defaults to 5s) plus exporter retry backoff, and far
+ * enough below the 24h STALE_RUN_TIMEOUT_MS that a settled run never races the
+ * stale sweep. A trace still arriving after this closes the run has its tail
+ * refused with per-span accounting rather than silently dropped.
+ */
+export const OTEL_TRACE_SETTLE_MS = 5 * 60 * 1000;
+
+/**
+ * Artifact GC scan bounds. The GC's pointer scan reads a run's events in pages
+ * of GC_EVENT_SCAN_PAGE_SIZE instead of `.collect()`ing them (a ~50k-event run
+ * would blow the query read limit). GC_MAX_EVENTS_PER_INVOCATION caps the TOTAL
+ * events examined across all candidates in one GC invocation; remaining
+ * candidates carry over to the next scheduled run (they stay in the candidate
+ * set until resolved).
+ */
+export const GC_EVENT_SCAN_PAGE_SIZE = 500;
+export const GC_MAX_EVENTS_PER_CANDIDATE = 5_000;
+export const GC_MAX_EVENTS_PER_INVOCATION = 100_000;
+
+/**
+ * Valid range for organizations.retentionDays (ADR 001), enforced by
+ * updateRetentionPolicy.
+ */
+export const MIN_RETENTION_DAYS = 1;
+export const MAX_RETENTION_DAYS = 3_650;
+
+// ---------------------------------------------------------------------------
+// ADR-002 — data model expansion. See docs/adr/002-data-model-expansion.md.
+// ---------------------------------------------------------------------------
+
+/** Write ceilings for runs.labels (distinct from tags — see ADR-002). */
+export const MAX_LABELS_PER_RUN = 10;
+export const MAX_LABEL_LENGTH = 40;
+
+/**
+ * runs.environment: well-known values (see below) or any custom string up to
+ * this length. Not a closed set — see helpers/run_fields.ts.
+ */
+export const MAX_ENVIRONMENT_LENGTH = 32;
+export const KNOWN_ENVIRONMENTS = [
+  "production",
+  "staging",
+  "development",
+  "preview",
+] as const;
+
+/** runs.sessionId — opaque correlation key, bounded to prevent abuse. */
+export const MAX_SESSION_ID_LENGTH = 200;
+
+/** runs.searchText byte budget (UTF-8), enforced by helpers/run_fields.ts. */
+export const MAX_SEARCH_TEXT_BYTES = 2 * 1024;
+
+/** Write ceilings for the evals table. */
+export const MAX_EVAL_NAME_LENGTH = 80;
+export const MAX_EVAL_DETAILS_BYTES = 4 * 1024;
+
+/** Write ceilings for alert_rules.channels. */
+export const MAX_ALERT_CHANNELS = 5;
+
+/** Closed set size for webhook_targets.events (run.completed/run.failed/eval.failed/alert.fired). */
+export const MAX_WEBHOOK_EVENTS = 4;
+
+/**
+ * computeDailyRollups cron bounds: orgs examined per sweep, agents examined
+ * per org, and the bounded runs-per-agent-per-day sample used to compute
+ * counts and (approximate, for oversized samples) duration percentiles.
+ */
+export const ROLLUP_MAX_ORGS_PER_SWEEP = 1_000;
+export const ROLLUP_MAX_AGENTS_PER_ORG = 200;
+export const ROLLUP_MAX_RUNS_SAMPLE = 5_000;
+
+/**
+ * Approximate usage-counter flush stride (usage_counters), mirroring
+ * sdk_ingest.ts's RATE_FLUSH_STRIDE: single-unit ingest calls flush the
+ * counter only ~1-in-STRIDE times (scaled up by STRIDE when flushed); batch
+ * calls always flush exactly.
+ */
+export const USAGE_FLUSH_STRIDE = 10;
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — action layer (docs/design/action_layer.md): alert evaluation,
+// webhook delivery, the key-authed read API, and eval auto-run.
+// ---------------------------------------------------------------------------
+
+/**
+ * Bounded sample of recent runs examined by the `failure_rate` alert-rule
+ * condition (convex/alert_engine.ts). Mirrors ROLLUP_MAX_RUNS_SAMPLE's
+ * rationale: an approximate rate computed from a bounded window is
+ * sufficient for an alert threshold, and avoids an unbounded scan of a busy
+ * org's run history.
+ */
+export const ALERT_FAILURE_RATE_SAMPLE_SIZE = 1_000;
+
+/** Batch size for one deliverPendingWebhooks cron invocation (convex/webhook_engine.ts). */
+export const WEBHOOK_DELIVERY_BATCH_SIZE = 50;
+
+/**
+ * Maximum delivery attempts before a webhook_deliveries row is marked
+ * terminally "failed" (no further retries scheduled). Attempt 1 is the
+ * initial send; attempts 2-6 are retries with computeBackoff delay.
+ */
+export const WEBHOOK_MAX_ATTEMPTS = 6;
+
+/** Write ceiling for agent_versions.evalRules (ADR-002 follow-up / Cycle 2). */
+export const MAX_EVAL_RULES_PER_VERSION = 20;
+
+// ---------------------------------------------------------------------------
+// Cycle 3 — cross-wiring & cohesion (read-scope keys, exact version compare,
+// cost-accuracy model denormalization, the deferred alert-email path).
+// ---------------------------------------------------------------------------
+
+/**
+ * Write ceiling for runs.modelsSeen: bounded, deduped list of model strings
+ * extracted from this run's llm.request/llm.response payloads. A run legit­
+ * imately touching more than 10 distinct models in one execution is already
+ * far outside normal usage; the cap exists so a pathological/malformed
+ * payload stream cannot grow the field without bound.
+ */
+export const MAX_MODELS_SEEN_PER_RUN = 10;
+
+/** Batch size for one deliverPendingEmails cron invocation (convex/email_engine.ts). */
+export const EMAIL_DELIVERY_BATCH_SIZE = 50;
+
+/**
+ * Maximum delivery attempts before an email_deliveries row is marked
+ * terminally "failed" (no further retries scheduled). Mirrors
+ * WEBHOOK_MAX_ATTEMPTS's rationale.
+ */
+export const EMAIL_MAX_ATTEMPTS = 6;
+
+// ---------------------------------------------------------------------------
+// ADR-004 — run explanations ("Why did this fail?"). See
+// docs/adr/004-run-explanations.md.
+// ---------------------------------------------------------------------------
+
+/** run_explanations.summary write ceiling (plain text). */
+export const MAX_EXPLANATION_SUMMARY_BYTES = 2 * 1024;
+
+/** run_explanations.rootCause write ceiling (plain text). */
+export const MAX_EXPLANATION_ROOT_CAUSE_BYTES = 1 * 1024;
+
+/** run_explanations.suggestedFix write ceiling (plain text, optional). */
+export const MAX_EXPLANATION_SUGGESTED_FIX_BYTES = 1 * 1024;
+
+/** Write ceiling for run_explanations.citedSequenceNumbers. */
+export const MAX_CITED_SEQUENCE_NUMBERS = 20;
+
+/**
+ * Bounded event read used to build grounding context (both for the
+ * deterministic heuristic and the optional LLM prompt). Generous relative to
+ * MAX_CITED_SEQUENCE_NUMBERS — an explanation only ever cites a handful of
+ * events, but the heuristic/LLM need enough surrounding context (the last N
+ * events leading up to the terminal event) to find them.
+ */
+export const EXPLANATION_MAX_EVENTS = 500;
+
+/** Bounded read of a run's evals, for explanation grounding context. */
+export const EXPLANATION_MAX_EVALS = 100;
+
+/** Current schema version stamped on every generated run_explanations row. */
+export const RUN_EXPLANATION_SCHEMA_VERSION = 1;
+
+/**
+ * Cap on `runIds` accepted by `getRunExplanationSummaries` (Cycle 2 —
+ * batched "why-preview" for a runs list, avoiding one round-trip per row).
+ * Generous for a single page of a runs list, small enough that a bounded
+ * `.first()` lookup per id stays cheap even if all 50 miss the by_run index
+ * cache.
+ */
+export const MAX_RUN_EXPLANATION_SUMMARY_BATCH = 50;
+
+// ---------------------------------------------------------------------------
+// ADR-006 — failure pattern resolution lifecycle. See
+// docs/adr/006-failure-resolution.md.
+// ---------------------------------------------------------------------------
+
+/** Write ceiling for failure_patterns.resolutionNote (plain text, optional). */
+export const MAX_RESOLUTION_NOTE_LENGTH = 2 * 1024;
+
+/**
+ * Write ceiling for failure_patterns.resolutionRef (plain text, optional —
+ * e.g. an agentVersionId or a URL). Never auto-fetched/validated as a real
+ * URL server-side; a generous cap that comfortably fits a long URL without
+ * allowing unbounded growth.
+ */
+export const MAX_RESOLUTION_REF_LENGTH = 2 * 1024;

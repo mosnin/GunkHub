@@ -1,222 +1,235 @@
 # Agent Flight Recorder
 
-Agent Flight Recorder is an agent execution debugging and replay platform. It records every
-event that occurs during an AI agent's run — LLM calls, tool invocations, memory reads and
-writes, handoffs, errors — and stores them as an immutable event graph. Engineers can then
-inspect, replay, and compare runs to understand why an agent behaved the way it did and
-exactly where a failure occurred.
+Agent Flight Recorder records agent executions as immutable event graphs, stores them
+durably in Convex, and lets engineers inspect, replay, and compare runs via a web UI.
 
-The primary v1 outcome is to make failures explainable.
+The core value proposition is debuggability: when an agent fails or behaves unexpectedly,
+an engineer can open the run trace, walk through every event in sequence, and understand
+exactly what happened and why. Replay and diff are derived views over the stored event log
+— they are never the source of truth.
 
----
-
-## Repo Shape
-
-```
-GunkHub/
-├── apps/
-│   └── web/               Next.js 14 app — UI, API routes, Clerk auth
-├── packages/
-│   ├── contracts/         Shared TypeScript types (no runtime deps)
-│   └── sdk/               Client recording library for agent instrumentation
-├── convex/                Backend: schema, queries, mutations, Convex auth
-├── docs/                  Architecture docs, ADRs, API reference
-├── tests/                 Integration and end-to-end tests
-├── scripts/               Developer utility scripts (seed, validate)
-├── .env.example           Authoritative list of required environment variables
-├── CLAUDE.md              Project constitution for AI-assisted development
-├── tsconfig.base.json     Strict TypeScript config extended by all packages
-└── pnpm-workspace.yaml    pnpm workspace declaration
-```
+**Primary v1 outcome: make failures explainable.**
 
 ---
 
-## Prerequisites
+## Monorepo Layout
 
-| Tool | Version | Notes |
-|------|---------|-------|
-| Node.js | 20+ | Use [nvm](https://github.com/nvm-sh/nvm) or [fnm](https://github.com/Schniz/fnm) |
-| pnpm | 9+ | `npm install -g pnpm@9` |
-| Convex CLI | latest | `npm install -g convex` |
-| Clerk account | — | Free tier at [clerk.com](https://clerk.com) |
+| Path | Owns |
+|------|------|
+| `apps/web` | Next.js 14 (App Router) UI, ingestion API routes, Clerk auth integration |
+| `packages/contracts` | Shared TypeScript types only — zero runtime dependencies |
+| `packages/sdk` | Client recording library — instruments agent code, ships events to Convex |
+| `packages/cli` | `afr` command-line interface — a read-only client of the `/api/v1` read API |
+| `packages/mcp` | MCP server — exposes the `/api/v1` read API to MCP clients; read-only, see [`docs/mcp.md`](docs/mcp.md) |
+| `convex/` | Backend schema, query/mutation functions, crons, Convex auth config |
+| `tests/` | Unit tests (`tests/unit`), integration tests against a real Convex deployment (`tests/integration`), end-to-end tests (`tests/e2e`), shared fixtures |
+| `scripts/` | Developer tooling: `validate.sh`, `check-schema-drift.ts`, `seed.ts`, `rebuild-projection.ts`, `verify-e2e.ts` |
+| `docs/` | Architecture, ADRs, ops runbooks, product docs — see [Docs Index](#docs-index) |
+
+See `CLAUDE.md` for the authoritative system-boundary and file-ownership rules, and
+`docs/architecture.md` for how the pieces fit together end to end.
 
 ---
 
-## Install
+## Quickstart
+
+Prerequisites: Node.js 20+, pnpm 9+ (`npm install -g pnpm@9`), a Clerk application, and a
+Convex deployment.
 
 ```bash
-# Clone the repository
 git clone <repo-url>
 cd GunkHub
-
-# Install all workspace dependencies
 pnpm install
 ```
 
----
-
-## Environment Setup
+### Environment setup
 
 ```bash
 cp .env.example .env.local
 ```
 
-Open `.env.local` and fill in all values. Every variable is documented in `.env.example`.
-You will need a Clerk app and a Convex deployment before the app will start.
+`.env.example` is the authoritative, documented list of every environment variable the
+app needs (Clerk keys, Convex URL/deploy key, blob storage, webhook secrets, test-only
+integration vars). Fill in `.env.local` before starting the app — you'll need a Clerk app
+and a Convex deployment first.
 
----
-
-## Run Locally
+### Run locally
 
 ```bash
 pnpm dev
 ```
 
-This starts all packages in parallel via Turbo:
+Starts `apps/web` (Next.js dev server, `http://localhost:3000`) and `convex dev`
+(pushes function changes to your Convex dev deployment) in parallel via Turbo.
 
-- **apps/web** — Next.js dev server at `http://localhost:3000`
-- **convex/** — `convex dev` watches and pushes function changes to your dev deployment
-
-The web app talks to your Convex dev deployment in the cloud; there is no local Convex server
-to run. The Convex dashboard at `https://dashboard.convex.dev` shows all data and function
-logs during development.
-
----
-
-## Available Scripts
+### Verification commands
 
 | Command | What it does |
-|---------|-------------|
-| `pnpm dev` | Start all apps and watchers in parallel |
+|---------|---------------|
+| `pnpm typecheck` | `tsc --noEmit` across every package (7 Turbo tasks) |
+| `pnpm lint` | ESLint across every package (7 Turbo tasks) |
 | `pnpm build` | Production build of all packages |
-| `pnpm typecheck` | Run `tsc --noEmit` across all packages |
-| `pnpm lint` | ESLint across all packages |
-| `pnpm test` | Run all test suites |
+| `pnpm test` | Run all unit test suites — including the MCP token-budget assertions, which are a release gate, not a nicety ([`CONTRIBUTING.md`](CONTRIBUTING.md)) |
 | `pnpm clean` | Delete all build artifacts and caches |
-| `./scripts/validate.sh` | Typecheck + build + lint with pass/fail summary |
+| `./scripts/validate.sh` | Runs typecheck + build + lint + schema-drift + convex-refs + design-tokens with a pass/fail summary — run this before pushing |
+
+CI (`.github/workflows/ci.yml`) runs ten jobs — typecheck, lint, dependency-audit,
+schema-drift, convex-refs, convex-codegen-sync, design-tokens, build, test, and a
+real-Convex integration test job — on every PR into `main`.
 
 ---
 
-## Package Ownership
+## SDK
 
-### `apps/web`
-
-The Next.js application that serves the Agent Flight Recorder UI. This package owns all
-user-facing pages (org selector, project list, run list, event trace viewer, diff view),
-all Next.js API routes, and the Clerk authentication integration. It imports entity types
-from `@agent-flight-recorder/contracts` and never defines its own duplicate types. It
-connects to the Convex backend via the ConvexProvider and uses Clerk's Next.js SDK for
-authentication middleware and session management.
-
-### `packages/contracts`
-
-The single source of truth for all shared TypeScript types. This package has zero runtime
-dependencies — it is types only. Every entity (`Organization`, `Project`, `Agent`,
-`AgentVersion`, `Run`, `Event`, `Artifact`, `Comment`) is defined here. Both the web app and
-the SDK import from this package. The Convex schema uses aligned-but-separate types because
-Convex generates its own validator types; however, the shape must match `contracts` exactly.
-Version this package carefully: any breaking change to a type must be coordinated with all
-consumers before merging.
-
-### `packages/sdk`
-
-The client-side recording library that agent authors instrument their code with. It provides
-a simple API (`recorder.startRun()`, `recorder.logEvent()`, `recorder.endRun()`) that batches
-and ships events to the Convex ingest mutation. The SDK handles sequence numbering,
-large-payload externalisation to blob storage, retry logic, and graceful degradation when the
-backend is unreachable. It imports all entity types from `@agent-flight-recorder/contracts`.
-
-### `convex/`
-
-The Convex backend. Contains the database schema (all tables and their validators), all query
-functions (read-only), all mutation functions (write), and Convex's auth configuration wired
-to Clerk via the Convex-Clerk integration. Every query and mutation is scoped to the calling
-user's organization — no cross-org data access is possible. The event log tables are
-append-only; there are no update or delete mutations for event records.
-
-### `docs/`
-
-Architecture decision records (ADRs), sequence diagrams, and API reference documentation.
-ADRs live in `docs/adr/` numbered sequentially. This is a human-readable knowledge base for
-the engineering team.
-
-### `tests/`
-
-Integration tests and end-to-end tests that run against a live Convex test deployment. Unit
-tests live alongside the code they test (co-located `*.test.ts` files). Integration tests that
-span package boundaries or require a running Convex backend live here.
-
-### `scripts/`
-
-Developer utility scripts. `validate.sh` runs the full typecheck/build/lint suite locally and
-prints a pass/fail summary. `seed.ts` will seed a local Convex deployment with realistic test
-data covering all entity types and run scenarios.
+Agent authors instrument their code with `@agent-flight-recorder/sdk`. See
+[`packages/sdk/README.md`](packages/sdk/README.md) for the quick-start, event builders,
+buffering/retry/spool behavior, and payload-externalization details.
 
 ---
 
-## What is Implemented in This Foundation
+## Investigating a failure
 
-The following is fully implemented and functional in this commit:
+Two read-only clients sit on the same `/api/v1` surface: the `afr` CLI
+(`packages/cli`) and the MCP server (`packages/mcp`). Both are deliberately tiered by
+cost, and **the order you call them in is the product**:
 
-- **Monorepo structure** — pnpm workspaces, Turbo task graph, all package directories created
-- **TypeScript configuration** — strict `tsconfig.base.json` extended by all packages
-- **ESLint configuration** — typescript-eslint, import plugin, type-aware linting rules
-- **Prettier configuration** — consistent formatting with per-file-type overrides
-- **Git configuration** — `.gitignore` covering all build artifacts, secrets, and caches
-- **Environment variable documentation** — `.env.example` with explanatory comments for all vars
-- **CI workflow** — GitHub Actions: typecheck, lint, build, test jobs with pnpm cache
-- **Validation script** — `scripts/validate.sh` with colored pass/fail output
-- **Seed script structure** — `scripts/seed.ts` with complete data model and entry point wiring
+```
+0. what is wrong, and                                   afr_triage()      ← START HERE
+   what do I look at first?                             ~332 tokens, no arguments
+1. what is broken? (breadth)  afr patterns           /  afr_list_failure_patterns
+2. did the fix hold?          afr patterns evidence … /  afr_get_pattern_evidence
+3. why did THIS run fail?     afr explain <runId>     /  afr_explain_run
+4. show me the events         afr export <runId>      /  afr_get_run_events  ← expensive
+```
 
-## What is Stubbed
+`afr_triage()` takes no arguments and every item it returns names the exact next tool
+and arguments to call — an agent never has to infer the ladder. Triage plus an
+explanation costs roughly an eighth of a single step-4 event window. Most
+investigations should end at step 3; many should end at step 0.
+[`docs/mcp.md`](docs/mcp.md) → "Start here" has the measured numbers, a worked example,
+and the CI-gate semantics.
 
-The following directories exist but contain only the minimum to satisfy the workspace:
-
-- `apps/web/` — directory exists; Next.js app not yet scaffolded
-- `packages/contracts/` — directory exists; types not yet defined
-- `packages/sdk/` — directory exists; recording client not yet implemented
-- `convex/` — directory exists; schema and functions not yet written
+`afr triage` is the CLI counterpart, and it is the same ranking — both surfaces import
+`toTriageResult` from `@agent-flight-recorder/sdk`, so they cannot disagree. For a build
+gate it maps the verdict onto exit codes: `0` clear, `10` findings, `11` inconclusive
+("nothing found, but the view was incomplete"). Exit `0` is unreachable on an incomplete
+scan. `afr patterns --state regressed` similarly exits `11` rather than `0` when its
+scan was truncated, so a gate cannot mistake an unfinished scan for a clean one — see
+[`docs/api_reference.md`](docs/api_reference.md) § "Exit codes" and
+[`docs/mcp.md`](docs/mcp.md) § "Using this as a CI gate".
 
 ---
 
-## What Comes Next
+## Docs Index
 
-The next phases of work, in priority order:
+- [`docs/architecture.md`](docs/architecture.md) — system architecture, entity hierarchy, event-log invariants, tenancy model, ingest paths, durability story
+- [`docs/adrs/`](docs/adrs/) and [`docs/adr/`](docs/adr/) — architecture decision records (two directories exist today: `docs/adrs/0001`–`0026` is the original sequence, `docs/adr/001`–`007` is a newer one; consult both when researching a decision, and do not merge or renumber them). Note that not every ADR is Accepted — [`docs/adr/007-otel-span-ingestion.md`](docs/adr/007-otel-span-ingestion.md) (OpenTelemetry span ingestion) is **Proposed, decision not settled**, and records why deriving the event log's sequence and lifecycle invariants from OTLP delivery may not be reconcilable with event-log immutability. Check an ADR's `Status:` line before building on it
+- [`docs/mcp.md`](docs/mcp.md) — the MCP server (`packages/mcp`). **Start with its "Start here" section**: the progressive-disclosure ladder, the measured token cost of each tier, a worked example of the intended investigation path, and the CI-gate/`scanTruncated` semantics. "Where the token figures come from" → "What keeps these numbers true" names the suites that stop those costs drifting, and the gaps that remain. Then the tool contract and client configuration
+- [`docs/api_reference.md`](docs/api_reference.md) — HTTP contract for the public v1 read API (`/api/v1/**`), key management, the alerts/webhooks management API, outbound webhook verification, and how the `afr` CLI and MCP server map onto all of it
+- [`docs/ops/`](docs/ops/) — CI setup, dependency-audit ignore rationale, observability
+- [`docs/operations_runbook.md`](docs/operations_runbook.md), [`docs/deployment_checklist.md`](docs/deployment_checklist.md) — operational procedures
+- [`design.md`](design.md) — "Neon — Server Room After Dark," the authoritative visual style for every UI change
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — dev workflow, verification gates (including the MCP token budgets and the obligation that comes with them), how to add event types / Convex functions / MCP tools / UI surfaces / packages
+- [`CLAUDE.md`](CLAUDE.md) — project constitution: system boundaries, entity model, event log and tenancy rules
 
-1. **Convex schema** — Define all tables (`organizations`, `projects`, `agents`,
-   `agentVersions`, `runs`, `events`, `artifacts`, `comments`) with proper validators and
-   indexes. Wire Clerk JWT auth.
+---
 
-2. **contracts package** — Define all entity types and ingest payload types in
-   `packages/contracts`. This unblocks SDK and web development.
+## Current Capabilities
 
-3. **SDK recording client** — Implement `packages/sdk` with `startRun`, `logEvent`,
-   `endRun`, large-payload externalisation, and retry logic.
+The following are implemented and enforced today, not aspirational:
 
-4. **Web app scaffolding** — Next.js app with Clerk integration, Convex provider, and the
-   base layout. Route structure: `/orgs/[orgSlug]/projects`, `/runs/[runId]`,
-   `/runs/[runId]/events/[eventId]`.
+### Core event log and platform
 
-5. **Run trace viewer** — The core UI: ordered event list with type icons, payload preview,
-   sequence number, timestamps, duration markers.
+- **Event log invariants** — append-only `events` table (no update/delete mutations),
+  server-enforced contiguous `sequenceNumber`s starting at 1, `run.started` required as
+  the first event, `run.completed`/`run.failed` required as the last (`convex/events.ts`,
+  `convex/sdk_ingest.ts`)
+- **Org tenancy** — every Convex query/mutation resolves `orgId` from the Clerk JWT via
+  `getAuthContext`/`requireOrgMembership` (`convex/auth.ts`) before touching any table;
+  `viewer`/`member`/`admin` role tiers with a rank-based minimum-role check
+- **Audit log** — an append-only `audit_log` table records every privileged mutation
+  (`convex/audit.ts`)
+- **Retention / erasure (ADR 001)** — per-org opt-in `retentionDays`; a daily cron
+  (`convex/retention.ts`) deletes terminal runs and their events/artifacts/comments past
+  the window; org deletion is tracked via `pendingDeletionAt` with operator-invoked purge;
+  configured from the web UI (`apps/web/src/components/settings/RetentionSection.tsx`)
+- **API-key SDK ingest with rate limits** — `x-api-key`-authenticated mutations in
+  `convex/sdk_ingest.ts` (`sdkCreateRun`, `sdkCreateEvents`, `sdkCreateArtifact`,
+  `sdkUpdateRunStatus`) enforce key revocation/expiry/scope and a fixed one-minute-window
+  per-key rate limit (`api_keys.rateLimitPerMin`)
+- **Durability spool** — the SDK's buffered `Recorder` supports an on-disk `FileSpool`
+  (JSONL, append-only) so events survive a process crash and are re-sent by
+  `recorder.recover()` on the next process start
+- **Payload externalization** — payloads over 10 KB are rejected inline and must be
+  uploaded as artifacts (blob storage pointer + SHA-256 checksum), enforced both in the
+  SDK and, defense-in-depth, in Convex (`sdk_ingest.ts` `assertPayloadWithinInlineLimit`)
+- **Sampling** — client-side head sampling with tail-bias for failures
+  (`packages/sdk/src/sampling.ts`), decided once per run, optionally deterministic
+  (`seedFromRunName`) or caller-overridden (`decider`); see `docs/architecture.md` §9 for
+  its effect on server-side rollups/usage/alerts
+- **Redaction** — SDK-side payload redaction before events leave the process
+  (`packages/sdk/src/redaction.ts`)
+- **Member management** — org member listing and role changes in the web UI
+  (`apps/web/app/(app)/settings/members/page.tsx`)
 
-6. **Replay logic** — Step-through replay of a run's event sequence. Stateless projection,
-   never stored.
+### Run organization and investigation
 
-7. **Diff logic** — Side-by-side comparison of two runs of the same agent version. Highlight
-   divergence points.
+- **Full-text search over runs** — a Convex search index (`search_runs`) over an
+  extracted `searchText` field, queried via `searchRuns` and surfaced in the web UI
+  (`apps/web/app/(app)/search/page.tsx`) and `GET /api/v1/runs`
+- **Run hierarchy and sessions** — parent/child sub-runs (`parentRunId`) and free-form
+  session grouping (`sessionId`) for multi-turn/multi-agent flows
+  (`apps/web/src/components/runs/RunHierarchyPanel.tsx`,
+  `apps/web/app/(app)/sessions/[sessionId]/page.tsx`)
+- **Environments** — per-run `environment` field (well-known values or a custom string),
+  filterable in the run list and the v1 read API
+- **Triage** — a linear `open → investigating → resolved` state machine for failed/
+  timed-out runs (`apps/web/app/api/runs/[id]/triage/route.ts`,
+  `apps/web/src/components/runs/TriageControl.tsx`)
+- **Evals** — pass/fail/score checks recorded against a run, written via a member-gated
+  mutation or an API-key ingest path for automated eval pipelines
+  (`convex/evals.ts`, `apps/web/src/components/runs/EvalsPanel.tsx`)
 
-8. **Full ingestion** — Batch ingest endpoint, SDK streaming mode, blob store integration for
-   large payloads.
+### Analytics, alerting, and delivery (ADR-002 / ADR-003)
+
+- **Analytics, cost, and version comparison** — daily per-agent rollups (`daily_rollups`)
+  and per-org usage counters (`usage_counters`), surfaced in a usage settings page
+  (`apps/web/app/(app)/settings/usage/page.tsx`) and an agent-version comparison view
+  (`apps/web/src/components/agents/VersionCompare.tsx`); see `docs/architecture.md` §9
+  for how client-side sampling affects these numbers
+- **Alerting** — org-configured, admin-managed alert rules (`run_failed` /
+  `failure_rate` / `eval_failed`) evaluated automatically on every run's terminal event,
+  configured via `/api/alerts/**` and the web UI (`apps/web/app/(app)/settings/alerts/page.tsx`)
+- **Outbound webhooks** — HTTPS-only, SSRF-guarded, HMAC-signed webhook delivery to
+  org-configured targets, with an append-only delivery log
+  (`convex/webhook_engine.ts`, `apps/web/app/(app)/settings/webhooks/page.tsx`)
+- **Email delivery** — the alert-rule email channel counterpart to webhooks, pluggable
+  via an `EmailNotifier` abstraction (console logger by default, Resend when
+  `AFR_EMAIL_PROVIDER=resend`) (`convex/email_engine.ts`, `convex/helpers/notifier.ts`)
+- **Data export** — bulk (`GET /api/export/runs`) and single-run
+  (`GET /api/export/runs/{runId}`) extraction of already-authorized data in
+  JSON/CSV/ndjson, rate-limited and streamed rather than materialized in memory
+- **Read-only public API surface** — the key-authenticated `/api/v1/**` read API
+  (`convex/read_api.ts`), the SDK-side `FlightReader` client (`packages/sdk/src/reader.ts`),
+  and the `afr` CLI (`packages/cli`, read-only: `runs list`, `runs get`, `tail`, `replay`,
+  `export`) — see `docs/api_reference.md` for the full contract
+
+### Scheduled jobs
+
+- Five daily crons (artifact GC, stale-run expiry, retention enforcement,
+  projection-integrity verification, daily rollup computation) and two per-minute crons
+  (webhook delivery, email delivery) — all defined in `convex/crons.ts`, detailed in
+  `docs/architecture.md` §8
 
 ---
 
 ## Contributing
 
-Before pushing any commit, run:
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full workflow. Before pushing any
+branch, run:
 
 ```bash
 ./scripts/validate.sh
 ```
 
-All three checks (typecheck, build, lint) must pass. CI enforces the same checks.
+Typecheck, build, lint, and schema-drift must all pass — CI enforces the same checks.

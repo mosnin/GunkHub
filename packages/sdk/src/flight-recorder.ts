@@ -1,3 +1,19 @@
+import { PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER } from '@agent-flight-recorder/contracts'
+
+import { buildErrorSummary } from './error-summary.js'
+import { externalizePayloadIfLarge, uploadArtifact } from './externalize.js'
+import { redactPayload } from './redaction.js'
+import { warnIfInsecureEndpoint } from './transport.js'
+import { SDK_VERSION } from './version.js'
+
+import type { RedactionConfig } from './redaction.js'
+import type {
+  EventType,
+  RunStartedPayload,
+  RunCompletedPayload,
+  RunFailedPayload,
+} from '@agent-flight-recorder/contracts'
+
 /**
  * Configuration for FlightRecorder.
  */
@@ -16,9 +32,64 @@ export interface FlightRecorderConfig {
   agentVersionId?: string
   /**
    * SDK version string included in run creation payloads.
-   * Defaults to '0.1.0'.
+   * Defaults to the package version ({@link SDK_VERSION}).
    */
   sdkVersion?: string
+  /**
+   * Maximum number of concurrent in-flight HTTP requests across all
+   * RunRecorders created by this FlightRecorder. Bounds `Promise.all` fan-outs
+   * of `recordEvent` so they cannot open unbounded connections. Must be >= 1.
+   * Default: 8.
+   */
+  maxConcurrentRequests?: number
+  /**
+   * Suppress the one-time console warning emitted when `baseUrl` uses plain
+   * HTTP to a non-localhost host (API key would transit in cleartext).
+   * Default: false.
+   */
+  allowInsecureEndpoint?: boolean
+  /**
+   * Redact sensitive data out of every recorded event payload BEFORE
+   * externalization measures its size — same redact-then-measure guarantee
+   * as the buffered `Recorder` path. See `RecorderOptions.redact` /
+   * {@link RedactionConfig} for the shared shape.
+   */
+  redact?: RedactionConfig
+  /**
+   * Called when the `redact` pipeline fails (invalid pattern, or
+   * `redact.custom` throwing). Must not throw; exceptions are swallowed.
+   */
+  onRedactionError?: (error: string) => void
+}
+
+/**
+ * Minimal counting semaphore used to bound concurrent in-flight requests.
+ * FIFO: waiters are released in acquisition order.
+ */
+class Semaphore {
+  private inFlight = 0
+  private readonly waiters: (() => void)[] = []
+
+  constructor(private readonly limit: number) {}
+
+  /** Resolves when a slot is available. Pair every acquire with a release. */
+  async acquire(): Promise<void> {
+    if (this.inFlight < this.limit) {
+      this.inFlight++
+      return
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve))
+  }
+
+  /** Release a slot, waking the oldest waiter if any (slot transfers to it). */
+  release(): void {
+    const next = this.waiters.shift()
+    if (next) {
+      next() // slot ownership transfers; inFlight unchanged
+    } else {
+      this.inFlight--
+    }
+  }
 }
 
 /**
@@ -27,6 +98,11 @@ export interface FlightRecorderConfig {
  * It manages the `agentId`/`apiKey` configuration so callers only need to
  * supply run-specific parameters when starting a run. All HTTP calls use
  * native `fetch` (Node 18+).
+ *
+ * Unlike the buffered {@link Recorder}, this is an un-buffered path: each event
+ * is POSTed immediately. It shares the SAME payload-externalization logic as the
+ * buffered path, so an oversized (>10 KB) payload is uploaded as an artifact and
+ * replaced with a pointer rather than being shipped inline and rejected.
  *
  * @example
  * ```typescript
@@ -47,32 +123,52 @@ export class FlightRecorder {
   readonly agentId: string
   private readonly agentVersionId: string | undefined
   private readonly sdkVersion: string
-  private sequenceCounter = 0
+  /** Bounds concurrent in-flight requests across all RunRecorders. */
+  private readonly semaphore: Semaphore
+  /** @internal Read by RunRecorder.recordEvent. */
+  readonly _redact: RedactionConfig | undefined
+  /** @internal Read by RunRecorder.recordEvent. */
+  readonly _onRedactionError: ((error: string) => void) | undefined
 
   /**
    * Create a new FlightRecorder.
    *
    * @param config - Recorder configuration including API key, base URL, and agent ID.
+   * @throws TypeError if `maxConcurrentRequests` is present but < 1.
    */
   constructor(config: FlightRecorderConfig) {
+    if (
+      config.maxConcurrentRequests !== undefined &&
+      (typeof config.maxConcurrentRequests !== 'number' ||
+        Number.isNaN(config.maxConcurrentRequests) ||
+        config.maxConcurrentRequests < 1)
+    ) {
+      throw new TypeError(
+        `FlightRecorderConfig.maxConcurrentRequests must be >= 1 (got ${String(config.maxConcurrentRequests)})`
+      )
+    }
     this.baseUrl = config.baseUrl.replace(/\/$/, '')
     this.apiKey = config.apiKey
     this.agentId = config.agentId
     this.agentVersionId = config.agentVersionId
-    this.sdkVersion = config.sdkVersion ?? '0.1.0'
+    this.sdkVersion = config.sdkVersion ?? SDK_VERSION
+    this.semaphore = new Semaphore(config.maxConcurrentRequests ?? 8)
+    this._redact = config.redact
+    this._onRedactionError = config.onRedactionError
+    warnIfInsecureEndpoint(this.baseUrl, config.allowInsecureEndpoint)
   }
 
   /**
-   * Increment and return the next sequence number.
-   *
-   * Sequence numbers are globally monotone within a `FlightRecorder` instance
-   * so that events from multiple concurrent `RunRecorder` instances remain
-   * orderable.
-   *
-   * @internal Used by RunRecorder — not intended for direct external use.
+   * Run `op` while holding a concurrency slot (released on settle).
+   * @internal Used by RunRecorder to bound recordEvent fan-outs.
    */
-  nextSequence(): number {
-    return ++this.sequenceCounter
+  async _withRequestSlot<T>(op: () => Promise<T>): Promise<T> {
+    await this.semaphore.acquire()
+    try {
+      return await op()
+    } finally {
+      this.semaphore.release()
+    }
   }
 
   /**
@@ -104,6 +200,7 @@ export class FlightRecorder {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': this.apiKey,
+        [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
       },
       body: JSON.stringify(body),
     })
@@ -120,7 +217,22 @@ export class FlightRecorder {
     }
 
     const data = (await response.json()) as { run: { id: string } }
-    return new RunRecorder(data.run.id, this)
+    const recorder = new RunRecorder(data.run.id, this)
+    // Event Log Rule 5: RUN_STARTED must be the first event. Emit it so a run
+    // created through this high-level path has a lifecycle log like the low-level
+    // Recorder path. The run.started event is non-terminal, so it stays
+    // best-effort here: a failed run.started must not break run creation.
+    const startedPayload: RunStartedPayload = {
+      type: 'run.started',
+      input: params?.metadata ?? null,
+      config: params?.metadata ?? {},
+    }
+    try {
+      await recorder.recordEvent('run.started', startedPayload)
+    } catch {
+      // best-effort: run creation already succeeded
+    }
+    return recorder
   }
 }
 
@@ -134,6 +246,17 @@ export class RunRecorder {
   readonly runId: string
 
   private readonly fr: FlightRecorder
+  /** Wall-clock time (ms) this run recorder was created, for duration_ms. */
+  private readonly startedAt: number
+  /**
+   * Per-run sequence counter. CLAUDE.md Event Log Rule 4 requires sequence
+   * numbers to be monotonically increasing integers starting at 1 *within a run*
+   * and contiguous — so the counter must live on the RunRecorder, not shared
+   * across runs on the parent FlightRecorder. The server now rejects
+   * non-contiguous sequences, so a shared counter would fail verification for
+   * every run after the first.
+   */
+  private sequenceCounter = 0
 
   /**
    * @param runId - Run ID returned by the server.
@@ -143,30 +266,64 @@ export class RunRecorder {
   constructor(runId: string, fr: FlightRecorder) {
     this.runId = runId
     this.fr = fr
+    this.startedAt = Date.now()
+  }
+
+  /** Increment and return the next per-run sequence number (starts at 1). */
+  private nextSequence(): number {
+    return ++this.sequenceCounter
   }
 
   /**
    * Record an event in this run.
    *
    * Calls POST /api/events. Sequence numbers are assigned automatically and
-   * monotonically. The caller is responsible for ensuring the run has not
-   * already reached a terminal state.
+   * monotonically. Oversized payloads (>10 KB serialized) are first uploaded as
+   * an artifact via POST /api/artifacts/upload and replaced with a compact
+   * pointer, matching the buffered `Recorder`/`HttpTransport` path — so a large
+   * payload is never shipped inline and 413'd. The caller is responsible for
+   * ensuring the run has not already reached a terminal state.
    *
-   * @param type - Event type string (e.g. 'RUN_STARTED', 'LLM_REQUEST', 'custom').
+   * @param type - Event type string (e.g. 'run.started', 'llm.request', 'custom').
    * @param payload - Arbitrary event payload. Must be JSON-serialisable.
    * @param parentEventId - Optional ID of the parent event for tree-shaped traces.
    * @returns The event ID assigned by the server.
-   * @throws Error if the request fails (network failure or non-2xx response).
+   * @throws Error if the request fails (network failure, upload failure, or non-2xx response).
    */
   async recordEvent(type: string, payload: unknown, parentEventId?: string): Promise<string> {
-    const seq = this.fr.nextSequence()
+    // Sequence numbers are assigned synchronously in call order, BEFORE queuing
+    // on the concurrency semaphore, so contiguity is preserved under fan-out.
+    const seq = this.nextSequence()
+    // Bound un-buffered fan-outs (e.g. Promise.all over many recordEvent calls)
+    // to `maxConcurrentRequests` in-flight HTTP requests.
+    return this.fr._withRequestSlot(() => this._sendEvent(type, payload, seq, parentEventId))
+  }
+
+  /** Perform the redact + externalize + POST for one event. Runs while holding a request slot. */
+  private async _sendEvent(type: string, payload: unknown, seq: number, parentEventId?: string): Promise<string> {
+    // Redact BEFORE externalization measures payload size — same
+    // redact-then-measure guarantee as the buffered Recorder path.
+    const redactConfig = this.fr._redact
+    const redactedPayload = redactConfig
+      ? redactPayload(payload as never, type as EventType, redactConfig, this.fr._onRedactionError)
+      : payload
+
+    // Externalize oversized payloads through the shared helper so this path
+    // enforces the same >10 KB rule as HttpTransport. Failures propagate.
+    const outgoingPayload = await externalizePayloadIfLarge(
+      this.runId,
+      type,
+      redactedPayload,
+      (runId, eventType, serialized) =>
+        uploadArtifact((u, i) => fetch(u, i), this.fr.baseUrl, this.fr.apiKey, runId, eventType, serialized),
+    )
 
     const body: Record<string, unknown> = {
       runId: this.runId,
       type,
       sequenceNumber: seq,
       timestamp: Date.now(),
-      payload,
+      payload: outgoingPayload,
     }
     if (parentEventId !== undefined) body['parentEventId'] = parentEventId
 
@@ -175,6 +332,7 @@ export class RunRecorder {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': this.fr.apiKey,
+        [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
       },
       body: JSON.stringify(body),
     })
@@ -197,35 +355,91 @@ export class RunRecorder {
   /**
    * Mark the run as completed.
    *
-   * Calls PATCH /api/runs/:id/status with `status: 'completed'`.
+   * Records the terminal `run.completed` event (Event Log Rule 5) and then calls
+   * PATCH /api/runs/:id/status with `status: 'completed'`. Unlike the previous
+   * implementation, a failure to record the terminal event is NOT swallowed —
+   * losing terminal telemetry is the worst failure mode for a flight recorder,
+   * so it propagates to the caller.
    *
-   * @param _metadata - Reserved for future use; currently ignored.
-   * @throws Error if the status update request fails.
+   * @param metadata - Optional output metadata recorded as the run.completed output.
+   * @throws Error if the terminal event cannot be recorded or the status update fails.
    */
-  async complete(_metadata?: Record<string, unknown>): Promise<void> {
+  async complete(metadata?: Record<string, unknown>): Promise<void> {
+    const payload: RunCompletedPayload = {
+      type: 'run.completed',
+      output: metadata ?? null,
+      duration_ms: Date.now() - this.startedAt,
+    }
+    // Surface terminal-event failures rather than swallowing them.
+    await this.recordEvent('run.completed', payload)
     await this._updateStatus('completed')
   }
 
   /**
    * Mark the run as failed.
    *
-   * Calls PATCH /api/runs/:id/status with `status: 'failed'`, then re-throws
-   * the original error so the caller's promise chain remains in a rejected
-   * state. If a status update error occurs it is swallowed so the original
-   * error is always the one surfaced.
+   * Records the terminal `run.failed` event (Event Log Rule 5), then calls
+   * PATCH /api/runs/:id/status with `status: 'failed'`, then re-throws the
+   * original error so the caller's promise chain remains rejected.
+   *
+   * Terminal-event failures are surfaced, not swallowed: if run.failed cannot be
+   * recorded, a combined error is thrown that still includes the original error's
+   * message (and carries the original as its `cause`). A subsequent status-update
+   * failure is swallowed so the original error stays the primary signal.
    *
    * @param error - The error that caused the failure. Can be an Error instance
    *   or a plain string message.
-   * @throws Always re-throws `error` after attempting the status update.
+   * @throws Always throws after attempting the status update — the original error
+   *   on the happy path, or a combined error if terminal telemetry could not be recorded.
    */
   async fail(error: Error | string): Promise<void> {
+    const originalError = error instanceof Error ? error : new Error(error)
+    // Preserve `.code` (e.g. a Node-style ECONNRESET/ENOENT on a fetch/fs
+    // error) the same way the buffered Recorder's failRun() does — dropping it
+    // here would silently discard diagnostic information the caller attached
+    // to the error, undermining "make failures explainable" (CLAUDE.md).
+    const code = 'code' in originalError ? (originalError as { code?: unknown }).code : undefined
+    // M4: short, bounded, searchable error summary — see error-summary.ts.
+    // Carried as a sibling field (not nested under `error`) so it can be
+    // carved out by externalizePayloadIfLarge and preserved even when the
+    // rest of the payload gets replaced with an artifact pointer. The
+    // `RunFailedPayload & { errorSummary?: string }` intersection is a
+    // SDK-local widening, not a contracts change — see error-summary.ts for
+    // the exact field/shape the server side needs to read.
+    const errorSummary = buildErrorSummary({
+      message: originalError.message,
+      ...(originalError.stack !== undefined && { stack: originalError.stack }),
+    })
+    const payload: RunFailedPayload & { errorSummary?: string } = {
+      type: 'run.failed',
+      error: {
+        message: originalError.message,
+        ...(originalError.stack !== undefined && { stack: originalError.stack }),
+        ...(typeof code === 'string' && { code }),
+      },
+      duration_ms: Date.now() - this.startedAt,
+      errorSummary,
+    }
+
+    try {
+      await this.recordEvent('run.failed', payload)
+    } catch (recErr) {
+      // Do NOT hide a dropped terminal event. Surface it, but keep the original
+      // agent error as the primary cause and in the message for callers matching on it.
+      const detail = recErr instanceof Error ? recErr.message : String(recErr)
+      const combined = new Error(
+        `${originalError.message} (additionally, run.failed telemetry could not be recorded: ${detail})`
+      )
+      ;(combined as { cause?: unknown }).cause = originalError
+      throw combined
+    }
+
     try {
       await this._updateStatus('failed')
     } catch {
       // Swallow status-update failures — the caller's error takes priority.
     }
-    if (error instanceof Error) throw error
-    throw new Error(error)
+    throw originalError
   }
 
   private async _updateStatus(status: 'completed' | 'failed' | 'cancelled'): Promise<void> {
@@ -234,6 +448,7 @@ export class RunRecorder {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': this.fr.apiKey,
+        [PROTOCOL_VERSION_HEADER]: String(PROTOCOL_VERSION),
       },
       body: JSON.stringify({ status, endedAt: Date.now() }),
     })

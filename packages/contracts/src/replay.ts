@@ -1,5 +1,4 @@
-import type { Event } from "./entities.js";
-import type { Run } from "./entities.js";
+import type { Event , Run } from "./entities.js";
 
 // ---------------------------------------------------------------------------
 // Replay projection — derived read-only view over the event log.
@@ -50,6 +49,22 @@ export interface ReplayFrame {
 export interface ReplayProjection {
   runId: string;
   frames: ReplayFrame[];
+  /**
+   * ADR-007: what this projection's frame order is entitled to CLAIM.
+   *
+   * Additive and optional so every existing producer and consumer is unchanged;
+   * absent should be read as `sequence-native`, which is what every projection
+   * built before OTel ingestion existed was.
+   *
+   * It is here rather than only in the web layer because `apiGetReplay`
+   * (convex/read_api.ts) returns a bare `ReplayProjection` straight to the
+   * `afr` CLI and the MCP server. Without this field those consumers cannot
+   * tell a verified timeline from an `ingest-unverified` one, and would render
+   * collector flush order as though it were the order things happened — the
+   * precise failure temporal ordering exists to remove. An unverifiable order
+   * must be LABELLED, not guessed.
+   */
+  orderingBasis?: import("./temporal.js").OrderingBasis;
   totalEvents: number;
   /** Wall-clock duration from first event timestamp to last event timestamp */
   duration_ms: number;

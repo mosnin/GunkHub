@@ -1,0 +1,7 @@
+# auth.setup.ts writes a REAL signed-in Clerk session (session cookie + dev
+# browser token) into this directory. It is a live credential for the Clerk
+# test instance and must never be committed.
+#
+# Ignore everything here except this file itself.
+*
+!.gitignore

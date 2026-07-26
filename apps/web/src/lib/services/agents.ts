@@ -102,27 +102,3 @@ export async function getAgent(agentId: string): Promise<Agent | null> {
     return null
   }
 }
-
-/**
- * Return agents that have at least one run in the authenticated org.
- * Used for the agent filter dropdown on the runs list page.
- */
-export async function listDistinctAgents(): Promise<Agent[]> {
-  const { orgId: clerkOrgId } = auth()
-  if (!clerkOrgId) throw new Error('Not authenticated — no org context')
-
-  const client = await getAuthedClient()
-
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-  const org = await client.query(convex.organizations.getOrganization, { clerkOrgId })
-  if (!org) throw new Error('Organization not found — run onboarding first')
-
-  const orgDoc = org as Record<string, unknown>
-
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-  const result = await client.query(convex.agents.listDistinctAgents, {
-    orgId: orgDoc._id,
-  })
-
-  return ((result as Record<string, unknown>[]) ?? []).map(mapAgent)
-}

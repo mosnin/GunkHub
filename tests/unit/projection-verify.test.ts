@@ -6,10 +6,8 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { verifyProjectionIntegrity } from '../../apps/web/src/lib/replay/verify.js'
-import type { ProjectionVerifyResult } from '../../apps/web/src/lib/replay/verify.js'
-import type { Event, Run } from '@agent-flight-recorder/contracts'
 
+import { verifyProjectionIntegrity } from '../../apps/web/src/lib/replay/verify.js'
 import {
   successfulRun,
   successfulRunEvents,
@@ -22,8 +20,12 @@ import {
   nestedRun,
   nestedRunEvents,
 } from '../fixtures/events.js'
-
 import { mockRun, mockRunEvents } from '../fixtures/runs.js'
+
+import type { ProjectionVerifyResult as _ProjectionVerifyResult } from '../../apps/web/src/lib/replay/verify.js'
+import type { Event, Run } from '@agent-flight-recorder/contracts'
+
+
 
 // ---------------------------------------------------------------------------
 // Helper: build a minimal run + event array with configurable sequence numbers

@@ -1,13 +1,19 @@
 import Link from 'next/link'
+import { Fragment } from 'react'
 
+import type { RunExplanationSummaryState } from '@/lib/services/explanations'
 import type { VerificationStatus } from '@/lib/services/projection_verify'
 import type { Run } from '@agent-flight-recorder/contracts'
 
+import { ExplanationPreview } from '@/components/runs/ExplanationPreview'
 import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
 import { Badge } from '@/components/ui/Badge'
+import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { LoadingState } from '@/components/ui/LoadingState'
 import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
+
+const FAILED_STATUSES = new Set(['failed', 'timed_out'])
 
 interface RunListProps {
   runs?: Run[]
@@ -15,9 +21,17 @@ interface RunListProps {
   agentVersionLabels?: Record<string, string>
   /** When provided, an Integrity column is shown for each row. */
   verificationStatuses?: Record<string, VerificationStatus>
+  /** "Why did this fail?" one-line preview, keyed by run ID — only meaningful for FAILED/timed_out rows. */
+  explanationSummaries?: Record<string, RunExplanationSummaryState>
 }
 
-export function RunList({ runs, loading, agentVersionLabels = {}, verificationStatuses }: RunListProps) {
+export function RunList({
+  runs,
+  loading,
+  agentVersionLabels = {},
+  verificationStatuses,
+  explanationSummaries,
+}: RunListProps) {
   if (loading) {
     return <LoadingState message="Loading runs..." />
   }
@@ -32,6 +46,7 @@ export function RunList({ runs, loading, agentVersionLabels = {}, verificationSt
   }
 
   const showIntegrity = verificationStatuses !== undefined
+  const columnCount = showIntegrity ? 8 : 7
 
   return (
     <div className="overflow-x-auto rounded-md border border-neutral-800">
@@ -66,18 +81,34 @@ export function RunList({ runs, loading, agentVersionLabels = {}, verificationSt
             </th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-neutral-800 bg-neutral-950">
+        <tbody className="bg-neutral-950">
           {runs.map((run) => {
             const verificationStatus = verificationStatuses?.[run.id]
+            const previewState =
+              FAILED_STATUSES.has(run.status) ? explanationSummaries?.[run.id] : undefined
+            const showPreview = previewState !== undefined && previewState.status !== 'unavailable'
             return (
-              <tr key={run.id} className="hover:bg-neutral-900 transition-colors duration-100 group">
+              <Fragment key={run.id}>
+              <tr
+                className={[
+                  'hover:bg-neutral-900 transition-colors duration-100 group',
+                  showPreview ? '' : 'border-b border-neutral-800',
+                ].join(' ')}
+              >
                 <td className="px-4 py-3">
-                  <Link
-                    href={`/runs/${run.id}`}
-                    className="font-mono text-xs text-neutral-300 group-hover:text-neutral-100 transition-colors duration-100"
-                  >
-                    {truncateId(run.id, 12)}
-                  </Link>
+                  <div className="flex items-center gap-1">
+                    <Link
+                      href={`/runs/${run.id}`}
+                      className="font-mono text-xs text-neutral-300 group-hover:text-neutral-100 transition-colors duration-100"
+                    >
+                      {truncateId(run.id, 12)}
+                    </Link>
+                    <CopyToClipboardButton
+                      value={run.id}
+                      label="Copy run ID"
+                      className="opacity-0 group-hover:opacity-100 focus:opacity-100"
+                    />
+                  </div>
                 </td>
                 <td className="px-4 py-3">
                   <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
@@ -91,7 +122,7 @@ export function RunList({ runs, loading, agentVersionLabels = {}, verificationSt
                         <IntegrityBadge status={verificationStatus} />
                       </Link>
                     ) : (
-                      <span className="text-xs text-neutral-700">—</span>
+                      <span className="text-xs text-pewter">—</span>
                     )}
                   </td>
                 )}
@@ -111,7 +142,7 @@ export function RunList({ runs, loading, agentVersionLabels = {}, verificationSt
                         {agentVersionLabels[run.agentVersionId]}
                       </span>
                     ) : (
-                      <span className="text-xs text-neutral-700">—</span>
+                      <span className="text-xs text-pewter">—</span>
                     )}
                   </Link>
                 </td>
@@ -144,13 +175,21 @@ export function RunList({ runs, loading, agentVersionLabels = {}, verificationSt
                       </span>
                     ))}
                     {(run.tags ?? []).length > 3 && (
-                      <span className="text-xs text-neutral-600 font-mono">
+                      <span className="text-xs text-pewter font-mono">
                         +{(run.tags ?? []).length - 3}
                       </span>
                     )}
                   </div>
                 </td>
               </tr>
+              {showPreview && previewState && (
+                <tr className="border-b border-neutral-800 bg-neutral-950">
+                  <td colSpan={columnCount} className="px-4 pb-2 pt-0">
+                    <ExplanationPreview state={previewState} />
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             )
           })}
         </tbody>

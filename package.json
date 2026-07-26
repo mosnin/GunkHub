@@ -14,11 +14,14 @@
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
+    "e2e": "pnpm --filter @agent-flight-recorder/tests run e2e",
     "clean": "turbo run clean && rm -rf node_modules .turbo"
   },
   "devDependencies": {
+    "@edge-runtime/vm": "^5.0.0",
     "@typescript-eslint/eslint-plugin": "^7.18.0",
     "@typescript-eslint/parser": "^7.18.0",
+    "convex-test": "^0.0.54",
     "eslint": "^8.57.0",
     "eslint-plugin-import": "^2.29.1",
     "prettier": "^3.3.3",
@@ -28,7 +31,23 @@
   },
   "pnpm": {
     "overrides": {
-      "typescript": "^5.6.3"
+      "typescript": "^5.6.3",
+      "convex": "^1.42.2",
+      "js-cookie@3.0.5": ">=3.0.7",
+      "postcss": "^8.5.23"
+    },
+    "auditConfig": {
+      "ignoreGhsas": [
+        "GHSA-h25m-26qc-wcjf",
+        "GHSA-q4gf-8mx6-v5v3",
+        "GHSA-8h8q-6873-q5fj",
+        "GHSA-c4j6-fc7j-m34r",
+        "GHSA-36qx-fr4f-26g5",
+        "GHSA-w24r-5266-9c3c",
+        "GHSA-p9j2-gv94-2wf4",
+        "GHSA-89xv-2m56-2m9x",
+        "GHSA-m99w-x7hq-7vfj"
+      ]
     }
   }
 }

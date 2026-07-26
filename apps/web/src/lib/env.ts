@@ -5,6 +5,11 @@ export const env = {
   // Server-only — never sent to the browser
   CLERK_SECRET_KEY: process.env.CLERK_SECRET_KEY ?? '',
   CLERK_WEBHOOK_SECRET: process.env.CLERK_WEBHOOK_SECRET ?? '',
+  // Shared secret presented to the webhook-only Convex lifecycle mutations
+  // (upsertOrganization / createOrganization / upsertMembership). Must match
+  // CONVEX_WEBHOOK_SECRET configured on the Convex deployment. Without it, those
+  // mutations reject the webhook route's calls. See ADR-0023.
+  CONVEX_WEBHOOK_SECRET: process.env.CONVEX_WEBHOOK_SECRET ?? '',
   // Blob storage — optional for local dev; required in production for large payload externalization.
   // When unset, the StubBlobStorageAdapter is used (in-memory, data lost on restart).
   // See .env.example for setup instructions.
@@ -27,3 +32,52 @@ if (typeof window !== 'undefined') {
 // Server-only vars (CLERK_SECRET_KEY, CLERK_WEBHOOK_SECRET) are validated
 // lazily in the route handlers that consume them, not at module load time.
 // Throwing at import time breaks `next build` where env vars are absent.
+
+type ServerEnvVar = keyof typeof env
+
+/**
+ * Env vars that support dual-accept rotation via a comma-separated value
+ * (`current,previous`). Restricting the type to these two keeps
+ * `getAcceptedSecrets` from being called on vars that were never designed
+ * to hold a list.
+ */
+type RotatableSecret = 'CONVEX_WEBHOOK_SECRET' | 'INTERNAL_VERIFY_SECRET'
+
+/**
+ * Parse a rotatable secret env var into its accepted values.
+ *
+ * During a rotation window the var holds `new,old` (comma-separated, entries
+ * trimmed, empty entries dropped) so both the incoming and outgoing secret
+ * validate. Outside a rotation window it holds a single value and this
+ * returns a one-element array.
+ *
+ * Convention: the FIRST entry is the "current" secret — the value used for
+ * outbound calls that must present a secret (e.g. the Clerk webhook route
+ * forwarding CONVEX_WEBHOOK_SECRET to Convex mutations). Every entry is a
+ * valid value for validating inbound requests (e.g. verify-derivation's
+ * x-internal-secret header). See docs/operations_runbook.md → "Secret
+ * rotation" for the end-to-end procedure.
+ */
+export function getAcceptedSecrets(name: RotatableSecret): string[] {
+  return env[name]
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+}
+
+/**
+ * Assert that the named server env vars are set, throwing an error that names
+ * every missing variable. Call this at FIRST USE inside a route handler — never
+ * at module scope, which would break `next build` where env vars are absent.
+ *
+ *   assertServerEnv('CLERK_WEBHOOK_SECRET', 'CONVEX_WEBHOOK_SECRET')
+ */
+export function assertServerEnv(...names: ServerEnvVar[]): void {
+  const missing = names.filter((name) => !env[name])
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required env var${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}. ` +
+        'See .env.example for setup instructions.',
+    )
+  }
+}

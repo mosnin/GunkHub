@@ -27,3 +27,15 @@ const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set([
 export function isTerminalStatus(status: RunStatus): boolean {
   return TERMINAL_STATUSES.has(status);
 }
+
+/**
+ * ADR-002 triage workflow state. Settable only on failed/timed_out runs.
+ * Enforced transitions: open -> investigating -> resolved, plus any -> open.
+ */
+export type RunTriageState = "open" | "investigating" | "resolved";
+
+export const RunTriageStateValues: RunTriageState[] = [
+  "open",
+  "investigating",
+  "resolved",
+];

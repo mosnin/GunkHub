@@ -1,0 +1,29 @@
+# CODEOWNERS — mirrors the ownership table in CLAUDE.md ("System Boundaries").
+#
+# All entries currently resolve to the repo owner handle; the comments record
+# which TEAM owns each boundary so review routing can be split into real
+# GitHub teams later without re-deriving the map.
+#
+# Later rules win over earlier ones for overlapping paths.
+
+# Root config + CI/CD + tooling → platform team (Team A)
+*                                   @mosnin
+/scripts/                           @mosnin
+/.github/                           @mosnin
+
+# apps/web (UI, API routes, Clerk integration) → web team
+/apps/web/                          @mosnin
+
+# convex/ (schema, queries, mutations, auth config) → data team
+/convex/                            @mosnin
+
+# packages/ (contracts + sdk + cli) → sdk team (contracts types reviewed with data team)
+/packages/                          @mosnin
+
+# packages/mcp (read-only MCP server over the /api/v1 read API) → platform team (Team A)
+# Read surface only: no write tools, no direct convex/ imports. See docs/mcp.md.
+/packages/mcp/                      @mosnin
+
+# Shared docs and tests — any team may edit; platform reviews structure
+/docs/                              @mosnin
+/tests/                             @mosnin

@@ -10,6 +10,11 @@ on:
   pull_request:
     branches:
       - main
+  # Weekly advisory sweep: runs ONLY the dependency-audit job (all other jobs
+  # are gated on `github.event_name != 'schedule'`) so new GHSA advisories
+  # surface even when no PR lands. Mondays 06:00 UTC.
+  schedule:
+    - cron: "0 6 * * 1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,19 +30,26 @@ jobs:
   typecheck:
     name: Typecheck
     runs-on: ubuntu-latest
+    # Scheduled runs are advisory sweeps — only dependency-audit runs.
+    # Downstream jobs (build/test/integration) skip automatically via `needs`.
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          version: 9
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
           run_install: false
 
       - name: Get pnpm store directory
@@ -46,7 +58,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -62,19 +74,24 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          version: 9
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
           run_install: false
 
       - name: Get pnpm store directory
@@ -83,7 +100,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -96,22 +113,64 @@ jobs:
       - name: Lint all packages
         run: pnpm lint
 
-  schema-drift:
-    name: Schema Drift Check
+  dependency-audit:
+    # Gates on known critical/high vulnerabilities in production dependencies.
+    # Runs as a separate job so registry flakiness never blocks typecheck/build.
+    # Also runs on the weekly `schedule` trigger so new advisories surface
+    # without waiting for a PR.
+    #
+    # Advisories that cannot be remediated on the current dependency lines are
+    # ignored via `pnpm.auditConfig.ignoreGhsas` in the root package.json.
+    # Per-GHSA rationale and revisit conditions: docs/ops/audit_ignores.md.
+    # Any NEW high/critical advisory fails this job.
+    name: Dependency Audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          version: 9
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
+          run_install: false
+
+      - name: Audit production dependencies (critical + high)
+        continue-on-error: false
+        # --audit-level=high fails only on high/critical; moderate and low are
+        # reported by scheduled dependency review, not gated here.
+        run: pnpm audit --prod --audit-level=high
+
+  schema-drift:
+    name: Schema Drift Check
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
           run_install: false
 
       - name: Get pnpm store directory
@@ -120,7 +179,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -133,23 +192,35 @@ jobs:
       - name: Check Convex schema drift
         run: pnpm tsx scripts/check-schema-drift.ts
 
-  build:
-    name: Build
+  convex-refs:
+    # Gates the apps/web/src/lib/convexFunctions.ts seam: those
+    # `makeFunctionReference('module:fn')` strings are invisible to TypeScript
+    # (convex/_generated/api.ts is an `anyApi` stub), so a wrong module, a wrong
+    # function name, a query/mutation kind mismatch, or a call site passing the
+    # wrong args all typecheck and fail only at runtime. This job cross-checks
+    # every ref and call site against the real convex/*.ts registrations by
+    # static parse — no Convex deployment, no network, no build needed, which is
+    # why it runs standalone alongside typecheck/lint rather than after build.
+    name: Convex Function Refs
     runs-on: ubuntu-latest
-    needs: [typecheck, lint, schema-drift]
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          version: 9
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
           run_install: false
 
       - name: Get pnpm store directory
@@ -158,7 +229,320 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Convex function references
+        run: pnpm tsx scripts/check-convex-refs.ts
+
+  convex-codegen-sync:
+    # Gates the ONE seam nothing else in this repo can check: the type contract
+    # between apps/web and convex/.
+    #
+    # `convex/_generated/api.ts` is HAND-AUTHORED, not generated. It exports
+    # `anyApi`, which types every backend function as `any`. There is no Convex
+    # deployment for this project and `convex codegen` cannot run offline — it
+    # authenticates against api.convex.dev to resolve the deployment and fails
+    # with 401 MissingAccessToken. So the stub is the only thing currently
+    # possible, NOT laziness.
+    #
+    # The consequence is what matters: every type guarantee across that seam is
+    # fake. A dropped filter param, a missing orgId, a missing projectId all
+    # cross it invisibly and fail only at runtime. `scripts/check-convex-refs.ts`
+    # is an elaborate hand-built substitute for what real codegen gives for free.
+    #
+    # This job closes the seam the instant a deployment exists, and in the
+    # meantime refuses to look green about it:
+    #   - CONVEX_DEPLOY_KEY present -> run real codegen, fail on any drift.
+    #   - CONVEX_DEPLOY_KEY absent  -> LOUDLY report that the seam is unverified
+    #     and coverage is zero, AND hard-fail if `_generated` has stopped being
+    #     an honest `anyApi` stub. An unverifiable claim is thereby made
+    #     verifiable: the stub may stay a stub, but it may not quietly grow
+    #     hand-written types that impersonate codegen output.
+    #
+    # Standalone (not in `build`'s `needs`), same reasoning as convex-refs and
+    # design-tokens: it is a correctness gate, not a precondition for compiling.
+    name: Convex Codegen Sync
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `secrets` is not available in a job-level `if:`, only at step level, so
+      # the gate is resolved here into an output the later steps branch on.
+      - name: Resolve CONVEX_DEPLOY_KEY gate
+        id: gate
+        shell: bash
+        env:
+          CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
+        run: |
+          if [ -n "$CONVEX_DEPLOY_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # pnpm does not hoist, so there is no root `node_modules/convex` and no
+      # `convex/` now imports `@agent-flight-recorder/contracts` (the divergence
+      # vocabulary — the engine holds no copy of it, deliberately). That package
+      # resolves through its `dist/`, which is gitignored, so on a fresh checkout
+      # nothing in convex/ resolves until contracts is built.
+      #
+      # `codegen` below passes --typecheck=disable and so does not need it TODAY.
+      # This step exists for the day a deploy key lands: `convex deploy` bundles
+      # convex/ for real and WILL need the dependency present. Building it here
+      # costs seconds and turns a confusing first-deploy failure — module not
+      # found, on a package that is right there in the workspace — into a
+      # non-event. Do not delete this because codegen appears not to need it.
+      - name: Build workspace dependencies of convex/
+        if: steps.gate.outputs.configured == 'true'
+        run: pnpm turbo run build --filter=@agent-flight-recorder/contracts
+
+      # pnpm does not hoist, so there is no root `node_modules/convex` and no
+      # root `node_modules/.bin/convex`. The CLI is resolved from the workspace
+      # package that actually depends on it, while cwd stays the repo root so
+      # `convex.json` (and therefore `functions: "convex/"`) resolves correctly.
+      - name: Regenerate convex/_generated
+        if: steps.gate.outputs.configured == 'true'
+        shell: bash
+        env:
+          CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
+        # --typecheck=disable: the dedicated `typecheck` job already owns that,
+        # and a type error here must not masquerade as a codegen-drift failure.
+        run: node convex/node_modules/convex/bin/main.js codegen --typecheck=disable
+
+      - name: Fail on codegen drift
+        if: steps.gate.outputs.configured == 'true'
+        shell: bash
+        # `git diff --exit-code` alone is NOT sufficient: real codegen emits
+        # `api.js`/`api.d.ts`/`server.js`/`server.d.ts`, none of which exist in
+        # the checked-in hand-authored tree. Those land as UNTRACKED files, which
+        # `git diff` does not see. `git status --porcelain` sees both.
+        run: |
+          STATUS="$(git status --porcelain -- convex/_generated)"
+          if [ -n "$STATUS" ]; then
+            echo "::error title=Convex Codegen Drift::convex/_generated is out of sync with 'convex codegen' output. Run it locally and commit the result."
+            {
+              echo "## Convex codegen drift"
+              echo
+              echo "\`convex/_generated\` does not match the output of \`convex codegen\`."
+              echo
+              echo '```'
+              echo "$STATUS"
+              echo '```'
+              echo
+              echo "### Diff"
+              echo '```diff'
+              git diff -- convex/_generated | head -300
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            git diff -- convex/_generated
+            exit 1
+          fi
+          echo "::notice title=Convex Codegen Sync::convex/_generated matches generated output — the web-to-backend type seam is REAL and verified."
+          echo "## Convex codegen sync: VERIFIED" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`convex/_generated\` matches \`convex codegen\` output. Backend function types are real." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "UNVERIFIED SEAM: convex/_generated is a hand-written any-stub"
+        if: steps.gate.outputs.configured != 'true'
+        shell: bash
+        run: |
+          echo "::warning title=UNVERIFIED TYPE SEAM::CONVEX_DEPLOY_KEY is not set. convex codegen did NOT run. convex/_generated is a hand-written anyApi stub, so EVERY apps/web -> convex/ function call is typed 'any' and NOTHING in this CI run verified that seam."
+          {
+            echo "## :rotating_light: Web-to-backend type seam: UNVERIFIED"
+            echo
+            echo "**\`CONVEX_DEPLOY_KEY\` is not set, so \`convex codegen\` did not run in this job.**"
+            echo
+            echo "What that means, concretely:"
+            echo
+            echo "- \`convex/_generated/api.ts\` is **hand-authored**, not generated. It exports \`anyApi\`."
+            echo "- Therefore **every** Convex function referenced from \`apps/web\` is typed \`any\`."
+            echo "- A wrong argument, a dropped filter param, a missing \`orgId\`, a missing \`projectId\`,"
+            echo "  a renamed function, or a changed return shape **all typecheck** and fail only at runtime."
+            echo "- A green \`typecheck\` job on this PR says **nothing** about that seam."
+            echo
+            echo "Partial, hand-built compensating controls (not a substitute for codegen):"
+            echo "\`scripts/check-convex-refs.ts\` (convex-refs job) and \`scripts/check-schema-drift.ts\` (schema-drift job)."
+            echo
+            echo "To close this permanently, see the **First-time bootstrap** section of"
+            echo "\`docs/deployment_checklist.md\`: create the Convex project, run \`convex dev\` once,"
+            echo "commit the real \`_generated\`, then set \`CONVEX_DEPLOY_KEY\` as a repository secret."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Makes the claim above VERIFIABLE rather than merely asserted. Without a
+      # deployment we cannot check that `_generated` is correct — but we can and
+      # must check that it is still honestly a stub. Hand-written types that
+      # impersonate codegen output would be strictly worse than `anyApi`: they
+      # would look like a real contract while being unenforced fiction.
+      - name: Assert the stub is still an honest stub
+        if: steps.gate.outputs.configured != 'true'
+        shell: bash
+        run: |
+          FAIL=0
+          if [ ! -f convex/_generated/api.ts ]; then
+            echo "::error title=Stub Integrity::convex/_generated/api.ts is missing."
+            FAIL=1
+          elif ! grep -q 'anyApi' convex/_generated/api.ts; then
+            echo "::error title=Stub Integrity::convex/_generated/api.ts no longer uses 'anyApi', but no CONVEX_DEPLOY_KEY is configured so 'convex codegen' could not have produced it. Hand-written types that impersonate codegen output are worse than the stub: they look like a contract nothing enforces. Either provision CONVEX_DEPLOY_KEY and commit real codegen output, or keep the honest anyApi stub."
+            FAIL=1
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            echo "## :x: Stub integrity check failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "See the error annotation above." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "::notice title=Stub Integrity::convex/_generated is still an honest anyApi stub (unverified seam, but not impersonating a real one)."
+
+  design-tokens:
+    # Gates apps/web against design.md, which CLAUDE.md declares the single
+    # authoritative source for the visual system — and which, until this job
+    # existed, NOTHING enforced. Not ESLint, not the type system, not the build:
+    # Tailwind accepts any class name and emits nothing for the ones it does not
+    # know, so an off-palette colour, a sub-AA text token, an off-scale font size
+    # or a dead utility all compile, build and ship in silence.
+    #
+    # The check parses design.md's own token table and WCAG matrix at run time
+    # rather than transcribing them (a checker holding its own copy of the
+    # palette would BE the second source of truth it exists to prevent), and
+    # resolves every Tailwind class back to a token by VALUE — so the remapped
+    # alias `text-neutral-500` is reported as the Ash it actually is.
+    #
+    # Standalone, like convex-refs: it needs no build, no deployment and no
+    # network, and it is a conformance gate rather than a precondition for
+    # compiling anything. Keeping it out of `build`'s `needs` means a red
+    # design-tokens fails the PR on its own without also suppressing the
+    # build/test/e2e feedback the rest of the tree depends on.
+    #
+    # ENFORCEMENT IS TIERED, NOT ALL-OR-NOTHING (see TIERS in the script):
+    #   Tier 1  blocking now — contrast defects, off-palette colour, arbitrary
+    #           colour, off-system radius, dead classes, and the four
+    #           document-level consistency checks. Any occurrence fails.
+    #   Tier 2  frozen at count — the ~1,140 alias/ramp spellings, baselined in
+    #           scripts/design-token-baseline.json. Fails only if a count RISES.
+    #           A ratchet, not a waiver: new violations are blocked immediately
+    #           and the debt is a committed number that may only go down.
+    #   Tier 3  report only — findings that are not statically decidable (mono
+    #           prose vs mark). Printed, never fails.
+    # `continue-on-error` is deliberately NOT set: an advisory job is one nobody
+    # ever turns back on.
+    name: Design Token Conformance
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `--all` so the job log carries the COMPLETE inventory rather than a
+      # capped sample. A conformance report you have to re-run locally to read
+      # is a report that gets skimmed and ignored.
+      - name: Check design-token conformance
+        run: pnpm tsx scripts/check-design-tokens.ts --all
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    # `convex-refs` is deliberately NOT in this list. It is a correctness gate on
+    # the ref table, not a precondition for compiling anything — a ref pointing at
+    # the wrong Convex function builds fine. Keeping it out of `needs` means a red
+    # convex-refs still fails the PR on its own without also suppressing the
+    # build/test/e2e feedback the rest of the tree depends on.
+    needs: [typecheck, lint, schema-drift]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -166,10 +550,10 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Cache Turbo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: .turbo
-          key: ${{ runner.os }}-turbo-${{ github.sha }}
+          key: ${{ runner.os }}-turbo-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-turbo-
 
@@ -179,23 +563,60 @@ jobs:
       - name: Build all packages
         run: pnpm build
 
-  test:
-    name: Test
+      # Both checks below need real build artifacts, so they live here rather
+      # than in jobs of their own — a separate job would repeat the ~60s build
+      # to inspect its output.
+      #
+      # Neither may run while another build is in flight: both read dist/, and
+      # tsup's `clean: true` empties it for tens of milliseconds to a few
+      # seconds at the start of every build. Inside one turbo invocation the
+      # ^build edges serialise that away; across concurrent invocations they
+      # would flake. Sequential steps in this job are the safe placement.
+      - name: Check build integrity
+        # A FAILED tsup DTS step leaves the PREVIOUS .d.ts on disk, so tsc
+        # typechecks clean against yesterday's types. `rm -rf dist` does NOT
+        # cure it — the artifact comes from a build that ran and partly failed,
+        # not one that never ran. Asserts declarations never predate the JS
+        # beside them (a direction test: the real inversion observed was 10.8s,
+        # which any staleness threshold loose enough for a loaded runner would
+        # have missed).
+        run: pnpm tsx scripts/check-build-integrity.ts
+
+      - name: Check MCP token budgets
+        # The budgets ARE the product claim: an agent spends ~332 tokens
+        # learning what is broken instead of ~3,844 fetching a run. Nothing
+        # else enforces that. Tools are enumerated from the server's own
+        # registry, so a newly registered tool with no declared budget fails
+        # rather than shipping unmeasured, and an empty/renamed registry exits
+        # 2 rather than passing everything trivially.
+        run: pnpm tsx scripts/check-token-budgets.ts
+
+  e2e:
+    name: E2E Smoke (Playwright)
     runs-on: ubuntu-latest
+    # Needs a successful build first, same reasoning as `test`: no point
+    # driving a browser against a build we already know is broken.
     needs: [build]
+    # Weekly schedule run is an advisory dependency-audit sweep only — see the
+    # `if` comment on `typecheck` above. Excluded here for the same reason.
+    if: github.event_name != 'schedule'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          version: 9
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
           run_install: false
 
       - name: Get pnpm store directory
@@ -204,7 +625,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -212,10 +633,122 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Cache Turbo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: .turbo
-          key: ${{ runner.os }}-turbo-${{ github.sha }}
+          key: ${{ runner.os }}-turbo-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # /opt/pw-browsers (used by local sandbox sessions) does not exist on
+      # hosted GitHub runners — install Playwright's own Chromium here.
+      # --with-deps also installs the OS-level shared libraries Chromium
+      # needs on a bare Ubuntu runner.
+      - name: Install Playwright Chromium
+        run: pnpm --filter @agent-flight-recorder/tests exec playwright install --with-deps chromium
+
+      # Unauthenticated tier only (see tests/e2e/auth.spec.ts for why the
+      # authenticated tier is skipped rather than run here). No live Convex
+      # deployment or real Clerk credentials are used or required — dummy
+      # values matching playwright.config.ts's DUMMY_ENV, passed here too so
+      # the webServer's `next build && next start` step has them without
+      # duplicating a separate build.
+      - name: Run e2e smoke suite
+        env:
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_Y2xlcmsuZTJlLmludmFsaWQk
+          CLERK_SECRET_KEY: sk_test_dummy00000000000000000000000000000000000000000
+          NEXT_PUBLIC_CONVEX_URL: https://example-e2e-placeholder.convex.cloud
+          # The authenticated tier cannot run without a Clerk DEVELOPMENT instance
+          # and a seeded Convex deployment — neither of which exists yet, and
+          # neither of which CI can provision for itself. Without this ack the
+          # coverage guard fails the job, which would leave `e2e` permanently red
+          # on something no contributor can fix. A job that is always red is a job
+          # everyone learns to ignore, and then it reports nothing at all.
+          #
+          # This is NOT a silent skip. With the ack set, the guard still runs and
+          # still prints the full report — every uncovered journey and every
+          # missing variable — as an annotation and a job summary. The failure is
+          # downgraded; the information is not.
+          #
+          # REMOVE THIS LINE once E2E_CLERK_* and a real NEXT_PUBLIC_CONVEX_URL are
+          # configured as repository secrets. See tests/e2e/README.md for the six
+          # variables and the Clerk dashboard settings they require.
+          AFR_E2E_ACK_NO_AUTH_COVERAGE: "1"
+        run: pnpm e2e
+
+      - name: Report authenticated e2e coverage
+        if: always()
+        run: |
+          {
+            echo "### Authenticated e2e coverage"
+            echo
+            echo "The authenticated tier is **not running**: 0 of 10 journeys execute."
+            echo "Every signed-in surface — run trace, event inspector, replay, diff,"
+            echo "failure patterns, resolution lifecycle — is unverified end to end."
+            echo
+            echo "This job being green means the UNAUTHENTICATED tier passed. It does"
+            echo "not mean the product works when signed in."
+            echo
+            echo "To close this: see \`tests/e2e/README.md\`, then delete the"
+            echo "\`AFR_E2E_ACK_NO_AUTH_COVERAGE\` line from this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-report
+          # playwright.config.ts lives at the repo root, so Playwright writes
+          # its report/trace/screenshot output there too, not under tests/.
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Cache Turbo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .turbo
+          key: ${{ runner.os }}-turbo-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-turbo-
 
@@ -238,17 +771,21 @@ jobs:
     #   but a subsequent step explicitly reports the skip status so it is visible in CI.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          version: 9
+          # No `version:` input on purpose. pnpm/action-setup treats specifying
+          # both this and package.json's `packageManager` as a hard error, and
+          # `packageManager: pnpm@9.15.0` is the more precise of the two — it
+          # pins the patch, matches what the lockfile was written by, and is the
+          # single source corepack and local dev already follow.
           run_install: false
 
       - name: Get pnpm store directory
@@ -257,7 +794,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -265,10 +802,10 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Cache Turbo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: .turbo
-          key: ${{ runner.os }}-turbo-${{ github.sha }}
+          key: ${{ runner.os }}-turbo-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-turbo-
 
@@ -276,11 +813,25 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Report integration test configuration
+        id: integration-config
         shell: bash
+        env:
+          CONVEX_TEST_URL: ${{ secrets.CONVEX_TEST_URL }}
         run: |
-          if [ -n "${{ secrets.CONVEX_TEST_URL }}" ]; then
+          # The `secrets` context is NOT available in any `if:` expression —
+          # not at job level and not at step level. Only `github`, `needs`,
+          # `vars`, `inputs`, `env`, `steps` and friends are. Referencing
+          # `secrets.*` in an `if:` is an invalid-expression STARTUP FAILURE:
+          # GitHub refuses to schedule the workflow at all, so every job
+          # silently never runs and the run reports failure with zero jobs.
+          # That is exactly what happened here — CI was dead for six commits
+          # while the local gate was green. So the presence check is resolved
+          # into a step OUTPUT, which `if:` may read.
+          if [ -n "$CONVEX_TEST_URL" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
             echo "::notice title=Integration Tests::Secrets are present — real-Convex integration tests WILL run."
           else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "::warning title=Integration Tests::CONVEX_TEST_URL secret is not set. Real-Convex integration tests will be SKIPPED. See docs/ops/ci_setup.md to provision secrets."
           fi
 
@@ -289,10 +840,13 @@ jobs:
           CONVEX_TEST_URL: ${{ secrets.CONVEX_TEST_URL }}
           TEST_API_KEY: ${{ secrets.TEST_API_KEY }}
           TEST_AGENT_ID: ${{ secrets.TEST_AGENT_ID }}
-        run: pnpm test --reporter=verbose tests/integration/api.test.ts
+        # Target the tests package directly and pass vitest flags after `--` so
+        # they reach vitest instead of being swallowed by turbo. The path is
+        # relative to the tests/ package (vitest root), so no `tests/` prefix.
+        run: pnpm --filter @agent-flight-recorder/tests test -- --reporter=verbose integration/api.test.ts
 
       - name: Verify integration tests were not silently skipped on main
-        if: github.ref == 'refs/heads/main' && secrets.CONVEX_TEST_URL == ''
+        if: github.ref == 'refs/heads/main' && steps.integration-config.outputs.configured == 'false'
         shell: bash
         run: |
           echo "::error title=Release Gate::Merging to main requires real-Convex integration tests. CONVEX_TEST_URL is not set. See docs/ops/ci_setup.md."

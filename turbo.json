@@ -14,7 +14,45 @@
       "dependsOn": ["^build"],
       "outputs": []
     },
+    "@agent-flight-recorder/sdk#typecheck": {
+      // `^build` builds DEPENDENCIES, not this package. packages/sdk/examples/*
+      // import '@agent-flight-recorder/sdk' by its own package name — on purpose,
+      // since their job is to show the public API exactly as a consumer types it —
+      // and that self-link resolves to dist/index.d.ts. So this typecheck needs
+      // its OWN build to have run, which `^build` never guarantees.
+      //
+      // The hole is invisible locally: a dist/ left over from any earlier build
+      // satisfies the import, so it only fails on a clean checkout. Reproduce with
+      // `rm -rf packages/sdk/dist && pnpm --filter @agent-flight-recorder/sdk typecheck`.
+      "dependsOn": ["^build", "build"],
+      "outputs": []
+    },
     "lint": {
+      // ESLint here is TYPE-AWARE (@typescript-eslint with a `project`), so it
+      // needs dependency .d.ts the same way tsc does. Without `^build` the
+      // imported types resolve to `error`, every value derived from them becomes
+      // `any`, and the no-unsafe-* rules fire en masse — 361 errors in the CLI,
+      // 64 in the SDK, none of them real. The failure only appears on a clean
+      // checkout, because any earlier build leaves a dist/ behind that satisfies
+      // the resolution.
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@agent-flight-recorder/sdk#test": {
+      // Third task with the same self-referential-import hole. dist_smoke and
+      // examples_smoke import '@agent-flight-recorder/sdk' by its own name and
+      // resolve to dist/, which `^build` never produces for this package. Cold,
+      // that is 6 failing tests; warm, it passes — so it was invisible until the
+      // tree was actually cleaned. `typecheck` and `lint` got this override when
+      // the hole was first found; `test` was missed.
+      "dependsOn": ["^build", "build"],
+      "outputs": ["coverage/**"]
+    },
+    "@agent-flight-recorder/sdk#lint": {
+      // Same self-referential-import reason as this package's typecheck: the
+      // examples import '@agent-flight-recorder/sdk' by name, which `^build`
+      // does not produce.
+      "dependsOn": ["^build", "build"],
       "outputs": []
     },
     "test": {

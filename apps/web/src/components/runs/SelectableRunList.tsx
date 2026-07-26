@@ -1,13 +1,17 @@
 'use client'
 
 import Link from 'next/link'
-import { useState, useTransition } from 'react'
+import { Fragment, useState, useTransition } from 'react'
 
+import type { RunExplanationSummaryState } from '@/lib/services/explanations'
 import type { VerificationStatus } from '@/lib/services/projection_verify'
 import type { Run } from '@agent-flight-recorder/contracts'
 
+import { ExplanationPreview } from '@/components/runs/ExplanationPreview'
 import { IntegrityBadge } from '@/components/runs/IntegrityBadge'
+import { EnvironmentChip, TriageChip } from '@/components/runs/RunMetaChips'
 import { Badge } from '@/components/ui/Badge'
+import { CopyToClipboardButton } from '@/components/ui/CopyToClipboardButton'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { bulkReverifyAction, type BulkReverifyResult } from '@/lib/actions/verification'
 import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
@@ -15,22 +19,41 @@ import { truncateId, formatDuration, formatRelativeTime } from '@/lib/utils'
 /** Run statuses that are eligible for on-demand reverification. */
 const TERMINAL_STATUSES = new Set<string>(['completed', 'failed', 'cancelled', 'timed_out'])
 
+/** Run statuses eligible for the "why did this fail?" list preview. */
+const FAILED_STATUSES = new Set<string>(['failed', 'timed_out'])
+
+/** checkbox, Run ID, Status, [Integrity], Agent, Version, Started, Duration, Tags. */
+const COLUMN_COUNT_WITH_INTEGRITY = 9
+const COLUMN_COUNT_WITHOUT_INTEGRITY = 8
+
 interface SelectableRunListProps {
   runs?: Run[]
   agentVersionLabels?: Record<string, string>
+  /**
+   * Omit (not `{}`) when verification status could not be loaded. Passing an
+   * empty map would render an Integrity column of em-dashes, which reads as
+   * "checked, nothing to report" — a claim we cannot make when the batch
+   * lookup failed. Undefined hides the column instead, and the caller is
+   * expected to explain the absence above the table.
+   */
   verificationStatuses?: Record<string, VerificationStatus>
+  /** "Why did this fail?" one-line preview, keyed by run ID — only meaningful for FAILED/timed_out rows. */
+  explanationSummaries?: Record<string, RunExplanationSummaryState>
 }
 
 /**
  * Runs table with multi-select checkboxes and a bulk re-verify action bar.
  * Used exclusively on the /runs page (not the dashboard).
- * Always shows the Integrity column.
+ * Shows the Integrity column only when verification statuses were loaded.
  */
 export function SelectableRunList({
   runs,
   agentVersionLabels = {},
-  verificationStatuses = {},
+  verificationStatuses,
+  explanationSummaries,
 }: SelectableRunListProps) {
+  const showIntegrity = verificationStatuses !== undefined
+  const columnCount = showIntegrity ? COLUMN_COUNT_WITH_INTEGRITY : COLUMN_COUNT_WITHOUT_INTEGRITY
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [bulkResult, setBulkResult] = useState<BulkReverifyResult | null>(null)
   const [isPending, startTransition] = useTransition()
@@ -40,6 +63,7 @@ export function SelectableRunList({
       <EmptyState
         title="No runs recorded yet."
         description="Runs will appear here once your agents start recording. Instrument your first agent with the SDK."
+        action={{ label: 'Set up recording in Settings', href: '/settings' }}
       />
     )
   }
@@ -84,7 +108,11 @@ export function SelectableRunList({
     <div>
       {/* Bulk action bar — shown when runs are selected or a result is available */}
       {(someSelected || bulkResult !== null) && (
-        <div className="mb-2 flex items-center gap-3 px-3 py-2 rounded-md border border-neutral-800 bg-neutral-900 text-xs font-mono">
+        <div
+          role="status"
+          aria-live="polite"
+          className="mb-2 flex items-center gap-3 px-3 py-2 rounded-md border border-neutral-800 bg-neutral-900 text-xs font-mono"
+        >
           {isPending ? (
             <span className="text-neutral-500">Re-verifying…</span>
           ) : someSelected ? (
@@ -92,7 +120,7 @@ export function SelectableRunList({
               <span className="text-neutral-400">
                 {selectedEligible.length} selected
                 {selectedIds.size > selectedEligible.length && (
-                  <span className="text-neutral-600 ml-1">
+                  <span className="text-pewter ml-1">
                     ({selectedIds.size - selectedEligible.length} non-terminal skipped)
                   </span>
                 )}
@@ -103,15 +131,28 @@ export function SelectableRunList({
                   setSelectedIds(new Set())
                   setBulkResult(null)
                 }}
-                className="text-neutral-600 hover:text-neutral-400 transition-colors duration-100"
+                className="text-pewter hover:text-cloud transition-colors duration-100"
               >
                 clear
               </button>
+              {selectedIds.size === 2 && (
+                /* Diff entry bridge — exactly 2 selected runs can be compared.
+                   Selection (insertion) order maps to left/right. */
+                <Link
+                  href={`/diff?left=${encodeURIComponent([...selectedIds][0] ?? '')}&right=${encodeURIComponent([...selectedIds][1] ?? '')}`}
+                  className="ml-auto px-2 py-0.5 rounded border text-xs font-mono transition-colors duration-100 border-neutral-700 text-neutral-300 hover:text-neutral-100 hover:border-neutral-600"
+                >
+                  Compare runs
+                </Link>
+              )}
               <button
                 type="button"
                 onClick={handleBulkReverify}
                 disabled={selectedEligible.length === 0}
-                className="ml-auto px-2 py-0.5 rounded border text-xs font-mono transition-colors duration-100 border-primary-800 text-primary-400 hover:text-primary-300 hover:border-primary-700 disabled:text-neutral-700 disabled:border-neutral-800"
+                className={[
+                  selectedIds.size === 2 ? '' : 'ml-auto',
+                  'px-2 py-0.5 rounded border text-xs font-mono transition-colors duration-100 border-primary-800 text-primary-400 hover:text-primary-300 hover:border-primary-700 disabled:text-pewter disabled:border-neutral-800',
+                ].join(' ')}
               >
                 Re-verify {selectedEligible.length}
               </button>
@@ -120,19 +161,19 @@ export function SelectableRunList({
             <>
               <span className="text-neutral-400">
                 {bulkResult.succeeded.length > 0 && (
-                  <span className="text-emerald-600">{bulkResult.succeeded.length} verified</span>
+                  <span className="text-neon-glow">{bulkResult.succeeded.length} verified</span>
                 )}
                 {bulkResult.succeeded.length > 0 && bulkResult.failed.length > 0 && (
-                  <span className="text-neutral-600 mx-1">·</span>
+                  <span className="text-pewter mx-1">·</span>
                 )}
                 {bulkResult.failed.length > 0 && (
-                  <span className="text-red-500">{bulkResult.failed.length} failed</span>
+                  <span className="text-destructive-500">{bulkResult.failed.length} failed</span>
                 )}
               </span>
               <button
                 type="button"
                 onClick={() => setBulkResult(null)}
-                className="ml-auto text-neutral-600 hover:text-neutral-400 transition-colors duration-100"
+                className="ml-auto text-pewter hover:text-cloud transition-colors duration-100"
               >
                 dismiss
               </button>
@@ -162,9 +203,11 @@ export function SelectableRunList({
               <th className="w-28 px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
                 Status
               </th>
-              <th className="w-28 px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
-                Integrity
-              </th>
+              {showIntegrity && (
+                <th className="w-28 px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                  Integrity
+                </th>
+              )}
               <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
                 Agent
               </th>
@@ -182,20 +225,25 @@ export function SelectableRunList({
               </th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-neutral-800 bg-neutral-950">
+          <tbody className="bg-neutral-950">
             {runs.map((run) => {
-              const verificationStatus = verificationStatuses[run.id]
+              const verificationStatus = verificationStatuses?.[run.id]
               const isEligible = TERMINAL_STATUSES.has(run.status)
               const isSelected = selectedIds.has(run.id)
               const wasSucceeded = bulkResult?.succeeded.includes(run.id) ?? false
               const wasFailed = bulkResult?.failed.includes(run.id) ?? false
+              const previewState = FAILED_STATUSES.has(run.status)
+                ? explanationSummaries?.[run.id]
+                : undefined
+              const showPreview = previewState !== undefined && previewState.status !== 'unavailable'
 
               return (
+                <Fragment key={run.id}>
                 <tr
-                  key={run.id}
                   className={[
                     'hover:bg-neutral-900 transition-colors duration-100 group',
                     isSelected ? 'bg-neutral-900/50' : '',
+                    showPreview ? '' : 'border-b border-neutral-800',
                   ].join(' ')}
                 >
                   <td className="px-3 py-3">
@@ -219,12 +267,17 @@ export function SelectableRunList({
                       >
                         {truncateId(run.id, 12)}
                       </Link>
+                      <CopyToClipboardButton
+                        value={run.id}
+                        label="Copy run ID"
+                        className="opacity-0 group-hover:opacity-100 focus:opacity-100"
+                      />
                       {wasSucceeded && (
-                        <span className="text-emerald-600 text-xs" aria-label="re-verified">✓</span>
+                        <span className="text-neon-glow text-xs" aria-label="re-verified">✓</span>
                       )}
                       {wasFailed && (
                         <span
-                          className="text-red-600 text-xs"
+                          className="text-destructive-500 text-xs"
                           aria-label="re-verify failed"
                           title={bulkResult?.errors[run.id]}
                         >
@@ -234,19 +287,22 @@ export function SelectableRunList({
                     </span>
                   </td>
                   <td className="px-4 py-3">
-                    <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
+                    <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden className="flex items-center gap-1.5 flex-wrap">
                       <Badge status={run.status} />
+                      {run.triageState && <TriageChip triageState={run.triageState} />}
                     </Link>
                   </td>
-                  <td className="px-4 py-3">
-                    {verificationStatus ? (
-                      <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
-                        <IntegrityBadge status={verificationStatus} />
-                      </Link>
-                    ) : (
-                      <span className="text-xs text-neutral-700">—</span>
-                    )}
-                  </td>
+                  {showIntegrity && (
+                    <td className="px-4 py-3">
+                      {verificationStatus ? (
+                        <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
+                          <IntegrityBadge status={verificationStatus} />
+                        </Link>
+                      ) : (
+                        <span className="text-xs text-pewter">—</span>
+                      )}
+                    </td>
+                  )}
                   <td className="px-4 py-3">
                     <Link
                       href={`/runs/${run.id}`}
@@ -257,13 +313,14 @@ export function SelectableRunList({
                     </Link>
                   </td>
                   <td className="px-4 py-3">
-                    <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden>
+                    <Link href={`/runs/${run.id}`} tabIndex={-1} aria-hidden className="flex items-center gap-1.5 flex-wrap">
+                      {run.environment && <EnvironmentChip environment={run.environment} />}
                       {run.agentVersionId && agentVersionLabels[run.agentVersionId] ? (
                         <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-mono text-neutral-400 bg-neutral-900 border border-neutral-800">
                           {agentVersionLabels[run.agentVersionId]}
                         </span>
                       ) : (
-                        <span className="text-xs text-neutral-700">—</span>
+                        <span className="text-xs text-pewter">—</span>
                       )}
                     </Link>
                   </td>
@@ -296,13 +353,21 @@ export function SelectableRunList({
                         </span>
                       ))}
                       {(run.tags ?? []).length > 3 && (
-                        <span className="text-xs text-neutral-600 font-mono">
+                        <span className="text-xs text-pewter font-mono">
                           +{(run.tags ?? []).length - 3}
                         </span>
                       )}
                     </div>
                   </td>
                 </tr>
+                {showPreview && previewState && (
+                  <tr className="border-b border-neutral-800 bg-neutral-950">
+                    <td colSpan={columnCount} className="px-4 pb-2 pt-0">
+                      <ExplanationPreview state={previewState} />
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
               )
             })}
           </tbody>

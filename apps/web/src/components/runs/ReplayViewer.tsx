@@ -1,42 +1,44 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { analyzeRunOrdering, readEventTiming } from '@agent-flight-recorder/contracts'
+import { useEffect, useMemo, useRef, useState } from 'react'
+
 
 import type { FailureSummary, ReplayFrame, ReplayProjection } from '@agent-flight-recorder/contracts'
 
+import {
+  EventTimingRows,
+  InferredTimingMark,
+  OrderingBasisNote,
+} from '@/components/runs/TemporalOrderNote'
 import { EmptyState } from '@/components/ui/EmptyState'
+import { isEditableTarget, isNavFirstKey, isNavLastKey } from '@/lib/hooks/useKeyScope'
 
 interface ReplayViewerProps {
   projection: ReplayProjection
   failureSummary: FailureSummary
 }
 
-// Actor → left border color class
+// Windowed rendering (parity with Timeline/DiffViewer): only this many frames
+// are mounted at once, with earlier/later expanders. Keeps the DOM bounded for
+// 10k-frame replays.
+const WINDOW_SIZE = 100
+
+// Actor → left border treatment. design.md limits colour to Neon Glow, the red
+// alert, and greys. The actor name is shown in the frame metadata, so hue only
+// encodes lifecycle: red for an errored frame, the single Neon accent for the
+// system/run lifecycle, neutral for every other actor.
 function actorBorderClass(frame: ReplayFrame): string {
-  if (frame.status === 'error') return 'border-l-red-600'
-  switch (frame.actor) {
-    case 'llm':       return 'border-l-violet-600'
-    case 'tool':      return 'border-l-amber-600'
-    case 'system':    return 'border-l-emerald-600'
-    case 'http':      return 'border-l-sky-600'
-    case 'memory':    return 'border-l-pink-600'
-    case 'retrieval': return 'border-l-cyan-600'
-    default:          return 'border-l-neutral-600'
-  }
+  if (frame.status === 'error') return 'border-l-destructive-600'
+  if (frame.actor === 'system') return 'border-l-neon-muted'
+  return 'border-l-neutral-700'
 }
 
-// Actor → dot color for the frame list
+// Actor → dot treatment, same rationale as actorBorderClass.
 function actorDotClass(frame: ReplayFrame): string {
-  if (frame.status === 'error') return 'bg-red-600'
-  switch (frame.actor) {
-    case 'llm':       return 'bg-violet-600'
-    case 'tool':      return 'bg-amber-600'
-    case 'system':    return 'bg-emerald-600'
-    case 'http':      return 'bg-sky-600'
-    case 'memory':    return 'bg-pink-600'
-    case 'retrieval': return 'bg-cyan-600'
-    default:          return 'bg-neutral-600'
-  }
+  if (frame.status === 'error') return 'bg-destructive-500'
+  if (frame.actor === 'system') return 'bg-neon-glow'
+  return 'bg-neutral-600'
 }
 
 function formatElapsed(ms: number): string {
@@ -48,13 +50,16 @@ interface FrameRowProps {
   frame: ReplayFrame
   isActive: boolean
   onClick: () => void
+  rowRef?: React.Ref<HTMLButtonElement>
 }
 
-function FrameRow({ frame, isActive, onClick }: FrameRowProps) {
+function FrameRow({ frame, isActive, onClick, rowRef }: FrameRowProps) {
   const indent = frame.depth * 16 // ml-4 = 16px per level
   return (
     <button
+      ref={rowRef}
       onClick={onClick}
+      aria-current={isActive ? 'true' : undefined}
       style={{ paddingLeft: `${8 + indent}px` }}
       className={[
         'w-full flex items-start gap-2 py-1.5 pr-3 text-left transition-colors duration-75',
@@ -76,22 +81,26 @@ function FrameRow({ frame, isActive, onClick }: FrameRowProps) {
         <span
           className={[
             'block text-xs font-mono truncate',
-            frame.status === 'error' ? 'text-red-400' : 'text-neutral-300',
+            frame.status === 'error' ? 'text-destructive-400' : 'text-neutral-300',
           ].join(' ')}
         >
           {frame.event.type}
         </span>
         {frame.payloadPreview && (
-          <span className="block text-xs text-neutral-600 truncate mt-0.5">
+          <span className="block text-xs text-pewter truncate mt-0.5">
             {frame.payloadPreview}
           </span>
         )}
       </span>
-      <span className="shrink-0 text-xs font-mono text-neutral-700 mt-0.5">
-        #{frame.event.sequenceNumber}
+      {/* `~` when this frame's instant was inferred rather than measured. Sits
+          beside the sequence number, which on a derived run is the order we
+          LEARNED of the event — not the order it happened. */}
+      <span className="shrink-0 flex items-center gap-1 text-xs font-mono text-pewter mt-0.5">
+        <InferredTimingMark timing={readEventTiming(frame.event)} />#
+        {frame.event.sequenceNumber}
       </span>
       {frame.status === 'terminal' && (
-        <span className="shrink-0 text-xs font-mono text-emerald-600 mt-0.5">
+        <span className="shrink-0 text-xs font-mono text-neon-glow mt-0.5">
           end
         </span>
       )}
@@ -104,7 +113,19 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
   const { frames } = projection
   const total = frames.length
 
+  // Frame-list window, centered on the current step initially. Expander buttons
+  // shift it; stepping outside the window recenters it (effect below).
+  const [windowStart, setWindowStart] = useState(0)
+  const activeRowRef = useRef<HTMLButtonElement | null>(null)
+
   const activeFrame = total > 0 ? frames[currentIndex] : null
+
+  // What the rendered order of these frames is entitled to CLAIM. Derived from
+  // the frames themselves, so no service or contract change is needed to carry
+  // it: `buildReplayProjection` has already ordered them, and this reports which
+  // ordering it used. Returns `sequence-native` for every first-party run, in
+  // which case `OrderingBasisNote` renders nothing.
+  const ordering = useMemo(() => analyzeRunOrdering(frames.map((f) => f.event)), [frames])
 
   function goPrev() {
     setCurrentIndex((i) => Math.max(0, i - 1))
@@ -114,24 +135,51 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
     setCurrentIndex((i) => Math.min(total - 1, i + 1))
   }
 
+  // Unified list-navigation model (shared with Timeline/EventInspector):
+  // ArrowLeft/ArrowRight step frames as before; `k`/`j` are the same "back"/
+  // "forward" aliases the other inspectors use for up/down, and g/Home,
+  // G/End jump to the first/last frame. See src/lib/hooks/useKeyScope.ts.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key === 'ArrowLeft') {
+      // Never hijack keys while the user is typing in a form control.
+      if (isEditableTarget(e.target)) return
+      if (e.key === 'ArrowLeft' || e.key === 'k') {
         e.preventDefault()
         setCurrentIndex((i) => Math.max(0, i - 1))
-      } else if (e.key === 'ArrowRight') {
+      } else if (e.key === 'ArrowRight' || e.key === 'j') {
         e.preventDefault()
         setCurrentIndex((i) => Math.min(total - 1, i + 1))
+      } else if (isNavFirstKey(e)) {
+        e.preventDefault()
+        setCurrentIndex(0)
+      } else if (isNavLastKey(e)) {
+        e.preventDefault()
+        setCurrentIndex(total - 1)
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [total])
 
+  // Keep the active frame inside the window: when stepping crosses the window
+  // edge, recenter the window on the current step.
+  useEffect(() => {
+    if (currentIndex < windowStart || currentIndex >= windowStart + WINDOW_SIZE) {
+      setWindowStart(
+        Math.max(0, Math.min(currentIndex - Math.floor(WINDOW_SIZE / 2), total - WINDOW_SIZE))
+      )
+    }
+  }, [currentIndex, windowStart, total])
+
+  // Stepping scrolls the active frame into view within the frame list.
+  useEffect(() => {
+    activeRowRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [currentIndex, windowStart])
+
   if (total === 0) {
     return (
       <div className="flex flex-col h-full">
-        <div className="px-4 py-2 bg-amber-950/40 border border-amber-900/50 rounded-md mx-6 mt-4 text-xs text-amber-500/80 font-medium">
+        <div className="px-4 py-2 bg-graphite border border-graphite-light rounded-[4px] mx-6 mt-4 text-xs text-pewter font-medium">
           Replay is a derived projection. The event log is not modified.
         </div>
         <div className="flex-1 flex items-center justify-center">
@@ -147,13 +195,20 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
   return (
     <div className="flex flex-col h-full">
       {/* Read-only banner */}
-      <div className="px-4 py-2 bg-amber-950/40 border border-amber-900/50 rounded-md mx-6 mt-4 text-xs text-amber-500/80 font-medium shrink-0">
+      <div className="px-4 py-2 bg-graphite border border-graphite-light rounded-[4px] mx-6 mt-4 text-xs text-pewter font-medium shrink-0">
         Replay is a derived projection. The event log is not modified.
       </div>
 
+      {/* Ordering basis — silent for a natively-recorded run. */}
+      {ordering.basis !== 'sequence-native' && (
+        <div className="mx-6 mt-2 shrink-0">
+          <OrderingBasisNote ordering={ordering} subject="replay" />
+        </div>
+      )}
+
       {/* Truncation warning — shown when the run exceeds MAX_EVENTS_PER_REPLAY */}
       {projection.truncated && (
-        <div className="px-4 py-2 bg-orange-950/40 border border-orange-900/50 rounded-md mx-6 mt-2 text-xs text-orange-400 font-medium shrink-0">
+        <div className="px-4 py-2 bg-graphite border border-graphite-light rounded-[4px] mx-6 mt-2 text-xs text-pewter font-medium shrink-0">
           This run contains more than 10,000 events. Only the first 10,000 are shown in this replay.
         </div>
       )}
@@ -186,28 +241,50 @@ export function ReplayViewer({ projection, failureSummary: _failureSummary }: Re
         </span>
 
         {activeFrame && (
-          <span className="text-xs font-mono text-neutral-600">
+          <span className="text-xs font-mono text-pewter">
             {formatElapsed(activeFrame.elapsed_ms)}
           </span>
         )}
 
-        <span className="ml-auto text-xs text-neutral-700">
-          ArrowLeft / ArrowRight to step
+        <span className="ml-auto text-xs text-pewter font-mono">
+          ←/→ or k/j to step · g/G first/last · press ? for all shortcuts
         </span>
       </div>
 
       {/* Main split: frame list + frame detail */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Frame list */}
+        {/* Frame list — windowed to WINDOW_SIZE mounted rows */}
         <div className="w-72 shrink-0 border-r border-neutral-800 overflow-y-auto">
-          {frames.map((frame, i) => (
-            <FrameRow
-              key={frame.event.id}
-              frame={frame}
-              isActive={i === currentIndex}
-              onClick={() => setCurrentIndex(i)}
-            />
-          ))}
+          {windowStart > 0 && (
+            <button
+              onClick={() => setWindowStart(Math.max(0, windowStart - WINDOW_SIZE))}
+              className="w-full text-left px-3 py-1.5 text-xs font-mono text-pewter hover:text-cloud border-b border-neutral-800 transition-colors duration-100"
+            >
+              ↑ {windowStart} earlier
+            </button>
+          )}
+          {frames.slice(windowStart, windowStart + WINDOW_SIZE).map((frame, relIdx) => {
+            const i = windowStart + relIdx
+            return (
+              <FrameRow
+                key={frame.event.id}
+                frame={frame}
+                isActive={i === currentIndex}
+                onClick={() => setCurrentIndex(i)}
+                rowRef={i === currentIndex ? activeRowRef : undefined}
+              />
+            )
+          })}
+          {windowStart + WINDOW_SIZE < total && (
+            <button
+              onClick={() =>
+                setWindowStart(Math.min(total - WINDOW_SIZE, windowStart + WINDOW_SIZE))
+              }
+              className="w-full text-left px-3 py-1.5 text-xs font-mono text-pewter hover:text-cloud border-t border-neutral-800 transition-colors duration-100"
+            >
+              ↓ {total - windowStart - WINDOW_SIZE} later
+            </button>
+          )}
         </div>
 
         {/* Frame detail */}
@@ -241,18 +318,18 @@ function FrameDetail({ frame }: FrameDetailProps) {
           <span
             className={[
               'text-sm font-mono font-semibold',
-              frame.status === 'error' ? 'text-red-400' : 'text-neutral-100',
+              frame.status === 'error' ? 'text-destructive-400' : 'text-neutral-100',
             ].join(' ')}
           >
             {event.type}
           </span>
           {frame.status === 'error' && (
-            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-red-950 text-red-400 border border-red-900">
+            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-destructive-900 text-destructive-400 border border-destructive-700">
               error
             </span>
           )}
           {frame.status === 'terminal' && (
-            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-900">
+            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-primary-900 text-neon-glow border border-primary-800">
               terminal
             </span>
           )}
@@ -273,10 +350,10 @@ function FrameDetail({ frame }: FrameDetailProps) {
         <div className="text-neutral-500">Elapsed</div>
         <div className="font-mono text-neutral-300">{formatElapsed(frame.elapsed_ms)}</div>
 
-        <div className="text-neutral-500">Timestamp</div>
-        <div className="font-mono text-neutral-300">
-          {new Date(event.timestamp).toISOString()}
-        </div>
+        {/* Timestamp — plus, for a derived event whose instant was clamped, the
+            raw value and the skew. A clamped instant was NOT measured, and it is
+            rendered as inferred rather than presented as a reading. */}
+        <EventTimingRows event={event} />
 
         {event.parentEventId && (
           <>

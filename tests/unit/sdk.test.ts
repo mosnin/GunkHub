@@ -1,11 +1,13 @@
+import { Recorder, Events, buildEvent, buildErrorSummary, ERROR_SUMMARY_MAX_LENGTH } from '@agent-flight-recorder/sdk'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { Recorder, Events, buildEvent } from '@agent-flight-recorder/sdk'
-import type { Transport, TransportAuth } from '@agent-flight-recorder/sdk'
+
 import type {
   CreateRunRequest,
   CreateRunResponse,
   CreateEventRequest,
+  Run,
 } from '@agent-flight-recorder/contracts'
+import type { Transport, TransportAuth } from '@agent-flight-recorder/sdk'
 
 // ---------------------------------------------------------------------------
 // Mock transport factory
@@ -25,13 +27,13 @@ const createMockTransport = (): Transport => ({
       tags: req.tags ?? [],
       triggeredBy: req.triggeredBy,
       sdkVersion: req.sdkVersion,
-    },
+    } as Run,
   })),
   sendEvents: vi.fn(async (_events: CreateEventRequest[], _auth: TransportAuth) => ({
     success: true as const,
     eventIds: _events.map((_, i) => `evt_mock_${i}`),
   })),
-  updateRunStatus: vi.fn(async () => {}),
+  updateRunStatus: vi.fn(async () => ({ success: true as const, eventIds: [] })),
 })
 
 // ---------------------------------------------------------------------------
@@ -129,6 +131,39 @@ describe('Recorder', () => {
     )
   })
 
+  it('preserves error.code on failRun even when the error has a stack (regression)', async () => {
+    // Regression for a bug where failRun's errPayload only copied `.code` when
+    // the error had NO `.stack` — but every `Error` instance has a stack, so a
+    // Node-style error (e.g. a fetch/fs error with `.code = 'ECONNRESET'`) had
+    // its code silently dropped from the recorded run.failed event.
+    await recorder.startRun('input')
+    const err = new Error('boom') as Error & { code?: string }
+    err.code = 'ECONNRESET'
+    await recorder.failRun(err)
+
+    const sendEventsMock = transport.sendEvents as unknown as { mock: { calls: [CreateEventRequest[], TransportAuth][] } }
+    const allEvents = sendEventsMock.mock.calls.flatMap((call) => call[0])
+    const runFailedEvent = allEvents.find((e) => e.type === 'run.failed')
+    expect(runFailedEvent).toBeDefined()
+    const payload = runFailedEvent!.payload as { error: { code?: string; stack?: string } }
+    expect(payload.error.code).toBe('ECONNRESET')
+    expect(payload.error.stack).toBeDefined()
+  })
+
+  it('failRun attaches a bounded errorSummary as a sibling field on the run.failed payload', async () => {
+    await recorder.startRun('input')
+    const err = new Error('something broke')
+    err.stack = 'Error: something broke\n    at doThing (/app/src/index.ts:12:5)'
+    await recorder.failRun(err)
+
+    const sendEventsMock = transport.sendEvents as unknown as { mock: { calls: [CreateEventRequest[], TransportAuth][] } }
+    const allEvents = sendEventsMock.mock.calls.flatMap((call) => call[0])
+    const runFailedEvent = allEvents.find((e) => e.type === 'run.failed')
+    expect(runFailedEvent).toBeDefined()
+    const payload = runFailedEvent!.payload as { errorSummary?: string }
+    expect(payload.errorSummary).toBe('something broke | at doThing (/app/src/index.ts:12:5)')
+  })
+
   it('calls transport.updateRunStatus with failed on failRun', async () => {
     await recorder.startRun('input')
     await recorder.failRun(new Error('something broke'))
@@ -187,6 +222,194 @@ describe('Recorder', () => {
     await recorder.endRun('first output')
     // Should not throw
     await expect(recorder.startRun('second input')).resolves.toBeDefined()
+  })
+
+  // --- Durability regression tests (audit Phase 0 / gate finding) ------------
+
+  it('does not drop events when a flush fails — batch is retried on next flush', async () => {
+    // First sendEvents fails, second succeeds. The failed batch must survive.
+    const sent: number[] = []
+    let call = 0
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        call += 1
+        if (call === 1) {
+          return { success: false as const, error: 'network down', retryable: true }
+        }
+        sent.push(...events.map((e) => e.sequenceNumber))
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+
+    await recorder.startRun('input') // records run.started (seq 1)
+    recorder.recordEvent('custom', { type: 'custom', data: 'a' }) // seq 2
+    const first = await recorder.flush()
+    expect(first.success).toBe(false) // failed — but not lost
+
+    recorder.recordEvent('custom', { type: 'custom', data: 'b' }) // seq 3
+    const second = await recorder.flush()
+    expect(second.success).toBe(true)
+    // All three events reach the server, in ascending sequence order.
+    expect(sent).toEqual([1, 2, 3])
+  })
+
+  it('shutdown() flushes buffered events and stops the flush timer', async () => {
+    const sent: number[] = []
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        sent.push(...events.map((e) => e.sequenceNumber))
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+    await recorder.startRun('input') // seq 1 (run.started)
+    recorder.recordEvent('custom', { type: 'custom', data: 'a' }) // seq 2
+    const result = await recorder.shutdown()
+    expect(result.success).toBe(true)
+    expect(sent).toContain(1)
+    expect(sent).toContain(2)
+  })
+
+  it('serializes concurrent failing flushes so the buffer stays in sequence order', async () => {
+    // Both flushes fail; without serialization the LIFO unshift would reorder the
+    // buffer to [later..., earlier...]. Serialized, order is preserved.
+    let call = 0
+    const captured: number[][] = []
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        call += 1
+        captured.push(events.map((e) => e.sequenceNumber))
+        if (call <= 2) return { success: false as const, error: 'down', retryable: true }
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+
+    await recorder.startRun('input') // seq 1
+    recorder.recordEvent('custom', { type: 'custom', data: 'a' }) // seq 2
+    const p1 = recorder.flush()
+    recorder.recordEvent('custom', { type: 'custom', data: 'b' }) // seq 3
+    const p2 = recorder.flush()
+    await Promise.all([p1, p2])
+
+    // A final flush drains whatever remains; it must be globally ascending.
+    await recorder.flush()
+    const finalBatch = captured[captured.length - 1]!
+    const ascending = [...finalBatch].sort((a, b) => a - b)
+    expect(finalBatch).toEqual(ascending)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Lifecycle ordering, sequence contiguity, and buffer overflow
+// ---------------------------------------------------------------------------
+
+describe('Recorder — lifecycle ordering & durability invariants', () => {
+  /** Transport that records every event it is asked to send, in order. */
+  const createCapturingTransport = (): { transport: Transport; sent: CreateEventRequest[] } => {
+    const sent: CreateEventRequest[] = []
+    const transport = createMockTransport()
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        sent.push(...events)
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+    return { transport, sent }
+  }
+
+  it('RUN_STARTED is the first event and the terminal event is last (endRun)', async () => {
+    const { transport, sent } = createCapturingTransport()
+    const rec = new Recorder(
+      { endpoint: 'http://localhost:3000', apiKey: 'k', agentId: 'a' },
+      transport,
+    )
+    await rec.startRun('input')
+    rec.recordEvent('custom', { type: 'custom', data: '1' })
+    rec.recordEvent('llm.request', { type: 'llm.request', model: 'gpt-4o', messages: [] })
+    await rec.endRun('done')
+
+    expect(sent[0]!.type).toBe('run.started')
+    expect(sent[sent.length - 1]!.type).toBe('run.completed')
+    // Sequence numbers are contiguous, ascending, and start at 1.
+    const seqs = sent.map((e) => e.sequenceNumber)
+    expect(seqs).toEqual(seqs.map((_, i) => i + 1))
+  })
+
+  it('terminal run.failed is last on failRun', async () => {
+    const { transport, sent } = createCapturingTransport()
+    const rec = new Recorder(
+      { endpoint: 'http://localhost:3000', apiKey: 'k', agentId: 'a' },
+      transport,
+    )
+    await rec.startRun('input')
+    rec.recordEvent('custom', { type: 'custom', data: 'x' })
+    await rec.failRun(new Error('boom'))
+
+    expect(sent[0]!.type).toBe('run.started')
+    expect(sent[sent.length - 1]!.type).toBe('run.failed')
+  })
+
+  it('a non-contiguous sequence number is rejected by the server and surfaced in the result', async () => {
+    // Transport mimics the backend contiguity check: sequence numbers must arrive
+    // contiguously starting at 1. A gap makes the flush fail (not silently pass).
+    const transport = createMockTransport()
+    let expectedNext = 1
+    ;(transport.sendEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      async (events: CreateEventRequest[]) => {
+        for (const e of events) {
+          if (e.sequenceNumber !== expectedNext) {
+            return {
+              success: false as const,
+              error: `non-contiguous sequence: expected ${expectedNext}, got ${e.sequenceNumber}`,
+              retryable: false,
+            }
+          }
+          expectedNext++
+        }
+        return { success: true as const, eventIds: events.map((_, i) => `e${i}`) }
+      },
+    )
+
+    const rec = new Recorder(
+      { endpoint: 'http://localhost:3000', apiKey: 'k', agentId: 'a' },
+      transport,
+    )
+    await rec.startRun('input') // run.started seq 1
+    rec.recordEvent('custom', { type: 'custom', data: 'a' }) // seq 2
+    // Inject a deliberate gap (seq jumps to 10).
+    rec.recordEvent('custom', { type: 'custom', data: 'b' }, { sequenceNumber: 10 })
+
+    const result = await rec.flush()
+    expect(result.success).toBe(false)
+    expect(result.errors[0]!.error).toContain('non-contiguous')
+  })
+
+  it('buffer overflow drops oldest non-terminal events but always preserves terminal + run.started', async () => {
+    const { transport, sent } = createCapturingTransport()
+    const rec = new Recorder(
+      {
+        endpoint: 'http://localhost:3000',
+        apiKey: 'k',
+        agentId: 'a',
+        // Large batch size so nothing auto-flushes; tiny buffer cap to force drops.
+        options: { maxBatchSize: 1000, maxBufferSize: 3 },
+      },
+      transport,
+    )
+    await rec.startRun('input') // run.started (protected)
+    for (let i = 0; i < 5; i++) {
+      rec.recordEvent('custom', { type: 'custom', data: `c${i}` })
+    }
+    // Record a terminal event directly; it must survive the overflow policy.
+    rec.recordEvent('run.failed', { type: 'run.failed', error: { message: 'x' }, duration_ms: 1 })
+
+    const result = await rec.flush()
+    const types = sent.map((e) => e.type)
+    // Protected events survive despite the buffer being far over capacity.
+    expect(types).toContain('run.started')
+    expect(types).toContain('run.failed')
+    // Oldest custom events were dropped; the dropped count is surfaced.
+    expect(result.droppedEvents).toBeGreaterThan(0)
+    expect(sent.length).toBeLessThan(1 + 5 + 1)
   })
 })
 
@@ -254,6 +477,49 @@ describe('Events builders', () => {
   it('runFailed includes duration_ms', () => {
     const e = Events.runFailed('run_1', { message: 'oops', code: 'ERR_503' }, 2500)
     expect(e.payload.duration_ms).toBe(2500)
+  })
+
+  it('runFailed omits errorSummary when not passed', () => {
+    const e = Events.runFailed('run_1', { message: 'oops' }, 2500)
+    expect('errorSummary' in e.payload).toBe(false)
+  })
+
+  it('runFailed includes errorSummary as a sibling field (not nested under error) when passed', () => {
+    const e = Events.runFailed('run_1', { message: 'oops' }, 2500, 'oops | at foo (file.ts:1:1)')
+    expect(e.payload.errorSummary).toBe('oops | at foo (file.ts:1:1)')
+    expect('errorSummary' in e.payload.error).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildErrorSummary (M4 — searchable error text for externalized failures)
+// ---------------------------------------------------------------------------
+
+describe('buildErrorSummary', () => {
+  it('returns just the message when there is no stack', () => {
+    expect(buildErrorSummary({ message: 'boom' })).toBe('boom')
+  })
+
+  it('appends the first "at " stack frame when present', () => {
+    const stack = 'Error: boom\n    at doThing (/app/src/index.ts:12:5)\n    at main (/app/src/index.ts:20:3)'
+    expect(buildErrorSummary({ message: 'boom', stack })).toBe('boom | at doThing (/app/src/index.ts:12:5)')
+  })
+
+  it('skips a stack header line that does not start with "at "', () => {
+    const stack = 'TypeError: boom\n    at frame1 (/x.ts:1:1)'
+    const summary = buildErrorSummary({ message: 'boom', stack })
+    expect(summary).toBe('boom | at frame1 (/x.ts:1:1)')
+  })
+
+  it('truncates to ERROR_SUMMARY_MAX_LENGTH characters', () => {
+    const longMessage = 'x'.repeat(1000)
+    const summary = buildErrorSummary({ message: longMessage })
+    expect(summary.length).toBe(ERROR_SUMMARY_MAX_LENGTH)
+  })
+
+  it('never throws on an empty message and no stack', () => {
+    expect(() => buildErrorSummary({ message: '' })).not.toThrow()
+    expect(buildErrorSummary({ message: '' })).toBe('')
   })
 
   it('runCompleted includes output and duration_ms', () => {

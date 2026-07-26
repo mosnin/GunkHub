@@ -1,0 +1,32 @@
+{
+  "name": "@agent-flight-recorder/cli",
+  "version": "0.19.0",
+  "description": "Command-line interface for Agent Flight Recorder (afr)",
+  "type": "module",
+  "bin": {
+    "afr": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config ../../tests/vitest.config.ts",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
+  },
+  "dependencies": {
+    "@agent-flight-recorder/contracts": "workspace:*",
+    "@agent-flight-recorder/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.1"
+  }
+}

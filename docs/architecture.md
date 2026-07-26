@@ -1,356 +1,450 @@
 # Architecture — Agent Flight Recorder
 
-**Version:** 1.0
-**Date:** 2026-04-09
-**Status:** Reflects Prompt 1 (Initial Foundation) build state.
+This document describes the system as it exists in this repository today. Every claim
+below is cited against a file path — if the code changes, update this document in the
+same PR (see `CLAUDE.md`).
 
 ---
 
-## 1. High-Level Architecture Diagram
+## 1. System Diagram
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Agent Codebase (Customer)                                          │
-│                                                                     │
-│   import { Recorder } from '@agent-flight-recorder/sdk'            │
-│   const r = new Recorder({ endpoint, apiKey, agentId })             │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │  HTTP (batched JSON)
-                           ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  apps/web  (Next.js 14 App Router, Vercel)                          │
-│                                                                     │
-│   /api/runs          POST  → createRun                              │
-│   /api/runs/:id      PATCH → updateRunStatus                        │
-│   /api/events        POST  → createEvent (batch)                    │
-│   /api/artifacts     POST  → createArtifact (after blob upload)     │
-│                                                                     │
-│   API Routes call Convex mutations via convex/nextjs client         │
-└──────────────┬──────────────────────────────────────────────────────┘
-               │  Convex client (type-safe RPC over WebSocket/HTTP)
-               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Convex Backend                                                     │
-│                                                                     │
-│   schema.ts         Table definitions and indexes                   │
-│   auth.ts           getAuthContext(), requireOrgMembership()        │
-│   runs.ts           listRuns, getRun, createRun, updateRunStatus    │
-│   events.ts         listEvents, getEvent, createEvent               │
-│   artifacts.ts      listArtifacts, createArtifact                   │
-│   comments.ts       listComments, createComment, resolveComment     │
-│   organizations.ts  getOrg, createOrg                               │
-│   projects.ts       listProjects, getProject, createProject         │
-│   helpers/          pagination.ts, storage.ts (BlobStorageAdapter)  │
-└──────────────┬──────────────────────────────────────────────────────┘
-               │  Convex built-in document store (internally PostgreSQL)
-               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Convex Document Store (managed, hosted by Convex)                  │
-│  Tables: organizations, projects, agents, agent_versions,           │
-│          runs, events, artifacts, comments, user_memberships        │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    SDK["Agent code<br/>@agent-flight-recorder/sdk<br/>(Recorder / FlightRecorder)"]
+    Browser["Browser<br/>Next.js UI + Clerk"]
+    Clerk["Clerk<br/>(identity provider)"]
 
-Separately, for large payloads (> 10 KB):
+    subgraph Web["apps/web (Next.js 14 App Router)"]
+      APIRoutes["Ingestion API routes<br/>/api/runs, /api/events,<br/>/api/artifacts/upload, /api/runs/:id/status"]
+      Webhook["/api/webhooks/clerk"]
+      UI["React pages + Convex React hooks<br/>(direct read path)"]
+    end
 
-┌──────────────┐     upload blob     ┌──────────────────────────────┐
-│  apps/web    │ ─────────────────▶  │  Blob Storage                │
-│  API route   │ ◀────────────────── │  (Vercel Blob / R2 — stub)   │
-│              │    storageKey        │                              │
-└──────────────┘                     └──────────────────────────────┘
-                                              ▲
-                                              │ Artifact record
-                                              │ stores storageKey
-                                     ┌────────┴────────────────────┐
-                                     │  Convex: artifacts table    │
-                                     └─────────────────────────────┘
+    Convex["Convex backend<br/>schema.ts, runs.ts, events.ts,<br/>sdk_ingest.ts, auth.ts, audit.ts"]
+    Blob["Blob storage<br/>(payloads > 10 KB, via convex/helpers/storage.ts)"]
+    Crons["Convex crons<br/>artifact_gc, stale_runs,<br/>retention, projection_verify"]
+
+    SDK -- "x-api-key, batched JSON" --> APIRoutes
+    Browser -- "Clerk session" --> UI
+    Clerk -- "JWT" --> Browser
+    Clerk -- "org.created / org.deleted /<br/>membership.created webhook" --> Webhook
+    APIRoutes -- "convex mutation<br/>(apiKeyHash auth)" --> Convex
+    UI -- "useQuery/useMutation<br/>(Clerk JWT)" --> Convex
+    Webhook -- "upsertOrganization /<br/>upsertMembership" --> Convex
+    APIRoutes -- "upload/read blob" --> Blob
+    Convex -- "artifact record:<br/>storageKey + SHA-256 checksum" --> Blob
+    Crons -- "scheduled actions" --> Convex
 ```
 
-**Web UI flow** (browser to Convex directly):
+**Two read/write seams, by design:**
 
-```
-Browser → Clerk (auth) → Convex React hooks (useQuery, useMutation)
-                            └─ Convex backend queries/mutations
-```
-
-The web UI bypasses Next.js API routes for read-heavy queries. It uses Convex React hooks directly from server or client components. The Next.js API routes are only the ingestion surface for the SDK.
+- **SDK -> Next.js API routes -> Convex** — the ingestion surface. Authenticated by
+  `x-api-key` (hashed and matched against `convex/api_keys`), never by a Clerk session.
+  `convex/sdk_ingest.ts` explicitly does not call `getAuthContext`/`requireOrgMembership`.
+- **Browser -> Convex directly** — the UI reads and writes via Convex React hooks using
+  the Clerk JWT (`ConvexProviderWithClerk`). Next.js API routes are not a general-purpose
+  API for the UI.
 
 ---
 
-## 2. Package Responsibility Matrix
+## 2. Entity Hierarchy
 
-| Package | Owns | Does NOT Own |
-|---------|------|--------------|
-| `apps/web` | Next.js App Router pages and layouts; React components; Tailwind config; API route handlers (`/api/**`); service layer (`lib/services/`); Clerk auth integration; `next.config.js`; `tailwind.config.ts` | Convex schema; Convex queries/mutations; SDK transport logic; shared type definitions |
-| `packages/contracts` | All shared TypeScript type definitions: entity types, event payload union, API request/response shapes, replay and diff projection types; Zod schemas if added | Runtime framework code; fetch/HTTP logic; Convex-specific types; UI components |
-| `packages/sdk` | `Recorder` class public API; event builder helpers (`Events.*`); `HttpTransport` implementation; `Transport` interface; buffering and retry logic; SDK-level types (`RecorderConfig`, `FlushResult`, etc.) | Convex schema; Next.js components; entity type definitions (imports from contracts) |
-| `convex/` | Convex schema (`schema.ts`); all query and mutation functions; `auth.ts` context helpers; `helpers/` utilities; `BlobStorageAdapter` interface | React components; Next.js routing; SDK transport; contract type definitions (imports from contracts) |
-| `scripts/` | `validate.sh` (CI validation gate); `seed.ts` (dev data seeding); `validate.ts` | Package logic |
-| `tests/` | Unit tests (`unit/`); integration test stubs (`integration/`); fixtures (`fixtures/`) | Package source code |
+```
+Organization
+  └── Project
+        └── Agent
+              └── AgentVersion
+                    └── Run
+                          └── Event
+```
+
+- **Artifact** hangs off **Run** (and optionally a specific **Event**) — a pointer to an
+  externalized large payload in blob storage, never the payload itself
+  (`convex/schema.ts` `artifacts` table).
+- **Comment** hangs off either a **Run** or an **Event** (`targetType: "run" | "event"`)
+  — human annotation on recorded data (`convex/schema.ts` `comments` table).
+- `AgentVersion` is immutable once created (`convex/schema.ts` `agent_versions` has no
+  update mutation path in `convex/agent_versions.ts`); a new version is required for any
+  change to an agent's configuration, system prompt, or tool list.
+- Every table except `user_memberships`/`api_keys`/`audit_log` carries an `orgId` field
+  and is indexed `by_org` (or a composite starting with `orgId`) — see `convex/schema.ts`.
+
+Both `packages/contracts/src/entities.ts` (the shared TypeScript shapes) and
+`convex/schema.ts` (the Convex validators) define this hierarchy; per `CLAUDE.md` the
+two must stay shape-aligned even though they are separate type systems.
 
 ---
 
-## 3. Data Flow: How a Run Gets Recorded
+## 3. Event Log Invariants
 
-This is the end-to-end path from SDK call to persisted event.
+Enforced in two places for defense in depth: the SDK (best-effort, client-side) and
+Convex (authoritative, server-side, in `convex/sdk_ingest.ts` `sdkCreateEvents` and the
+Clerk-session path `convex/events.ts`).
 
-### Step 1: SDK starts a run
+1. **Append-only, immutable.** `events` table has no update/delete mutation. Comment in
+   `convex/schema.ts`: `"IMMUTABILITY: Events must never be updated or deleted."`
+2. **Sequence contiguity.** `sequenceNumber` must be a positive integer, monotonically
+   increasing per run, starting at 1, with no gaps and no repeats. Server-side check in
+   `sdk_ingest.ts` compares against `state.maxSeq + 1` and throws the stable code
+   `SEQUENCE_CONFLICT` on mismatch. A duplicate resend of an already-stored
+   `(runId, sequenceNumber)` pair is idempotent — it returns the existing event's id
+   rather than erroring (this is what makes SDK retries safe).
+3. **`run.started` first, a terminal event last.** The first event of a run must be
+   `run.started` (`RUN_STARTED_TYPE` check in `sdk_ingest.ts`); once `run.completed` or
+   `run.failed` is stored, no further events may be appended (`RUN_NOT_ACTIVE`). A run
+   with no terminal event is in-progress (`status: "running"`); storing the terminal
+   event also patches the run's `status`/`endedAt` directly, so the run record and the
+   event log can never disagree.
+4. **10 KB inline payload ceiling.** `MAX_INLINE_PAYLOAD_BYTES = 10 * 1024` in
+   `sdk_ingest.ts`. Applied uniformly — there is no type-based exemption for a
+   client-claimed `_externalized` payload, precisely so a spoofed `type` field cannot
+   smuggle an oversized payload past the guard. Over the limit, the event must be
+   replaced with an `ExternalizedPayload` pointer (`packages/contracts/src/events.ts`):
+   `{ type: "_externalized", originalType, _artifact: { artifactId, storageKey,
+   storageBucket, checksum, size } }`.
+5. **Closed event-type set.** `EventType` in `packages/contracts/src/events.ts` is the
+   source of truth. It is mirrored (not imported — Convex cannot resolve the contracts
+   package path) as `VALID_EVENT_TYPES` in both `convex/events.ts` and
+   `convex/sdk_ingest.ts`; both carry a `MUST stay in sync` comment. Adding an event type
+   means updating all three plus the SDK's `Events` builders in
+   `packages/sdk/src/events.ts` — see `CONTRIBUTING.md`. **The mirror is
+   currently broken:** the in-flight contracts change adds an 18th type,
+   `otel.span.unmapped`, which neither Convex copy carries yet, so that type
+   cannot be written through `sdkCreateEvents` today (see
+   [`docs/adr/007`](adr/007-otel-span-ingestion.md) C4).
 
-```
-Recorder.startRun(input, config)
-  → HttpTransport.createRun({ agentId, metadata, tags, sdkVersion })
-    → POST /api/runs
-      → Next.js API route handler
-        → Validates Clerk auth (Bearer token or x-api-key header)
-        → Calls convex mutation: createRun({ orgId, projectId, agentId, ... })
-          → requireOrgMembership() check
-          → ctx.db.insert("runs", { status: "pending", startedAt: now, ... })
-          → Returns run document
-      → Returns { run: Run } JSON
-    → SDK stores runId in RunContext
-  → SDK emits run.started event (buffered)
-```
-
-### Step 2: SDK records events during execution
-
-```
-Recorder.recordEvent("llm.request", payload)
-  → payload serialized, sequenceNumber assigned (local counter)
-  → pushed to eventBuffer[]
-  → if buffer.length >= maxBatchSize: flush()
-  → or: flush() fires on flushIntervalMs timer
-```
-
-### Step 3: SDK flushes event batch
-
-```
-Recorder.flush()
-  → HttpTransport.sendEvents(eventBuffer[], { apiKey })
-    → POST /api/events  (body: CreateEventRequest[])
-      → Next.js API route handler
-        → Validates auth
-        → For each event in batch:
-          → calls convex mutation: createEvent({ runId, type, sequenceNumber, timestamp, payload })
-            → Verifies run exists and is in "running" state
-            → requireOrgMembership() check
-            → ctx.db.insert("events", { ... })
-      → Returns { eventIds: string[] }
-    → FlushResult returned to caller
-```
-
-### Step 4: SDK ends the run
-
-```
-Recorder.endRun(output)
-  → Appends run.completed event to buffer
-  → flush() (synchronous, drains buffer)
-  → HttpTransport.updateRunStatus(runId, "completed", endedAt)
-    → PATCH /api/runs/:id/status
-      → Calls convex mutation: updateRunStatus({ runId, status: "completed", endedAt })
-        → Validates transition (running → completed is valid)
-        → ctx.db.patch(runId, { status: "completed", endedAt })
-```
-
-### Payload externalization path (triggered when payload > 10 KB)
-
-```
-SDK detects payload > 10 KB
-  → POST /api/artifacts/upload  (body: { runId, eventId?, mimeType, data: base64 })
-    → Next.js API route
-      → Calls BlobStorageAdapter.upload(key, data, mimeType)
-      → Calls convex mutation: createArtifact({ storageKey, checksum, size, ... })
-      → Returns { storageKey, artifactId }
-  → SDK builds pointer payload: { __externalized: true, artifactId, storageKey, checksum }
-  → Continues with recordEvent() using pointer payload
-```
+> **The ingest path admits no policy check, and this is load-bearing.**
+> [`docs/adr/009`](adr/009-policy-engine.md) authorises a declarative policy
+> engine (*"agent X may not call tool Y"*) and rules, in W1–W5, that it must
+> have **no presence whatsoever on the write path**: `sdkCreateRun`,
+> `sdkCreateEvents`, `sdkCreateArtifact` and their `convex/events.ts`
+> equivalents gain no policy code and no new rejection code, and no policy
+> evaluation may run inside an ingest transaction even non-rejectingly —
+> because an evaluation that merely *throws* fails the surrounding insert and
+> becomes a refusal by accident. Refusing to record a violation destroys the
+> evidence of the violation. A run that breaks every configured rule must
+> ingest byte-identically to one that breaks none.
+>
+> **Backend implemented; no read surface yet.** `convex/helpers/policy.ts` (its
+> PART 1 states the same ruling), the `policies` table, `convex/policies.ts`
+> and `convex/policy_gate.ts` exist. No `/api/v1/**` route, SDK method, CLI
+> command, UI or MCP tool reaches them. The rule above is *tested*, in
+> `tests/unit/policy_adversarial_ingest.test.ts` — a forbidden tool call is
+> accepted and stored with its name intact, and forbidden and allowed calls
+> produce indistinguishable ingest outcomes. (Several comments in `convex/`
+> cite that assertion as living in a `convex/policies.test.ts`, which does not
+> exist; the filename is stale, not the guarantee.) Detection, when wired, is
+> scheduled off the terminal event exactly as alerting is (§8) — scheduling is
+> not gating.
 
 ---
 
-## 4. Auth Flow
+## 4. Tenancy Model
 
-Clerk is the identity provider. Convex is the authorization enforcer.
-
-```
-User visits web app
-  → ClerkProvider wraps the app (apps/web/src/app/layout.tsx)
-  → Clerk handles sign-in, org selection
-  → On sign-in, Clerk issues a JWT with claims including:
-      { sub: "user_2abc...", org_id: "org_2xyz...", ... }
-
-User makes a request to Convex (via React hook)
-  → ConvexProviderWithClerk passes Clerk JWT to Convex
-  → Convex validates JWT signature against Clerk's JWKS
-  → ctx.auth.getUserIdentity() returns the validated identity
-
-SDK makes a request to Next.js API route
-  → Sends x-api-key: <org_api_key> header
-  → Next.js API route validates the API key
-  → Looks up orgId from the API key record
-  → Calls Convex mutation with orgId in the mutation args
-  → Convex mutation calls requireOrgMembership(ctx, orgId) to confirm
-
-Inside every Convex query/mutation:
-  1. Call getAuthContext(ctx) → extracts clerkUserId, clerkOrgId from JWT
-  2. Look up Organization by clerkOrgId → get Convex orgId
-  3. Call requireOrgMembership(ctx, orgId) → verify UserMembership record exists
-  4. All subsequent db queries use orgId in the filter
-```
-
-**Key file:** `convex/auth.ts` — `getAuthContext()` and `requireOrgMembership()`.
-
-**Multi-tenancy guarantee:** Because every query filters by `orgId` derived from the authenticated user's Clerk org, it is structurally impossible for org A to see org B's data — provided `getAuthContext()` is always called first, which CLAUDE.md enforces as a code convention.
+- **Clerk organization is the tenancy boundary.** Clerk's `org_id` JWT claim maps 1:1 to
+  a Convex `organizations` record via the `clerkOrgId` field
+  (`organizations.by_clerk_org_id` index).
+- **Every Clerk-session query/mutation** calls `getAuthContext(ctx)`
+  (`convex/auth.ts`) first, which throws `"Unauthorized"` if there is no identity or no
+  `org_id` claim, then resolves the Convex `orgId`. Mutations that need a minimum
+  privilege additionally call `requireOrgMembership(ctx, orgId, { minimumRole })`.
+- **Role tiers.** `user_memberships.role` is one of `viewer` / `member` / `admin`, ranked
+  0/1/2 in `convex/auth.ts` (`ROLE_RANK`). `requireOrgMembership` defaults to
+  `minimumRole: "viewer"` and rejects callers ranked below the requested minimum.
+- **The SDK ingest path is a separate authorization path entirely** — see Section 5. It
+  never calls `getAuthContext`; it resolves and scopes to an org via the API key's
+  `orgId` field instead. Every ingest mutation in `sdk_ingest.ts` checks
+  `run.orgId !== apiKey.orgId` (or the agent/version equivalent) before touching data —
+  this is the cross-org leak guard for the ingest surface.
+- **Guarantee:** because every code path resolves an `orgId` before querying, and every
+  index/filter includes it, a query for org A can never surface org B's records —
+  provided every new query/mutation follows this pattern (`CLAUDE.md` Tenancy Rule 3).
 
 ---
 
-## 5. Blob Storage Abstraction
+## 5. Ingest Paths and the Error-Code Contract
 
-### The Interface
+Two distinct ingest paths exist, authenticated differently:
 
-```typescript
-// convex/helpers/storage.ts
+| Path | Auth | Entry point | Convex functions |
+|------|------|-------------|-------------------|
+| Clerk-session (web UI) | Clerk JWT, `getAuthContext` + `requireOrgMembership` | Convex React hooks called directly from `apps/web` | `convex/runs.ts`, `convex/events.ts`, `convex/comments.ts`, etc. |
+| SDK ingest | `x-api-key` header, hashed and matched against `convex/api_keys` | `apps/web/app/api/{runs,events,artifacts,runs/[id]/status}/route.ts` | `convex/sdk_ingest.ts`: `sdkCreateRun`, `sdkCreateEvents`, `sdkCreateArtifact`, `sdkUpdateRunStatus`, `checkIngestAuth` |
 
-export interface BlobStorageAdapter {
-  upload(key: string, data: ArrayBuffer, mimeType: string): Promise<string>;
-  getUrl(key: string): Promise<string>;
-  delete(key: string): Promise<void>;
-}
-```
+**A third path — OpenTelemetry span ingestion — is in progress and NOT usable.**
+It is tracked in [`docs/adr/007-otel-span-ingestion.md`](adr/007-otel-span-ingestion.md),
+whose status is **Proposed, decision not settled**: deriving contiguous
+`sequenceNumber`s (Rule 4) and `run.started`/terminal events (Rule 5) from
+multi-batch, retried, partially-ordered OTLP delivery may not be reconcilable
+with event-log immutability (Rule 1) at all. As of `b15e921` plus the
+in-flight contracts change, what exists is **types only** —
+`packages/contracts/src/provenance.ts` (`EventProvenance`, the `sdk | otel`
+discriminator), an optional `Event.provenance`, the `otel.span.unmapped` event
+type, and the `OtelDerivedEventWrite`/`IngestOtelSpansRequest` shapes in
+`api.ts`. There is **no OTLP endpoint, no span→event mapping, no sequence
+synthesis, and no Convex-side storage**: `convex/` is entirely unchanged, so the
+`events` table still has no provenance field and `check-schema-drift.ts`
+currently fails on `"provenance" is in contracts but missing from
+convex/schema.ts`. Do not treat this path as available, and do not read the
+contract types as evidence that the ordering problem has been solved. When it
+lands, it becomes a row in the table above and this paragraph goes away.
 
-### Why it exists
+Every SDK ingest mutation calls `resolveApiKey` first, which checks existence,
+revocation (`revokedAt`), expiration (`expiresAt`), and scope (`scopes` — a key with no
+`scopes` array has full ingest access for back-compat), then throttled-stamps
+`lastUsedAt`. `resolveApiKey` also enforces the fixed one-minute-window rate limit
+(`api_keys.rateLimitPerMin` / `rateWindowStart` / `rateWindowCount`) — approximated for
+high-throughput single-unit calls via a Morris-style stride counter
+(`RATE_FLUSH_STRIDE = 25`) to avoid serializing every ingest call on one document, exact
+for small limits and for batch calls.
 
-The blob storage implementation is the most likely infrastructure component to change between v1 and v2. Vercel Blob is convenient for initial development and staging; production workloads may require R2, S3, or GCS for cost and latency reasons. Hiding the implementation behind an interface means:
+### Error-code contract
 
-1. The rest of the codebase depends only on the interface, not the provider SDK.
-2. Swapping providers requires changing exactly one file (the adapter implementation) and no call sites.
-3. Tests can inject a `MockBlobStorageAdapter` that stores bytes in memory.
+Convex throws `Error("CODE: human text")` via `afrError()` (`convex/helpers/errors.ts`).
+The codes that cross the SDK boundary are the closed set in
+`packages/contracts/src/api_errors.ts` (`AFR_API_ERROR_CODES`) — **append-only; a
+deployed SDK matches on the exact string, so an existing code must never be renamed or
+removed**:
 
-### Current state (Prompt 1)
+| Code | Meaning | HTTP status (`apiHandler.ts` `AFR_CODE_TO_STATUS`) |
+|------|---------|------|
+| `RUN_NOT_ACTIVE` | Event append attempted on a terminal/cancelled run | 409 |
+| `SEQUENCE_CONFLICT` | Non-contiguous or otherwise invalid `sequenceNumber` | 409 |
+| `EVENT_LIMIT_EXCEEDED` | Run hit `MAX_EVENTS_PER_RUN` | 422 |
+| `ARTIFACT_LIMIT_EXCEEDED` | Run hit `MAX_ARTIFACTS_PER_RUN` | 422 |
+| `COMMENT_LIMIT_EXCEEDED` | Target hit its comment cap | 422 |
+| `RATE_LIMITED` | Per-API-key ingest rate limit exceeded | 429 (with `Retry-After: 60`) |
 
-The interface is defined. There is no concrete implementation yet — the stub comment in `storage.ts` notes "Replace this stub with real Vercel Blob or R2 implementation in v1.1."
-
-### How to swap implementations
-
-1. Create a new file, e.g. `convex/helpers/storage-r2.ts`, that implements `BlobStorageAdapter`.
-2. Change the instantiation site (the Next.js API route that handles artifact upload) to use the new adapter.
-3. Update `.env.example` with the new adapter's required environment variables.
-4. No other files need to change.
-
----
-
-## 6. API Route Design: Next.js / Convex Seam
-
-The Next.js API routes are the **ingestion surface** — they are the entry point for SDK HTTP calls. They are not a general-purpose API. Browser-side UI reads go directly from React components to Convex using the Convex React SDK, bypassing Next.js entirely.
-
-### Ingestion routes (SDK → Next.js → Convex)
-
-```
-POST   /api/runs                  Create a run (SDK startRun)
-PATCH  /api/runs/[runId]/status   Update run status (SDK endRun/failRun)
-POST   /api/events                Batch-append events (SDK flush)
-POST   /api/artifacts             Register an artifact after blob upload
-```
-
-### Why Next.js API routes (not Convex HTTP actions)?
-
-Convex does support HTTP actions as an alternative ingest path. We chose Next.js API routes for v1 because:
-
-1. **Auth is unified:** The web app and the SDK use the same auth middleware. Adding a separate Convex HTTP endpoint would require duplicating auth logic.
-2. **Middleware:** Next.js middleware (rate limiting, request logging, API key validation) is easier to apply at the route level than in Convex HTTP actions.
-3. **Co-location:** Having the ingest routes in `apps/web` keeps the entire application in one deployable unit.
-
-### Seam note
-
-The Next.js API routes are a thin adapter layer. They:
-1. Validate the auth token / API key
-2. Parse and validate the request body (using Zod schemas from `packages/contracts`)
-3. Call the appropriate Convex mutation
-4. Return the Convex response as JSON
-
-They do not contain business logic. Business logic lives in Convex mutations.
+`apps/web/src/lib/apiHandler.ts` (`mapAfrErrorResponse`) parses the `CODE:` prefix out of
+the Convex-wrapped error message (Convex re-wraps server errors in its own envelope, so
+the parser scans every colon-delimited token, not just the first) and returns a JSON body
+`{ code, message, details: { requestId } }` with the mapped status. Unrecognized errors
+fall through to the route's own handling (401 for a bad/missing API key) or are rethrown
+for `withApiHandler` to log and genericize.
 
 ---
 
-## 7. Why Convex (not a Traditional ORM)
+## 6. Blob Storage / Payload Externalization
 
-We chose Convex over a traditional stack (Prisma + PostgreSQL, Drizzle + PlanetScale, etc.) for the following reasons:
+`convex/helpers/storage.ts` defines the storage abstraction Convex-side; the actual
+upload for SDK-originated artifacts flows through
+`apps/web/app/api/artifacts/upload/route.ts`, backed by Vercel Blob
+(`BLOB_STORE_URL`/`BLOB_STORE_TOKEN` in `.env.example`). An artifact record
+(`convex/schema.ts` `artifacts` table) stores `storageKey`, `storageBucket`, `size`, and
+a SHA-256 `checksum` — never the payload bytes. Artifacts dedupe per `(runId, checksum)`
+(`sdk_ingest.ts` `sdkCreateArtifact`), so a retried upload after a failed `/api/events`
+call does not create a duplicate blob record.
 
-**Real-time subscriptions (future):** Convex queries are reactive by default. When an event is written to the database, any browser that has an active `useQuery("events.listEvents", ...)` hook automatically receives the updated result without polling. This is table stakes for live run monitoring (v2 feature). Building this on a traditional ORM would require a separate WebSocket layer (Pusher, Ably, or custom).
-
-**Built-in auth:** Convex integrates directly with Clerk via its `ConvexProviderWithClerk` pattern. The JWT is validated inside Convex, and `ctx.auth.getUserIdentity()` returns the decoded identity without any custom JWT middleware. This eliminates an entire class of auth bugs.
-
-**Type-safe queries:** Convex generates TypeScript types from the schema. `ctx.db.insert("runs", { ... })` is type-checked against the schema at compile time. There are no SQL strings that escape the type system.
-
-**No connection pooling:** Convex manages its own connection infrastructure. There is no `DATABASE_URL`, no connection pool configuration, no cold-start connection overhead. This simplifies deployment significantly.
-
-**Trade-offs accepted:**
-- Convex is a hosted service — vendor lock-in exists. Migrating away would require re-implementing queries and mutations using a different backend.
-- Complex joins require multiple queries and in-memory assembly. Convex does not support SQL JOINs. For v1's data volumes, this is acceptable.
-- The Convex document model limits document size to 1 MB. The payload externalization rule (>10 KB to blob storage) is partly motivated by staying safely below this limit.
-
----
-
-## 8. Scalability Seams
-
-The v1 architecture is a modular monolith. The following seams exist to allow evolution without a full rewrite:
-
-### Ingest layer seam
-
-The Next.js API routes (`/api/runs`, `/api/events`) are the seam between the SDK and the backend. When ingest volume grows beyond what a single Vercel function can handle:
-
-1. Replace the Next.js API routes with a standalone ingest service (Node.js + Express, or a Cloudflare Worker).
-2. The SDK's `HttpTransport` only needs its `endpoint` config updated — no SDK changes required.
-3. The Convex backend remains unchanged.
-
-This seam is already protected: the SDK is configured with an `endpoint` parameter rather than a hard-coded URL.
-
-### Blob storage seam
-
-As described in Section 5, the `BlobStorageAdapter` interface is the seam for swapping blob providers. Moving from Vercel Blob to R2 or S3 requires changing one file.
-
-### Projection seam
-
-`ReplayProjection` and `RunDiff` are currently computed on demand in the web app service layer. If run sizes grow to millions of events, these computations will become slow. The seam for this is:
-
-1. Add a background Convex action that materializes projections into a `replay_snapshots` table.
-2. The web app service layer checks for a cached snapshot first, falls back to live computation if not found.
-3. No schema changes to the canonical `events` table required.
-
-### Auth seam
-
-The current auth model uses Clerk's organization as the tenancy boundary. If the product expands to support SSO, custom identity providers, or per-user API keys with fine-grained permissions:
-
-1. The `getAuthContext()` helper in `convex/auth.ts` is the single seam. Changing the auth token extraction and org lookup logic here propagates to all queries and mutations automatically.
-2. The `UserMembership` table already supports `admin`, `member`, `viewer` roles, giving a foundation for RBAC expansion.
+**GC bookkeeping:** once an event's `_externalized` payload references an artifact, the
+event's id is stamped onto `artifacts.referencedByEventId`
+(`sdk_ingest.ts` — patching the artifact, never the event, so event-log immutability
+holds) so the artifact permanently leaves the daily `artifact_gc` cron's
+orphan-candidate scan (`convex/artifact_gc.ts`, scheduled in `convex/crons.ts`).
 
 ---
 
-## 9. What is a Modular Monolith and Why v1 Uses It
+## 7. Durability Story (SDK -> Server)
 
-A modular monolith is a single deployable application with **internally enforced module boundaries**. It is contrasted with:
+The buffered `Recorder` (`packages/sdk/src/recorder.ts`) is the durability-hardened path
+(the un-buffered `FlightRecorder` in `packages/sdk/src/flight-recorder.ts` sends each
+event immediately instead, trading durability for simplicity):
 
-- A **big ball of mud**: one deployable, no enforced boundaries, code calls code arbitrarily.
-- **Microservices**: multiple deployable services that communicate over the network.
+1. **Buffer.** `recordEvent` assigns a local, per-run monotonic `sequenceNumber` and
+   pushes the built event onto an in-memory `eventBuffer`. Terminal event types
+   (`run.completed`/`run.failed`/`run.cancelled`) are protected from ever being dropped
+   on overflow (`PROTECTED_EVENT_TYPES` in `recorder.ts`).
+2. **Spool (optional, Node-only).** `FileSpool` (`packages/sdk/src/file-spool.ts`) is an
+   append-only JSONL file. Appending resolves once data is handed to the OS page cache
+   (survives a process crash, not a kernel panic/power loss unless `{ fsync: true }` is
+   set). `Recorder.recover()` uses `peek()` -> send -> `clear()`, in that order, so a
+   crash mid-recovery re-sends duplicates (safe — see idempotency below) rather than
+   losing entries. The spool has no file locking; it is a single-process-per-path
+   primitive by design.
+3. **Per-run batching.** `flush()` groups the buffer `groupByRun` and ships each run's
+   events together, preserving order within a run. Flushes are chained
+   (`flushChain`) so two overlapping flush triggers (the flush timer and the
+   max-batch-size trigger) can never reorder the buffer — a reordered flush would fail
+   the server's contiguity check and permanently wedge the run.
+4. **Server idempotency.** Because `sdk_ingest.ts`'s `sdkCreateEvents` treats a resend of
+   an already-stored `(runId, sequenceNumber)` as a no-op returning the existing event
+   id (rather than a conflict), retries from an unreliable network or a spool replay are
+   always safe to resend — the worst case is redundant network calls, never a duplicate
+   or corrupted event.
 
-Agent Flight Recorder is a modular monolith. There is one deployment target (Vercel + Convex), but the code is organized into packages with strict ownership rules:
+---
 
-```
-packages/contracts  ← pure types, zero deps
-packages/sdk        ← depends on: contracts
-apps/web            ← depends on: contracts (not sdk)
-convex/             ← depends on: contracts (not sdk, not web)
-```
+## 8. Scheduled Jobs
 
-**Why modular monolith for v1:**
+All defined in `convex/crons.ts`. Four run daily in UTC; two run every minute
+(interval jobs, not time-of-day):
 
-1. **Operational simplicity:** One `vercel deploy` command ships the entire application. No inter-service networking, no service discovery, no distributed tracing overhead.
+| Schedule (UTC) | Job | Action |
+|------------|-----|--------|
+| 01:00 daily | `enforce-retention` | `retention:enforceRetention` — deletes terminal runs (and their events/artifacts/comments/verification results) past an org's opt-in `retentionDays` window (ADR 001) |
+| 02:00 daily | `artifact-gc` | `artifact_gc:cleanOrphanedArtifacts` — deletes artifacts older than 24h with no referencing event, from both blob storage and Convex |
+| 03:00 daily | `expire-stale-runs` | `stale_runs:expireStaleRuns` — transitions runs stuck in `"running"` for >24h to `"timed_out"` |
+| 04:30 daily | `verify-projection-integrity` | `projection_verify:verifyRecentRuns` — checks sequence contiguity for up to 50 recent terminal runs, recording a `verification_results` row |
+| 05:00 daily | `compute-daily-rollups` | `rollups:computeDailyRollups` (ADR-002) — computes yesterday's per-agent terminal-run counts, duration percentiles, and token totals into `daily_rollups`, after the other daily jobs so it sees post-retention/post-GC state |
+| every 1 min | `deliver-pending-webhooks` | `webhook_engine:deliverPendingWebhooks` (ADR-003) — drains due `"pending"` rows in `webhook_deliveries`, in bounded batches (`WEBHOOK_DELIVERY_BATCH_SIZE`) |
+| every 1 min | `deliver-pending-emails` | `email_engine:deliverPendingEmails` (ADR-003) — drains due `"pending"` rows in `email_deliveries` (alert-rule email channels) through whichever `EmailNotifier` `convex/helpers/notifier.ts`'s `getConfiguredEmailNotifier()` resolves to (console logger by default; `AFR_EMAIL_PROVIDER=resend` opts into a real send) |
 
-2. **Type safety across the entire call graph:** Because all packages are in one pnpm workspace and share types from `packages/contracts`, TypeScript can catch type mismatches between the SDK's `CreateEventRequest` and the Convex mutation's `args` schema at build time — before any code runs.
+Retention runs before artifact GC deliberately, so GC sees the post-retention state.
 
-3. **Team velocity:** The v1 team is small. Distributed architecture adds cognitive overhead and deployment complexity that is not justified until the system needs to scale beyond a single-region deployment.
+**Terminal-event alert/eval scheduling (not a cron — an inline scheduler
+call):** the moment a run's terminal event (`run.completed`/`run.failed`) is
+stored — in both the Clerk-session path (`convex/events.ts`) and the SDK
+ingest path (`convex/sdk_ingest.ts`) — the mutation calls
+`ctx.scheduler.runAfter(0, ...)` against a single Convex action,
+`alert_engine.runEvalsThenEvaluateAlerts`, that sequences auto-run evals and
+then alert-rule evaluation for that run. This runs non-blocking relative to
+the event-insert mutation, and is scheduled as **one** action (not two
+independent `runAfter(0, ...)` calls) specifically so eval results are
+guaranteed to exist before alert evaluation reads them — two independent
+scheduler calls would race and could let alert evaluation run before an eval
+insert lands, permanently missing the alert for that run. This is what makes
+alerting and webhook/email delivery actually live end to end: terminal event
+→ scheduled alert evaluation → `alert_events`/`webhook_deliveries`/
+`email_deliveries` row → drained by the per-minute crons above. See
+`docs/api_reference.md` §3 for the outbound delivery contract this produces.
 
-4. **The seams exist for future extraction:** The `BlobStorageAdapter` interface, the SDK's injectable `Transport`, and the Next.js API route surface are all places where independent services could be inserted. When the time comes to extract the ingest layer, the boundary is clean.
+**Run explanation lifecycle ("Why did this fail?", ADR-004 — also not a
+cron, an inline scheduler call):** the same terminal-transition paths that
+schedule alert evaluation above also schedule
+`ctx.scheduler.runAfter(0, ...)` against `run_explanations:generateRunExplanation`
+whenever a run lands in `failed`, `timed_out`, or `cancelled` — the
+`run.failed` terminal event (`convex/events.ts`, `convex/sdk_ingest.ts`), an
+admin's `updateRunStatus` call, and the `expire-stale-runs` cron above (a run
+that cron transitions to `timed_out` gets an explanation scheduled the same
+way a directly-failed run does). Generation is non-blocking relative to
+whatever mutation/cron scheduled it, and never runs for `completed` or
+still-active runs — `getRunExplanation` returns `null` for those rather than
+a placeholder.
 
-**What "modular" means in practice:**
-- The file ownership map in `CLAUDE.md` is the enforcement mechanism.
-- No relative imports that escape a package boundary (ESLint enforces this).
-- Each package has its own `tsconfig.json`, `package.json`, and can be independently built.
-- Changing the contracts package requires updating all consumers in the same PR — this is what prevents type drift between services.
+Each generation:
+
+1. Computes a deterministic `FailureSummary` from the run's own event log
+   (`convex/helpers/failure_summary.ts`, a dependency-free mirror of
+   `apps/web/src/lib/replay/failure.ts` — Convex cannot import across the
+   `apps/web` boundary) plus its evals.
+2. ALWAYS computes `buildHeuristicExplanation` (`convex/insights.ts`) first
+   — zero-config, deterministic, and the result that ships whenever no LLM
+   provider is configured or the LLM path is skipped/discarded.
+3. Optionally also calls a configured `ExplanationLLM`
+   (`convex/helpers/llm_provider.ts` — `NoopExplanationLLM` by default,
+   `HttpExplanationLLM` when `AFR_LLM_PROVIDER=http`) with a grounding prompt
+   listing only the run's real `sequenceNumber`s, fenced with an
+   `UNTRUSTED_TRACE_DATA` delimiter around every agent/tool-controlled
+   string (event excerpts, failure reason/message) — `neutralizeTraceMarkers`
+   strips any literal occurrence of the fence markers from that content first
+   so trace data can never forge a fake close/reopen of the fence.
+4. Validates any LLM result via `validateCitedSeqNums` — citations not
+   present in the run's own event window are stripped — and discards the LLM
+   result entirely (falling back to the heuristic) unless what remains cites
+   at least one real event and has a non-empty summary/root cause. This is
+   the unconditional grounding guarantee: no stored explanation, from either
+   path, can cite a fabricated event.
+5. Stores one row per run in `run_explanations` (delete-then-insert
+   regeneration, not append-only — a generated artifact *about* the
+   immutable event log, not an observation recorded *into* it) and audits
+   every regeneration (`run_explanation.regenerated` in `audit_log`).
+
+`regenerateRunExplanation` (admin-gated action, `POST
+/api/runs/[id]/explanation/regenerate`) re-runs this same pipeline
+synchronously on demand. See `docs/adr/004-run-explanations.md` and
+`docs/design/explanations.md` for the full threat model and HTTP surface.
+
+---
+
+## 9. Sampling and Its Effect on Rollups, Alerts, and Usage Counters
+
+The SDK supports client-side head sampling with tail-bias for failures
+(`packages/sdk/src/sampling.ts`, `SamplingConfig`/`decideSampling`): a
+sampling decision is made once at `startRun()`, optionally seeded
+deterministically from the run name (`seedFromRunName`) or overridden by a
+caller-supplied `decider`. An unsampled run's events are never transmitted to
+the server at all — unless `alwaysKeepFailures` is set, in which case an
+unsampled run that ends via `failRun()` retroactively ships its
+shadow-buffered events.
+
+This has a consequence every consumer of server-side aggregates must
+understand: **sampling is a client-side, per-SDK-integration configuration
+decision that is completely invisible to the server.** Convex has no
+knowledge that a run was sampled out — it simply never receives it. This
+means:
+
+- **`usage_counters` undercount** actual agent activity whenever any caller
+  samples below `rate: 1`. The counters are already documented as
+  approximate/observability-grade (ADR-002), but sampling is an additional,
+  separate source of undercount on top of the counters' own
+  contention-mitigation approximation.
+- **`daily_rollups` undercount** the true population of runs for any
+  agent/day where a sampled SDK integration is in use — the rollup's
+  percentiles and totals are computed only over what actually reached
+  Convex, which is a biased-by-tail-inclusion subset when
+  `alwaysKeepFailures` is set (failures are over-represented relative to
+  their true rate, successes under-represented).
+- **`failure_rate` alerts (`convex/alert_engine.ts`) evaluate only over
+  sampled-in traffic.** If an org's agents sample at `rate: 0.1`, a
+  `failure_rate` alert's computed percentage is over that 10% window, not
+  the agent's true failure rate — and with `alwaysKeepFailures` enabled, the
+  sampled-in population is deliberately failure-biased, which can make a
+  `failure_rate` alert fire more eagerly than the true failure rate
+  warrants (or, without `alwaysKeepFailures`, under-fire because failures
+  are sampled out at the same rate as successes).
+- **An alert admin configuring `failure_rate` thresholds in the web UI has no
+  visibility into whether, or at what rate, the org's SDK integrations
+  sample** — sampling is set in SDK-side code the alert admin may not
+  control or even know about. This is a real operational gap: there is no
+  current mechanism (as of this cycle) for the server to distinguish a "10
+  failures out of 10 sampled runs" scenario from a true 100% failure rate.
+
+None of this violates the event log's own invariants (the sampled-out
+events genuinely never existed server-side, which is different from the log
+being incomplete for events that were ingested) — but it does mean every
+rollup/usage/alert consumer must treat these aggregates as **"over whatever
+reached the server,"** not as ground truth about agent behavior.
+
+---
+
+## 10. Search-Index Gap for Externalized Error Payloads
+
+`runs.searchText` (the field behind the `search_runs` search index,
+ADR-002) is appended to at terminal reconcile when a `run.failed` event
+lands, via `extractErrorMessage(evt.payload)`
+(`convex/helpers/run_fields.ts`, called from both `convex/events.ts` and
+`convex/sdk_ingest.ts`). This extraction reads `payload.message` /
+`payload.errorMessage` / `payload.error.message` directly off the **event's
+stored payload as received**.
+
+When a `run.failed` payload exceeds the 10 KB inline ceiling (Event Log Rule
+3), the stored payload is not the original error object — it is the
+`_externalized` pointer shape (`{ type: "_externalized", originalType,
+_artifact: { artifactId, storageKey, storageBucket, checksum, size } }`,
+`packages/contracts/src/events.ts`). `extractErrorMessage` runs against this
+pointer object, which has none of `message`/`errorMessage`/`error.message`,
+so it returns `undefined` and `runs.searchText` is **not** updated with any
+error text for that run.
+
+**Practical effect:** a run that fails with a large error payload (a long
+stack trace, a big tool-output dump) is *less* discoverable via
+`searchRuns`/`GET /api/v1/runs` full-text search than a run with a small
+error message, purely because of payload size — the opposite of what an
+engineer debugging a bad failure would want. This is a known gap, not yet
+addressed: closing it would require either fetching the externalized
+artifact's content at terminal-reconcile time (an extra blob read on every
+large-payload failure) or truncating/summarizing the original error message
+into `searchText` *before* externalization decides to externalize the full
+payload (i.e. computing a short excerpt earlier in the ingest pipeline, independent
+of the size check). Neither is implemented as of this cycle.
+
+---
+
+## 11. Where This Document Can Go Stale
+
+This file describes source-of-truth code paths, not aspirations. When any of the
+following change, update this document in the same PR: `convex/schema.ts`,
+`convex/sdk_ingest.ts`, `convex/auth.ts`, `convex/crons.ts`,
+`convex/alert_engine.ts`, `convex/webhook_engine.ts`, `convex/email_engine.ts`,
+`packages/contracts/src/{entities,events,api_errors}.ts`,
+`packages/sdk/src/{recorder,flight-recorder,file-spool,sampling}.ts`,
+`apps/web/src/lib/apiHandler.ts`.

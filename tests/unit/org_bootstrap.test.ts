@@ -12,6 +12,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
+
 import type { Organization, AuthContext } from '@agent-flight-recorder/contracts'
 
 // ---------------------------------------------------------------------------

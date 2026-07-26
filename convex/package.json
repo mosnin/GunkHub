@@ -1,0 +1,22 @@
+{
+  "name": "@agent-flight-recorder/convex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
+  },
+  "dependencies": {
+    "convex": "^1.42.2",
+    "@agent-flight-recorder/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.1",
+    "convex-test": "^0.0.54",
+    "@edge-runtime/vm": "^5.0.0"
+  }
+}

@@ -4,13 +4,36 @@
   "private": true,
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "e2e": "playwright test --config=../playwright.config.ts",
+    "e2e:ui": "playwright test --config=../playwright.config.ts --ui",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.convex-seam.json && tsc --noEmit -p tsconfig.dom.json",
+    "lint": "eslint . --ext .ts,.tsx --max-warnings 0"
   },
   "dependencies": {
+    "@agent-flight-recorder/cli": "workspace:*",
     "@agent-flight-recorder/contracts": "workspace:*",
+    "@agent-flight-recorder/mcp": "workspace:*",
     "@agent-flight-recorder/sdk": "workspace:*"
   },
   "devDependencies": {
+    "@opentelemetry/api": "1.9.0",
+    "@opentelemetry/otlp-transformer": "0.57.2",
+    "@opentelemetry/resources": "1.30.1",
+    "@opentelemetry/sdk-trace-base": "1.30.1",
+    "@playwright/test": "1.56.1",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/jest-dom": "^6.10.0",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "clsx": "^2.1.0",
+    "jsdom": "^26.1.0",
+    "protobufjs": "^8.7.1",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
     "typescript": "^5.4.0",
     "vitest": "^1.6.0"
   }

@@ -1,0 +1,51 @@
+{
+  // Typecheck project for the ONE class of test that must type-import a
+  // `convex/` module: the hand-maintained seams between the Convex engines and
+  // `packages/contracts`.
+  //
+  // WHY THIS FILE EXISTS
+  // `convex/tsconfig.json` deliberately sets `exactOptionalPropertyTypes: false`
+  // (Convex's generated document types declare optional fields as `field?: T`
+  // while `ctx.db.insert()/patch()` accept an explicit `undefined`, so the flag
+  // errors on essentially every insert — 47 errors across 19 files at last
+  // count, ~28 of them raw `ctx.db.insert(...)` calls that cannot be written
+  // any other way). `tests/tsconfig.json` inherits `true` from
+  // `tsconfig.base.json`. A test that type-imports a Convex module therefore
+  // drags a legitimately-written backend file into a stricter project and fails
+  // typecheck on code that is correct under its own config.
+  //
+  // The fix is NOT to relax the flag in `tests/tsconfig.json` — that strictness
+  // is what makes fixture drift fail CI, and it stays on for every other test.
+  // Instead this project compiles the seam files under the BACKEND's config, by
+  // extending `convex/tsconfig.json` directly rather than restating its flags.
+  // If Team A ever manages to turn `exactOptionalPropertyTypes` back on in
+  // `convex/`, this project follows automatically and the divergence is gone
+  // with no edit here.
+  //
+  // KEEP THIS FILE'S `include` NARROW. Every file listed here trades
+  // `exactOptionalPropertyTypes` for the ability to see Convex types. That is
+  // the right trade only for files whose entire job is pinning a cross-boundary
+  // seam. Ordinary tests belong in `tests/tsconfig.json`.
+  //
+  // Run by `pnpm --filter @agent-flight-recorder/tests typecheck`, which runs
+  // both projects. See CONTRIBUTING.md § Verification gates.
+  "extends": "../convex/tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    // Own buildinfo file so this project's incremental state does not collide
+    // with tests/tsconfig.json's.
+    "tsBuildInfoFile": "./tsconfig.convex-seam.tsbuildinfo",
+    // Same relaxations tests/tsconfig.json makes for test code (positional
+    // array access, record indexing). Everything else stays as convex/ has it.
+    "noUncheckedIndexedAccess": false,
+    "noPropertyAccessFromIndexSignature": false
+  },
+  // Seam files only. Their Convex imports are pulled in transitively and
+  // checked under convex/'s own options, which is the entire point.
+  "include": ["unit/fix_confidence_vocab.test.ts"],
+  "exclude": ["node_modules"]
+}

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useTransition } from 'react'
 
 import { Button } from '@/components/ui/Button'
 import { createAgentAction } from '@/lib/actions/agents'
+import { useFocusTrap } from '@/lib/hooks/useFocusTrap'
 
 interface CreateAgentModalProps {
   isOpen: boolean
@@ -18,6 +19,7 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
   const [error, setError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
   const nameRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useFocusTrap<HTMLDivElement>(isOpen)
 
   // Reset state when modal opens
   useEffect(() => {
@@ -25,7 +27,6 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
       setName('')
       setDescription('')
       setError(null)
-      setTimeout(() => nameRef.current?.focus(), 50)
     }
   }, [isOpen])
 
@@ -61,10 +62,17 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
       onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
     >
-      <div className="w-full max-w-md mx-4 rounded-lg border border-neutral-700 bg-neutral-900 shadow-xl">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-agent-title"
+        tabIndex={-1}
+        className="w-full max-w-md mx-4 rounded-[4px] border border-graphite-light bg-graphite-deep outline-none"
+      >
         {/* Header */}
         <div className="px-5 py-4 border-b border-neutral-800">
-          <h2 className="text-sm font-semibold text-neutral-100">New Agent</h2>
+          <h2 id="create-agent-title" className="text-sm font-semibold text-neutral-100">New Agent</h2>
         </div>
 
         {/* Form */}
@@ -84,14 +92,16 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
                 onChange={(e) => setName(e.target.value)}
                 maxLength={80}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? 'create-agent-error' : undefined}
+                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50"
               />
             </div>
 
             {/* Description */}
             <div>
               <label htmlFor="agent-description" className="block text-xs font-medium text-neutral-400 mb-1.5">
-                Description <span className="text-neutral-600">(optional)</span>
+                Description <span className="text-pewter">(optional)</span>
               </label>
               <textarea
                 id="agent-description"
@@ -101,13 +111,17 @@ export function CreateAgentModal({ isOpen, projectId, onClose, onCreated }: Crea
                 onChange={(e) => setDescription(e.target.value)}
                 maxLength={200}
                 disabled={isPending}
-                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
+                className="w-full px-3 py-2 text-sm bg-neutral-950 border border-neutral-700 rounded-md text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-primary-500 focus:border-primary-500 disabled:opacity-50 resize-none"
               />
             </div>
 
             {/* Error */}
             {error && (
-              <p className="text-xs text-destructive-400 bg-destructive-900/30 border border-destructive-800/50 rounded-md px-3 py-2">
+              <p
+                id="create-agent-error"
+                role="alert"
+                className="text-xs text-destructive-400 bg-destructive-900/30 border border-destructive-800/50 rounded-md px-3 py-2"
+              >
                 {error}
               </p>
             )}

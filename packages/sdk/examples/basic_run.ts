@@ -18,17 +18,16 @@
 import {
   Recorder,
   Events,
-  HttpTransport,
   FlightRecorder,
   type Transport,
   type TransportAuth,
-} from '@agent-flight-recorder/sdk'
+ type TransportResponse } from '@agent-flight-recorder/sdk'
+
 import type {
   CreateRunRequest,
   CreateRunResponse,
   CreateEventRequest,
 } from '@agent-flight-recorder/contracts'
-import type { TransportResponse } from '@agent-flight-recorder/sdk'
 
 // ---------------------------------------------------------------------------
 // MockTransport — logs to console instead of sending HTTP requests.
@@ -49,13 +48,14 @@ class MockTransport implements Transport {
         orgId: 'org_demo',
         projectId: 'proj_demo',
         agentId: req.agentId,
-        agentVersionId: req.agentVersionId,
+        // exactOptionalPropertyTypes: only spread optional fields when defined
+        ...(req.agentVersionId !== undefined && { agentVersionId: req.agentVersionId }),
         status: 'running',
         startedAt: Date.now(),
         metadata: req.metadata ?? {},
         tags: req.tags ?? [],
-        triggeredBy: req.triggeredBy,
-        sdkVersion: req.sdkVersion,
+        ...(req.triggeredBy !== undefined && { triggeredBy: req.triggeredBy }),
+        ...(req.sdkVersion !== undefined && { sdkVersion: req.sdkVersion }),
       },
     }
   }
@@ -69,8 +69,9 @@ class MockTransport implements Transport {
     return { success: true, eventIds: events.map((_, i) => `evt_mock_${Date.now()}_${i}`) }
   }
 
-  async updateRunStatus(runId: string, status: string, endedAt?: number, _auth?: TransportAuth): Promise<void> {
+  async updateRunStatus(runId: string, status: string, endedAt?: number, _auth?: TransportAuth): Promise<TransportResponse> {
     console.log(`[MockTransport] updateRunStatus → ${runId} = ${status}  endedAt=${endedAt}`)
+    return { success: true, eventIds: [] }
   }
 }
 
@@ -90,6 +91,15 @@ async function runHappyPath(transport: Transport) {
       options: {
         flushIntervalMs: 5000,
         maxBatchSize: 50,
+        // Observability of loss: these fire when telemetry is at risk.
+        onDrop: (count, reason) => console.warn(`[example] dropped ${count} event(s): ${reason}`),
+        onFlushError: (error) => console.warn(`[example] background flush failed: ${error}`),
+        // Durability (opt-in, Node-only): persist events to a JSONL write-ahead
+        // spool so a crash can't lose them; re-send on startup with recover().
+        //   import { FileSpool } from '@agent-flight-recorder/sdk'
+        //   spool: new FileSpool('/var/tmp/afr/worker-1.jsonl'),
+        //   onSpoolError: (error) => console.warn('spool error:', error),
+        // then, before starting runs:  await recorder.recover()
       },
     },
     transport
@@ -239,7 +249,7 @@ async function runFlightRecorder() {
 // Entry point — selects transport based on CLI flags
 // ---------------------------------------------------------------------------
 
-;(async () => {
+(async () => {
   const useLive = process.argv.includes('--live')
   const useFlightRecorder = process.argv.includes('--flight-recorder')
 

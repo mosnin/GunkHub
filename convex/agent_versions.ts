@@ -1,6 +1,10 @@
-import { query, mutation } from "convex/server";
 import { v } from "convex/values";
-import { requireOrgMembership } from "./auth.js";
+
+import { query, mutation } from "./_generated/server.js";
+import { recordAuditEvent } from "./audit.js";
+import { getAuthContext, requireOrgMembership } from "./auth.js";
+import { validateEvalRules } from "./helpers/agent_version_fields.js";
+import { MAX_PAGE_SIZE } from "./helpers/pagination.js";
 
 /**
  * Create a new version for an agent. Requires admin role.
@@ -12,18 +16,31 @@ export const createAgentVersion = mutation({
     version: v.string(),
     changelog: v.optional(v.string()),
     configSnapshot: v.optional(v.any()),
+    // Cycle 2 (docs/design/action_layer.md): optional eval auto-run rule set,
+    // evaluated by Team B's insights.runEvalsForRun against every terminal
+    // run created against this version. Bounded to
+    // MAX_EVAL_RULES_PER_VERSION and shape-validated by validateEvalRules —
+    // see convex/schema.ts for why this is stored as v.array(v.any()).
+    evalRules: v.optional(v.array(v.any())),
   },
   handler: async (ctx, args) => {
-    const agent = await ctx.db.get(args.agentId);
-    if (!agent) throw new Error("Agent not found");
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Resolve and authorize the CALLER
+    // before observing args.agentId. This is a WRITE path, so the collapse must
+    // also precede the uniqueness scan below — otherwise a cross-org caller
+    // could learn which version strings exist on another org's agent.
+    const { userId, orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId, { minimumRole: "admin" });
 
-    await requireOrgMembership(ctx, agent.orgId, { minimumRole: "admin" });
+    // Cross-org agent and nonexistent agent collapse to one outcome.
+    const agent = await ctx.db.get(args.agentId);
+    if (!agent || agent.orgId !== orgId) throw new Error("Agent not found");
 
     const trimmedVersion = args.version.trim();
     if (!trimmedVersion) throw new Error("version is required");
     if (trimmedVersion.length > 64) {
       throw new Error("version must be 64 characters or fewer");
     }
+    validateEvalRules(args.evalRules);
 
     // Uniqueness check within the agent
     const existing = await ctx.db
@@ -45,10 +62,21 @@ export const createAgentVersion = mutation({
       ...(args.configSnapshot !== undefined && {
         configSnapshot: args.configSnapshot,
       }),
+      ...(args.evalRules !== undefined && { evalRules: args.evalRules }),
     });
 
     const doc = await ctx.db.get(id);
     if (!doc) throw new Error("Failed to create agent version");
+
+    await recordAuditEvent(ctx, {
+      orgId: agent.orgId,
+      actorClerkUserId: userId,
+      action: "agent_version.created",
+      targetType: "agent_version",
+      targetId: String(id),
+      metadata: { agentId: String(args.agentId), version: trimmedVersion },
+    });
+
     return doc;
   },
 });
@@ -61,16 +89,25 @@ export const listAgentVersions = query({
     agentId: v.id("agents"),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the agent is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
+    // Cross-org agent and nonexistent agent collapse to one outcome.
     const agent = await ctx.db.get(args.agentId);
-    if (!agent) throw new Error("Agent not found");
+    if (!agent || agent.orgId !== orgId) throw new Error("Agent not found");
 
-    await requireOrgMembership(ctx, agent.orgId);
-
-    return await ctx.db
+    // Bounded: at most MAX_PAGE_SIZE versions returned (no unbounded .collect()).
+    const versions = await ctx.db
       .query("agent_versions")
       .withIndex("by_agent", (q) => q.eq("agentId", args.agentId))
       .order("desc")
-      .collect();
+      .take(MAX_PAGE_SIZE);
+
+    // Defence in depth: a version stamped with a different org than its agent is
+    // a data defect, not something to hand back across the boundary.
+    return versions.filter((v) => v.orgId === orgId);
   },
 });
 
@@ -85,9 +122,14 @@ export const paginateAgentVersions = query({
     cursor: v.union(v.string(), v.null()),
   },
   handler: async (ctx, args) => {
+    // TENANCY (CLAUDE.md Tenancy Rule 3). Caller resolved and authorized first;
+    // the agent is observed only afterwards.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
+
+    // Cross-org agent and nonexistent agent collapse to one outcome.
     const agent = await ctx.db.get(args.agentId);
-    if (!agent) throw new Error("Agent not found");
-    await requireOrgMembership(ctx, agent.orgId);
+    if (!agent || agent.orgId !== orgId) throw new Error("Agent not found");
 
     const numItems = Math.min(args.numItems ?? 20, 100);
     const page = await ctx.db
@@ -97,7 +139,8 @@ export const paginateAgentVersions = query({
       .paginate({ numItems, cursor: args.cursor });
 
     return {
-      versions: page.page,
+      // Defence in depth, as in listAgentVersions.
+      versions: page.page.filter((v) => v.orgId === orgId),
       nextCursor: page.isDone ? null : page.continueCursor,
     };
   },
@@ -111,10 +154,18 @@ export const getAgentVersion = query({
     versionId: v.id("agent_versions"),
   },
   handler: async (ctx, args) => {
-    const version = await ctx.db.get(args.versionId);
-    if (!version) return null;
+    // TENANCY (CLAUDE.md Tenancy Rule 3). This previously returned null for a
+    // missing version but THREW for a version owned by another org, which made
+    // it an existence oracle. The caller is resolved from auth alone, before
+    // args.versionId is observed; both cases now collapse to the same null.
+    //
+    // NOT swallowed: unauthenticated callers, callers with no org context, and
+    // callers who are not members of their own active org still throw.
+    const { orgId } = await getAuthContext(ctx);
+    await requireOrgMembership(ctx, orgId);
 
-    await requireOrgMembership(ctx, version.orgId);
+    const version = await ctx.db.get(args.versionId);
+    if (!version || version.orgId !== orgId) return null;
 
     return version;
   },
