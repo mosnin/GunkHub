@@ -284,6 +284,17 @@ or design for them until v1 ships and the decision is revisited.
 > scheduling that make delivery live). The two lifted items are removed below
 > and replaced with pointers to the ADRs that govern them.
 
+> **Amendment (2026-07-25):** ADR-009 (`docs/adr/009-policy-engine.md`) lifts a
+> third item, and lifts only **part** of its bullet: the declarative policy
+> engine is authorised; "compliance features" as a category and audit log
+> export are not. Unlike ADR-002 and ADR-003, ADR-009 was written *before* its
+> implementation — its central ruling (a policy engine inside a flight recorder
+> must never refuse to record a violation) constrains where the code may be
+> put, so it had to precede the code. The engine's pure half
+> (`convex/helpers/policy.ts`, the `policies` table) landed while it was being
+> written and reached the same ruling independently; every read surface, the
+> pre-flight, and the contracts vocabulary are still missing (ADR-009 §10).
+
 - Real-time collaboration or live streaming of events to multiple viewers
 - ~~Analytics dashboards, aggregate metrics, or usage statistics~~ — lifted by
   ADR-002: usage counters, daily rollups, and the analytics/cost/version-
@@ -291,7 +302,15 @@ or design for them until v1 ships and the decision is revisited.
   (additive schema only, org-scoped, approximate/observability-grade
   counters — never a substitute for the event log as source of truth).
 - Agent marketplace or agent registry
-- Policy engine, compliance features, or audit log export
+- ~~Policy engine~~, compliance features, or audit log export — the **policy
+  engine** half is lifted by ADR-009 (`docs/adr/009-policy-engine.md`):
+  declarative rules evaluated over recorded runs, plus an advisory SDK
+  pre-flight, subject to ADR-009's constraints (never on the write path —
+  ingest accepts everything it accepted before; org-scoped; admin-managed,
+  audit-snapshotted rules; outcomes never stored at all; mandatory coverage on
+  every result; and no verdict meaning "compliant"). **Compliance
+  features as a category and audit log export remain frozen** — see ADR-009
+  constraint 7 for what would have to be true to lift them.
 - Multi-region or distributed ingestion infrastructure
 - Billing, usage metering, or subscription management
 - ~~Webhooks or external integrations (Slack, PagerDuty, etc.)~~ — lifted by

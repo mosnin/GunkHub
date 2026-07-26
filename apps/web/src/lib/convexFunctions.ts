@@ -4,7 +4,7 @@
 
 import { makeFunctionReference } from 'convex/server'
 
-import type { BudgetMeter, BudgetPeriod, BudgetScope } from '@agent-flight-recorder/contracts'
+import type { BudgetMeter, BudgetPeriod, BudgetScope, PolicyRule, PolicySubject } from '@agent-flight-recorder/contracts'
 
 type Q = 'query'
 type M = 'mutation'
@@ -45,6 +45,76 @@ type BudgetNarrowingArgs = {
 
 /** Clerk-authed evaluation: the org is NAMED, and Convex re-checks membership in it. */
 type BudgetSubjectArgs = BudgetNarrowingArgs & { orgId: string }
+
+/**
+ * The narrowing ids the key-authed policy pre-flight accepts, mirroring
+ * `convex/policy_gate.ts`'s `sdkCheckPolicy` validator.
+ *
+ * THERE IS NO `orgId` FIELD AND THERE MUST NEVER BE ONE. The org comes from the
+ * key; a caller that cannot name an organization cannot name someone else's.
+ * Every id below only NARROWS within the key's own org and is re-checked to
+ * belong to it, so a foreign id and a missing one yield the identical NOT_FOUND
+ * and this surface is not an existence oracle for another org's records.
+ *
+ * A `type` and not an `interface`, for the reason {@link CausalWalkArgs}
+ * documents: Convex constrains args to `Record<string, unknown>`, and only type
+ * aliases get the implicit index signature that satisfies it.
+ */
+type SdkPolicySubjectArgs = {
+  apiKeyHash: string
+  projectId?: string
+  agentId?: string
+  agentVersionId?: string
+  environment?: string
+  runId?: string
+}
+
+/**
+ * Mirrors `convex/policies.ts`'s `createPolicy` validator.
+ *
+ * THE STORED SHAPE IS CONTRACTS' SHAPE. `convex/schema.ts`'s `policies` table
+ * stores `rule` and `subject` as the same nested unions contracts declares, with
+ * the same OPTIONAL arrays, so `PolicyRule` and `PolicySubject` are imported
+ * here rather than restated — Repo Conventions → Types, and the only way the two
+ * cannot drift.
+ *
+ * An earlier revision of this block declared a flat
+ * `{scope, scopeId, prohibits, matcher}` and asserted that the difference from
+ * contracts "is not cosmetic". It was not cosmetic; it was imaginary. No such
+ * validator has ever existed, and `check-convex-refs.ts` caught the resulting
+ * call — which is the entire reason that script exists, since
+ * `convex/_generated/api.ts` is an `anyApi` stub and TypeScript checks none of
+ * these references.
+ */
+type CreatePolicyArgs = {
+  orgId: string
+  name: string
+  rule: PolicyRule
+  subject: PolicySubject
+  rationale: string
+  enabled?: boolean
+}
+
+/**
+ * Mirrors `convex/policies.ts`'s `updatePolicy` validator.
+ *
+ * NOTE WHAT IS NOT HERE, AND IT IS THE SAME SPLIT CONTRACTS DRAWS BETWEEN
+ * `UpsertPolicyRequest` AND `DisablePolicyRequest`: no `enabled`. Changing what
+ * a policy forbids and switching it off are different acts with different blast
+ * radii, and an operator who wanted the second must not be able to do the first
+ * by supplying one extra field. `enabled` moves only through `disablePolicy`,
+ * which requires a `reason` for the audit log. There is no delete either.
+ *
+ * A terms change bumps `revision` server-side, which is what makes a report and
+ * a rule that disagree DETECTABLE rather than silently reconciled.
+ */
+type UpdatePolicyArgs = {
+  policyId: string
+  name?: string
+  rule?: PolicyRule
+  subject?: PolicySubject
+  rationale?: string
+}
 
 /**
  * Key-authed evaluation: the org comes from the KEY and there is deliberately
@@ -466,6 +536,78 @@ export const convex = {
   budget_gate: {
     sdkCheckBudget: makeFunctionReference<Q, SdkBudgetSubjectArgs, unknown>(
       'budget_gate:sdkCheckBudget',
+    ),
+  },
+
+  // --- DECLARATIVE POLICY (ADR-009) ----------------------------------------
+  //
+  // EVERY REF BELOW DECLARES ITS ARGS. Same reason as the budget block above,
+  // one notch sharper: a dropped or misspelled arg here does not fail, it
+  // returns a WELL-FORMED EVALUATION ABOUT A DIFFERENT SUBJECT — and a
+  // compliance answer about the wrong subject is the one defect in this product
+  // whose reader is an auditor rather than an engineer who could go check.
+  //
+  // THE RETURNS ARE `unknown`, DELIBERATELY. Annotating them `PolicyEvaluation`
+  // or `PolicySnapshot` would be the worst possible lie available at this seam:
+  // nothing verifies a string-named reference against the function it names, and
+  // the two vocabularies genuinely differ (`convex/helpers/policy.ts` speaks
+  // `LocalPolicy` / `LocalPolicyFinding`; contracts speaks `PolicyDefinition` /
+  // `PolicyOutcome`, and neither is a superset of the other — see
+  // `lib/policies/localWire.ts`). TypeScript would then vouch for a body that
+  // contracts' own `policySnapshotRefusals` refuses. `unknown` forces every
+  // consumer through the narrowing in `lib/policies/`, which is the only thing
+  // that actually establishes what arrived.
+  policies: {
+    /** Clerk-authed, member-gated. Rows carry `interpretable` — a rule the engine cannot read grades nothing. */
+    listPolicies: makeFunctionReference<
+      Q,
+      { orgId: string; limit?: number; cursor?: string },
+      unknown
+    >('policies:listPolicies'),
+    getPolicy: makeFunctionReference<Q, { policyId: string }, unknown>('policies:getPolicy'),
+    /** Every enabled policy governing ONE run, evaluated over that run's log. Derived; never stored back. */
+    evaluateRunAgainstPolicies: makeFunctionReference<Q, { runId: string }, unknown>(
+      'policies:evaluateRunAgainstPolicies',
+    ),
+    /** ONE policy across many runs. Every run the scan did not reach is an explicit finding NAMING the run. */
+    scanRunsAgainstPolicy: makeFunctionReference<
+      Q,
+      { policyId: string; limit?: number; cursor?: string },
+      unknown
+    >('policies:scanRunsAgainstPolicy'),
+    /** ADMIN-gated, audited. */
+    createPolicy: makeFunctionReference<M, CreatePolicyArgs, unknown>('policies:createPolicy'),
+    /** ADMIN-gated, audited. Bumps `revision` on any terms change. */
+    updatePolicy: makeFunctionReference<M, UpdatePolicyArgs, unknown>('policies:updatePolicy'),
+    /**
+     * ADMIN-gated, audited. THE ONLY LIFECYCLE OPERATION — there is deliberately
+     * no delete, because a policy that governed recorded runs is part of how
+     * those runs were judged and removing the row makes past outcomes
+     * uninterpretable.
+     */
+    disablePolicy: makeFunctionReference<
+      M,
+      { policyId: string; enabled: boolean; reason: string },
+      unknown
+    >('policies:disablePolicy'),
+  },
+  // The API-key-authed pre-flight gate (convex/policy_gate.ts). Separate module
+  // for the same reason budget_gate.ts is separate from budgets.ts: it must
+  // never reach for Clerk.
+  //
+  // NOTE THE ABSENT `orgId`, and note that the absence is the tenancy property
+  // rather than an omission: the caller cannot name an organization, so it
+  // cannot name someone else's. The optional ids only NARROW within the key's
+  // own org and are each re-checked to belong to it.
+  //
+  // NOTE ALSO WHAT IS NOT HERE: there is no key-authed EVALUATION function in
+  // `convex/policy_gate.ts`. `policies:evaluateRunAgainstPolicies` and
+  // `policies:scanRunsAgainstPolicy` both call `getAuthContext`, which an API
+  // key cannot satisfy. That absence is why `GET /api/v1/policies/evaluate`
+  // returns a 501 naming this gap rather than a body.
+  policy_gate: {
+    sdkCheckPolicy: makeFunctionReference<Q, SdkPolicySubjectArgs, unknown>(
+      'policy_gate:sdkCheckPolicy',
     ),
   },
 } as const

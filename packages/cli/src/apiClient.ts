@@ -21,6 +21,12 @@ import type {
   BudgetSnapshotParams,
   ManualResetRequest,
   ManualTripRequest,
+  DisablePolicyRequest,
+  PolicyMutationResult,
+  PolicySubjectParams,
+  UpsertPolicyRequest,
+  V1PolicyEvaluationData,
+  V1PolicySnapshotData,
   V1BudgetSnapshotData,
   CausalDirection,
   CausalTraceParams,
@@ -355,6 +361,85 @@ export async function getFailurePatternEvidence(
 ): Promise<V1PatternEvidenceData> {
   try {
     return await new FlightReader(config, fetchImpl).getFailurePatternEvidence(fingerprintHash)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POLICY — the read half is a projection over recorded runs; the write half is
+// an admin-gated mutation owned by `convex/`.
+// ---------------------------------------------------------------------------
+
+/**
+ * List the policies governing a subject.
+ *
+ * Routes through `FlightReader`, so a listing that ignored the subject
+ * parameter, or one carrying a recording-suppression directive, reaches the CLI
+ * as an `ApiClientError` rather than as a plausible-looking listing.
+ */
+export async function getPolicySnapshot(
+  config: ApiClientConfig,
+  params: PolicySubjectParams,
+  fetchImpl?: ApiFetchLike
+): Promise<V1PolicySnapshotData> {
+  try {
+    return await new FlightReader(config, fetchImpl).getPolicySnapshot(params)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/**
+ * Evaluate every policy governing a subject against RECORDED runs.
+ *
+ * Note what does NOT come back as an error: a `not_evaluable` outcome and a
+ * truncated scan are the server telling the truth, and the CLI turns them into
+ * exit 21 rather than into a transport failure. Only a suppression directive is
+ * refused outright — see `assertPolicyEvaluationTrustworthy` in the SDK.
+ */
+export async function getPolicyEvaluation(
+  config: ApiClientConfig,
+  params: PolicySubjectParams,
+  fetchImpl?: ApiFetchLike
+): Promise<V1PolicyEvaluationData> {
+  try {
+    return await new FlightReader(config, fetchImpl).getPolicyEvaluation(params)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/**
+ * Define or replace a policy. PRIVILEGED — admin-gated and audited server-side
+ * into the append-only admin audit log (CLAUDE.md Event Log Rule 6).
+ *
+ * SERVER SUPPORT: the route is the web layer's to build against `convex/`'s
+ * mutation. Until it exists this surfaces `not_found` (exit 3), which is the
+ * honest outcome — a privileged mutation that silently no-ops would be far
+ * worse, and a policy an operator believes exists and does not is a compliance
+ * gap wearing a green tick.
+ */
+export async function upsertPolicy(
+  config: ApiClientConfig,
+  request: UpsertPolicyRequest,
+  fetchImpl?: ApiFetchLike
+): Promise<PolicyMutationResult> {
+  try {
+    return await postV1<PolicyMutationResult>(config, '/api/v1/policies/upsert', request, fetchImpl)
+  } catch (err) {
+    toApiClientError(err)
+  }
+}
+
+/** Disable a policy. PRIVILEGED and audited — see {@link upsertPolicy}. There is deliberately no delete. */
+export async function disablePolicy(
+  config: ApiClientConfig,
+  request: DisablePolicyRequest,
+  fetchImpl?: ApiFetchLike
+): Promise<PolicyMutationResult> {
+  try {
+    return await postV1<PolicyMutationResult>(config, '/api/v1/policies/disable', request, fetchImpl)
   } catch (err) {
     toApiClientError(err)
   }

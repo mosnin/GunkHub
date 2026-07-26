@@ -113,6 +113,30 @@ Clerk-session path `convex/events.ts`).
    cannot be written through `sdkCreateEvents` today (see
    [`docs/adr/007`](adr/007-otel-span-ingestion.md) C4).
 
+> **The ingest path admits no policy check, and this is load-bearing.**
+> [`docs/adr/009`](adr/009-policy-engine.md) authorises a declarative policy
+> engine (*"agent X may not call tool Y"*) and rules, in W1–W5, that it must
+> have **no presence whatsoever on the write path**: `sdkCreateRun`,
+> `sdkCreateEvents`, `sdkCreateArtifact` and their `convex/events.ts`
+> equivalents gain no policy code and no new rejection code, and no policy
+> evaluation may run inside an ingest transaction even non-rejectingly —
+> because an evaluation that merely *throws* fails the surrounding insert and
+> becomes a refusal by accident. Refusing to record a violation destroys the
+> evidence of the violation. A run that breaks every configured rule must
+> ingest byte-identically to one that breaks none.
+>
+> **Backend implemented; no read surface yet.** `convex/helpers/policy.ts` (its
+> PART 1 states the same ruling), the `policies` table, `convex/policies.ts`
+> and `convex/policy_gate.ts` exist. No `/api/v1/**` route, SDK method, CLI
+> command, UI or MCP tool reaches them. The rule above is *tested*, in
+> `tests/unit/policy_adversarial_ingest.test.ts` — a forbidden tool call is
+> accepted and stored with its name intact, and forbidden and allowed calls
+> produce indistinguishable ingest outcomes. (Several comments in `convex/`
+> cite that assertion as living in a `convex/policies.test.ts`, which does not
+> exist; the filename is stale, not the guarantee.) Detection, when wired, is
+> scheduled off the terminal event exactly as alerting is (§8) — scheduling is
+> not gating.
+
 ---
 
 ## 4. Tenancy Model

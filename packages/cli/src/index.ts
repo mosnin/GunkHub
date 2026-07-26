@@ -33,6 +33,15 @@ import {
   runPatternsEvidence,
 } from './commands/patterns-evidence.js'
 import { PATTERNS_HELP, parsePatternsArgs, printPatterns, runPatterns } from './commands/patterns.js'
+import {
+  POLICY_HELP,
+  exitCodeForPolicy,
+  parsePolicyArgs,
+  printPolicy,
+  printPolicyMutation,
+  runPolicyMutation,
+  runPolicyScan,
+} from './commands/policy.js'
 import { printRecordDemo, runRecordDemo } from './commands/record-demo.js'
 import { REPLAY_HELP, parseReplayArgs, printReplay, runReplay } from './commands/replay.js'
 import { RUNS_GET_HELP, parseRunsGetArgs, printRunsGet, runRunsGet } from './commands/runs-get.js'
@@ -106,6 +115,28 @@ export type {
   BudgetMutationCommandResult,
   BudgetPrivilegedResult,
 } from './commands/budget.js'
+export {
+  parsePolicyArgs,
+  runPolicyScan,
+  runPolicyMutation,
+  printPolicy,
+  printPolicyMutation,
+  exitCodeForPolicy,
+  validatePolicyDefineArgs,
+  validatePolicyDisableArgs,
+  describeRule,
+  describeSubject,
+  POLICY_EXIT_VIOLATION,
+  POLICY_EXIT_INDETERMINATE,
+  POLICY_HELP,
+} from './commands/policy.js'
+export type {
+  PolicyArgs,
+  PolicyScanResult,
+  PolicyCommandResult,
+  PolicyMutationCommandResult,
+  PolicyPrivilegedResult,
+} from './commands/policy.js'
 export { runConfigCheck, printConfigCheck } from './commands/config-check.js'
 export type { ConfigCheck, ConfigCheckResult, FetchLike } from './commands/config-check.js'
 export { runRecordDemo, printRecordDemo } from './commands/record-demo.js'
@@ -157,6 +188,12 @@ Commands:
                                 if the breaker cannot be consulted, this does not
                                 pass. Exit 10 tripped, 11 cannot establish.
                                 'afr budget list|trip|reset' for the rest.
+  afr policy scan --agent <id> | --env <name> | --org
+                                Did any recorded run break a declared policy?
+                                FAILS CLOSED: anything it could not evaluate
+                                exits 21, and no flag makes that a pass. Exit 20
+                                violation, 21 cannot establish.
+                                'afr policy list|define|disable' for the rest.
   afr triage                    START HERE: what is wrong right now, and what to look at first
   afr cause <runId> --direction up|down|both
                                 What caused this run, and what did it break? Walks the
@@ -271,6 +308,33 @@ export async function main(argv: string[], log: (line: string) => void = console
       // consulted, no budget governs the subject, or an expired yes was
       // honoured inside an explicitly configured grace.
       return result.ok ? exitCodeForBudget(result) : result.exitCode
+    }
+
+    case 'policy': {
+      const args = parsePolicyArgs(afterCommand)
+      if (args.help === true || args.subcommand === undefined) {
+        log(POLICY_HELP)
+        // Bare `afr policy` is a usage error (1); `--help` is not (0). A
+        // compliance gate that typos the subcommand must not exit 0.
+        return args.help === true ? 0 : 1
+      }
+      if (args.subcommand === 'define' || args.subcommand === 'disable') {
+        const mutation = await runPolicyMutation(args, args.subcommand)
+        printPolicyMutation(mutation, log)
+        return mutation.ok ? 0 : mutation.exitCode
+      }
+      if (args.subcommand !== 'scan' && args.subcommand !== 'list') {
+        log(`Unknown 'policy' subcommand: ${args.subcommand}. Try scan, list, define or disable.`)
+        return 1
+      }
+      const result = await runPolicyScan(args)
+      printPolicy(args, result, log)
+      // Transport/usage failures keep the shared 0-4 convention; a SUCCESSFUL
+      // scan maps its verdict to 0/20/21 through a TOTAL table. Exit 0 is
+      // unreachable unless every policy governing the subject was evaluable over
+      // every run in scope — and there is deliberately no flag that relaxes it,
+      // because the output of a compliance scan gets attested to.
+      return result.ok ? exitCodeForPolicy(result) : result.exitCode
     }
 
     case 'triage': {

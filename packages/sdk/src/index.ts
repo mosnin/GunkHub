@@ -62,6 +62,27 @@ export { V1ApiError, fetchV1, postV1, tryParseV1Json, messageFromV1Body } from '
 export { BudgetGuard, snapshotRefusals } from './budget-guard.js'
 export type { BudgetGuardConfig, SnapshotAcceptance } from './budget-guard.js'
 
+// DECLARATIVE POLICY — the second thing in this SDK that does something other
+// than record. `PolicyPreflight` is the in-process seam: it holds a listing of
+// the policies governing a subject, answers `check(act)` synchronously with NO
+// I/O AT ALL (a prohibition is decidable in the client; only spend needs the
+// server), and NEVER THROWS.
+//
+// IT ADVISES; IT DOES NOT PREVENT. Nothing exported here asserts that a call was
+// blocked, prevented or enforced — those are facts about a process this library
+// sits inside and does not control. And it decides A DESCRIPTION OF AN ACT, not
+// an act: nothing binds the tool name passed to `check()` to the call
+// subsequently made (ADR-009 §7.7).
+//
+// ABOVE ALL, IT HAS NO CHANNEL TO THE RECORDER. There is no way for an answer
+// from this class to cause an event not to be recorded, and every band carries
+// `recordRegardless: true` — the literal type — to say so in the value an
+// integrator reads. A flight recorder must never refuse to record a violation;
+// the breach is the most valuable row in the log. See
+// `packages/contracts/src/policy.ts`, invariant 0.
+export { PolicyPreflight } from './policy-preflight.js'
+export type { PolicyPreflightConfig, PolicySnapshotAcceptance } from './policy-preflight.js'
+
 // Generic projection primitives — shared by the MCP server's projections and
 // by anything else shaping a v1 response into a budgeted one. See
 // `./projection.ts` for why these live here rather than in `packages/mcp`.
@@ -150,6 +171,9 @@ export type {
   V1CausalTraceData,
   BudgetSnapshotParams,
   V1BudgetSnapshotData,
+  PolicySubjectParams,
+  V1PolicySnapshotData,
+  V1PolicyEvaluationData,
 } from './reader.js'
 export type { V1ApiConfig, V1FetchLike, V1ApiErrorKind, V1Envelope } from './v1-client.js'
 
@@ -366,6 +390,79 @@ export type {
   ManualTripRequest,
   ManualResetRequest,
   BudgetMutationResult,
+  // Declarative policy ("may this agent call that tool?"). THE EVIDENTIAL
+  // ASYMMETRY IS INVERTED FROM SPEND, and every separation below follows from
+  // that:
+  //
+  //   VIOLATED IS CHEAP, SATISFIED IS NEARLY UNPROVABLE. A `PolicyViolationProof`
+  //   is one event citation. A `PolicyCoverageProof` needs five literal-typed
+  //   fields — and a sixth that no amount of reading can supply, because
+  //   `Events.toolCall` and `Events.httpRequest` are MANUAL BUILDERS with no
+  //   interception behind them: a complete read of an incomplete recording
+  //   proves nothing about the world. So satisfaction requires an
+  //   `InstrumentationClaim` the AGENT made, and `{ claims: 'undeclared' }` — the
+  //   state of every agent today — makes `satisfied` UNREACHABLE. That is the
+  //   honest answer, the same way `provably_under` is unreachable for a
+  //   counter-backed budget.
+  //
+  //   `SatisfactionLicence` IS A ONE-MEMBER UNION. Exactly one way to establish
+  //   satisfaction, and the extension point is a single greppable line.
+  //
+  //   NOT-EVALUABLE vs SATISFIED — `violatedPolicyId` / `satisfiedPolicyId` /
+  //   `undecidedPolicyId` share no field, so `o.satisfiedPolicyId ??
+  //   o.undecidedPolicyId` does not compile. There is no one-word name for the
+  //   good outcome anywhere, and `PolicyOutcomeCounts` requires all three counts
+  //   so a bare `satisfiedCount` — the figure that leaves the type system and
+  //   ends up in a questionnaire — is unconstructible.
+  //
+  //   THE POLICY vs THE SDK vs THE CALL — "a policy forbids this" and "the SDK
+  //   advised against" are ours. "The call was prevented" is not, and
+  //   `FORBIDDEN_PREVENTION_CLAIM_FIELDS` is the vocabulary the wire gate
+  //   refuses, alongside `FORBIDDEN_SUPPRESSION_FIELDS` (invariant 0) and
+  //   `FORBIDDEN_COMPLIANCE_CLAIM_FIELDS` (invariant 2).
+  //
+  // See `packages/contracts/src/policy.ts` and ADR-009.
+  PolicyRule,
+  PolicyRuleKind,
+  PolicySubject,
+  PolicyDefinition,
+  InstrumentationClaim,
+  CompleteInstrumentationClaim,
+  PolicyEventCitation,
+  ViolationDecidedBy,
+  RuleMatch,
+  RecordedActEvent,
+  PolicyViolationProof,
+  PolicyCoverageProof,
+  SatisfactionLicence,
+  PolicyOutcome,
+  PolicyViolated,
+  PolicySatisfied,
+  PolicyNotEvaluable,
+  PolicyNotEvaluableKind,
+  PolicyOutcomeCounts,
+  PolicyEvaluation,
+  PolicyEvaluationScan,
+  PolicyVerdict,
+  PolicyUnusableReason,
+  PolicyUnusableFieldFinding,
+  PolicyClaim,
+  PolicyClaimContradiction,
+  PolicyClaimFinding,
+  PolicySnapshot,
+  ProposedAct,
+  PolicyUnavailablePolicy,
+  PolicyPreflightAnswer,
+  PolicyPreflightInput,
+  AdvisedAgainstByPolicy,
+  NoListedPolicyForbidsThisAct,
+  NoPolicyGovernsThisSubject,
+  ProceededWithinGrace,
+  AdvisedAgainstWithoutAnswer,
+  ProceededWithoutPolicyAnswer,
+  UpsertPolicyRequest,
+  DisablePolicyRequest,
+  PolicyMutationResult,
 } from '@agent-flight-recorder/contracts'
 
 // Divergence verdict/coverage RULES (runtime). One implementation of "is this
@@ -521,4 +618,85 @@ export {
   BREAKER_FRESHNESS_CADENCE_MULTIPLE,
   MAX_BREAKER_ANSWER_FRESHNESS_MS,
   MAX_BREAKER_GRACE_MS,
+  // Policy RULES (runtime). Same single-definition posture, and here it is the
+  // matching predicate that matters most: the preflight answers "may I call
+  // this" from a raw URL a caller holds, and the evaluator answers "did this
+  // happen" from a recorded `http.request` payload. TWO IMPLEMENTATIONS OF ONE
+  // PREDICATE means an act the preflight permitted is later reported as a
+  // violation, or the reverse.
+  //
+  // `decidePreflight` is THE rule, shared by `PolicyPreflight` and `afr policy
+  // check`. `mayProceedWithAct` is the boolean, backed by a TOTAL map so a
+  // seventh band cannot ship unclassified. `computePolicyVerdict` is
+  // four-valued, and only its longest-named band is an all-clear.
+  decidePreflight,
+  mayProceedWithAct,
+  wasAdvisedAgainstBySdk,
+  actIsForbiddenBy,
+  hostFallsUnder,
+  // EXTRACTION AND MATCHING TOGETHER, IN ONE FUNCTION. `matchRecordedEventAgainstPolicy`
+  // takes a whole recorded event and answers in four bands, because the obvious
+  // factoring — a reader handing a string to a matcher — produced a live false
+  // all-clear: the reader accepted `host` as well as `url`, the matcher only
+  // parsed URLs, and a recorded egress to a denied host was counted fully
+  // legible, matched against nothing, and cleared the run. There is deliberately
+  // no exported function that does half of this. `undecidable` is NOT
+  // `permitted_by_this_rule`, and a value present but uninterpretable is
+  // evidence we could not read, never evidence of compliance.
+  matchRecordedEventAgainstPolicy,
+  hostForMatching,
+  isExternalizedPayload,
+  // `[]` is a misconfiguration, not a deny-all — a rule that forbids nothing
+  // while looking exactly like one that checked. Read at EVALUATION time, not
+  // only at write time, so a row written by another client cannot grade runs
+  // clean.
+  isInterpretableRule,
+  // "Does this policy govern anything?" — enabled AND interpretable, read once
+  // so a loader cannot filter on a different notion than the matcher uses. A
+  // disabled policy reaching the evaluator is `not_evaluable`, never a
+  // violation: a false all-clear is believed, but A FALSE VIOLATION IS ACTED ON
+  // — somebody rolls back on a rule that was explicitly turned off.
+  policyGoverns,
+  // "Can this rule be decided from the event TYPE alone?" — true ONLY for a rule
+  // that denies the operation itself, and that is the one case where an
+  // externalized payload still proves a violation. Widening it to partial lists
+  // manufactures proofs (ADR-009 §4.3).
+  ruleIsDecidableFromEventTypeAlone,
+  // "Does this agent's declaration cover the operation class this rule is
+  // about?" — what stops a tool-call declaration licensing an egress all-clear.
+  instrumentationCovers,
+  // The gate. `isCoverageProof` is the single most important validator in the
+  // feature: it is what stands between a partial read of an undeclared agent and
+  // a false all-clear.
+  isCoverageProof,
+  isEstablishedSatisfied,
+  isAllClear,
+  computePolicyVerdict,
+  establishedViolations,
+  countPolicyOutcomes,
+  policyEvaluationRefusals,
+  policySnapshotRefusals,
+  evaluationUnusableFields,
+  evaluationClaimContradictions,
+  complianceClaimIn,
+  // The sentences are COMPOSED, never transmitted — so no surface can render an
+  // unevaluable policy in the all-clear register. Render these, never a string
+  // from the wire.
+  policyOutcomeStatement,
+  policyVerdictStatement,
+  preflightStatement,
+  PREFLIGHT_STILL_RECORDS,
+  FORBIDDEN_PREVENTION_CLAIM_FIELDS,
+  FORBIDDEN_COMPLIANCE_CLAIM_FIELDS,
+  FORBIDDEN_SUPPRESSION_FIELDS,
+  FORBIDDEN_POLICY_WIRE_FIELDS,
+  FORBIDDEN_COMPLIANCE_PROSE,
+  POLICY_RULE_KINDS,
+  POLICY_SUBJECT_KINDS,
+  POLICY_NOT_EVALUABLE_KINDS,
+  RULE_DECIDING_EVIDENCE,
+  MAX_POLICIES_PER_ORG,
+  MAX_POLICY_OUTCOMES,
+  MAX_POLICY_ANSWER_FRESHNESS_MS,
+  MAX_POLICY_GRACE_MS,
 } from '@agent-flight-recorder/contracts'

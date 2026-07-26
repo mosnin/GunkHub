@@ -79,6 +79,26 @@ export const AUDIT_ACTIONS = [
   "budget.tripped",
   "budget.auto_tripped",
   "budget.reset",
+  // DECLARATIVE POLICY (convex/policies.ts, convex/helpers/policy.ts).
+  //
+  // A policy definition is the rule an org's compliance answers are graded
+  // against, so changing one silently changes what every past and future report
+  // says. All four are admin-gated and audited per Event Log Rule 6.
+  //
+  // `policy.deleted` CARRIES THE FULL RULE SNAPSHOT IN ITS METADATA, and that is
+  // deliberate rather than incidental: the definitions table is ordinary
+  // mutable config, so without the snapshot a deleted policy's terms are
+  // unrecoverable and a report someone read last week becomes unreconstructible.
+  // `policy.updated` carries the before/after rule and the new revision for the
+  // same reason — see `policies.revision` in convex/schema.ts.
+  //
+  // THERE IS NO `policy.enforced` AND THERE WILL NOT BE. Nothing in this feature
+  // acts on a running agent; these four name what an OPERATOR did to a stored
+  // definition, which is the only thing this product observed.
+  "policy.created",
+  "policy.updated",
+  "policy.deleted",
+  "policy.enabled_changed",
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

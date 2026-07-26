@@ -1326,4 +1326,130 @@ export default defineSchema({
     // The trip-recording sweep walks enabled budgets across all orgs. Ranging on
     // `enabled` keeps a deployment full of disabled budgets off the sweep.
     .index("by_enabled", ["enabled"]),
+
+  // ---------------------------------------------------------------------------
+  // DECLARATIVE POLICY — "agent X may not call tool Y", "no run in environment Z
+  // may egress to host H", evaluated against RECORDED runs.
+  //
+  // VOCABULARY IS `packages/contracts/src/policy.ts`, WHICH IS AUTHORITATIVE.
+  // `rule` / `subject` / `rationale` / `revision` are its spellings, not this
+  // file's. They are written out as v.literal unions because Convex's validator
+  // DSL cannot be built from a runtime array, and convex/policies.ts asserts at
+  // module load that these agree with `POLICY_RULE_KINDS` / `POLICY_SUBJECT_KINDS`
+  // — so a vocabulary change in contracts fails loudly here instead of drifting
+  // into a rule the engine silently never matches.
+  //
+  // READ convex/helpers/policy.ts BEFORE CHANGING ANYTHING HERE. Its PART 2 is
+  // the ruling that shapes this table: A POLICY NEVER REFUSES, MUTATES OR
+  // SUPPRESSES AN EVENT. Refusing to record a violation destroys the evidence of
+  // the violation, and a recorder that goes blind at the moment something goes
+  // wrong is worse than one with no policy feature at all.
+  //
+  // WHAT IS NOT IN THIS TABLE, AND MUST NEVER BE:
+  //
+  //   NO `action` / `onViolation` / `severity` / `mode` FIELD. There is no
+  //     "block" mode to add later. A policy says what must not happen; it does
+  //     not say what to do to the event that shows it happened, because the
+  //     answer is always the same — record it. No ingest module imports the
+  //     policy modules at all: asserted structurally in convex/policies.test.ts
+  //     over the import graph, because "does not reject" is a property of code
+  //     that a bug can undo and "cannot run there" is not.
+  //   NO STORED OUTCOME. No `lastEvaluatedAt`, no `violationCount`, no cached
+  //     verdict. An outcome is a DERIVED PROJECTION over the append-only log
+  //     (Event Log Rule 2), computed at query time in convex/policies.ts. A
+  //     stored compliance verdict is a figure that can disagree with the log it
+  //     came from — and it is exactly the figure someone would attest to.
+  //
+  // AND THERE IS NO DELETE, per contracts' `DisablePolicyRequest`: a policy that
+  // governed recorded runs is part of how those runs were judged, so removing the
+  // row would make past outcomes uninterpretable. `disablePolicy` is the
+  // operation, it requires a reason, and it is audited.
+  //
+  // ADDITIVE: net-new table, no existing document affected, no migration.
+  // ---------------------------------------------------------------------------
+  policies: defineTable({
+    orgId: v.id("organizations"),
+    name: v.string(),
+
+    // -- WHAT IS FORBIDDEN --------------------------------------------------
+    // AN ABSENT `deniedTools` / `deniedHosts` MEANS THE OPERATION ITSELF IS
+    // DENIED ("may not call any tool" / "may not egress at all"), and that is
+    // load-bearing rather than a convenience: it is the ONE form under which an
+    // externalized payload still proves a violation, because the event TYPE
+    // survives externalization while the tool name does not. Contracts'
+    // `ruleIsDecidableFromEventTypeAlone` is the predicate, and it is true only
+    // for `undefined` — widening it to short lists manufactures proofs.
+    //
+    // AN EMPTY ARRAY IS A MISCONFIGURATION, NOT A WIDENED RULE, and the two are
+    // one serialization step apart: `undefined` forbids everything, `[]` forbids
+    // nothing forever. A `[]` rule would clear a run that called the banned tool
+    // while looking identical to a rule that genuinely checked. It is refused at
+    // write time AND re-checked at EVALUATION time
+    // (helpers/policy.ts `isInterpretableRule`), because a row restored from a
+    // backup or written before the guard existed must be reported
+    // `policy_unreadable` rather than silently matching nothing.
+    rule: v.union(
+      v.object({
+        kind: v.literal("tool_denied"),
+        deniedTools: v.optional(v.array(v.string())),
+      }),
+      v.object({
+        kind: v.literal("egress_denied"),
+        deniedHosts: v.optional(v.array(v.string())),
+      }),
+    ),
+
+    // -- WHO IT APPLIES TO --------------------------------------------------
+    // Typed foreign keys (`v.id`), never bare strings, so Convex checks
+    // referential integrity. `environment` is a plain string because
+    // runs.environment is itself an open string (ADR-002) — AND BECAUSE IT IS A
+    // LABEL THE CLIENT CHOSE, NOT A TRUST BOUNDARY: an agent that mislabels its
+    // environment is outside every rule scoped that way with nothing detecting
+    // it. Every report scoped this way says so in its own coverage statement.
+    subject: v.union(
+      v.object({ appliesTo: v.literal("org") }),
+      v.object({ appliesTo: v.literal("project"), projectId: v.id("projects") }),
+      v.object({ appliesTo: v.literal("agent"), agentId: v.id("agents") }),
+      v.object({ appliesTo: v.literal("environment"), environment: v.string() }),
+    ),
+
+    /**
+     * REQUIRED prose: why this act is forbidden. Travels into every outcome, so a
+     * violation on a screen at 3am states its own justification rather than a
+     * policy id somebody has to go and look up.
+     */
+    rationale: v.string(),
+
+    /** A disabled policy governs nothing, and is NOT a policy evaluated and satisfied. */
+    enabled: v.boolean(),
+
+    /**
+     * Bumped on EVERY terms change (rule/subject/name/rationale), and NOT on an
+     * enable/disable, which changes whether the rule is in force and not what it
+     * says. STAMPED ON EVERY OUTCOME.
+     *
+     * An evaluation applies TODAY'S rule to a run that finished last month — a
+     * legitimate question, and a dishonest one if the rule can change underneath
+     * a report someone already read. An outcome that does not name the revision
+     * it was judged under is one nobody can reproduce.
+     */
+    revision: v.number(),
+
+    createdAt: v.number(),
+    createdBy: v.string(),
+    updatedAt: v.optional(v.number()),
+    updatedBy: v.optional(v.string()),
+    /** Set by disablePolicy. Never cleared on re-enable — a historical marker, not the live flag. */
+    disabledAt: v.optional(v.number()),
+    disabledBy: v.optional(v.string()),
+  })
+    // The admin listing, and the only unfiltered read of this table.
+    .index("by_org", ["orgId"])
+    // Every EVALUATION and every pre-flight listing wants "the enabled policies
+    // for this org" and nothing else. Ranging on `enabled` keeps a deployment
+    // full of disabled policies off the hot path instead of reading and
+    // discarding them. Justified by two callers shipping in this same change
+    // (convex/policies.ts's evaluation surface and convex/policy_gate.ts's
+    // pre-flight query); there is no speculative third.
+    .index("by_org_enabled", ["orgId", "enabled"]),
 });

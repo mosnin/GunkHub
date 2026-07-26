@@ -259,6 +259,20 @@ record *which person* made a privileged change). An API key has no human actor b
 it, and an MCP tool call has no human in the loop at all — so this surface can reflect
 lifecycle state, and can never assert it.
 
+**In particular, the policy pre-flight does not belong here.**
+[`docs/adr/009`](adr/009-policy-engine.md) authorises a declarative policy engine
+with two halves: reading policy findings (a read, and legitimate on this surface
+under the ordinary rules once the routes exist) and an advisory pre-flight the SDK
+asks before acting. The second requires a key with **`ingest:write`** — a pre-write
+check belongs to the write path, the same reasoning that put
+`convex/budget_gate.ts` behind `ingest:write` rather than `read` — and this package
+must never hold such a key. The pre-flight is a `packages/sdk` seam, like
+`BudgetGuard`. That it *reads* rather than mutates is not sufficient warrant: the
+scope it needs is the disqualifying fact. No read surface for either half exists
+yet — only the engine's pure fold — so nothing is buildable here today; this is
+recorded now because "it's only a query" is the argument that would otherwise land
+the pre-flight here the moment a route appears.
+
 It also does not talk to Convex directly. It holds no deploy key and no Clerk session.
 It reaches the product over the public `/api/v1/**` HTTP API with an API key, exactly
 like the `afr` CLI, and inherits that door's org scoping and rate limits. See

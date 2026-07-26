@@ -33,6 +33,8 @@ import {
   traversalClaimContradictions,
   traversalIncoherences,
   traversalUnusableFields,
+  evaluationUnusableFields,
+  policySnapshotRefusals,
 } from '@agent-flight-recorder/contracts'
 
 import { warnIfInsecureEndpoint } from './transport.js'
@@ -52,6 +54,8 @@ import type {
   FleetDivergenceReport,
   FleetHealthReport,
   PatternResolutionEvidence,
+  PolicyEvaluation,
+  PolicySnapshot,
   ReplayProjection,
   Run,
   RunExplanation,
@@ -2529,6 +2533,206 @@ export class FlightReader {
     )
     assertBreakerSnapshotTrustworthy(data.snapshot, params)
     return data
+  }
+
+  /**
+   * List the policies governing a subject, for the in-process
+   * {@link PolicyPreflight}.
+   *
+   * A LISTING OF DEFINITIONS, NOT OF ANSWERS — unlike `getBudgetSnapshot`.
+   * Deliberate: a prohibition is decidable in the client from the definition and
+   * the proposed act, so one round trip per shelf life serves every act. Only
+   * spend needs the server, because only the server can sum it.
+   *
+   * @param params - name exactly one subject.
+   * @returns the listing, refused if it cannot be answered from.
+   * @throws {@link V1ApiError} on any auth/not-found/rate-limit/server/network failure.
+   * @throws {@link V1ApiError} with `kind: 'invalid_response'` if the listing
+   *   cannot be trusted — see {@link assertPolicySnapshotTrustworthy}.
+   * @throws {RangeError} if no subject was named — a caller bug, before any request.
+   */
+  async getPolicySnapshot(params: PolicySubjectParams): Promise<V1PolicySnapshotData> {
+    const named = [params?.projectId, params?.agentId, params?.environment].filter(
+      (value) => typeof value === 'string' && value.length > 0
+    )
+    if (named.length === 0 && params?.orgWide !== true) {
+      throw new RangeError(
+        `getPolicySnapshot: name a subject (projectId, agentId or environment), or pass orgWide: true. There is ` +
+          `deliberately no implicit default: a preflight whose subject is implicit silently changes meaning the ` +
+          `day someone adds an org-wide policy.`
+      )
+    }
+
+    const data = await fetchV1<V1PolicySnapshotData>(
+      this.config,
+      '/api/v1/policies/snapshot',
+      {
+        ...(params.projectId !== undefined && { projectId: params.projectId }),
+        ...(params.agentId !== undefined && { agentId: params.agentId }),
+        ...(params.environment !== undefined && { environment: params.environment }),
+        ...(params.orgWide === true && { orgWide: 'true' }),
+      },
+      this.fetchImpl
+    )
+    assertPolicySnapshotTrustworthy(data.snapshot, params)
+    return data
+  }
+
+  /**
+   * Evaluate every policy governing a subject against RECORDED runs.
+   *
+   * THE RETROSPECTIVE HALF, and the read-only one. It computes nothing that
+   * changes what an agent does; it reports what the log shows and, far more
+   * often, what the log cannot show.
+   *
+   * NOTE WHAT THIS METHOD DOES NOT REFUSE. A `not_evaluable` outcome, a truncated
+   * scan, and an `instrumentation_undeclared` finding are all the server TELLING
+   * THE TRUTH in a field, and the correct response is an `evaluation_incomplete`
+   * verdict — which `computePolicyVerdict` already produces. Throwing them away
+   * here would replace a verdict the caller can act on with an exception they did
+   * not ask for.
+   *
+   * @param params - name exactly one subject.
+   * @returns the evaluation. Pair with `computePolicyVerdict`.
+   * @throws {@link V1ApiError} on transport failure, or with `kind:
+   *   'invalid_response'` when the body cannot be reported on at all.
+   */
+  async getPolicyEvaluation(params: PolicySubjectParams): Promise<V1PolicyEvaluationData> {
+    const data = await fetchV1<V1PolicyEvaluationData>(
+      this.config,
+      '/api/v1/policies/evaluate',
+      {
+        ...(params.projectId !== undefined && { projectId: params.projectId }),
+        ...(params.agentId !== undefined && { agentId: params.agentId }),
+        ...(params.environment !== undefined && { environment: params.environment }),
+        ...(params.orgWide === true && { orgWide: 'true' }),
+      },
+      this.fetchImpl
+    )
+    assertPolicyEvaluationTrustworthy(data.evaluation)
+    return data
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/policies/**
+//
+// "May this agent call that tool?", asked of the record. Policy types are
+// contracts' (`packages/contracts/src/policy.ts`); the engine is Team A's.
+// ---------------------------------------------------------------------------
+
+/** Parameters for the policy read methods. Name exactly one subject, or `orgWide`. */
+export interface PolicySubjectParams {
+  projectId?: string
+  agentId?: string
+  /**
+   * `runs.environment`. A LABEL THE CLIENT CHOSE, NOT A TRUST BOUNDARY (ADR-009
+   * §7.3) — an agent that mislabels its environment is outside every rule scoped
+   * this way, and nothing detects it.
+   */
+  environment?: string
+  /** Explicit opt-in to the org-wide subject. Never a default. */
+  orgWide?: boolean
+}
+
+/** Response shape for `GET /api/v1/policies/snapshot`. */
+export interface V1PolicySnapshotData {
+  snapshot: PolicySnapshot
+}
+
+/** Response shape for `GET /api/v1/policies/evaluate`. */
+export interface V1PolicyEvaluationData {
+  evaluation: PolicyEvaluation
+}
+
+/**
+ * Refuse a policy listing that cannot be answered from.
+ *
+ * TWO GROUNDS, and the first is the one every read surface in this SDK now
+ * checks:
+ *
+ * 1. IGNORED PARAMETERS. The subject is echoed on `snapshot.subject`, and a
+ *    deployment that listed a different subject's policies returned a
+ *    well-formed answer to a question nobody asked — here, "some other agent's
+ *    prohibitions", applied to this one. In the permissive direction that is a
+ *    forbidden tool call the preflight never mentions.
+ *
+ * 2. ANYTHING `policySnapshotRefusals` NAMES. That is the single definition,
+ *    shared with `PolicyPreflight` and the CLI, and it includes the total sweep
+ *    for `FORBIDDEN_SUPPRESSION_FIELDS` — a policy definition carrying
+ *    `suppressViolation: true` is the worst possible place for that field, and
+ *    invariant 0 says it is refused rather than obeyed.
+ */
+function assertPolicySnapshotTrustworthy(snapshot: PolicySnapshot, params: PolicySubjectParams): void {
+  const context = 'getPolicySnapshot'
+  const subject = (snapshot as { subject?: unknown })?.subject
+  if (subject === null || typeof subject !== 'object' || Array.isArray(subject)) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: the listing carried no \`subject\`, so there is no way to check that these policies govern the ` +
+        `subject that was asked about. Refusing.`
+    )
+  }
+  const echoed = subject as Record<string, unknown>
+  const expected: Record<string, string | undefined> = {
+    project: params.projectId,
+    agent: params.agentId,
+    environment: params.environment,
+  }
+  for (const [appliesTo, requested] of Object.entries(expected)) {
+    if (requested === undefined) continue
+    const field = appliesTo === 'project' ? 'projectId' : appliesTo === 'agent' ? 'agentId' : 'environment'
+    if (echoed['appliesTo'] !== appliesTo || echoed[field] !== requested) {
+      throw new V1ApiError(
+        'invalid_response',
+        `${context}: asked about ${appliesTo}=${JSON.stringify(requested)} but the listing reports ` +
+          `${JSON.stringify(echoed['appliesTo'] ?? null)}=${JSON.stringify(echoed[field] ?? null)}. This ` +
+          `deployment ignored the parameter, so these policies govern something else — and a preflight answered ` +
+          `from another subject's prohibitions is a forbidden call nobody is warned about.`
+      )
+    }
+  }
+
+  const refusals = policySnapshotRefusals(snapshot)
+  if (refusals.length > 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `${context}: this policy listing cannot be answered from — ${refusals.join('; ')}. A listing that cannot be ` +
+        `trusted is treated as NO listing, and the caller's own PolicyUnavailablePolicy decides what that means.`
+    )
+  }
+}
+
+/**
+ * Refuse a policy evaluation that cannot be reported on at all.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ONE THING THAT IS REFUSED HERE AND NOT DOWNGRADED
+ * ---------------------------------------------------------------------------
+ *
+ * Almost nothing. `computePolicyVerdict` already downgrades a body with any
+ * refusal to `evaluation_incomplete` — a verdict the caller can act on — and
+ * throwing would replace it with an exception they did not ask for.
+ *
+ * WHAT IS REFUSED IS THE SUPPRESSION DIRECTIVE, AND ONLY IT. A body carrying
+ * `dropEvent`, `suppressViolation` or `doNotRecord` is not a slightly wrong
+ * answer to be softened into an incomplete verdict; it is a deployment asking
+ * this SDK to help a breach go unrecorded, which invariant 0 forbids outright. A
+ * caller who sees this exception should treat it as a compromised or
+ * misconfigured backend, not as a bad scan.
+ */
+function assertPolicyEvaluationTrustworthy(evaluation: PolicyEvaluation): void {
+  const suppression = evaluationUnusableFields(evaluation).filter(
+    (finding) => finding.reason === 'forbidden_suppression_directive'
+  )
+  if (suppression.length > 0) {
+    throw new V1ApiError(
+      'invalid_response',
+      `getPolicyEvaluation: this deployment's response carries a RECORDING-SUPPRESSION DIRECTIVE at ` +
+        `${suppression.map((f) => f.path).join(', ')}. A flight recorder must never refuse to record a violation — ` +
+        `the breach is the most valuable event in the log — so this body is refused outright rather than read. ` +
+        `Treat this as a compromised or misconfigured backend, not as a failed scan.`
+    )
   }
 }
 
